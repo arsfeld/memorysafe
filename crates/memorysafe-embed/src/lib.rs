@@ -1,5 +1,7 @@
 //! Embedding generation, int8 quantization, and vectors.
 
+#[cfg(feature = "model2vec")]
+pub mod model2vec;
 pub mod quantize;
 pub mod test_embedder;
 
@@ -22,5 +24,7 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, text: &str) -> Result<Embedding, EmbedError>;
 }
 
+#[cfg(feature = "model2vec")]
+pub use model2vec::Model2VecEmbedder;
 pub use quantize::{QuantizeError, QuantizedVector};
 pub use test_embedder::DeterministicEmbedder;
