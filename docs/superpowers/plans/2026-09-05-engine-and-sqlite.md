@@ -2294,6 +2294,21 @@ mod tests {
     }
 
     #[test]
+    fn a_dim_that_lies_about_its_vector_is_not_comparable() {
+        // Fields are public and deserialized, so `dim` can disagree with the
+        // vector it describes. Two such embeddings must not compare equal just
+        // because their declared dims match.
+        let honest = Embedding::new(vec![0.0; 4], EmbedderId::new("m"));
+        assert_eq!(honest.dim, 4);
+        assert!(honest.is_comparable_to(&honest));
+
+        let liar = Embedding { vector: vec![0.0; 2], embedder: EmbedderId::new("m"), dim: 4 };
+        assert!(!liar.is_comparable_to(&honest), "a lying dim was accepted");
+        assert!(!honest.is_comparable_to(&liar));
+        assert!(!liar.is_comparable_to(&liar), "self-comparison hid the inconsistency");
+    }
+
+    #[test]
     fn vectors_from_different_embedders_are_not_comparable() {
         assert!(emb("model2vec-base", 256).is_comparable_to(&emb("model2vec-base", 256)));
         assert!(!emb("model2vec-base", 256).is_comparable_to(&emb("nomic-v1.5", 256)));
@@ -2394,11 +2409,26 @@ pub struct Embedding {
 }
 
 impl Embedding {
+    /// Derives `dim` from the vector rather than accepting it separately, so
+    /// the two cannot disagree.
+    pub fn new(vector: Vec<f32>, embedder: EmbedderId) -> Self {
+        let dim = u16::try_from(vector.len()).unwrap_or(u16::MAX);
+        Self { vector, embedder, dim }
+    }
+
     /// Vectors from different models occupy different spaces. Comparing them
     /// produces silently meaningless similarities, so every comparison site
     /// must gate on this.
+    ///
+    /// Compares the actual vector lengths as well as the declared `dim`. The
+    /// fields are public and `Deserialize`d, so `dim` can lie about the vector
+    /// it describes — and a `dim` that agrees while the vectors differ in
+    /// length is exactly the silent-nonsense case this guard exists to stop.
     pub fn is_comparable_to(&self, other: &Embedding) -> bool {
-        self.embedder == other.embedder && self.dim == other.dim
+        self.embedder == other.embedder
+            && self.dim == other.dim
+            && self.vector.len() == other.vector.len()
+            && self.vector.len() == self.dim as usize
     }
 }
 ```
@@ -2412,6 +2442,7 @@ use crate::ids::{AuditId, ItemId, Scope};
 use crate::item::MemoryItem;
 use crate::score::Score;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 /// Cap on `WorkingSet::omitted`. A recall over a large corpus considers many
 /// candidates; the response must stay bounded.
@@ -2453,6 +2484,12 @@ pub struct RecallRequest {
     pub query: Option<String>,
     pub tags_any: Vec<String>,
     pub kinds: Vec<String>,
+    /// Bound recall to when the remembered thing happened. Both are pushed
+    /// into SQL as hard filters, below the policy, like every other filter
+    /// here — without them the backend's time-filter machinery would exist
+    /// but be unreachable from any caller.
+    pub occurred_after: Option<OffsetDateTime>,
+    pub occurred_before: Option<OffsetDateTime>,
     pub mode: RecallMode,
     pub budget: RecallBudget,
     /// The caller's clearance. Items above this level are excluded in SQL,
@@ -2461,6 +2498,17 @@ pub struct RecallRequest {
 }
 
 /// A retrieval hit before composition. `relevance` fuses vector and keyword.
+///
+/// `relevance`, `vector_score` and `keyword_score` are bare `f32`, deliberately
+/// breaking the crate's "never a bare `f32`" rule. `Score` is `[0,1]`; cosine
+/// spans `[-1,1]` and BM25 is unbounded, so wrapping these would make
+/// `Score::new` reject valid retrieval signal and `Score::clamped` destroy the
+/// magnitude a ranker needs. Contrast `RedundancyAssessment::near_duplicates`,
+/// which *can* use `Score` only because it is pre-filtered above a floor.
+/// `value` and `fragility` are genuine governance scores and stay `Score`.
+///
+/// Because these are `f32`, any sort on them must use `total_cmp` — a
+/// degenerate zero-vector cosine can produce NaN.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScoredCandidate {
     pub item: MemoryItem,
@@ -2492,6 +2540,11 @@ pub struct WorkingSet {
     /// Truncated to `OMITTED_CAP`.
     pub omitted: Vec<OmittedItem>,
     /// Set by the engine after `record_recall`; the policy leaves it `None`.
+    ///
+    /// `None` means "not yet audited", and the type cannot distinguish that
+    /// from "audited" — so nothing stops an unaudited working set reaching a
+    /// caller. "Every recall is audited" is a product claim, so the engine
+    /// asserts this is `Some` at its public boundary (see the read-path task).
     pub audit_id: Option<AuditId>,
 }
 
@@ -10254,8 +10307,8 @@ impl Engine {
             filters: HardFilters {
                 tags_any: req.tags_any.clone(),
                 kinds: req.kinds.clone(),
-                occurred_after: None,
-                occurred_before: None,
+                occurred_after: req.occurred_after,
+                occurred_before: req.occurred_before,
                 sensitivity_ceiling: req.sensitivity_ceiling,
                 exclude_pending_embedding: false,
             },
@@ -10284,6 +10337,10 @@ impl Engine {
 
         let policy = self.policy.clone();
         let (r, c, x) = (req.clone(), candidates.clone(), ctx.clone());
+        debug_assert!(
+            candidates.iter().all(|c| c.item.scope == req.scope),
+            "backend returned a candidate outside the requested scope"
+        );
         let composed = match validate::call_policy(move || policy.compose(&r, &c, &x)) {
             Ok(ws) => ws,
             Err(failure) => match self.stance {
