@@ -145,7 +145,11 @@ mod tests {
     fn retain_constructor_produces_a_normal_protection_decision() {
         let d = Decision::retain(
             PolicyId::new("baseline", "0.1.0"),
-            Reason::new(ReasonCode::NovelContent, "no near duplicates", features! {}),
+            Reason::new(
+                ReasonCode::NovelContent,
+                "no near duplicates",
+                features! { "best_similarity" => 0.12 },
+            ),
         );
         assert!(matches!(
             d.action,
@@ -155,6 +159,11 @@ mod tests {
         ));
         assert!(d.evictions.is_empty());
         assert!(d.has_reason(ReasonCode::NovelContent));
+        // `has_reason` compares only `.code`, so assert the rest of the Reason
+        // survived too — a constructor that rebuilt it from just the code would
+        // otherwise pass.
+        assert_eq!(d.reasons[0].detail, "no near duplicates");
+        assert_eq!(d.reasons[0].evidence.get("best_similarity"), Some(&0.12));
     }
 
     #[test]
@@ -183,5 +192,60 @@ mod tests {
             ),
         };
         assert_eq!(e.reason.code, ReasonCode::LowValue);
+    }
+
+    #[test]
+    fn has_reason_searches_evictions_as_well_as_reasons() {
+        // `has_reason` searches BOTH vectors. Every other test here builds a
+        // decision whose match is in `reasons`, and `||` short-circuits, so the
+        // evictions branch is never evaluated — deleting it passes all of them.
+        let d = Decision {
+            action: Action::Retain {
+                protection: Protection::Normal,
+            },
+            evictions: vec![Eviction {
+                item: ItemId::new(),
+                reason: Reason::new(ReasonCode::CapacityPressure, "made room", features! {}),
+            }],
+            reasons: vec![Reason::new(ReasonCode::NovelContent, "novel", features! {})],
+            policy: PolicyId::new("baseline", "0.1.0"),
+        };
+        assert!(
+            d.has_reason(ReasonCode::NovelContent),
+            "missed the reasons vector"
+        );
+        assert!(
+            d.has_reason(ReasonCode::CapacityPressure),
+            "missed the evictions vector"
+        );
+        assert!(!d.has_reason(ReasonCode::TtlExpired));
+    }
+
+    #[test]
+    fn action_is_internally_tagged_on_the_wire() {
+        // Audit rows store this shape. Dropping `tag = "kind"` would silently
+        // switch to serde's externally-tagged form and orphan every stored row,
+        // and no Rust-level `matches!` assertion would notice.
+        assert_eq!(
+            serde_json::to_string(&Action::Retain {
+                protection: Protection::Normal
+            })
+            .unwrap(),
+            r#"{"kind":"retain","protection":{"kind":"normal"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Action::Reject).unwrap(),
+            r#"{"kind":"reject"}"#
+        );
+        let merge = Action::Merge {
+            into: ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            strategy: MergeStrategy::AppendAndUnion,
+        };
+        assert_eq!(
+            serde_json::to_string(&merge).unwrap(),
+            r#"{"kind":"merge","into":"01ARZ3NDEKTSV4RRFFQ69G5FAV","strategy":"append_and_union"}"#
+        );
+        let back: Action = serde_json::from_str(r#"{"kind":"reject"}"#).unwrap();
+        assert!(matches!(back, Action::Reject));
     }
 }

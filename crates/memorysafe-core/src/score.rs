@@ -6,12 +6,18 @@ use std::collections::BTreeMap;
 /// audit rows serialize deterministically.
 pub type FeatureMap = BTreeMap<String, f64>;
 
+// Two arms, not one with `#[allow(unused_mut)]`: an empty invocation needs no
+// mutable binding, and a suppression inside an exported macro would land in
+// every expansion at every call site forever — including future ones where the
+// lint would be telling the truth.
 #[macro_export]
 macro_rules! features {
-    ($($k:expr => $v:expr),* $(,)?) => {{
-        #[allow(unused_mut)]
+    () => {
+        $crate::score::FeatureMap::new()
+    };
+    ($($k:expr => $v:expr),+ $(,)?) => {{
         let mut m = $crate::score::FeatureMap::new();
-        $( m.insert($k.to_string(), $v as f64); )*
+        $( m.insert($k.to_string(), $v as f64); )+
         m
     }};
 }
