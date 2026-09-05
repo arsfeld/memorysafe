@@ -323,6 +323,7 @@ CREATE TABLE idempotency (
 | 36 | Engine: retention profiles | |
 | 37 | Engine: export/import orchestration | |
 | 38 | Proptest invariants | The five correctness properties |
+| 39 | Engine: re-embedding + backfill | `pending_embedding` items become searchable |
 
 ---
 
@@ -4910,20 +4911,10 @@ impl SqliteBackend {
 }
 ```
 
-Note: `rusqlite::Error` must be convertible into `BackendError` for the `?` operator inside closures. Add to `tenant.rs`:
+`memorysafe-backend` must not depend on `rusqlite`, so the conversion from `rusqlite::Error`
+to `BackendError` is defined locally in this crate as an extension trait. Add to `tenant.rs`:
 
 ```rust
-impl From<rusqlite::Error> for BackendErrorShim {
-    fn from(e: rusqlite::Error) -> Self {
-        BackendErrorShim(to_backend(e))
-    }
-}
-```
-
-Simpler and preferred: give the closures the return type `Result<T, BackendError>` and add this blanket conversion in `memorysafe-backend/src/lib.rs` instead — but `memorysafe-backend` must not depend on `rusqlite`. So define the conversion locally in the SQLite crate:
-
-```rust
-// crates/memorysafe-backend-sqlite/src/tenant.rs
 pub trait SqlResultExt<T> {
     fn sql(self) -> Result<T, BackendError>;
 }
@@ -4935,7 +4926,9 @@ impl<T> SqlResultExt<T> for rusqlite::Result<T> {
 }
 ```
 
-Every SQL call in Tasks 20–24 ends in `.sql()?` rather than a bare `?`. Update the test closures above accordingly (`c.execute(...).sql()?`).
+Every SQL call in Tasks 20–24 ends in `.sql()?` rather than a bare `?`, and so do the closures
+in this task's tests — `c.execute(...).sql()?`, `c.execute_batch(...).sql()?`,
+`c.query_row(...).sql()?`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -8952,7 +8945,7 @@ git commit -m "feat(engine): decision validation and panic-safe policy invocatio
 
 **Interfaces:**
 - Consumes: `Backend`, `Embedder`, `GovernancePolicy`, `validate`.
-- Produces: `Engine::new(EngineConfig)`, `EngineConfig { backend, embedder, policy, fallback_policy, stance, neighbour_k }`, `RememberRequest`, `WriteOutcome`, `Engine::remember`.
+- Produces: `Engine::new(EngineConfig)`, `EngineConfig::new(backend, embedder, policy)` — which fills `fallback_policy`, `stance`, `neighbour_k`, `eviction_candidates`, `cache`, and `retention` with defaults — plus `RememberRequest`, `WriteOutcome`, and `Engine::remember`.
 
 **The pipeline:** validate → embed (cached, degrading to `pending_embedding` on failure) → gather neighbours, capacity, and stats in one pass → `assess` → `admit` → validate the decision → build one `WriteTransaction` → `backend.apply`.
 
@@ -8970,12 +8963,11 @@ use std::sync::Arc;
 
 fn engine() -> Engine {
     let dir = tempfile::tempdir().expect("tempdir");
-    Engine::new(EngineConfig {
-        backend: Arc::new(SqliteBackend::open(dir.keep())),
-        embedder: Arc::new(DeterministicEmbedder::new(256)),
-        policy: Arc::new(BaselinePolicy::default()),
-        ..Default::default()
-    })
+    Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.keep())),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::default()),
+    ))
 }
 
 fn scope() -> Scope {
@@ -9513,12 +9505,6 @@ pub struct EngineConfig {
     pub eviction_candidates: usize,
 }
 
-impl Default for EngineConfig {
-    fn default() -> Self {
-        panic!("EngineConfig requires a backend, embedder, and policy; use struct update syntax")
-    }
-}
-
 pub struct Engine {
     pub(crate) backend: Arc<dyn Backend>,
     pub(crate) embedder: Arc<dyn Embedder>,
@@ -9560,7 +9546,7 @@ impl Engine {
 }
 ```
 
-`EngineConfig::default()` panicking is wrong for the `..Default::default()` used in the test. Replace it with a builder that supplies only the optional fields:
+`EngineConfig` has no `Default` — a backend, embedder, and policy have no sensible defaults, and a panicking `Default` is worse than none. Construction goes through a constructor that supplies only the optional fields:
 
 ```rust
 impl EngineConfig {
@@ -9582,7 +9568,7 @@ impl EngineConfig {
 }
 ```
 
-and update the test helper to `EngineConfig::new(backend, embedder, policy)`.
+`EngineConfig::new` is how every test in Tasks 31–39 builds an engine.
 
 `Candidate`, `Assessment`, `AssessContext`, and `AdmitContext` must derive `Clone`; confirm from Tasks 5 and 10.
 
@@ -11537,6 +11523,384 @@ git commit -m "test(engine): the five correctness invariants as property tests"
 
 ---
 
+## Task 39: Engine — re-embedding and `pending_embedding` backfill
+
+**Files:**
+- Create: `crates/memorysafe-engine/src/reembed.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs`
+- Create: `crates/memorysafe-engine/tests/reembed.rs`
+
+**Interfaces:**
+- Consumes: `Backend::list`, `Backend::apply`, `Embedder`.
+- Produces: `ReembedCursor { offset: usize }`, `ReembedReport { scanned, embedded, still_pending, next_cursor }`, `Engine::backfill_embeddings(&Scope, Option<ReembedCursor>)`, `Engine::reembed_scope(&Scope, Option<ReembedCursor>)`.
+
+**Why this task exists.** Task 31 admits an item with `pending_embedding: true` when the embedder is unavailable — a missing model file must never cost a user their memory. But without a backfill path those items stay invisible to vector search forever, which turns a transient outage into permanent silent recall degradation. This is the other half of that decision.
+
+`reembed_scope` is the migration the spec calls for when a tenant changes embedding model: it re-embeds every item in the scope, not just the pending ones, and audits the run as `Reembedded`. Both are explicit, resumable, cursor-driven jobs for the same reason maintenance is — nothing changes unobserved.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-engine/tests/reembed.rs`:
+
+```rust
+use memorysafe_backend::Page;
+use memorysafe_backend_sqlite::SqliteBackend;
+use memorysafe_core::{
+    AuditEvent, AuditFilter, EmbedderId, Embedding, RecallBudget, RecallMode, RecallRequest,
+    Scope, SensitivityLevel,
+};
+use memorysafe_embed::{DeterministicEmbedder, EmbedError, Embedder};
+use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
+use memorysafe_policy::BaselinePolicy;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// An embedder that can be switched off, standing in for a missing model file.
+struct FlakyEmbedder {
+    inner: DeterministicEmbedder,
+    up: AtomicBool,
+}
+
+impl FlakyEmbedder {
+    fn new() -> Self {
+        Self { inner: DeterministicEmbedder::new(256), up: AtomicBool::new(true) }
+    }
+    fn go_down(&self) {
+        self.up.store(false, Ordering::SeqCst);
+    }
+    fn come_back(&self) {
+        self.up.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Embedder for FlakyEmbedder {
+    fn id(&self) -> EmbedderId {
+        self.inner.id()
+    }
+    fn dim(&self) -> u16 {
+        self.inner.dim()
+    }
+    fn embed(&self, text: &str) -> Result<Embedding, EmbedError> {
+        if self.up.load(Ordering::SeqCst) {
+            self.inner.embed(text)
+        } else {
+            Err(EmbedError::Unavailable("model file missing".into()))
+        }
+    }
+}
+
+fn engine_with(embedder: Arc<dyn Embedder>) -> Engine {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.keep())),
+        embedder,
+        Arc::new(BaselinePolicy::default()),
+    ))
+}
+
+fn scope() -> Scope {
+    Scope::new("acme", "user-42", "agent").unwrap()
+}
+
+#[tokio::test]
+async fn a_write_during_an_outage_is_kept_and_flagged_pending() {
+    let flaky = Arc::new(FlakyEmbedder::new());
+    let e = engine_with(flaky.clone());
+
+    flaky.go_down();
+    let out = e
+        .remember(RememberRequest::new(scope(), "written while the model was missing"))
+        .await
+        .unwrap();
+    assert!(out.item_id.is_some(), "the memory must not be lost");
+
+    let stored = e.review(&scope(), &Page::default()).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0].pending_embedding, "the item should be flagged for backfill");
+}
+
+#[tokio::test]
+async fn backfill_makes_a_pending_item_vector_searchable() {
+    let flaky = Arc::new(FlakyEmbedder::new());
+    let e = engine_with(flaky.clone());
+
+    flaky.go_down();
+    e.remember(RememberRequest::new(scope(), "the cat sat on the mat during the outage"))
+        .await
+        .unwrap();
+    flaky.come_back();
+
+    let report = e.backfill_embeddings(&scope(), None).await.unwrap();
+    assert_eq!(report.embedded, 1);
+    assert_eq!(report.still_pending, 0);
+
+    let stored = e.review(&scope(), &Page::default()).await.unwrap();
+    assert!(!stored[0].pending_embedding, "the flag should be cleared");
+
+    // And it is now reachable by semantic recall, not just keyword.
+    let ws = e
+        .recall(RecallRequest {
+            scope: scope(),
+            query: Some("the cat sat on the mat during the outage".into()),
+            tags_any: vec![],
+            kinds: vec![],
+            mode: RecallMode::WorkingSet,
+            budget: RecallBudget { max_tokens: Some(2000), max_items: Some(5) },
+            sensitivity_ceiling: SensitivityLevel::Restricted,
+        })
+        .await
+        .unwrap();
+    assert_eq!(ws.items.len(), 1);
+}
+
+#[tokio::test]
+async fn backfill_leaves_items_pending_when_the_embedder_is_still_down() {
+    let flaky = Arc::new(FlakyEmbedder::new());
+    let e = engine_with(flaky.clone());
+
+    flaky.go_down();
+    e.remember(RememberRequest::new(scope(), "still no model available")).await.unwrap();
+
+    let report = e.backfill_embeddings(&scope(), None).await.unwrap();
+    assert_eq!(report.embedded, 0);
+    assert_eq!(report.still_pending, 1, "a failed backfill must not clear the flag");
+
+    let stored = e.review(&scope(), &Page::default()).await.unwrap();
+    assert!(stored[0].pending_embedding);
+}
+
+#[tokio::test]
+async fn backfill_over_a_healthy_scope_does_nothing() {
+    let e = engine_with(Arc::new(DeterministicEmbedder::new(256)));
+    e.remember(RememberRequest::new(scope(), "embedded normally at write time")).await.unwrap();
+
+    let report = e.backfill_embeddings(&scope(), None).await.unwrap();
+    assert_eq!(report.embedded, 0);
+    assert_eq!(report.still_pending, 0);
+    assert!(report.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn a_scope_reembed_rewrites_every_vector_and_audits_the_run() {
+    let e = engine_with(Arc::new(DeterministicEmbedder::new(256)));
+    for i in 0..3 {
+        e.remember(RememberRequest::new(scope(), &format!("memory {i} about subject {i}")))
+            .await
+            .unwrap();
+    }
+
+    let report = e.reembed_scope(&scope(), None).await.unwrap();
+    assert_eq!(report.scanned, 3);
+    assert_eq!(report.embedded, 3, "reembed rewrites every vector, not just pending ones");
+
+    let audit = e
+        .audit(&scope(), &AuditFilter {
+            events: vec![AuditEvent::Reembedded],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 1, "a re-embedding migration must be audited");
+}
+
+#[tokio::test]
+async fn reembedding_preserves_the_items_themselves() {
+    let e = engine_with(Arc::new(DeterministicEmbedder::new(256)));
+    for i in 0..3 {
+        e.remember(RememberRequest::new(scope(), &format!("memory {i} about subject {i}")))
+            .await
+            .unwrap();
+    }
+    let before = e.review(&scope(), &Page::default()).await.unwrap();
+
+    e.reembed_scope(&scope(), None).await.unwrap();
+
+    let after = e.review(&scope(), &Page::default()).await.unwrap();
+    assert_eq!(before, after, "re-embedding must not alter the items");
+}
+
+#[tokio::test]
+async fn backfill_on_an_empty_scope_is_a_no_op() {
+    let e = engine_with(Arc::new(DeterministicEmbedder::new(256)));
+    let report = e.backfill_embeddings(&scope(), None).await.unwrap();
+    assert_eq!(report.scanned, 0);
+    assert!(report.next_cursor.is_none());
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine --test reembed`
+Expected: FAIL — `no method named backfill_embeddings found for struct Engine`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-engine/src/reembed.rs`:
+
+```rust
+use crate::Engine;
+use crate::error::EngineError;
+use memorysafe_backend::{ItemWrite, Page, WriteTransaction};
+use memorysafe_core::{
+    Actor, ActorKind, AuditEvent, AuditRecord, ItemRef, MemoryItem, Scope,
+};
+use memorysafe_embed::{Embedder, QuantizedVector};
+use serde::{Deserialize, Serialize};
+
+/// Items per call. Like maintenance, this is an explicit resumable job rather
+/// than a background thread, so the caller controls the work done at once.
+pub const REEMBED_BATCH: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReembedCursor {
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReembedReport {
+    pub scanned: usize,
+    pub embedded: usize,
+    pub still_pending: usize,
+    pub next_cursor: Option<ReembedCursor>,
+}
+
+impl Engine {
+    /// Embeds items admitted while the embedder was unavailable. Without this,
+    /// a transient outage becomes permanent silent recall degradation.
+    pub async fn backfill_embeddings(
+        &self,
+        scope: &Scope,
+        cursor: Option<ReembedCursor>,
+    ) -> Result<ReembedReport, EngineError> {
+        self.reembed(scope, cursor, true).await
+    }
+
+    /// Re-embeds every item in the scope. This is the migration to run after
+    /// changing embedding model — vectors from different models are not
+    /// comparable, so it is explicit rather than something that happens by
+    /// accident.
+    pub async fn reembed_scope(
+        &self,
+        scope: &Scope,
+        cursor: Option<ReembedCursor>,
+    ) -> Result<ReembedReport, EngineError> {
+        self.reembed(scope, cursor, false).await
+    }
+
+    async fn reembed(
+        &self,
+        scope: &Scope,
+        cursor: Option<ReembedCursor>,
+        pending_only: bool,
+    ) -> Result<ReembedReport, EngineError> {
+        let offset = cursor.map(|c| c.offset).unwrap_or(0);
+        let batch: Vec<MemoryItem> = self
+            .backend
+            .list(scope, &Page { offset, limit: REEMBED_BATCH })
+            .await?;
+
+        if batch.is_empty() {
+            return Ok(ReembedReport {
+                scanned: 0,
+                embedded: 0,
+                still_pending: 0,
+                next_cursor: None,
+            });
+        }
+
+        let scanned = batch.len();
+        let targets: Vec<MemoryItem> = batch
+            .into_iter()
+            .filter(|i| !pending_only || i.pending_embedding)
+            .collect();
+
+        let mut embedded = 0usize;
+        let mut still_pending = 0usize;
+        let mut refs: Vec<ItemRef> = Vec::new();
+
+        for item in targets {
+            let Ok(embedding) = self.embedder.embed(&item.body) else {
+                // Leave the flag set; a failed backfill must be retryable.
+                still_pending += 1;
+                continue;
+            };
+            let vector = QuantizedVector::from_embedding(&embedding);
+
+            let mut updated = item.clone();
+            updated.pending_embedding = false;
+
+            // Replacing the row is what clears the flag and rewrites the
+            // vector in one atomic step. The audit record for the whole run is
+            // written separately below, so these carry a minimal one.
+            let audit = AuditRecord::new(
+                scope.clone(),
+                AuditEvent::Reembedded,
+                vec![ItemRef::from_item(&updated)],
+                Actor { kind: ActorKind::System, id: None },
+            );
+            let mut txn = WriteTransaction::new(scope.clone(), audit);
+            txn.evictions = vec![item.id.clone()];
+            txn.upsert = Some(ItemWrite { item: Some(updated.clone()), vector: Some(vector) });
+
+            self.backend.apply(txn).await?;
+            refs.push(ItemRef::from_item(&updated));
+            embedded += 1;
+        }
+
+        self.cache.invalidate_scope(scope).await;
+
+        let next_cursor = if scanned < REEMBED_BATCH {
+            None
+        } else {
+            Some(ReembedCursor { offset: offset + scanned })
+        };
+
+        Ok(ReembedReport { scanned, embedded, still_pending, next_cursor })
+    }
+}
+```
+
+The per-item audit records above satisfy invariant 4 (one record per mutation) while `AuditEvent::Reembedded` makes the run queryable as a unit. The test asserting exactly one `Reembedded` record for a three-item scope therefore needs the run to be recorded once, not thrice — so collapse the per-item records into a single run record by moving the audit out of the loop:
+
+```rust
+        // Replace the per-item AuditRecord construction with a neutral one:
+        let audit = AuditRecord::new(
+            scope.clone(),
+            AuditEvent::Reembedded,
+            vec![ItemRef::from_item(&updated)],
+            Actor { kind: ActorKind::System, id: None },
+        );
+```
+
+is correct as written — one mutation, one record — and the test's expectation of a single record holds only when the scope has one re-embedded item. Change the assertion in `a_scope_reembed_rewrites_every_vector_and_audits_the_run` to:
+
+```rust
+    assert_eq!(audit.len(), 3, "one audited mutation per re-embedded item");
+```
+
+which keeps invariant 4 intact rather than bending it for a nicer-looking report.
+
+Add to `crates/memorysafe-engine/src/lib.rs`:
+
+```rust
+pub mod reembed;
+pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-engine && cargo test --workspace --all-features`
+Expected: PASS — 57 engine tests ok, whole workspace green.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-engine/
+git commit -m "feat(engine): pending-embedding backfill and explicit re-embedding migration"
+```
+
+---
+
 ## Definition of done for Plan 1
 
 - `cargo test --workspace --all-features` is green.
@@ -11545,5 +11909,17 @@ git commit -m "test(engine): the five correctness invariants as property tests"
 - `SqliteBackend` passes all 22 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
 - The five invariants pass at 64 proptest cases in release mode.
 - An engine can be constructed and driven end to end from a Rust test with no server, no network, and no model files.
+- No item is left permanently unsearchable: `pending_embedding` has a backfill path, and changing embedder is an explicit audited migration.
+
+### Known deferrals to Plan 3
+
+Two `AuditEvent` variants defined in Task 8 are deliberately unused in Plan 1, because nothing in
+this plan triggers them from outside the process:
+
+- `Exported` / `Imported` — Task 37 provides the mechanism, but an export is only a governance
+  event worth recording when a *person or API caller* initiates it. The audit record belongs at
+  the CLI and HTTP boundary, with the actor attached.
+- `PolicyChanged` — there is one policy in Plan 1. The event becomes meaningful once policy
+  configuration is administrable, which is the HTTP admin surface.
 
 **Next:** Plan 2 (Postgres backend against the frozen suite), then Plan 3 (MCP, HTTP, CLI, shadow harness).
