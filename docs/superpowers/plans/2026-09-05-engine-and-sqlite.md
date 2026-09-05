@@ -7162,6 +7162,21 @@ pub fn candidate(body: &str, relevance: f32) -> ScoredCandidate {
 }
 ```
 
+Extend the CI purity job in `.github/workflows/ci.yml` to cover this crate. Task 1 created the
+job with a step named for both crates but a check covering only `memorysafe-core`; this task is
+where `memorysafe-policy` starts existing, so this is where the Global Constraint "policies are
+pure" becomes enforceable:
+
+```yaml
+      - name: memorysafe-core and memorysafe-policy must have no I/O dependencies
+        run: |
+          for crate in memorysafe-core memorysafe-policy; do
+            cargo tree -p "$crate" --edges normal --prefix none \
+              | grep -Ei '^(tokio|rusqlite|sqlx|reqwest|hyper) ' && exit 1
+            echo "$crate is I/O free"
+          done
+```
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy`
