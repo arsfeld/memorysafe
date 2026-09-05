@@ -2679,6 +2679,49 @@ mod tests {
     }
 
     #[test]
+    fn compose_and_maintain_are_reachable_through_the_trait() {
+        // Half the trait's surface had no test and neither of these two context
+        // types was ever constructed, so a wrong field or a non-Clone field
+        // would have been caught only by the signature still compiling.
+        let p: Box<dyn GovernancePolicy> = Box::new(AlwaysAdmit);
+
+        let req = RecallRequest {
+            scope: Scope::new("t", "s", "n").unwrap(),
+            query: Some("anything".into()),
+            tags_any: vec![],
+            kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
+            mode: RecallMode::WorkingSet,
+            budget: RecallBudget::default(),
+            sensitivity_ceiling: SensitivityLevel::Internal,
+        };
+        let compose_ctx = ComposeContext {
+            scope: Scope::new("t", "s", "n").unwrap(),
+            stats: ScopeStats::default(),
+            now: OffsetDateTime::UNIX_EPOCH,
+        };
+        let ws = p.compose(&req, &[], &compose_ctx).unwrap();
+        assert!(ws.items.is_empty());
+        assert_eq!(compose_ctx.clone(), compose_ctx);
+
+        let maintain_ctx = MaintainContext {
+            scope: Scope::new("t", "s", "n").unwrap(),
+            batch: vec![],
+            remaining_after_batch: 0,
+            capacity: CapacityState {
+                budget: Budget::UNBOUNDED,
+                used_items: 0,
+                used_bytes: 0,
+            },
+            stats: ScopeStats::default(),
+            now: OffsetDateTime::UNIX_EPOCH,
+        };
+        assert!(p.maintain(&maintain_ctx).unwrap().is_empty());
+        assert_eq!(maintain_ctx.clone(), maintain_ctx);
+    }
+
+    #[test]
     fn admit_context_exposes_capacity_without_exposing_the_backend() {
         let ctx = AdmitContext {
             scope: Scope::new("t", "s", "n").unwrap(),
@@ -2746,7 +2789,14 @@ pub struct Candidate {
 }
 
 /// A candidate paired with the assessment `assess` produced for it.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Borrows rather than owns, and deliberately does NOT derive `Clone`: a
+/// derived `Clone` here would copy the references, not the values, which is
+/// not what a reader expects from every other `Clone` in this module. The
+/// engine clones the owned `Candidate` and `Assessment` and rebuilds this
+/// struct inside its `catch_unwind` boundary, so nothing needs to clone the
+/// pair itself.
+#[derive(Debug, PartialEq)]
 pub struct Assessed<'a> {
     pub candidate: &'a Candidate,
     pub assessment: &'a Assessment,
@@ -2784,15 +2834,32 @@ pub struct ComposeContext {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaintainContext {
     pub scope: Scope,
-    /// One page of the scope's items. Maintenance is a resumable job; the
-    /// engine pages through and calls `maintain` per batch.
-    pub batch: Vec<MemoryItem>,
+    /// One page of the scope's items, carrying the same `value`/`fragility`
+    /// signal `AdmitContext::eviction_candidates` carries — capacity reclaim
+    /// during maintenance is the same decision `admit` makes under pressure,
+    /// and a policy handed bare `MemoryItem`s could only sort by age.
+    ///
+    /// Maintenance is a resumable job; the engine pages through and calls
+    /// `maintain` per batch. `remaining_after_batch` says how much of the scope
+    /// this page does not cover, so a policy can tell a partial view from the
+    /// whole thing before evicting on the strength of it.
+    pub batch: Vec<ScoredCandidate>,
+    /// Items in this scope not included in `batch`. Zero means this is the
+    /// last page and the policy is seeing everything that is left.
+    pub remaining_after_batch: u64,
     pub capacity: CapacityState,
     pub stats: ScopeStats,
     pub now: OffsetDateTime,
 }
 
 /// The seam. Pure: the engine performs all I/O and hands in everything above.
+///
+/// `Err` from any method means the CALL failed and the engine should fall back
+/// to a baseline policy. It does not mean "skip this item": `compose` reports
+/// per-candidate exclusions through `WorkingSet::omitted`, each with a reason,
+/// and `maintain` simply returns no `Decision` for an item it declines to act
+/// on. A policy that returns `Err` because one candidate of two hundred was
+/// unscoreable would discard the other hundred and ninety-nine.
 pub trait GovernancePolicy: Send + Sync {
     fn id(&self) -> PolicyId;
 
@@ -8925,7 +8992,7 @@ pub fn decisions(
     let mut out = Vec::new();
 
     // 1. TTL expiry. Pinned items are exempt — pinning is absolute.
-    for item in &ctx.batch {
+    for item in ctx.batch.iter().map(|c| &c.item) {
         if item.protection == Protection::Pinned {
             continue;
         }
@@ -8952,7 +9019,7 @@ pub fn decisions(
         out.iter().flat_map(|d| d.evictions.iter().map(|e| e.item.clone())).collect();
 
     // 2. Release protection windows that have elapsed.
-    for item in &ctx.batch {
+    for item in ctx.batch.iter().map(|c| &c.item) {
         if expired.contains(&item.id) {
             continue;
         }
@@ -8982,14 +9049,22 @@ pub fn decisions(
     }
 
     let mut over = after_expiry - max_items;
-    let mut reclaimable: Vec<&MemoryItem> = ctx
+    // Rank by what it costs to lose the item, matching `admit`'s eviction
+    // order, and fall back to age only to break ties.
+    let mut reclaimable: Vec<&ScoredCandidate> = ctx
         .batch
         .iter()
-        .filter(|i| !expired.contains(&i.id) && i.protection.is_evictable(ctx.now))
+        .filter(|c| !expired.contains(&c.item.id) && c.item.protection.is_evictable(ctx.now))
         .collect();
-    reclaimable.sort_by_key(|i| reclaim_rank(i));
+    reclaimable.sort_by(|a, b| {
+        let cost = |c: &ScoredCandidate| c.value.get() * (1.0 - c.fragility.get()).max(0.0);
+        cost(a)
+            .total_cmp(&cost(b))
+            .then_with(|| reclaim_rank(&a.item).cmp(&reclaim_rank(&b.item)))
+    });
 
-    for item in reclaimable {
+    for candidate in reclaimable {
+        let item = &candidate.item;
         if over == 0 {
             break;
         }
@@ -10879,10 +10954,29 @@ impl Engine {
         }
 
         let scanned = batch.len();
+        let capacity = self.backend.capacity_state(scope).await?;
+        // Wrap into `ScoredCandidate` exactly as the write path does, so
+        // `maintain` ranks evictions on the same signal `admit` does.
+        let scored: Vec<ScoredCandidate> = batch
+            .into_iter()
+            .map(|item| ScoredCandidate {
+                estimated_tokens: ((item.body.len() as f32 / 4.0).ceil() as u32).max(1),
+                relevance: 0.0,
+                vector_score: None,
+                keyword_score: None,
+                value: memorysafe_core::Score::clamped(0.5),
+                fragility: memorysafe_core::Score::clamped(0.5),
+                item,
+            })
+            .collect();
+        let remaining_after_batch = capacity
+            .used_items
+            .saturating_sub((offset + scanned) as u64);
         let ctx = MaintainContext {
             scope: scope.clone(),
-            batch,
-            capacity: self.backend.capacity_state(scope).await?,
+            batch: scored,
+            remaining_after_batch,
+            capacity,
             stats: self.backend.scope_stats(scope).await?,
             now: OffsetDateTime::now_utc(),
         };
@@ -10911,7 +11005,7 @@ impl Engine {
                 let pinned = ctx
                     .batch
                     .iter()
-                    .any(|i| i.id == e.item && i.protection == Protection::Pinned);
+                    .any(|c| c.item.id == e.item && c.item.protection == Protection::Pinned);
                 if !pinned {
                     to_forget.push(e.item.clone());
                 }
