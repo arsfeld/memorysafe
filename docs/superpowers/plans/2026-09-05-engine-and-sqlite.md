@@ -3514,7 +3514,7 @@ impl QuantizedVector {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-embed`
-Expected: PASS — 12 tests ok.
+Expected: PASS — 14 tests ok (8 from Task 11 after its two fix rounds, plus the 6 here).
 
 - [ ] **Step 5: Commit**
 
