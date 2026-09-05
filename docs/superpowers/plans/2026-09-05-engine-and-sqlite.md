@@ -10690,3 +10690,860 @@ git commit -m "feat(engine): content-addressed embedding cache and scope stats c
 ```
 
 ---
+
+## Task 36: Engine — retention profiles
+
+**Files:**
+- Create: `crates/memorysafe-engine/src/retention.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs`, `src/mutate.rs`
+- Create: `crates/memorysafe-engine/tests/retention.rs`
+
+**Interfaces:**
+- Consumes: `Backend::audit`, `Backend::purge_subject`.
+- Produces: `RetentionSpan`, `PurgeCascade`, `AuditRetention`, `RetentionProfile` (`Balanced` | `GdprStrict` | `HipaaRetain` | `Forensic`), `RetentionProfile::retention()`, `RetentionProfile::from_name(&str)`, and `Engine::purge_subject` honouring the configured profile.
+
+**The four profiles are the tested, documented surface.** Free-form overrides are permitted but unsupported — that is what keeps "configurable per tenant" from meaning an untestable matrix.
+
+| Profile | `detail` | `purge_cascade` | `aggregate` |
+|---|---|---|---|
+| `balanced` (default) | `UntilSubjectPurge` | `Cascade` | `Forever` |
+| `gdpr_strict` | `Days(90)` | `Cascade` | `Days(365)` |
+| `hipaa_retain` | `Days(2190)` | `Preserve` | `Forever` |
+| `forensic` | `Forever` | `Preserve` | `Forever` |
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-engine/tests/retention.rs`:
+
+```rust
+use memorysafe_backend_sqlite::SqliteBackend;
+use memorysafe_core::{AuditFilter, Scope, SubjectId, TenantId};
+use memorysafe_embed::DeterministicEmbedder;
+use memorysafe_engine::{
+    Engine, EngineConfig, PurgeCascade, RememberRequest, RetentionProfile, RetentionSpan,
+};
+use memorysafe_policy::BaselinePolicy;
+use std::sync::Arc;
+
+fn engine(profile: RetentionProfile) -> Engine {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cfg = EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.keep())),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::default()),
+    );
+    cfg.retention = profile;
+    Engine::new(cfg)
+}
+
+fn scope() -> Scope {
+    Scope::new("acme", "user-42", "agent").unwrap()
+}
+
+#[test]
+fn the_four_profiles_match_the_documented_table() {
+    assert_eq!(
+        RetentionProfile::Balanced.retention().detail,
+        RetentionSpan::UntilSubjectPurge
+    );
+    assert_eq!(RetentionProfile::Balanced.retention().purge_cascade, PurgeCascade::Cascade);
+
+    assert_eq!(RetentionProfile::GdprStrict.retention().detail, RetentionSpan::Days(90));
+    assert_eq!(
+        RetentionProfile::GdprStrict.retention().aggregate,
+        RetentionSpan::Days(365)
+    );
+
+    assert_eq!(RetentionProfile::HipaaRetain.retention().detail, RetentionSpan::Days(2190));
+    assert_eq!(
+        RetentionProfile::HipaaRetain.retention().purge_cascade,
+        PurgeCascade::Preserve
+    );
+
+    assert_eq!(RetentionProfile::Forensic.retention().detail, RetentionSpan::Forever);
+    assert_eq!(RetentionProfile::Forensic.retention().purge_cascade, PurgeCascade::Preserve);
+}
+
+#[test]
+fn profiles_parse_from_their_documented_names() {
+    assert_eq!(RetentionProfile::from_name("balanced"), Some(RetentionProfile::Balanced));
+    assert_eq!(RetentionProfile::from_name("gdpr_strict"), Some(RetentionProfile::GdprStrict));
+    assert_eq!(RetentionProfile::from_name("hipaa_retain"), Some(RetentionProfile::HipaaRetain));
+    assert_eq!(RetentionProfile::from_name("forensic"), Some(RetentionProfile::Forensic));
+    assert_eq!(RetentionProfile::from_name("nonsense"), None);
+    assert_eq!(RetentionProfile::default(), RetentionProfile::Balanced);
+}
+
+#[tokio::test]
+async fn balanced_cascades_audit_with_the_subject() {
+    let e = engine(RetentionProfile::Balanced);
+    e.remember(RememberRequest::new(scope(), "a memory that will be purged")).await.unwrap();
+
+    let report = e
+        .purge_subject(&TenantId::new("acme").unwrap(), &SubjectId::new("user-42").unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(report.items_removed, 1);
+    assert!(report.audit_rows_removed >= 1);
+    assert_eq!(report.audit_rows_preserved, 0);
+    assert!(e.audit(&scope(), &AuditFilter::default()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn hipaa_retain_preserves_audit_across_a_subject_purge() {
+    let e = engine(RetentionProfile::HipaaRetain);
+    e.remember(RememberRequest::new(scope(), "a clinical note")).await.unwrap();
+
+    let report = e
+        .purge_subject(&TenantId::new("acme").unwrap(), &SubjectId::new("user-42").unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(report.items_removed, 1, "the item itself always goes");
+    assert!(report.audit_rows_preserved >= 1, "hipaa_retain must keep the decision record");
+    assert_eq!(report.audit_rows_removed, 0);
+
+    let audit = e.audit(&scope(), &AuditFilter::default()).await.unwrap();
+    assert!(!audit.is_empty(), "the audit trail was destroyed under hipaa_retain");
+    // Even preserved, no body may survive.
+    let json = serde_json::to_string(&audit).unwrap();
+    assert!(!json.contains("clinical note"), "preserved audit leaked a body");
+}
+
+#[tokio::test]
+async fn the_item_is_always_removed_regardless_of_profile() {
+    for profile in [
+        RetentionProfile::Balanced,
+        RetentionProfile::GdprStrict,
+        RetentionProfile::HipaaRetain,
+        RetentionProfile::Forensic,
+    ] {
+        let e = engine(profile);
+        e.remember(RememberRequest::new(scope(), "the memory itself")).await.unwrap();
+        e.purge_subject(&TenantId::new("acme").unwrap(), &SubjectId::new("user-42").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            e.review(&scope(), &Default::default()).await.unwrap().is_empty(),
+            "{profile:?} left the item behind"
+        );
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine --test retention`
+Expected: FAIL — `cannot find type RetentionProfile in memorysafe_engine`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-engine/src/retention.rs`:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionSpan {
+    Forever,
+    Days(u32),
+    /// Detail lives exactly as long as the subject does.
+    UntilSubjectPurge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeCascade {
+    /// A subject purge removes that subject's audit rows too.
+    Cascade,
+    /// Audit rows survive the subject. Bodies never did, so what remains is
+    /// ids, digests, and feature numbers.
+    Preserve,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRetention {
+    pub detail: RetentionSpan,
+    pub purge_cascade: PurgeCascade,
+    /// Counts, rates, and score distributions by policy version. Never
+    /// identifying, so it can outlive everything else.
+    pub aggregate: RetentionSpan,
+}
+
+/// The tested, documented surface. Free-form overrides are permitted but
+/// unsupported — this is what keeps "configurable per tenant" from becoming an
+/// untestable matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionProfile {
+    #[default]
+    Balanced,
+    GdprStrict,
+    HipaaRetain,
+    Forensic,
+}
+
+impl RetentionProfile {
+    pub fn retention(self) -> AuditRetention {
+        match self {
+            RetentionProfile::Balanced => AuditRetention {
+                detail: RetentionSpan::UntilSubjectPurge,
+                purge_cascade: PurgeCascade::Cascade,
+                aggregate: RetentionSpan::Forever,
+            },
+            RetentionProfile::GdprStrict => AuditRetention {
+                detail: RetentionSpan::Days(90),
+                purge_cascade: PurgeCascade::Cascade,
+                aggregate: RetentionSpan::Days(365),
+            },
+            RetentionProfile::HipaaRetain => AuditRetention {
+                detail: RetentionSpan::Days(2190),
+                purge_cascade: PurgeCascade::Preserve,
+                aggregate: RetentionSpan::Forever,
+            },
+            RetentionProfile::Forensic => AuditRetention {
+                detail: RetentionSpan::Forever,
+                purge_cascade: PurgeCascade::Preserve,
+                aggregate: RetentionSpan::Forever,
+            },
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "balanced" => Some(RetentionProfile::Balanced),
+            "gdpr_strict" => Some(RetentionProfile::GdprStrict),
+            "hipaa_retain" => Some(RetentionProfile::HipaaRetain),
+            "forensic" => Some(RetentionProfile::Forensic),
+            _ => None,
+        }
+    }
+}
+```
+
+Add `retention: RetentionProfile` to `EngineConfig` (defaulting to `RetentionProfile::default()` in `EngineConfig::new`) and to `Engine`.
+
+Rewrite `Engine::purge_subject` in `mutate.rs` to honour the profile. The backend's `purge_subject` always cascades, so under `Preserve` the audit rows are read out first and reinserted after:
+
+```rust
+    pub async fn purge_subject(
+        &self,
+        tenant: &TenantId,
+        subject: &SubjectId,
+    ) -> Result<PurgeOutcome, EngineError> {
+        let cascade = self.retention.retention().purge_cascade;
+
+        // Under Preserve, capture the audit rows before the backend cascades
+        // them away. Bodies were never in them, so what is kept is ids,
+        // digests, and feature numbers.
+        let preserved: Vec<AuditRecord> = if cascade == PurgeCascade::Preserve {
+            let mut all = Vec::new();
+            for namespace in self.namespaces_of(tenant, subject).await? {
+                let scope = Scope {
+                    tenant: tenant.clone(),
+                    subject: subject.clone(),
+                    namespace,
+                };
+                all.extend(
+                    self.backend
+                        .audit(&scope, &AuditFilter { limit: 100_000, ..Default::default() })
+                        .await?,
+                );
+            }
+            all
+        } else {
+            vec![]
+        };
+
+        let report = self.backend.purge_subject(tenant, subject).await?;
+
+        let mut restored = 0u64;
+        for record in preserved {
+            self.backend.record_recall(record).await?;
+            restored += 1;
+        }
+
+        Ok(PurgeOutcome {
+            items_removed: report.items_removed,
+            audit_rows_removed: if cascade == PurgeCascade::Preserve {
+                0
+            } else {
+                report.audit_rows_removed
+            },
+            audit_rows_preserved: restored,
+        })
+    }
+
+    /// Namespaces the subject owns. Derived from its items, which is enough
+    /// for v1: a namespace with no items has no audit worth preserving.
+    async fn namespaces_of(
+        &self,
+        tenant: &TenantId,
+        subject: &SubjectId,
+    ) -> Result<Vec<memorysafe_core::Namespace>, EngineError> {
+        let probe = Scope {
+            tenant: tenant.clone(),
+            subject: subject.clone(),
+            namespace: memorysafe_core::Namespace::new("default")
+                .expect("default is a valid namespace"),
+        };
+        let selector = memorysafe_backend::ScopeSelector {
+            tenant: tenant.clone(),
+            subject: Some(subject.clone()),
+            namespace: None,
+            include_audit: false,
+        };
+        let mut namespaces: Vec<memorysafe_core::Namespace> = self
+            .backend
+            .export(&selector)
+            .await?
+            .into_iter()
+            .filter_map(|r| match r {
+                memorysafe_backend::ExportRecord::Item { item, .. } => {
+                    Some(item.scope.namespace)
+                }
+                _ => None,
+            })
+            .collect();
+        namespaces.sort();
+        namespaces.dedup();
+        let _ = probe;
+        Ok(namespaces)
+    }
+```
+
+Add `pub mod retention;` and
+`pub use retention::{AuditRetention, PurgeCascade, RetentionProfile, RetentionSpan};` to `lib.rs`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-engine`
+Expected: PASS — 44 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-engine/
+git commit -m "feat(engine): four named audit retention profiles honoured on subject purge"
+```
+
+---
+
+## Task 37: Engine — export and import orchestration
+
+**Files:**
+- Create: `crates/memorysafe-engine/src/portability.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs`
+- Create: `crates/memorysafe-engine/tests/portability.rs`
+
+**Interfaces:**
+- Consumes: `Backend::export`, `Backend::import`.
+- Produces: `Engine::export(&ScopeSelector) -> Result<ExportStream, EngineError>`, `Engine::export_ndjson(&ScopeSelector) -> Result<String, EngineError>`, `Engine::export_markdown(&ScopeSelector) -> Result<String, EngineError>`, `Engine::import_ndjson(&str) -> Result<ImportReport, EngineError>`, `Engine::import`.
+
+**Why markdown too:** the spec's portable archive is "newline-delimited JSON plus a rendered markdown view of the items for human reading." The JSON is the round-trip format; the markdown is what makes "your memory is yours" mean something a person can actually open.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-engine/tests/portability.rs`:
+
+```rust
+use memorysafe_backend::ScopeSelector;
+use memorysafe_backend_sqlite::SqliteBackend;
+use memorysafe_core::{Scope, TenantId};
+use memorysafe_embed::DeterministicEmbedder;
+use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
+use memorysafe_policy::BaselinePolicy;
+use std::sync::Arc;
+
+fn engine() -> Engine {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.keep())),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::default()),
+    ))
+}
+
+fn scope() -> Scope {
+    Scope::new("acme", "user-42", "agent").unwrap()
+}
+
+fn selector(include_audit: bool) -> ScopeSelector {
+    ScopeSelector {
+        tenant: TenantId::new("acme").unwrap(),
+        subject: None,
+        namespace: None,
+        include_audit,
+    }
+}
+
+async fn seed(e: &Engine) {
+    for body in [
+        "the production migration runs on Sundays",
+        "the deploy key rotates every ninety days",
+        "the on-call rotation starts Monday morning",
+    ] {
+        e.remember(RememberRequest::new(scope(), body)).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn ndjson_round_trips_through_a_fresh_engine() {
+    let source = engine();
+    seed(&source).await;
+
+    let ndjson = source.export_ndjson(&selector(true)).await.unwrap();
+    assert!(ndjson.lines().count() >= 4, "header plus three items");
+
+    let target = engine();
+    let report = target.import_ndjson(&ndjson).await.unwrap();
+    assert_eq!(report.items_imported, 3);
+
+    let mut before = source.review(&scope(), &Default::default()).await.unwrap();
+    let mut after = target.review(&scope(), &Default::default()).await.unwrap();
+    before.sort_by(|a, b| a.id.cmp(&b.id));
+    after.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(before, after, "the round trip did not reproduce the corpus");
+}
+
+#[tokio::test]
+async fn every_ndjson_line_is_a_standalone_json_object() {
+    let e = engine();
+    seed(&e).await;
+    let ndjson = e.export_ndjson(&selector(false)).await.unwrap();
+    for line in ndjson.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).expect("each line parses");
+        assert!(value.get("record").is_some(), "each line names its record type");
+    }
+}
+
+#[tokio::test]
+async fn the_markdown_view_is_readable_and_contains_the_bodies() {
+    let e = engine();
+    seed(&e).await;
+    let md = e.export_markdown(&selector(false)).await.unwrap();
+
+    assert!(md.contains("# MemorySafe export"));
+    assert!(md.contains("the production migration runs on Sundays"));
+    assert!(md.contains("acme / user-42 / agent"), "scope must be identifiable");
+}
+
+#[tokio::test]
+async fn importing_the_same_stream_twice_changes_nothing_the_second_time() {
+    let source = engine();
+    seed(&source).await;
+    let ndjson = source.export_ndjson(&selector(false)).await.unwrap();
+
+    let target = engine();
+    target.import_ndjson(&ndjson).await.unwrap();
+    let second = target.import_ndjson(&ndjson).await.unwrap();
+
+    assert_eq!(second.items_imported, 0);
+    assert_eq!(second.items_skipped_existing, 3);
+    assert_eq!(target.review(&scope(), &Default::default()).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn malformed_ndjson_is_rejected_with_a_useful_error() {
+    let e = engine();
+    let err = e.import_ndjson("{not json at all").await.unwrap_err();
+    assert!(err.to_string().contains("line 1"), "the error must name the bad line: {err}");
+}
+
+#[tokio::test]
+async fn exporting_an_empty_scope_yields_a_header_and_nothing_else() {
+    let e = engine();
+    let ndjson = e.export_ndjson(&selector(false)).await.unwrap();
+    assert_eq!(ndjson.lines().count(), 1);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine --test portability`
+Expected: FAIL — `no method named export_ndjson found for struct Engine`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-engine/src/portability.rs`:
+
+```rust
+use crate::Engine;
+use crate::error::EngineError;
+use memorysafe_backend::{
+    ExportRecord, ExportStream, ImportReport, ImportStream, ScopeSelector,
+};
+
+impl Engine {
+    pub async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, EngineError> {
+        Ok(self.backend.export(sel).await?)
+    }
+
+    pub async fn import(&self, stream: ImportStream) -> Result<ImportReport, EngineError> {
+        Ok(self.backend.import(stream).await?)
+    }
+
+    /// The round-trip format: one JSON object per line.
+    pub async fn export_ndjson(&self, sel: &ScopeSelector) -> Result<String, EngineError> {
+        let stream = self.export(sel).await?;
+        let mut out = String::new();
+        for record in &stream {
+            let line = serde_json::to_string(record)
+                .map_err(|e| EngineError::Validation(e.to_string()))?;
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    pub async fn import_ndjson(&self, ndjson: &str) -> Result<ImportReport, EngineError> {
+        let mut stream: ImportStream = Vec::new();
+        for (i, line) in ndjson.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: ExportRecord = serde_json::from_str(line).map_err(|e| {
+                EngineError::Validation(format!("line {}: {e}", i + 1))
+            })?;
+            stream.push(record);
+        }
+        self.import(stream).await
+    }
+
+    /// A human-readable rendering. This is what makes "your memory is yours"
+    /// mean something a person can open, rather than a JSON blob.
+    pub async fn export_markdown(&self, sel: &ScopeSelector) -> Result<String, EngineError> {
+        let stream = self.export(sel).await?;
+        let mut out = String::from("# MemorySafe export\n\n");
+
+        let mut current_scope: Option<String> = None;
+        for record in &stream {
+            let ExportRecord::Item { item, .. } = record else {
+                continue;
+            };
+            let scope_label = format!(
+                "{} / {} / {}",
+                item.scope.tenant, item.scope.subject, item.scope.namespace
+            );
+            if current_scope.as_deref() != Some(scope_label.as_str()) {
+                out.push_str(&format!("## {scope_label}\n\n"));
+                current_scope = Some(scope_label);
+            }
+
+            out.push_str(&format!("### {}\n\n", item.id));
+            out.push_str(&format!("- **kind:** {}\n", item.kind));
+            out.push_str(&format!("- **created:** {}\n", item.created_at));
+            out.push_str(&format!("- **sensitivity:** {:?}\n", item.sensitivity));
+            out.push_str(&format!("- **protection:** {:?}\n", item.protection));
+            if !item.tags.is_empty() {
+                out.push_str(&format!("- **tags:** {}\n", item.tags.join(", ")));
+            }
+            out.push_str(&format!("\n{}\n\n", item.body));
+        }
+
+        Ok(out)
+    }
+}
+```
+
+Add `pub mod portability;` to `lib.rs`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-engine`
+Expected: PASS — 50 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-engine/
+git commit -m "feat(engine): portable ndjson export/import plus a human-readable markdown view"
+```
+
+---
+
+## Task 38: The five correctness invariants
+
+**Files:**
+- Create: `crates/memorysafe-engine/tests/invariants.rs`
+- Modify: `.github/workflows/ci.yml`
+
+**Interfaces:**
+- Consumes: the whole stack.
+- Produces: five `proptest` properties. These are the definition of correct for this system.
+
+**The five, from the spec.** Capacity is never exceeded. Pinned items are never evicted. The sensitivity ceiling is never violated on recall. Every mutation has exactly one audit record. Export → import round-trips exactly.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-engine/tests/invariants.rs`:
+
+```rust
+use memorysafe_backend::ScopeSelector;
+use memorysafe_backend_sqlite::SqliteBackend;
+use memorysafe_core::{
+    AuditFilter, Budget, Protection, RecallBudget, RecallMode, RecallRequest, Scope,
+    SensitivityLevel, TenantId,
+};
+use memorysafe_embed::DeterministicEmbedder;
+use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
+use memorysafe_policy::BaselinePolicy;
+use proptest::prelude::*;
+use std::sync::Arc;
+
+fn engine() -> Engine {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.keep())),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::default()),
+    ))
+}
+
+fn scope() -> Scope {
+    Scope::new("acme", "user-42", "agent").unwrap()
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+}
+
+/// Bodies are distinct enough that the redundancy check does not collapse them
+/// all into merges, which would make the capacity properties vacuous.
+fn bodies() -> impl Strategy<Value = Vec<String>> {
+    prop::collection::vec(0u32..10_000, 1..40)
+        .prop_map(|ns| {
+            ns.into_iter()
+                .enumerate()
+                .map(|(i, n)| format!("memory {i} concerning subject {n} and topic {n}"))
+                .collect()
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// Invariant 1: capacity is never exceeded, whatever the write sequence.
+    #[test]
+    fn capacity_is_never_exceeded(bodies in bodies(), max in 1usize..12) {
+        runtime().block_on(async {
+            let e = engine();
+            e.set_budget(&scope(), Budget { max_items: Some(max as u64), max_bytes: None })
+                .await
+                .unwrap();
+
+            for b in &bodies {
+                let _ = e.remember(RememberRequest::new(scope(), b)).await;
+            }
+
+            let stored = e.review(&scope(), &memorysafe_backend::Page { offset: 0, limit: 1000 })
+                .await
+                .unwrap();
+            prop_assert!(
+                stored.len() <= max,
+                "budget {max} exceeded: {} items stored",
+                stored.len()
+            );
+
+            let state = e.capacity_state(&scope()).await.unwrap();
+            prop_assert_eq!(state.used_items, stored.len() as u64, "accounting drifted");
+            Ok(())
+        })?;
+    }
+
+    /// Invariant 2: a pinned item survives any amount of pressure.
+    #[test]
+    fn pinned_items_are_never_evicted(bodies in bodies()) {
+        runtime().block_on(async {
+            let e = engine();
+            let pinned = e
+                .remember(RememberRequest::new(scope(), "the pinned memory that must survive"))
+                .await
+                .unwrap()
+                .item_id
+                .unwrap();
+            e.protect(&scope(), &pinned, Protection::Pinned).await.unwrap();
+
+            e.set_budget(&scope(), Budget { max_items: Some(2), max_bytes: None })
+                .await
+                .unwrap();
+
+            for b in &bodies {
+                let _ = e.remember(RememberRequest::new(scope(), b)).await;
+            }
+            let _ = e.maintain(&scope(), None).await;
+
+            let stored = e.review(&scope(), &memorysafe_backend::Page { offset: 0, limit: 1000 })
+                .await
+                .unwrap();
+            prop_assert!(
+                stored.iter().any(|i| i.id == pinned),
+                "a pinned item was evicted"
+            );
+            Ok(())
+        })?;
+    }
+
+    /// Invariant 3: nothing above the caller's ceiling is ever returned.
+    #[test]
+    fn the_sensitivity_ceiling_is_never_violated(bodies in bodies(), ceiling in 0i64..5) {
+        runtime().block_on(async {
+            let e = engine();
+            let level = SensitivityLevel::from_ordinal(ceiling).unwrap();
+
+            for (i, b) in bodies.iter().enumerate() {
+                let mut r = RememberRequest::new(scope(), b);
+                // Force a spread of sensitivity levels via caller hints.
+                r.sensitivity_hint = SensitivityLevel::from_ordinal((i % 5) as i64);
+                let _ = e.remember(r).await;
+            }
+
+            for mode in [RecallMode::WorkingSet, RecallMode::Search] {
+                let ws = e.recall(RecallRequest {
+                    scope: scope(),
+                    query: Some("memory concerning subject".into()),
+                    tags_any: vec![],
+                    kinds: vec![],
+                    mode,
+                    budget: RecallBudget { max_tokens: Some(8000), max_items: Some(50) },
+                    sensitivity_ceiling: level,
+                })
+                .await
+                .unwrap();
+
+                for s in &ws.items {
+                    prop_assert!(
+                        s.item.sensitivity <= level,
+                        "{:?} leaked past a {:?} ceiling in {:?} mode",
+                        s.item.sensitivity, level, mode
+                    );
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    /// Invariant 4: one audit record per mutation, never more, never fewer.
+    #[test]
+    fn every_mutation_has_exactly_one_audit_record(bodies in bodies()) {
+        runtime().block_on(async {
+            let e = engine();
+            let mut mutations = 0usize;
+
+            for b in &bodies {
+                if e.remember(RememberRequest::new(scope(), b)).await.is_ok() {
+                    mutations += 1;
+                }
+            }
+
+            let audit = e.audit(&scope(), &AuditFilter { limit: 100_000, ..Default::default() })
+                .await
+                .unwrap();
+            prop_assert_eq!(
+                audit.len(), mutations,
+                "{} mutations produced {} audit records",
+                mutations, audit.len()
+            );
+
+            // And no body ever reached the trail.
+            let json = serde_json::to_string(&audit).unwrap();
+            prop_assert!(!json.contains("concerning subject"), "audit leaked a body");
+            Ok(())
+        })?;
+    }
+
+    /// Invariant 5: export then import reproduces the corpus exactly.
+    #[test]
+    fn export_import_round_trips_exactly(bodies in bodies()) {
+        runtime().block_on(async {
+            let source = engine();
+            for b in &bodies {
+                let _ = source.remember(RememberRequest::new(scope(), b)).await;
+            }
+
+            let selector = ScopeSelector {
+                tenant: TenantId::new("acme").unwrap(),
+                subject: None,
+                namespace: None,
+                include_audit: false,
+            };
+            let ndjson = source.export_ndjson(&selector).await.unwrap();
+
+            let target = engine();
+            target.import_ndjson(&ndjson).await.unwrap();
+
+            let page = memorysafe_backend::Page { offset: 0, limit: 1000 };
+            let mut before = source.review(&scope(), &page).await.unwrap();
+            let mut after = target.review(&scope(), &page).await.unwrap();
+            before.sort_by(|a, b| a.id.cmp(&b.id));
+            after.sort_by(|a, b| a.id.cmp(&b.id));
+
+            prop_assert_eq!(before, after, "the round trip lost or altered items");
+            Ok(())
+        })?;
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine --test invariants`
+Expected: FAIL — `no method named capacity_state found for struct Engine`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Add the missing read-through accessor to `crates/memorysafe-engine/src/lib.rs`:
+
+```rust
+    pub async fn capacity_state(&self, scope: &Scope)
+        -> Result<memorysafe_core::CapacityState, EngineError>
+    {
+        Ok(self.backend.capacity_state(scope).await?)
+    }
+```
+
+Any invariant that then fails is a real defect, not a test problem. The two most likely, and their fixes:
+
+- **Capacity exceeded.** `Engine::remember` offers eviction candidates only when `capacity.budget.is_bounded()` (Task 31, `gather::admit_context`). Confirm the budget is read fresh per write rather than cached — `CacheConfig` caches `ScopeStats`, never `CapacityState`, and that distinction is load-bearing.
+- **Audit count mismatch.** A rejected write must still write exactly one audit record. Confirm the `Action::Reject` branch in `remember` builds a `WriteTransaction` with no `upsert` and no `merge` but still passes its audit record through `backend.apply`.
+
+Add the invariants job to `.github/workflows/ci.yml`:
+
+```yaml
+  invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: The five correctness invariants
+        run: cargo test -p memorysafe-engine --test invariants --release
+        env:
+          PROPTEST_CASES: 64
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
+Expected: PASS — the whole workspace green: 5 invariants, 22 backend conformance tests, and the unit and integration suites of all six crates.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-engine/ .github/workflows/ci.yml
+git commit -m "test(engine): the five correctness invariants as property tests"
+```
+
+---
+
+## Definition of done for Plan 1
+
+- `cargo test --workspace --all-features` is green.
+- `cargo clippy --all-targets --all-features -- -D warnings` is clean.
+- The CI purity job confirms `memorysafe-core` and `memorysafe-policy` pull in no I/O crates.
+- `SqliteBackend` passes all 22 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
+- The five invariants pass at 64 proptest cases in release mode.
+- An engine can be constructed and driven end to end from a Rust test with no server, no network, and no model files.
+
+**Next:** Plan 2 (Postgres backend against the frozen suite), then Plan 3 (MCP, HTTP, CLI, shadow harness).
