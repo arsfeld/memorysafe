@@ -210,11 +210,20 @@ mod tests {
     #[test]
     fn documents_whose_tokens_cancel_do_not_collapse_together() {
         // The all-cancel branch used to pin a constant vector, so every
-        // document reaching it became identical to every other. Two-word
-        // inputs reach it readily.
-        let e = DeterministicEmbedder::new(256);
-        let a = e.embed("the repo").unwrap();
-        let b = e.embed("spoon valley").unwrap();
+        // document reaching it became identical to every other.
+        //
+        // At dim=256 with three probes per token, driving the accumulator to
+        // exactly zero is vanishingly rare -- a brute-force sweep of common
+        // two-word inputs found none. Cancellation gets far more likely as
+        // dim shrinks, so this test uses dim=5, where it is not merely
+        // plausible but confirmed: a standalone reproduction of the
+        // three-probe algorithm shows the raw (pre-normalisation)
+        // accumulator for both "dog it" and "at river" is exactly
+        // [0.0, 0.0, 0.0, 0.0, 0.0] at dim=5, so `embed` genuinely takes the
+        // fallback branch for both, not just one.
+        let e = DeterministicEmbedder::new(5);
+        let a = e.embed("dog it").unwrap();
+        let b = e.embed("at river").unwrap();
         let sim: f32 = a.vector.iter().zip(&b.vector).map(|(x, y)| x * y).sum();
         assert!(sim < 0.99, "disjoint documents collapsed together at {sim}");
 
@@ -228,6 +237,6 @@ mod tests {
         }
 
         // And still deterministic.
-        assert_eq!(e.embed("the repo").unwrap().vector, a.vector);
+        assert_eq!(e.embed("dog it").unwrap().vector, a.vector);
     }
 }
