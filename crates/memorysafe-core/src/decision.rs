@@ -248,4 +248,42 @@ mod tests {
         let back: Action = serde_json::from_str(r#"{"kind":"reject"}"#).unwrap();
         assert!(matches!(back, Action::Reject));
     }
+
+    #[test]
+    fn a_full_decision_round_trips_through_json() {
+        // The audit table stores this whole struct in its `decision` column and
+        // reads it back with serde_json. Nothing else here exercises Merge,
+        // ReplaceBody, a populated evictions vector, or PolicyId on the wire.
+        let d = Decision {
+            action: Action::Merge {
+                into: ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+                strategy: MergeStrategy::ReplaceBody,
+            },
+            evictions: vec![Eviction {
+                item: ItemId::parse("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap(),
+                reason: Reason::new(
+                    ReasonCode::CapacityPressure,
+                    "evicted to make room",
+                    features! { "value" => 0.11, "eviction_cost" => 0.02 },
+                ),
+            }],
+            reasons: vec![Reason::new(
+                ReasonCode::HighRedundancy,
+                "folded into a close neighbour",
+                features! { "similarity" => 0.95 },
+            )],
+            policy: PolicyId::new("baseline", "0.1.0"),
+        };
+
+        let json = serde_json::to_string(&d).unwrap();
+        let back: Decision = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d, "a stored decision did not survive the round trip");
+
+        // Spot-check the wire spellings the audit table is queried on.
+        assert!(json.contains(r#""kind":"merge""#), "{json}");
+        assert!(json.contains(r#""strategy":"replace_body""#), "{json}");
+        assert!(json.contains(r#""code":"capacity_pressure""#), "{json}");
+        assert_eq!(back.policy.to_string(), "baseline@0.1.0");
+        assert_eq!(back.reasons[0].detail, "folded into a close neighbour");
+    }
 }
