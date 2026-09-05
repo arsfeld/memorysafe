@@ -158,6 +158,10 @@ mod tests {
             dim: 8,
         };
         let q = QuantizedVector::from_embedding(&z);
+        // A zero scale would be persisted to SQLite and make every vector reconstructed
+        // from bytes dot to exactly 0.0 forever, a silent retrieval failure. The guard
+        // ensures scale stays 1.0 (or at least nonzero), keeping the struct sane.
+        assert_eq!(q.scale, 1.0, "scale must be 1.0 for zero vectors, not 0.0");
         assert_eq!(q.dot(&q).unwrap(), 0.0);
     }
 }
