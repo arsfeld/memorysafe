@@ -5441,3 +5441,686 @@ git commit -m "feat(sqlite): item and audit persistence; isolation conformance p
 ```
 
 ---
+
+## Task 21: SQLite — vectors and brute-force search
+
+**Files:**
+- Create: `crates/memorysafe-backend-sqlite/src/vectors.rs`
+- Modify: `crates/memorysafe-backend-sqlite/src/lib.rs`
+- Modify: `crates/memorysafe-backend-sqlite/tests/conformance.rs`
+
+**Interfaces:**
+- Consumes: `QuantizedVector`, `items::row_to_item`.
+- Produces: `vectors::insert(&Connection, &ItemId, &Scope, &QuantizedVector)`, `vectors::delete`, `vectors::scope_embedder(&Connection, &Scope) -> Option<(String, u16)>`, `vectors::search(&Connection, &Scope, &QuantizedVector, k) -> Vec<(MemoryItem, f32)>`, and a real `Backend::neighbours`.
+
+**Design:** no ANN index. Load the scope's vector rows, score them with `QuantizedVector::dot`, keep the top k with a bounded heap. Exact results, nothing to rebuild after every write. `scope_embedder` reports which model a scope's vectors use so a probe from a different model is rejected rather than silently compared.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `crates/memorysafe-backend-sqlite/tests/conformance.rs`:
+
+```rust
+use memorysafe_backend::conformance::retrieval;
+
+#[tokio::test]
+async fn vector_search_ranks_by_similarity() {
+    retrieval::vector_search_ranks_by_similarity(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn cross_model_vectors_are_rejected() {
+    retrieval::cross_model_vectors_are_rejected(&SqliteFactory).await;
+}
+```
+
+Append to `crates/memorysafe-backend-sqlite/src/vectors.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema;
+    use memorysafe_embed::{DeterministicEmbedder, Embedder};
+    use rusqlite::Connection;
+
+    fn conn() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        schema::initialise(&c).unwrap();
+        c
+    }
+
+    #[test]
+    fn top_k_is_bounded_and_sorted_descending() {
+        let c = conn();
+        let scope = memorysafe_core::Scope::new("t", "s", "n").unwrap();
+        let e = DeterministicEmbedder::new(256);
+
+        for body in ["alpha one", "alpha two", "alpha three", "unrelated finance topic"] {
+            let item = {
+                let mut i = memorysafe_backend::conformance::fx::item(&scope, body);
+                i.body = body.to_string();
+                i
+            };
+            crate::items::insert(&c, &item).unwrap();
+            let q = memorysafe_embed::QuantizedVector::from_embedding(&e.embed(body).unwrap());
+            insert(&c, &item.id, &scope, &q).unwrap();
+        }
+
+        let probe =
+            memorysafe_embed::QuantizedVector::from_embedding(&e.embed("alpha one").unwrap());
+        let hits = search(&c, &scope, &probe, 2).unwrap();
+
+        assert_eq!(hits.len(), 2, "k was not honoured");
+        assert!(hits[0].1 >= hits[1].1, "results not sorted descending");
+        assert_eq!(hits[0].0.body, "alpha one");
+    }
+
+    #[test]
+    fn scope_embedder_reports_the_stored_model() {
+        let c = conn();
+        let scope = memorysafe_core::Scope::new("t", "s", "n").unwrap();
+        assert_eq!(scope_embedder(&c, &scope).unwrap(), None);
+
+        let e = DeterministicEmbedder::new(256);
+        let item = memorysafe_backend::conformance::fx::item(&scope, "hello");
+        crate::items::insert(&c, &item).unwrap();
+        let q = memorysafe_embed::QuantizedVector::from_embedding(&e.embed("hello").unwrap());
+        insert(&c, &item.id, &scope, &q).unwrap();
+
+        assert_eq!(
+            scope_embedder(&c, &scope).unwrap(),
+            Some(("deterministic-256".to_string(), 256))
+        );
+    }
+
+    #[test]
+    fn deleting_an_item_cascades_to_its_vector() {
+        let c = conn();
+        let scope = memorysafe_core::Scope::new("t", "s", "n").unwrap();
+        let e = DeterministicEmbedder::new(256);
+        let item = memorysafe_backend::conformance::fx::item(&scope, "transient");
+        crate::items::insert(&c, &item).unwrap();
+        let q = memorysafe_embed::QuantizedVector::from_embedding(&e.embed("transient").unwrap());
+        insert(&c, &item.id, &scope, &q).unwrap();
+
+        crate::items::delete(&c, &scope, &item.id).unwrap();
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "vector row survived its item");
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend-sqlite vectors`
+Expected: FAIL — `cannot find function search in this scope`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-backend-sqlite/src/vectors.rs`:
+
+```rust
+use crate::items::{ITEM_COLUMNS, row_to_item};
+use crate::tenant::SqlResultExt;
+use memorysafe_backend::BackendError;
+use memorysafe_core::{ItemId, MemoryItem, Scope};
+use memorysafe_embed::QuantizedVector;
+use rusqlite::{Connection, params};
+
+pub fn insert(
+    conn: &Connection,
+    id: &ItemId,
+    scope: &Scope,
+    q: &QuantizedVector,
+) -> Result<(), BackendError> {
+    conn.execute(
+        "INSERT INTO vectors (item_id, subject, namespace, embedder, dim, scale, q)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(item_id) DO UPDATE SET
+             embedder=excluded.embedder, dim=excluded.dim,
+             scale=excluded.scale, q=excluded.q",
+        params![
+            id.as_str(),
+            scope.subject.as_str(),
+            scope.namespace.as_str(),
+            q.embedder.to_string(),
+            q.dim as i64,
+            q.scale as f64,
+            q.to_bytes(),
+        ],
+    )
+    .sql()?;
+    Ok(())
+}
+
+pub fn delete(conn: &Connection, id: &ItemId) -> Result<(), BackendError> {
+    conn.execute("DELETE FROM vectors WHERE item_id = ?1", params![id.as_str()]).sql()?;
+    Ok(())
+}
+
+/// Which embedder this scope's vectors were produced by. `None` when the scope
+/// holds no vectors yet. Comparing across models yields silently meaningless
+/// similarities, so every search gates on this.
+pub fn scope_embedder(
+    conn: &Connection,
+    scope: &Scope,
+) -> Result<Option<(String, u16)>, BackendError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT embedder, dim FROM vectors
+             WHERE subject=?1 AND namespace=?2 LIMIT 1",
+        )
+        .sql()?;
+    let mut rows = stmt
+        .query_map(params![scope.subject.as_str(), scope.namespace.as_str()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u16))
+        })
+        .sql()?;
+    match rows.next() {
+        Some(r) => Ok(Some(r.sql()?)),
+        None => Ok(None),
+    }
+}
+
+/// Exact brute-force top-k. No ANN index: per-scope corpora are small, results
+/// are exact, and there is nothing to rebuild after every write.
+pub fn search(
+    conn: &Connection,
+    scope: &Scope,
+    probe: &QuantizedVector,
+    k: usize,
+) -> Result<Vec<(MemoryItem, f32)>, BackendError> {
+    if k == 0 {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        "SELECT i.rowid, {cols}, v.embedder AS v_embedder, v.dim AS v_dim,
+                v.scale AS v_scale, v.q AS v_q
+         FROM items i JOIN vectors v ON v.item_id = i.id
+         WHERE i.subject = ?1 AND i.namespace = ?2
+           AND v.embedder = ?3 AND v.dim = ?4",
+        cols = ITEM_COLUMNS
+            .split(", ")
+            .map(|c| format!("i.{c} AS {c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let tenant = scope.tenant.as_str().to_string();
+    let mut stmt = conn.prepare(&sql).sql()?;
+    let rows = stmt
+        .query_map(
+            params![
+                scope.subject.as_str(),
+                scope.namespace.as_str(),
+                probe.embedder.to_string(),
+                probe.dim as i64,
+            ],
+            move |r| {
+                let item = row_to_item(r, &tenant)?;
+                let scale: f64 = r.get("v_scale")?;
+                let bytes: Vec<u8> = r.get("v_q")?;
+                Ok((item, scale as f32, bytes))
+            },
+        )
+        .sql()?;
+
+    let mut scored: Vec<(MemoryItem, f32)> = Vec::new();
+    for row in rows {
+        let (item, scale, bytes) = row.sql()?;
+        let q = QuantizedVector::from_bytes(
+            probe.embedder.clone(),
+            probe.dim,
+            scale,
+            &bytes,
+        )
+        .map_err(|e| BackendError::Storage { message: e.to_string(), retryable: false })?;
+        let score = probe.dot(&q).map_err(|e| BackendError::EmbedderMismatch {
+            got: e.to_string(),
+            expected: probe.embedder.to_string(),
+        })?;
+        scored.push((item, score));
+    }
+
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored.truncate(k);
+    Ok(scored)
+}
+```
+
+Replace the placeholder `neighbours` in `lib.rs`:
+
+```rust
+    async fn neighbours(&self, scope: &Scope, embedding: &Embedding, k: usize)
+        -> Result<Vec<ScoredCandidate>, BackendError>
+    {
+        let (scope, embedding) = (scope.clone(), embedding.clone());
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| {
+                // Refuse a probe from a model the scope was not indexed with.
+                if let Some((stored, dim)) = vectors::scope_embedder(c, &scope)?
+                    && (stored != embedding.embedder.to_string() || dim != embedding.dim)
+                {
+                    return Err(BackendError::EmbedderMismatch {
+                        got: format!("{}:{}", embedding.embedder, embedding.dim),
+                        expected: format!("{stored}:{dim}"),
+                    });
+                }
+                let probe = memorysafe_embed::QuantizedVector::from_embedding(&embedding);
+                let hits = vectors::search(c, &scope, &probe, k)?;
+                Ok(hits
+                    .into_iter()
+                    .map(|(item, score)| ScoredCandidate {
+                        estimated_tokens: estimate_tokens(&item.body),
+                        item,
+                        relevance: score,
+                        vector_score: Some(score),
+                        keyword_score: None,
+                        value: memorysafe_core::Score::ZERO,
+                        fragility: memorysafe_core::Score::ZERO,
+                    })
+                    .collect())
+            })
+            .await
+    }
+```
+
+Add the shared token estimator to `lib.rs`:
+
+```rust
+/// Rough token count for budget packing: ~4 bytes per token, the usual
+/// English approximation. Deliberately cheap — the budget is a guide, not a
+/// contract with a specific tokenizer.
+pub(crate) fn estimate_tokens(body: &str) -> u32 {
+    ((body.len() as f32 / 4.0).ceil() as u32).max(1)
+}
+```
+
+Add `pub mod vectors;` and wire vector insert/delete into `apply`:
+
+```rust
+                for id in &txn.evictions {
+                    items::delete(&tx, &txn.scope, id)?;
+                    vectors::delete(&tx, id)?;
+                    evicted.push(id.clone());
+                }
+
+                let mut item_id = None;
+                if let Some(w) = &txn.upsert
+                    && let Some(item) = &w.item
+                {
+                    items::insert(&tx, item)?;
+                    if let Some(v) = &w.vector {
+                        vectors::insert(&tx, &item.id, &txn.scope, v)?;
+                    }
+                    item_id = Some(item.id.clone());
+                }
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend-sqlite`
+Expected: PASS — 3 unit tests plus 6 conformance tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-backend-sqlite/
+git commit -m "feat(sqlite): exact brute-force vector search with cross-model rejection"
+```
+
+---
+
+## Task 22: SQLite — FTS5 keyword search and hybrid retrieval
+
+**Files:**
+- Create: `crates/memorysafe-backend-sqlite/src/keyword.rs`
+- Create: `crates/memorysafe-backend-sqlite/src/retrieve.rs`
+- Modify: `crates/memorysafe-backend-sqlite/src/lib.rs`
+- Modify: `crates/memorysafe-backend-sqlite/tests/conformance.rs`
+
+**Interfaces:**
+- Consumes: `vectors::search`, `items::row_to_item`.
+- Produces: `keyword::escape_fts_query(&str) -> Option<String>`, `keyword::search(&Connection, &Scope, &str, limit)`, `retrieve::candidates(&Connection, &Scope, &CandidateQuery)`, and a real `Backend::retrieve_candidates`.
+
+**Two things this task must get right.** FTS5 treats `"`, `*`, `NEAR`, `AND`, `OR`, and parentheses as operators, so raw user text is a query-injection and a crash risk — every term is quoted and internal quotes are doubled. And hard filters (`sensitivity_ceiling`, tags, kinds, time bounds, pending-embedding) are applied in SQL, never after fetching, because a policy must never be able to widen a candidate set.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `crates/memorysafe-backend-sqlite/tests/conformance.rs`:
+
+```rust
+#[tokio::test]
+async fn sensitivity_ceiling_is_enforced_in_the_query() {
+    retrieval::sensitivity_ceiling_is_enforced_in_the_query(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn tag_and_kind_filters_narrow_results() {
+    retrieval::tag_and_kind_filters_narrow_results(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn keyword_search_finds_exact_terms() {
+    retrieval::keyword_search_finds_exact_terms(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn keyword_search_escapes_user_input() {
+    retrieval::keyword_search_escapes_user_input(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn hybrid_returns_both_signal_sources() {
+    retrieval::hybrid_returns_both_signal_sources(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn pagination_is_stable() {
+    retrieval::pagination_is_stable(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn pending_embedding_items_are_excluded_when_asked() {
+    retrieval::pending_embedding_items_are_excluded_when_asked(&SqliteFactory).await;
+}
+```
+
+Append to `crates/memorysafe-backend-sqlite/src/keyword.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_terms_become_quoted_terms() {
+        assert_eq!(escape_fts_query("zstandard").as_deref(), Some("\"zstandard\""));
+        assert_eq!(
+            escape_fts_query("cat mat").as_deref(),
+            Some("\"cat\" OR \"mat\"")
+        );
+    }
+
+    #[test]
+    fn operators_are_neutralised_rather_than_interpreted() {
+        // "AND"/"OR"/"NEAR" must be searched for, not executed.
+        assert_eq!(escape_fts_query("a AND b").as_deref(), Some("\"a\" OR \"AND\" OR \"b\""));
+        assert_eq!(escape_fts_query("*").as_deref(), Some("\"*\""));
+        assert_eq!(escape_fts_query("(unbalanced").as_deref(), Some("\"(unbalanced\""));
+    }
+
+    #[test]
+    fn embedded_quotes_are_doubled_so_the_term_stays_one_token() {
+        assert_eq!(escape_fts_query("say \"hi\"").as_deref(), Some("\"say\" OR \"\"\"hi\"\"\""));
+    }
+
+    #[test]
+    fn empty_or_punctuation_only_input_yields_no_query() {
+        assert_eq!(escape_fts_query(""), None);
+        assert_eq!(escape_fts_query("   "), None);
+        assert_eq!(escape_fts_query("\""), Some("\"\"\"\"".to_string()));
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend-sqlite keyword`
+Expected: FAIL — `cannot find function escape_fts_query in this scope`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-backend-sqlite/src/keyword.rs`:
+
+```rust
+use crate::items::{ITEM_COLUMNS, row_to_item};
+use crate::tenant::SqlResultExt;
+use memorysafe_core::{MemoryItem, Scope};
+use memorysafe_backend::BackendError;
+use rusqlite::{Connection, params};
+
+/// Turns arbitrary user text into a safe FTS5 MATCH expression.
+///
+/// Every whitespace-separated term is wrapped in double quotes, which makes
+/// FTS5 treat it as a literal string rather than an operator; internal quotes
+/// are doubled per FTS5's own escaping rule. Terms are OR-ed so a multi-word
+/// query behaves like "any of these", which is what hybrid retrieval wants —
+/// precision comes from the vector side.
+pub fn escape_fts_query(raw: &str) -> Option<String> {
+    let terms: Vec<String> = raw
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    Some(terms.join(" OR "))
+}
+
+/// Returns `(item, bm25_score)` where a higher score is a better match.
+pub fn search(
+    conn: &Connection,
+    scope: &Scope,
+    raw_query: &str,
+    limit: usize,
+) -> Result<Vec<(MemoryItem, f32)>, BackendError> {
+    let Some(expr) = escape_fts_query(raw_query) else {
+        return Ok(vec![]);
+    };
+    let sql = format!(
+        "SELECT {cols}, bm25(items_fts) AS bm25
+         FROM items_fts
+         JOIN items i ON i.rowid = items_fts.rowid
+         WHERE items_fts MATCH ?1 AND i.subject = ?2 AND i.namespace = ?3
+         ORDER BY bm25 ASC LIMIT ?4",
+        cols = ITEM_COLUMNS
+            .split(", ")
+            .map(|c| format!("i.{c} AS {c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let tenant = scope.tenant.as_str().to_string();
+    let mut stmt = conn.prepare(&sql).sql()?;
+    let rows = stmt
+        .query_map(
+            params![expr, scope.subject.as_str(), scope.namespace.as_str(), limit as i64],
+            move |r| {
+                let item = row_to_item(r, &tenant)?;
+                let bm25: f64 = r.get("bm25")?;
+                Ok((item, bm25 as f32))
+            },
+        )
+        .sql()?;
+
+    // bm25() returns negative values, more negative meaning a better match.
+    // Flip and squash into (0, 1] so it can be fused with cosine.
+    let mut out = Vec::new();
+    for row in rows {
+        let (item, bm25) = row.sql()?;
+        let positive = (-bm25).max(0.0);
+        out.push((item, positive / (1.0 + positive)));
+    }
+    Ok(out)
+}
+```
+
+`crates/memorysafe-backend-sqlite/src/retrieve.rs`:
+
+```rust
+use crate::{estimate_tokens, keyword, vectors};
+use memorysafe_backend::{BackendError, CandidateQuery, HardFilters};
+use memorysafe_core::{MemoryItem, Score, Scope, ScoredCandidate};
+use rusqlite::Connection;
+use std::collections::HashMap;
+
+/// Weight on the vector signal when both are present. Keyword carries the rest.
+const VECTOR_WEIGHT: f32 = 0.7;
+
+/// Applied in Rust only over rows the SQL already narrowed, as a second line of
+/// defence. The SQL predicates are the enforcement point.
+fn passes(item: &MemoryItem, f: &HardFilters) -> bool {
+    if item.sensitivity > f.sensitivity_ceiling {
+        return false;
+    }
+    if f.exclude_pending_embedding && item.pending_embedding {
+        return false;
+    }
+    if !f.kinds.is_empty() && !f.kinds.contains(&item.kind) {
+        return false;
+    }
+    if !f.tags_any.is_empty() && !item.tags.iter().any(|t| f.tags_any.contains(t)) {
+        return false;
+    }
+    if let Some(after) = f.occurred_after
+        && item.occurred_at.is_none_or(|t| t < after)
+    {
+        return false;
+    }
+    if let Some(before) = f.occurred_before
+        && item.occurred_at.is_none_or(|t| t > before)
+    {
+        return false;
+    }
+    true
+}
+
+pub fn candidates(
+    conn: &Connection,
+    scope: &Scope,
+    query: &CandidateQuery,
+) -> Result<Vec<ScoredCandidate>, BackendError> {
+    if !query.is_valid() {
+        return Err(BackendError::InvalidQuery(
+            "a query must carry an embedding, text, or both".into(),
+        ));
+    }
+
+    // Over-fetch from each source; fusion and the policy narrow afterwards.
+    let fetch = query.limit.saturating_mul(4).max(query.limit);
+
+    let mut merged: HashMap<String, (MemoryItem, Option<f32>, Option<f32>)> = HashMap::new();
+
+    if let Some(embedding) = &query.embedding
+        && let Some((stored, dim)) = vectors::scope_embedder(conn, scope)?
+        && stored == embedding.embedder.to_string()
+        && dim == embedding.dim
+    {
+        let probe = memorysafe_embed::QuantizedVector::from_embedding(embedding);
+        for (item, score) in vectors::search(conn, scope, &probe, fetch)? {
+            merged
+                .entry(item.id.as_str().to_string())
+                .or_insert((item, None, None))
+                .1 = Some(score);
+        }
+    }
+
+    if let Some(text) = &query.text {
+        for (item, score) in keyword::search(conn, scope, text, fetch)? {
+            let e = merged.entry(item.id.as_str().to_string()).or_insert((item, None, None));
+            e.2 = Some(score);
+        }
+    }
+
+    let mut out: Vec<ScoredCandidate> = merged
+        .into_values()
+        .filter(|(item, _, _)| passes(item, &query.filters))
+        .map(|(item, vector_score, keyword_score)| {
+            let relevance = match (vector_score, keyword_score) {
+                (Some(v), Some(k)) => VECTOR_WEIGHT * v + (1.0 - VECTOR_WEIGHT) * k,
+                (Some(v), None) => v,
+                (None, Some(k)) => k,
+                (None, None) => 0.0,
+            };
+            ScoredCandidate {
+                estimated_tokens: estimate_tokens(&item.body),
+                item,
+                relevance,
+                vector_score,
+                keyword_score,
+                value: Score::ZERO,
+                fragility: Score::ZERO,
+            }
+        })
+        .collect();
+
+    // Ties broken by id so ordering is total and pagination is reproducible.
+    out.sort_by(|a, b| {
+        b.relevance.total_cmp(&a.relevance).then_with(|| a.item.id.cmp(&b.item.id))
+    });
+    out.truncate(query.limit);
+    Ok(out)
+}
+```
+
+Wire the SQL-side filters into `vectors::search` and `keyword::search` by adding a `filters: &HardFilters` parameter to both and appending predicates:
+
+```rust
+// Shared helper in retrieve.rs, used to build the WHERE fragment for both.
+pub fn filter_sql(f: &HardFilters, args: &mut Vec<Box<dyn rusqlite::ToSql>>) -> String {
+    let mut sql = String::new();
+    args.push(Box::new(f.sensitivity_ceiling.ordinal()));
+    sql.push_str(&format!(" AND i.sensitivity <= ?{}", args.len()));
+    if f.exclude_pending_embedding {
+        sql.push_str(" AND i.pending_embedding = 0");
+    }
+    if !f.kinds.is_empty() {
+        let ph: Vec<String> =
+            (0..f.kinds.len()).map(|i| format!("?{}", args.len() + i + 1)).collect();
+        sql.push_str(&format!(" AND i.kind IN ({})", ph.join(",")));
+        for k in &f.kinds {
+            args.push(Box::new(k.clone()));
+        }
+    }
+    if !f.tags_any.is_empty() {
+        let ph: Vec<String> =
+            (0..f.tags_any.len()).map(|i| format!("?{}", args.len() + i + 1)).collect();
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM json_each(i.tags) WHERE json_each.value IN ({}))",
+            ph.join(",")
+        ));
+        for t in &f.tags_any {
+            args.push(Box::new(t.clone()));
+        }
+    }
+    if let Some(after) = f.occurred_after {
+        args.push(Box::new(after.unix_timestamp()));
+        sql.push_str(&format!(" AND i.occurred_at >= ?{}", args.len()));
+    }
+    if let Some(before) = f.occurred_before {
+        args.push(Box::new(before.unix_timestamp()));
+        sql.push_str(&format!(" AND i.occurred_at <= ?{}", args.len()));
+    }
+    sql
+}
+```
+
+Replace the placeholder `retrieve_candidates` in `lib.rs`:
+
+```rust
+    async fn retrieve_candidates(&self, scope: &Scope, query: &CandidateQuery)
+        -> Result<Vec<ScoredCandidate>, BackendError>
+    {
+        let (scope, query) = (scope.clone(), query.clone());
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| retrieve::candidates(c, &scope, &query))
+            .await
+    }
+```
+
+`CandidateQuery` needs `Clone`; confirm the derive from Task 14.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend-sqlite`
+Expected: PASS — 4 keyword unit tests plus 13 conformance tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-backend-sqlite/
+git commit -m "feat(sqlite): FTS5 keyword search with escaping and hybrid fusion"
+```
+
+---
