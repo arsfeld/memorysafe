@@ -2323,6 +2323,26 @@ mod tests {
     }
 
     #[test]
+    fn a_budget_is_inclusive_at_its_exact_limit() {
+        // `<=`, not `<`. With `<` the last slot of every budget is unusable:
+        // `compose` packs while `fits(tokens + next, len + 1)` holds, so an item
+        // that exactly fills the budget would be silently dropped and the caller
+        // would get fewer memories than they asked for, with no error.
+        let b = RecallBudget { max_tokens: Some(2000), max_items: Some(10) };
+        assert!(b.fits(2000, 10), "a budget must include its own limit");
+        assert!(!b.fits(2001, 10));
+        assert!(!b.fits(2000, 11));
+
+        // And each limit is inclusive independently.
+        let tokens_only = RecallBudget { max_tokens: Some(100), max_items: None };
+        assert!(tokens_only.fits(100, usize::MAX));
+        assert!(!tokens_only.fits(101, 0));
+        let items_only = RecallBudget { max_tokens: None, max_items: Some(3) };
+        assert!(items_only.fits(u32::MAX, 3));
+        assert!(!items_only.fits(0, 4));
+    }
+
+    #[test]
     fn an_unbounded_budget_fits_anything() {
         let b = RecallBudget { max_tokens: None, max_items: None };
         assert!(b.fits(u32::MAX, usize::MAX));
