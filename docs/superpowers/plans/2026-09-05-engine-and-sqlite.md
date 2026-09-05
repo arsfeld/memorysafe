@@ -9599,3 +9599,1094 @@ git commit -m "feat(engine): remember pipeline with governance decisions surface
 ```
 
 ---
+
+## Task 32: Engine — `recall`
+
+**Files:**
+- Create: `crates/memorysafe-engine/src/read.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs`
+- Create: `crates/memorysafe-engine/tests/read.rs`
+
+**Interfaces:**
+- Consumes: `Backend::retrieve_candidates`, `GovernancePolicy::compose`, `validate::working_set`.
+- Produces: `Engine::recall(RecallRequest) -> Result<WorkingSet, EngineError>`.
+
+**The pipeline:** build a `CandidateQuery` whose `HardFilters` carry the caller's sensitivity ceiling → over-fetch from the backend → `compose` → validate that the working set is a subset of what was offered → write a `Recalled` audit record → return with `audit_id` set. Access statistics are updated without blocking the response.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-engine/tests/read.rs`:
+
+```rust
+use memorysafe_backend_sqlite::SqliteBackend;
+use memorysafe_core::{
+    AuditEvent, RecallBudget, RecallMode, RecallRequest, Scope, SensitivityLevel,
+};
+use memorysafe_embed::DeterministicEmbedder;
+use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
+use memorysafe_policy::BaselinePolicy;
+use std::sync::Arc;
+
+fn engine() -> Engine {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.keep())),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::default()),
+    ))
+}
+
+fn scope() -> Scope {
+    Scope::new("acme", "user-42", "agent").unwrap()
+}
+
+fn recall(query: &str, ceiling: SensitivityLevel, max_items: usize) -> RecallRequest {
+    RecallRequest {
+        scope: scope(),
+        query: Some(query.into()),
+        tags_any: vec![],
+        kinds: vec![],
+        mode: RecallMode::WorkingSet,
+        budget: RecallBudget { max_tokens: Some(4000), max_items: Some(max_items) },
+        sensitivity_ceiling: ceiling,
+    }
+}
+
+async fn seed(e: &Engine, bodies: &[&str]) {
+    for b in bodies {
+        e.remember(RememberRequest::new(scope(), b)).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn recall_returns_relevant_memories_each_with_a_reason() {
+    let e = engine();
+    seed(&e, &[
+        "the cat sat on the mat",
+        "quarterly revenue exceeded projections",
+        "the deployment pipeline runs nightly",
+    ])
+    .await;
+
+    let ws = e.recall(recall("the cat sat on the mat", SensitivityLevel::Restricted, 5))
+        .await
+        .unwrap();
+
+    assert!(!ws.items.is_empty());
+    assert!(ws.items.iter().all(|s| !s.reason.detail.is_empty()), "every item needs a reason");
+    assert!(ws.audit_id.is_some(), "a recall must be audited");
+}
+
+#[tokio::test]
+async fn a_restricted_memory_never_reaches_a_caller_cleared_only_to_personal() {
+    let e = engine();
+    // Detected as Restricted by the credential patterns.
+    e.remember(RememberRequest::new(
+        scope(),
+        "the deploy api key is sk-abc123def456ghi789jkl012 for cats",
+    ))
+    .await
+    .unwrap();
+    seed(&e, &["an ordinary note about cats"]).await;
+
+    let ws = e.recall(recall("cats", SensitivityLevel::Personal, 10)).await.unwrap();
+
+    assert!(
+        ws.items.iter().all(|s| s.item.sensitivity <= SensitivityLevel::Personal),
+        "the sensitivity ceiling leaked"
+    );
+    let json = serde_json::to_string(&ws).unwrap();
+    assert!(!json.contains("sk-abc123"), "a restricted body reached the response");
+}
+
+#[tokio::test]
+async fn the_item_budget_is_respected_and_the_rest_is_reported() {
+    let e = engine();
+    let bodies: Vec<String> =
+        (0..8).map(|i| format!("distinct memory {i} concerning subject {i}")).collect();
+    let refs: Vec<&str> = bodies.iter().map(|s| s.as_str()).collect();
+    seed(&e, &refs).await;
+
+    let ws = e.recall(recall("distinct memory", SensitivityLevel::Restricted, 3)).await.unwrap();
+    assert!(ws.items.len() <= 3);
+    assert!(!ws.omitted.is_empty(), "what was cut must be reported");
+}
+
+#[tokio::test]
+async fn search_mode_bypasses_composition_but_not_governance() {
+    let e = engine();
+    e.remember(RememberRequest::new(
+        scope(),
+        "the deploy api key is sk-abc123def456ghi789jkl012 for cats",
+    ))
+    .await
+    .unwrap();
+    seed(&e, &["an ordinary note about cats"]).await;
+
+    let mut req = recall("cats", SensitivityLevel::Personal, 10);
+    req.mode = RecallMode::Search;
+    let ws = e.recall(req).await.unwrap();
+
+    assert!(
+        ws.items.iter().all(|s| s.item.sensitivity <= SensitivityLevel::Personal),
+        "search mode must still enforce the ceiling"
+    );
+    assert!(ws.audit_id.is_some(), "search mode must still be audited");
+}
+
+#[tokio::test]
+async fn a_recall_over_an_empty_scope_is_empty_not_an_error() {
+    let e = engine();
+    let ws = e.recall(recall("anything", SensitivityLevel::Restricted, 5)).await.unwrap();
+    assert!(ws.items.is_empty());
+    assert!(ws.omitted.is_empty());
+}
+
+#[tokio::test]
+async fn the_recall_audit_record_names_what_was_returned_and_what_was_cut() {
+    let e = engine();
+    seed(&e, &["alpha memory about cats", "beta memory about cats"]).await;
+    e.recall(recall("cats", SensitivityLevel::Restricted, 1)).await.unwrap();
+
+    let audit = e
+        .audit(&scope(), &memorysafe_core::AuditFilter {
+            events: vec![AuditEvent::Recalled],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(audit.len(), 1);
+    assert!(!audit[0].items.is_empty(), "the recall audit must name the returned items");
+    let json = serde_json::to_string(&audit).unwrap();
+    assert!(!json.contains("alpha memory"), "the recall audit leaked a body");
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine --test read`
+Expected: FAIL — `no method named recall found for struct Engine`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-engine/src/read.rs`:
+
+```rust
+use crate::Engine;
+use crate::error::EngineError;
+use crate::validate;
+use memorysafe_backend::{CandidateQuery, HardFilters};
+use memorysafe_core::{
+    Actor, ActorKind, AuditEvent, AuditRecord, ComposeContext, ItemRef, RecallRequest,
+    ScoredCandidate, WorkingSet,
+};
+use memorysafe_embed::Embedder;
+use time::OffsetDateTime;
+
+/// Over-fetch factor: composition needs room to trade relevance for diversity
+/// and to fill the replay quota, so it must see more than it will return.
+const OVERFETCH: usize = 8;
+
+impl Engine {
+    pub async fn recall(&self, req: RecallRequest) -> Result<WorkingSet, EngineError> {
+        let limit = req.budget.max_items.unwrap_or(20).saturating_mul(OVERFETCH).clamp(10, 500);
+
+        let embedding = req
+            .query
+            .as_deref()
+            .filter(|q| !q.trim().is_empty())
+            .and_then(|q| self.embedder.embed(q).ok());
+
+        if embedding.is_none() && req.query.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(EngineError::Validation(
+                "a recall needs a query; filter-only recall is not supported in v1".into(),
+            ));
+        }
+
+        let query = CandidateQuery {
+            embedding,
+            text: req.query.clone(),
+            // The security boundary: these run in SQL, below the policy.
+            filters: HardFilters {
+                tags_any: req.tags_any.clone(),
+                kinds: req.kinds.clone(),
+                occurred_after: None,
+                occurred_before: None,
+                sensitivity_ceiling: req.sensitivity_ceiling,
+                exclude_pending_embedding: false,
+            },
+            limit,
+        };
+
+        let candidates: Vec<ScoredCandidate> =
+            self.backend.retrieve_candidates(&req.scope, &query).await?;
+
+        if candidates.is_empty() {
+            let audit = AuditRecord::new(
+                req.scope.clone(),
+                AuditEvent::Recalled,
+                vec![],
+                Actor { kind: ActorKind::Agent, id: None },
+            );
+            let audit_id = self.backend.record_recall(audit).await?;
+            return Ok(WorkingSet { audit_id: Some(audit_id), ..WorkingSet::empty() });
+        }
+
+        let ctx = ComposeContext {
+            scope: req.scope.clone(),
+            stats: self.backend.scope_stats(&req.scope).await?,
+            now: OffsetDateTime::now_utc(),
+        };
+
+        let policy = self.policy.clone();
+        let (r, c, x) = (req.clone(), candidates.clone(), ctx.clone());
+        let composed = match validate::call_policy(move || policy.compose(&r, &c, &x)) {
+            Ok(ws) => ws,
+            Err(failure) => match self.stance {
+                validate::FailureStance::FailClosed => {
+                    return Err(EngineError::PolicyRefused(failure.to_string()));
+                }
+                validate::FailureStance::FailSafe => self
+                    .fallback_policy
+                    .compose(&req, &candidates, &ctx)
+                    .map_err(|e| EngineError::PolicyRefused(e.to_string()))?,
+            },
+        };
+
+        // A policy may narrow the candidate set; it may never widen it.
+        if let Err(invalid) = validate::working_set(&composed, &candidates) {
+            return Err(EngineError::PolicyRefused(invalid.to_string()));
+        }
+
+        let refs: Vec<ItemRef> =
+            composed.items.iter().map(|s| ItemRef::from_item(&s.item)).collect();
+        let audit = AuditRecord::new(
+            req.scope.clone(),
+            AuditEvent::Recalled,
+            refs,
+            Actor { kind: ActorKind::Agent, id: None },
+        );
+        let audit_id = self.backend.record_recall(audit).await?;
+
+        Ok(WorkingSet { audit_id: Some(audit_id), ..composed })
+    }
+}
+```
+
+Add `pub mod read;` to `lib.rs`. `RecallRequest`, `ScoredCandidate`, and `ComposeContext` need `Clone`; confirm from Tasks 9 and 10.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-engine`
+Expected: PASS — 22 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-engine/
+git commit -m "feat(engine): recall pipeline with the sensitivity ceiling enforced below the policy"
+```
+
+---
+
+## Task 33: Engine — `forget`, `protect`, and `purge_subject`
+
+**Files:**
+- Create: `crates/memorysafe-engine/src/mutate.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs`
+- Create: `crates/memorysafe-engine/tests/mutate.rs`
+
+**Interfaces:**
+- Consumes: `Backend::apply`, `Backend::purge_subject`, `Backend::get`.
+- Produces: `ForgetSelector` (`Ids(Vec<ItemId>)` | `Tag(String)` | `Kind(String)`), `Engine::forget`, `Engine::protect`, `Engine::purge_subject`.
+
+**Note:** `protect` is the only path that changes `MemoryItem::protection` outside admission, per the spec. It writes its own audit record so "why is this pinned?" is answerable from the trail alone.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-engine/tests/mutate.rs`:
+
+```rust
+use memorysafe_backend_sqlite::SqliteBackend;
+use memorysafe_core::{
+    AuditEvent, AuditFilter, Protection, Scope, SubjectId, TenantId,
+};
+use memorysafe_embed::DeterministicEmbedder;
+use memorysafe_engine::{Engine, EngineConfig, ForgetSelector, RememberRequest};
+use memorysafe_policy::BaselinePolicy;
+use std::sync::Arc;
+use time::{Duration, OffsetDateTime};
+
+fn engine() -> Engine {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.keep())),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::default()),
+    ))
+}
+
+fn scope() -> Scope {
+    Scope::new("acme", "user-42", "agent").unwrap()
+}
+
+#[tokio::test]
+async fn forgetting_by_id_removes_the_item_and_audits_it() {
+    let e = engine();
+    let out = e.remember(RememberRequest::new(scope(), "a memory to delete")).await.unwrap();
+    let id = out.item_id.unwrap();
+
+    let f = e.forget(&scope(), ForgetSelector::Ids(vec![id.clone()])).await.unwrap();
+    assert_eq!(f.forgotten, vec![id]);
+    assert!(e.review(&scope(), &Default::default()).await.unwrap().is_empty());
+
+    let audit = e
+        .audit(&scope(), &AuditFilter { events: vec![AuditEvent::Forgotten], ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 1);
+}
+
+#[tokio::test]
+async fn forgetting_by_tag_removes_only_matching_items() {
+    let e = engine();
+    for (body, tag) in [("alpha note", "work"), ("beta note", "home"), ("gamma note", "work")] {
+        let mut r = RememberRequest::new(scope(), body);
+        r.tags = vec![tag.into()];
+        e.remember(r).await.unwrap();
+    }
+
+    let f = e.forget(&scope(), ForgetSelector::Tag("work".into())).await.unwrap();
+    assert_eq!(f.forgotten.len(), 2);
+    let left = e.review(&scope(), &Default::default()).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].body, "beta note");
+}
+
+#[tokio::test]
+async fn forgetting_something_that_does_not_exist_is_not_an_error() {
+    let e = engine();
+    let f = e
+        .forget(&scope(), ForgetSelector::Ids(vec![memorysafe_core::ItemId::new()]))
+        .await
+        .unwrap();
+    assert!(f.forgotten.is_empty());
+}
+
+#[tokio::test]
+async fn pinning_an_item_survives_a_later_capacity_squeeze() {
+    let e = engine();
+    let out = e.remember(RememberRequest::new(scope(), "never forget this one")).await.unwrap();
+    let id = out.item_id.unwrap();
+
+    e.protect(&scope(), &id, Protection::Pinned).await.unwrap();
+
+    e.set_budget(&scope(), memorysafe_core::Budget { max_items: Some(1), max_bytes: None })
+        .await
+        .unwrap();
+    for i in 0..4 {
+        e.remember(RememberRequest::new(scope(), &format!("filler memory {i} about topic {i}")))
+            .await
+            .unwrap();
+    }
+
+    let left = e.review(&scope(), &Default::default()).await.unwrap();
+    assert!(
+        left.iter().any(|i| i.id == id),
+        "a pinned item was evicted under capacity pressure"
+    );
+}
+
+#[tokio::test]
+async fn protecting_writes_its_own_audit_record() {
+    let e = engine();
+    let id = e
+        .remember(RememberRequest::new(scope(), "worth protecting"))
+        .await
+        .unwrap()
+        .item_id
+        .unwrap();
+
+    let until = OffsetDateTime::now_utc() + Duration::days(7);
+    e.protect(&scope(), &id, Protection::Protected { until }).await.unwrap();
+
+    let audit = e.audit(&scope(), &AuditFilter::default()).await.unwrap();
+    assert_eq!(audit.len(), 2, "remember plus protect");
+}
+
+#[tokio::test]
+async fn purging_a_subject_removes_everything_it_owns() {
+    let e = engine();
+    let doomed = Scope::new("acme", "doomed", "agent").unwrap();
+    let keeper = Scope::new("acme", "keeper", "agent").unwrap();
+
+    for i in 0..3 {
+        e.remember(RememberRequest::new(doomed.clone(), &format!("subject memory {i}")))
+            .await
+            .unwrap();
+    }
+    e.remember(RememberRequest::new(keeper.clone(), "another subject's memory")).await.unwrap();
+
+    let report = e
+        .purge_subject(&TenantId::new("acme").unwrap(), &SubjectId::new("doomed").unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(report.items_removed, 3);
+    assert!(e.review(&doomed, &Default::default()).await.unwrap().is_empty());
+    assert_eq!(e.review(&keeper, &Default::default()).await.unwrap().len(), 1);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine --test mutate`
+Expected: FAIL — `cannot find enum ForgetSelector in memorysafe_engine`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-engine/src/mutate.rs`:
+
+```rust
+use crate::Engine;
+use crate::error::EngineError;
+use crate::outcome::{ForgetOutcome, PurgeOutcome, WriteOutcome};
+use memorysafe_backend::{ItemWrite, Page, WriteTransaction};
+use memorysafe_core::{
+    Action, Actor, ActorKind, AuditEvent, AuditRecord, ItemId, ItemRef, Protection, Reason,
+    ReasonCode, Scope, SubjectId, TenantId, features,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetSelector {
+    Ids(Vec<ItemId>),
+    Tag(String),
+    Kind(String),
+}
+
+/// Paging bound for selector-based forget. Beyond this a caller should purge
+/// the subject or narrow the selector.
+const FORGET_SCAN_LIMIT: usize = 1000;
+
+impl Engine {
+    pub async fn forget(
+        &self,
+        scope: &Scope,
+        selector: ForgetSelector,
+    ) -> Result<ForgetOutcome, EngineError> {
+        let targets: Vec<ItemId> = match selector {
+            ForgetSelector::Ids(ids) => {
+                let mut present = Vec::new();
+                for id in ids {
+                    if self.backend.get(scope, &id).await?.is_some() {
+                        present.push(id);
+                    }
+                }
+                present
+            }
+            ForgetSelector::Tag(tag) => self
+                .backend
+                .list(scope, &Page { offset: 0, limit: FORGET_SCAN_LIMIT })
+                .await?
+                .into_iter()
+                .filter(|i| i.tags.contains(&tag))
+                .map(|i| i.id)
+                .collect(),
+            ForgetSelector::Kind(kind) => self
+                .backend
+                .list(scope, &Page { offset: 0, limit: FORGET_SCAN_LIMIT })
+                .await?
+                .into_iter()
+                .filter(|i| i.kind == kind)
+                .map(|i| i.id)
+                .collect(),
+        };
+
+        let refs: Vec<ItemRef> = Vec::new();
+        let audit = AuditRecord::new(
+            scope.clone(),
+            AuditEvent::Forgotten,
+            refs,
+            Actor { kind: ActorKind::Human, id: None },
+        );
+        let mut txn = WriteTransaction::new(scope.clone(), audit);
+        txn.evictions = targets.clone();
+
+        let applied = self.backend.apply(txn).await?;
+        Ok(ForgetOutcome { forgotten: applied.evicted, audit_id: applied.audit_id })
+    }
+
+    /// The only path that changes `protection` outside admission.
+    pub async fn protect(
+        &self,
+        scope: &Scope,
+        id: &ItemId,
+        protection: Protection,
+    ) -> Result<WriteOutcome, EngineError> {
+        let Some(mut item) = self.backend.get(scope, id).await? else {
+            return Err(EngineError::NotFound(id.to_string()));
+        };
+        item.protection = protection;
+
+        let audit = AuditRecord::new(
+            scope.clone(),
+            AuditEvent::Admitted,
+            vec![ItemRef::from_item(&item)],
+            Actor { kind: ActorKind::Human, id: None },
+        );
+        let mut txn = WriteTransaction::new(scope.clone(), audit);
+        // Replace the row: delete then insert, in one transaction.
+        txn.evictions = vec![id.clone()];
+        txn.upsert = Some(ItemWrite { item: Some(item), vector: None });
+
+        let applied = self.backend.apply(txn).await?;
+        Ok(WriteOutcome {
+            item_id: applied.item_id,
+            action: Action::Retain { protection },
+            reasons: vec![Reason::new(
+                ReasonCode::Pinned,
+                "protection set by explicit request",
+                features! {},
+            )],
+            merged_into: None,
+            evicted: vec![],
+            audit_id: applied.audit_id,
+        })
+    }
+
+    pub async fn purge_subject(
+        &self,
+        tenant: &TenantId,
+        subject: &SubjectId,
+    ) -> Result<PurgeOutcome, EngineError> {
+        let report = self.backend.purge_subject(tenant, subject).await?;
+        Ok(PurgeOutcome {
+            items_removed: report.items_removed,
+            audit_rows_removed: report.audit_rows_removed,
+            audit_rows_preserved: report.audit_rows_preserved,
+        })
+    }
+}
+```
+
+Add `pub mod mutate;` and `pub use mutate::ForgetSelector;` to `lib.rs`.
+
+**Note on `protect` and vectors:** deleting the row cascades its vector away, so `protect` re-embeds. Add that to `protect` before building the transaction:
+
+```rust
+        let vector = self.embedder.embed(&item.body).ok().map(|e| {
+            memorysafe_embed::QuantizedVector::from_embedding(&e)
+        });
+```
+
+and pass it as `ItemWrite { item: Some(item), vector }`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-engine`
+Expected: PASS — 28 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-engine/
+git commit -m "feat(engine): forget, protect, and subject purge"
+```
+
+---
+
+## Task 34: Engine — resumable maintenance job
+
+**Files:**
+- Create: `crates/memorysafe-engine/src/maintain.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs`
+- Create: `crates/memorysafe-engine/tests/maintain.rs`
+
+**Interfaces:**
+- Consumes: `GovernancePolicy::maintain`, `Backend::list`, `Backend::apply`.
+- Produces: `MaintainCursor { offset: usize }`, `MaintainReport { scanned, forgotten, protection_released, next_cursor }`, `Engine::maintain(&Scope, Option<MaintainCursor>)`.
+
+**Design constraint from the spec:** maintenance is an explicit, resumable job with a cursor — not a background thread that quietly mutates state. Every change it makes goes through the same atomic, audited path as a write.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-engine/tests/maintain.rs`:
+
+```rust
+use memorysafe_backend_sqlite::SqliteBackend;
+use memorysafe_core::{AuditEvent, AuditFilter, Budget, Scope};
+use memorysafe_embed::DeterministicEmbedder;
+use memorysafe_engine::{Engine, EngineConfig, MaintainCursor, RememberRequest};
+use memorysafe_policy::BaselinePolicy;
+use std::sync::Arc;
+use time::Duration;
+
+fn engine() -> Engine {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.keep())),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::default()),
+    ))
+}
+
+fn scope() -> Scope {
+    Scope::new("acme", "user-42", "agent").unwrap()
+}
+
+#[tokio::test]
+async fn an_expired_item_is_removed_and_the_reason_is_recorded() {
+    let e = engine();
+    let mut r = RememberRequest::new(scope(), "this memory expires immediately");
+    r.ttl = Some(Duration::seconds(-1)); // already past
+    e.remember(r).await.unwrap();
+    e.remember(RememberRequest::new(scope(), "this one has no expiry at all")).await.unwrap();
+
+    let report = e.maintain(&scope(), None).await.unwrap();
+    assert_eq!(report.forgotten, 1);
+
+    let left = e.review(&scope(), &Default::default()).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].body, "this one has no expiry at all");
+
+    let audit = e
+        .audit(&scope(), &AuditFilter {
+            events: vec![AuditEvent::MaintenanceRun],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!audit.is_empty(), "maintenance must write an audit record");
+}
+
+#[tokio::test]
+async fn maintenance_over_a_healthy_scope_changes_nothing() {
+    let e = engine();
+    for i in 0..3 {
+        e.remember(RememberRequest::new(scope(), &format!("healthy memory {i} about topic {i}")))
+            .await
+            .unwrap();
+    }
+    let report = e.maintain(&scope(), None).await.unwrap();
+    assert_eq!(report.forgotten, 0);
+    assert_eq!(e.review(&scope(), &Default::default()).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn maintenance_resumes_from_its_cursor() {
+    let e = engine();
+    for i in 0..250 {
+        let mut r = RememberRequest::new(scope(), &format!("memory number {i} on subject {i}"));
+        r.idempotency_key = Some(format!("seed-{i}"));
+        e.remember(r).await.unwrap();
+    }
+
+    let first = e.maintain(&scope(), None).await.unwrap();
+    assert!(first.next_cursor.is_some(), "a large scope must page");
+    assert!(first.scanned > 0);
+
+    let second = e.maintain(&scope(), first.next_cursor).await.unwrap();
+    assert!(second.scanned > 0);
+    assert!(
+        second.next_cursor.is_none() || second.next_cursor.unwrap().offset > first.scanned,
+        "the cursor must advance"
+    );
+}
+
+#[tokio::test]
+async fn maintenance_reclaims_an_over_budget_namespace() {
+    let e = engine();
+    // Seed above budget, then tighten the budget so the scope is over it.
+    for i in 0..6 {
+        e.remember(RememberRequest::new(scope(), &format!("memory {i} concerning subject {i}")))
+            .await
+            .unwrap();
+    }
+    e.set_budget(&scope(), Budget { max_items: Some(3), max_bytes: None }).await.unwrap();
+
+    let report = e.maintain(&scope(), None).await.unwrap();
+    assert_eq!(report.forgotten, 3, "6 items against a budget of 3 means 3 reclaimed");
+    assert_eq!(e.review(&scope(), &Default::default()).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn maintenance_on_an_empty_scope_is_a_no_op() {
+    let e = engine();
+    let report = e.maintain(&scope(), None).await.unwrap();
+    assert_eq!(report.scanned, 0);
+    assert_eq!(report.forgotten, 0);
+    assert!(report.next_cursor.is_none());
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine --test maintain`
+Expected: FAIL — `cannot find struct MaintainCursor in memorysafe_engine`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-engine/src/maintain.rs`:
+
+```rust
+use crate::Engine;
+use crate::error::EngineError;
+use crate::validate;
+use memorysafe_backend::{Page, WriteTransaction};
+use memorysafe_core::{
+    Action, Actor, ActorKind, AuditEvent, AuditRecord, ItemId, MaintainContext, Protection,
+};
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
+/// Items examined per call. Maintenance is explicit and resumable rather than
+/// a background thread, so the caller controls how much work happens at once.
+pub const MAINTAIN_BATCH: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintainCursor {
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintainReport {
+    pub scanned: usize,
+    pub forgotten: usize,
+    pub protection_released: usize,
+    pub next_cursor: Option<MaintainCursor>,
+}
+
+impl Engine {
+    pub async fn maintain(
+        &self,
+        scope: &memorysafe_core::Scope,
+        cursor: Option<MaintainCursor>,
+    ) -> Result<MaintainReport, EngineError> {
+        let offset = cursor.map(|c| c.offset).unwrap_or(0);
+        let batch = self
+            .backend
+            .list(scope, &Page { offset, limit: MAINTAIN_BATCH })
+            .await?;
+
+        if batch.is_empty() {
+            return Ok(MaintainReport {
+                scanned: 0,
+                forgotten: 0,
+                protection_released: 0,
+                next_cursor: None,
+            });
+        }
+
+        let scanned = batch.len();
+        let ctx = MaintainContext {
+            scope: scope.clone(),
+            batch,
+            capacity: self.backend.capacity_state(scope).await?,
+            stats: self.backend.scope_stats(scope).await?,
+            now: OffsetDateTime::now_utc(),
+        };
+
+        let policy = self.policy.clone();
+        let x = ctx.clone();
+        let decisions = match validate::call_policy(move || policy.maintain(&x)) {
+            Ok(d) => d,
+            Err(failure) => match self.stance {
+                validate::FailureStance::FailClosed => {
+                    return Err(EngineError::PolicyRefused(failure.to_string()));
+                }
+                validate::FailureStance::FailSafe => self
+                    .fallback_policy
+                    .maintain(&ctx)
+                    .map_err(|e| EngineError::PolicyRefused(e.to_string()))?,
+            },
+        };
+
+        let mut to_forget: Vec<ItemId> = Vec::new();
+        let mut released = 0usize;
+
+        for d in &decisions {
+            for e in &d.evictions {
+                // The engine enforces pinning even if a policy forgets.
+                let pinned = ctx
+                    .batch
+                    .iter()
+                    .any(|i| i.id == e.item && i.protection == Protection::Pinned);
+                if !pinned {
+                    to_forget.push(e.item.clone());
+                }
+            }
+            if matches!(d.action, Action::Retain { protection: Protection::Normal })
+                && d.evictions.is_empty()
+            {
+                released += 1;
+            }
+        }
+
+        let forgotten = to_forget.len();
+
+        if !to_forget.is_empty() || released > 0 {
+            let audit = AuditRecord::new(
+                scope.clone(),
+                AuditEvent::MaintenanceRun,
+                vec![],
+                Actor { kind: ActorKind::System, id: None },
+            );
+            let mut txn = WriteTransaction::new(scope.clone(), audit);
+            txn.evictions = to_forget;
+            self.backend.apply(txn).await?;
+        }
+
+        // Advance past what survived; forgotten rows have shifted the window.
+        let next_offset = offset + scanned.saturating_sub(forgotten);
+        let next_cursor = if scanned < MAINTAIN_BATCH {
+            None
+        } else {
+            Some(MaintainCursor { offset: next_offset })
+        };
+
+        Ok(MaintainReport { scanned, forgotten, protection_released: released, next_cursor })
+    }
+}
+```
+
+Add to `lib.rs`:
+
+```rust
+pub mod maintain;
+pub use maintain::{MAINTAIN_BATCH, MaintainCursor, MaintainReport};
+```
+
+`MaintainContext` needs `Clone`; confirm from Task 10.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-engine`
+Expected: PASS — 33 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-engine/
+git commit -m "feat(engine): explicit resumable maintenance job with audited changes"
+```
+
+---
+
+## Task 35: Engine — cache and invalidation
+
+**Files:**
+- Create: `crates/memorysafe-engine/src/cache.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs`, `src/write.rs`, `src/read.rs`
+- Create: `crates/memorysafe-engine/tests/cache.rs`
+
+**Interfaces:**
+- Consumes: `moka::future::Cache`, `Scope::key()`.
+- Produces: `EngineCache::new(CacheConfig)`, `EngineCache::embedding(text) / put_embedding`, `EngineCache::stats(scope) / put_stats`, `EngineCache::invalidate_scope(scope)`, `CacheConfig { embedding_capacity, stats_capacity, stats_ttl }`.
+
+**What is and is not cached.** Embeddings are cached by content hash — the same text always embeds identically, so this is free correctness. Scope statistics are cached with a short TTL because they change slowly and are read on every write. **Composed working sets are deliberately not cached**: they depend on the corpus, the clock, and the replay state, and a stale one would return memories that were since forgotten. Any write invalidates its scope.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-engine/tests/cache.rs`:
+
+```rust
+use memorysafe_core::Scope;
+use memorysafe_embed::{DeterministicEmbedder, Embedder};
+use memorysafe_engine::cache::{CacheConfig, EngineCache};
+
+fn scope() -> Scope {
+    Scope::new("acme", "user-42", "agent").unwrap()
+}
+
+#[tokio::test]
+async fn an_embedding_is_returned_from_cache_on_the_second_ask() {
+    let c = EngineCache::new(CacheConfig::default());
+    let e = DeterministicEmbedder::new(256);
+    let v = e.embed("some memory text").unwrap();
+
+    assert!(c.embedding("some memory text").await.is_none());
+    c.put_embedding("some memory text", v.clone()).await;
+    assert_eq!(c.embedding("some memory text").await.unwrap().vector, v.vector);
+}
+
+#[tokio::test]
+async fn different_text_does_not_collide() {
+    let c = EngineCache::new(CacheConfig::default());
+    let e = DeterministicEmbedder::new(256);
+    c.put_embedding("first", e.embed("first").unwrap()).await;
+    assert!(c.embedding("second").await.is_none());
+}
+
+#[tokio::test]
+async fn scope_stats_are_cached_and_invalidated_together() {
+    let c = EngineCache::new(CacheConfig::default());
+    let stats = memorysafe_core::ScopeStats { item_count: 7, ..Default::default() };
+
+    c.put_stats(&scope(), stats.clone()).await;
+    assert_eq!(c.stats(&scope()).await.unwrap().item_count, 7);
+
+    c.invalidate_scope(&scope()).await;
+    assert!(c.stats(&scope()).await.is_none(), "a write must invalidate its scope");
+}
+
+#[tokio::test]
+async fn invalidating_one_scope_leaves_another_alone() {
+    let c = EngineCache::new(CacheConfig::default());
+    let other = Scope::new("acme", "user-99", "agent").unwrap();
+    let stats = memorysafe_core::ScopeStats { item_count: 3, ..Default::default() };
+
+    c.put_stats(&scope(), stats.clone()).await;
+    c.put_stats(&other, stats).await;
+    c.invalidate_scope(&scope()).await;
+
+    assert!(c.stats(&scope()).await.is_none());
+    assert!(c.stats(&other).await.is_some(), "invalidation crossed scopes");
+}
+
+#[tokio::test]
+async fn embeddings_survive_scope_invalidation() {
+    // Embeddings are content-addressed, so a write cannot make one stale.
+    let c = EngineCache::new(CacheConfig::default());
+    let e = DeterministicEmbedder::new(256);
+    c.put_embedding("durable text", e.embed("durable text").unwrap()).await;
+    c.invalidate_scope(&scope()).await;
+    assert!(c.embedding("durable text").await.is_some());
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine --test cache`
+Expected: FAIL — `unresolved import memorysafe_engine::cache`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-engine/src/cache.rs`:
+
+```rust
+use memorysafe_core::{Embedding, Scope, ScopeStats};
+use moka::future::Cache;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CacheConfig {
+    pub embedding_capacity: u64,
+    pub stats_capacity: u64,
+    pub stats_ttl: Duration,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            embedding_capacity: 10_000,
+            stats_capacity: 5_000,
+            // Short: statistics feed fragility scoring, and a stale corpus mean
+            // skews every assessment made against it.
+            stats_ttl: Duration::from_secs(30),
+        }
+    }
+}
+
+/// In-process caches. Deliberately excludes composed working sets: those depend
+/// on the corpus, the clock, and replay state, so a stale one would surface
+/// memories that have since been forgotten.
+pub struct EngineCache {
+    embeddings: Cache<String, Embedding>,
+    stats: Cache<String, ScopeStats>,
+}
+
+impl EngineCache {
+    pub fn new(config: CacheConfig) -> Self {
+        Self {
+            embeddings: Cache::builder().max_capacity(config.embedding_capacity).build(),
+            stats: Cache::builder()
+                .max_capacity(config.stats_capacity)
+                .time_to_live(config.stats_ttl)
+                .build(),
+        }
+    }
+
+    fn embedding_key(text: &str) -> String {
+        blake3::hash(text.as_bytes()).to_hex().to_string()
+    }
+
+    pub async fn embedding(&self, text: &str) -> Option<Embedding> {
+        self.embeddings.get(&Self::embedding_key(text)).await
+    }
+
+    pub async fn put_embedding(&self, text: &str, embedding: Embedding) {
+        self.embeddings.insert(Self::embedding_key(text), embedding).await;
+    }
+
+    pub async fn stats(&self, scope: &Scope) -> Option<ScopeStats> {
+        self.stats.get(&scope.key()).await
+    }
+
+    pub async fn put_stats(&self, scope: &Scope, stats: ScopeStats) {
+        self.stats.insert(scope.key(), stats).await;
+    }
+
+    /// Called after every write. Embeddings are content-addressed and are not
+    /// affected.
+    pub async fn invalidate_scope(&self, scope: &Scope) {
+        self.stats.invalidate(&scope.key()).await;
+    }
+}
+
+impl Default for EngineCache {
+    fn default() -> Self {
+        Self::new(CacheConfig::default())
+    }
+}
+```
+
+Wire it into the engine. Add to `EngineConfig` and `Engine`:
+
+```rust
+    pub cache: CacheConfig,
+    // in Engine:
+    pub(crate) cache: cache::EngineCache,
+```
+
+with `cache: CacheConfig::default()` in `EngineConfig::new` and
+`cache: cache::EngineCache::new(config.cache)` in `Engine::new`.
+
+Add a cached embed helper on `Engine` and use it in both `write.rs` and `read.rs` in place of the direct `self.embedder.embed(...)` calls:
+
+```rust
+    pub(crate) async fn embed_cached(&self, text: &str) -> Option<memorysafe_core::Embedding> {
+        if let Some(hit) = self.cache.embedding(text).await {
+            return Some(hit);
+        }
+        match self.embedder.embed(text) {
+            Ok(v) => {
+                self.cache.put_embedding(text, v.clone()).await;
+                Some(v)
+            }
+            Err(_) => None,
+        }
+    }
+```
+
+In `write.rs`, after a successful `backend.apply`, add:
+
+```rust
+        self.cache.invalidate_scope(&req.scope).await;
+```
+
+Add `pub mod cache;` and `pub use cache::{CacheConfig, EngineCache};` to `lib.rs`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-engine`
+Expected: PASS — 38 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-engine/
+git commit -m "feat(engine): content-addressed embedding cache and scope stats cache"
+```
+
+---
