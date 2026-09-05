@@ -6124,3 +6124,682 @@ git commit -m "feat(sqlite): FTS5 keyword search with escaping and hybrid fusion
 ```
 
 ---
+
+## Task 23: SQLite — capacity accounting, merge, and idempotency
+
+**Files:**
+- Create: `crates/memorysafe-backend-sqlite/src/capacity.rs`
+- Modify: `crates/memorysafe-backend-sqlite/src/lib.rs`
+- Modify: `crates/memorysafe-backend-sqlite/tests/conformance.rs`
+
+**Interfaces:**
+- Consumes: `items`, `vectors`, `audit`.
+- Produces: `capacity::ensure_row`, `capacity::state`, `capacity::set_budget`, `capacity::adjust(conn, scope, delta_items, delta_bytes)`, `capacity::stats`, `items::merge`, `idempotency` handling in `apply`, and real `Backend::capacity_state`, `scope_stats`, `set_budget`.
+
+**The correctness detail:** capacity accounting is a row per namespace, updated inside the same transaction as the item write. Combined with `TenantManager::with_write`'s per-tenant lock from Task 19, two concurrent admits cannot both conclude there is room.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `crates/memorysafe-backend-sqlite/tests/conformance.rs`:
+
+```rust
+use memorysafe_backend::conformance::{atomicity, capacity};
+
+#[tokio::test]
+async fn capacity_accounting_tracks_items_and_bytes() {
+    capacity::capacity_accounting_tracks_items_and_bytes(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn eviction_releases_capacity() {
+    capacity::eviction_releases_capacity(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn concurrent_admits_do_not_double_count() {
+    capacity::concurrent_admits_do_not_double_count(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn scope_stats_reflect_the_corpus() {
+    capacity::scope_stats_reflect_the_corpus(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn admit_evict_and_audit_commit_together() {
+    atomicity::admit_evict_and_audit_commit_together(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn a_failed_transaction_leaves_no_trace() {
+    atomicity::a_failed_transaction_leaves_no_trace(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn every_mutation_writes_exactly_one_audit_record() {
+    atomicity::every_mutation_writes_exactly_one_audit_record(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn idempotent_writes_replay_the_original_outcome() {
+    atomicity::idempotent_writes_replay_the_original_outcome(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn idempotency_conflict_on_different_payload() {
+    atomicity::idempotency_conflict_on_different_payload(&SqliteFactory).await;
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend-sqlite --test conformance`
+Expected: FAIL — `capacity_accounting_tracks_items_and_bytes` panics: `assertion left == right failed: 0 vs 1`, because `capacity_state` still returns the placeholder.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-backend-sqlite/src/capacity.rs`:
+
+```rust
+use crate::tenant::SqlResultExt;
+use memorysafe_backend::BackendError;
+use memorysafe_core::{Budget, CapacityState, Scope, ScopeStats};
+use rusqlite::{Connection, params};
+
+pub fn ensure_row(conn: &Connection, scope: &Scope) -> Result<(), BackendError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO capacity (subject, namespace, used_items, used_bytes)
+         VALUES (?1, ?2, 0, 0)",
+        params![scope.subject.as_str(), scope.namespace.as_str()],
+    )
+    .sql()?;
+    Ok(())
+}
+
+pub fn set_budget(
+    conn: &Connection,
+    scope: &Scope,
+    budget: Budget,
+) -> Result<(), BackendError> {
+    ensure_row(conn, scope)?;
+    conn.execute(
+        "UPDATE capacity SET max_items = ?3, max_bytes = ?4
+         WHERE subject = ?1 AND namespace = ?2",
+        params![
+            scope.subject.as_str(),
+            scope.namespace.as_str(),
+            budget.max_items.map(|v| v as i64),
+            budget.max_bytes.map(|v| v as i64),
+        ],
+    )
+    .sql()?;
+    Ok(())
+}
+
+pub fn state(conn: &Connection, scope: &Scope) -> Result<CapacityState, BackendError> {
+    let row = conn
+        .query_row(
+            "SELECT max_items, max_bytes, used_items, used_bytes FROM capacity
+             WHERE subject = ?1 AND namespace = ?2",
+            params![scope.subject.as_str(), scope.namespace.as_str()],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .ok();
+
+    Ok(match row {
+        Some((mi, mb, ui, ub)) => CapacityState {
+            budget: Budget { max_items: mi.map(|v| v as u64), max_bytes: mb.map(|v| v as u64) },
+            used_items: ui.max(0) as u64,
+            used_bytes: ub.max(0) as u64,
+        },
+        None => CapacityState { budget: Budget::UNBOUNDED, used_items: 0, used_bytes: 0 },
+    })
+}
+
+/// Applied inside the write transaction. Deltas are signed; the row is clamped
+/// at zero so a bookkeeping slip cannot go negative and wrap.
+pub fn adjust(
+    conn: &Connection,
+    scope: &Scope,
+    delta_items: i64,
+    delta_bytes: i64,
+) -> Result<(), BackendError> {
+    ensure_row(conn, scope)?;
+    conn.execute(
+        "UPDATE capacity
+         SET used_items = MAX(0, used_items + ?3),
+             used_bytes = MAX(0, used_bytes + ?4)
+         WHERE subject = ?1 AND namespace = ?2",
+        params![scope.subject.as_str(), scope.namespace.as_str(), delta_items, delta_bytes],
+    )
+    .sql()?;
+    Ok(())
+}
+
+pub fn stats(conn: &Connection, scope: &Scope) -> Result<ScopeStats, BackendError> {
+    let (count, total): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM items
+             WHERE subject = ?1 AND namespace = ?2",
+            params![scope.subject.as_str(), scope.namespace.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .sql()?;
+
+    let median: i64 = if count == 0 {
+        0
+    } else {
+        conn.query_row(
+            "SELECT byte_size FROM items WHERE subject = ?1 AND namespace = ?2
+             ORDER BY byte_size LIMIT 1 OFFSET ?3",
+            params![scope.subject.as_str(), scope.namespace.as_str(), count / 2],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    };
+
+    Ok(ScopeStats {
+        item_count: count.max(0) as u64,
+        total_bytes: total.max(0) as u64,
+        // Computed by the engine from sampled neighbours; the backend has no
+        // cheap way to produce it and a wrong value is worse than zero.
+        mean_neighbour_similarity: 0.0,
+        median_item_bytes: median.max(0) as u64,
+    })
+}
+```
+
+Add `items::merge` to `items.rs`:
+
+```rust
+/// Folds a new body and metadata into an existing item. Returns the byte-size
+/// delta so capacity accounting stays exact.
+pub fn merge(
+    conn: &Connection,
+    scope: &Scope,
+    target: &ItemId,
+    body: &str,
+    tags: &[String],
+    attrs: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<i64, BackendError> {
+    let Some(existing) = get(conn, scope, target)? else {
+        return Err(BackendError::MergeTargetMissing(target.clone()));
+    };
+    let before = existing.byte_size() as i64;
+
+    let mut merged_tags = existing.tags.clone();
+    for t in tags {
+        if !merged_tags.contains(t) {
+            merged_tags.push(t.clone());
+        }
+    }
+    let mut merged_attrs = existing.attrs.clone();
+    for (k, v) in attrs {
+        merged_attrs.insert(k.clone(), v.clone());
+    }
+
+    let mut updated = existing;
+    updated.body = body.to_string();
+    updated.tags = merged_tags;
+    updated.attrs = merged_attrs;
+    let after = updated.byte_size() as i64;
+
+    conn.execute(
+        "UPDATE items SET body = ?4, tags = ?5, attrs = ?6, byte_size = ?7
+         WHERE id = ?1 AND subject = ?2 AND namespace = ?3",
+        params![
+            target.as_str(),
+            scope.subject.as_str(),
+            scope.namespace.as_str(),
+            updated.body,
+            serde_json::to_string(&updated.tags).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&updated.attrs).unwrap_or_else(|_| "{}".into()),
+            after,
+        ],
+    )
+    .sql()?;
+    Ok(after - before)
+}
+```
+
+Rewrite `apply` in `lib.rs` to its final form:
+
+```rust
+    async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError> {
+        if !txn.is_valid() {
+            return Err(BackendError::InvalidTransaction(
+                "a transaction may not both insert and merge".into(),
+            ));
+        }
+        let tenant = txn.scope.tenant.clone();
+        self.tenants
+            .with_write(&tenant, move |conn| {
+                // Idempotency is checked inside the write lock, so a retry
+                // racing the original cannot slip past.
+                if let Some(key) = &txn.idempotency_key {
+                    let prior: Option<(String, String)> = conn
+                        .query_row(
+                            "SELECT payload_digest, outcome FROM idempotency WHERE key = ?1",
+                            params![key],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .ok();
+                    if let Some((digest, outcome)) = prior {
+                        if txn.payload_digest.as_deref() != Some(digest.as_str()) {
+                            return Err(BackendError::IdempotencyConflict);
+                        }
+                        let mut replay: AppliedWrite = serde_json::from_str(&outcome)
+                            .map_err(|e| tenant::storage_error(e, false))?;
+                        replay.replayed = true;
+                        replay.replayed_outcome = Some(outcome);
+                        return Ok(replay);
+                    }
+                }
+
+                let tx = conn.transaction().map_err(|e| tenant::storage_error(e, false))?;
+                capacity::ensure_row(&tx, &txn.scope)?;
+
+                let mut delta_items: i64 = 0;
+                let mut delta_bytes: i64 = 0;
+                let mut evicted = Vec::new();
+
+                for id in &txn.evictions {
+                    let size = items::delete(&tx, &txn.scope, id)?;
+                    vectors::delete(&tx, id)?;
+                    if size > 0 {
+                        delta_items -= 1;
+                        delta_bytes -= size as i64;
+                    }
+                    evicted.push(id.clone());
+                }
+
+                let mut item_id = None;
+
+                if let Some(w) = &txn.upsert
+                    && let Some(item) = &w.item
+                {
+                    items::insert(&tx, item)?;
+                    if let Some(v) = &w.vector {
+                        vectors::insert(&tx, &item.id, &txn.scope, v)?;
+                    }
+                    delta_items += 1;
+                    delta_bytes += item.byte_size() as i64;
+                    item_id = Some(item.id.clone());
+                }
+
+                if let Some(m) = &txn.merge {
+                    let diff = items::merge(
+                        &tx, &txn.scope, &m.target, &m.body, &m.tags, &m.attrs,
+                    )?;
+                    if let Some(v) = &m.vector {
+                        vectors::insert(&tx, &m.target, &txn.scope, v)?;
+                    }
+                    delta_bytes += diff;
+                    item_id = Some(m.target.clone());
+                }
+
+                capacity::adjust(&tx, &txn.scope, delta_items, delta_bytes)?;
+                let audit_id = audit::insert(&tx, &txn.audit)?;
+
+                let applied = AppliedWrite {
+                    item_id,
+                    audit_id,
+                    evicted,
+                    replayed: false,
+                    replayed_outcome: None,
+                };
+
+                if let Some(key) = &txn.idempotency_key {
+                    tx.execute(
+                        "INSERT INTO idempotency (key, subject, namespace, payload_digest,
+                             outcome, at)
+                         VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![
+                            key,
+                            txn.scope.subject.as_str(),
+                            txn.scope.namespace.as_str(),
+                            txn.payload_digest.clone().unwrap_or_default(),
+                            serde_json::to_string(&applied)
+                                .map_err(|e| tenant::storage_error(e, false))?,
+                            time::OffsetDateTime::now_utc().unix_timestamp(),
+                        ],
+                    )
+                    .sql()?;
+                }
+
+                tx.commit().map_err(|e| tenant::storage_error(e, false))?;
+                Ok(applied)
+            })
+            .await
+    }
+```
+
+Replace the three remaining placeholders:
+
+```rust
+    async fn capacity_state(&self, scope: &Scope) -> Result<CapacityState, BackendError> {
+        let scope = scope.clone();
+        self.tenants.with_conn(&scope.tenant.clone(), move |c| capacity::state(c, &scope)).await
+    }
+
+    async fn scope_stats(&self, scope: &Scope) -> Result<ScopeStats, BackendError> {
+        let scope = scope.clone();
+        self.tenants.with_conn(&scope.tenant.clone(), move |c| capacity::stats(c, &scope)).await
+    }
+
+    async fn set_budget(&self, scope: &Scope, budget: Budget) -> Result<(), BackendError> {
+        let scope = scope.clone();
+        self.tenants
+            .with_write(&scope.tenant.clone(), move |c| capacity::set_budget(c, &scope, budget))
+            .await
+    }
+```
+
+Add `pub mod capacity;` and `use rusqlite::params;` to `lib.rs`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend-sqlite`
+Expected: PASS — 22 conformance tests minus the 5 lifecycle ones, i.e. 17 conformance tests plus 12 unit tests, all ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-backend-sqlite/
+git commit -m "feat(sqlite): locked capacity accounting, merge, and idempotent writes"
+```
+
+---
+
+## Task 24: SQLite — purge and portable export/import
+
+**Files:**
+- Create: `crates/memorysafe-backend-sqlite/src/purge.rs`
+- Create: `crates/memorysafe-backend-sqlite/src/portability.rs`
+- Modify: `crates/memorysafe-backend-sqlite/src/lib.rs`
+- Modify: `crates/memorysafe-backend-sqlite/tests/conformance.rs`
+
+**Interfaces:**
+- Consumes: everything in the crate.
+- Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and a single `full_conformance_suite` test.
+
+**Milestone: the complete 22-test conformance suite passes.** From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
+
+- [ ] **Step 1: Write the failing test**
+
+Replace the individual conformance tests in `crates/memorysafe-backend-sqlite/tests/conformance.rs` with one entry point plus the lifecycle additions:
+
+```rust
+use memorysafe_backend::conformance::{BackendFactory, run_conformance_suite};
+use memorysafe_backend_sqlite::SqliteBackend;
+use std::future::Future;
+
+struct SqliteFactory;
+
+impl BackendFactory for SqliteFactory {
+    type B = SqliteBackend;
+    fn create(&self) -> impl Future<Output = Self::B> + Send {
+        async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            SqliteBackend::open(dir.keep())
+        }
+    }
+}
+
+/// The whole suite. Plan 2's Postgres backend runs this same function.
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_passes_the_backend_conformance_suite() {
+    run_conformance_suite(&SqliteFactory).await;
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend-sqlite --test conformance`
+Expected: FAIL — `purge_subject_removes_everything_for_that_subject` panics: `assertion left == right failed: 0 vs 6`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-backend-sqlite/src/purge.rs`:
+
+```rust
+use crate::tenant::SqlResultExt;
+use memorysafe_backend::{BackendError, PurgeReport};
+use memorysafe_core::SubjectId;
+use rusqlite::{Connection, params};
+
+/// Right-to-delete for one subject. A first-class operation rather than a
+/// scan-and-delete loop: everything for the subject goes in one transaction
+/// across every namespace it owns.
+pub fn subject(conn: &mut Connection, subject: &SubjectId) -> Result<PurgeReport, BackendError> {
+    let tx = conn.transaction().map_err(|e| crate::tenant::storage_error(e, false))?;
+    let s = subject.as_str();
+
+    let vectors_removed =
+        tx.execute("DELETE FROM vectors WHERE subject = ?1", params![s]).sql()? as u64;
+    let items_removed =
+        tx.execute("DELETE FROM items WHERE subject = ?1", params![s]).sql()? as u64;
+    // `balanced`, the default retention profile, cascades audit with the
+    // subject. Profiles that preserve it are applied by the engine, which
+    // rewrites the rows before calling this.
+    let audit_rows_removed =
+        tx.execute("DELETE FROM audit WHERE subject = ?1", params![s]).sql()? as u64;
+    tx.execute("DELETE FROM idempotency WHERE subject = ?1", params![s]).sql()?;
+    tx.execute("DELETE FROM capacity WHERE subject = ?1", params![s]).sql()?;
+
+    tx.commit().map_err(|e| crate::tenant::storage_error(e, false))?;
+
+    Ok(PurgeReport {
+        items_removed,
+        vectors_removed,
+        audit_rows_removed,
+        audit_rows_preserved: 0,
+    })
+}
+```
+
+`crates/memorysafe-backend-sqlite/src/portability.rs`:
+
+```rust
+use crate::items::{ITEM_COLUMNS, row_to_item};
+use crate::tenant::SqlResultExt;
+use crate::{capacity, items, vectors};
+use base64::Engine as _;
+use memorysafe_backend::{
+    BackendError, ExportRecord, ExportStream, ExportVector, ImportReport, ImportStream,
+    ScopeSelector,
+};
+use memorysafe_core::{AuditFilter, Scope};
+use memorysafe_embed::QuantizedVector;
+use rusqlite::{Connection, params};
+
+pub const FORMAT_VERSION: u32 = 1;
+
+pub fn export(
+    conn: &Connection,
+    sel: &ScopeSelector,
+) -> Result<ExportStream, BackendError> {
+    let mut out: ExportStream = vec![ExportRecord::Header {
+        format_version: FORMAT_VERSION,
+        exported_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+    }];
+
+    let sql = format!(
+        "SELECT {cols}, v.embedder AS v_embedder, v.dim AS v_dim, v.scale AS v_scale,
+                v.q AS v_q
+         FROM items i LEFT JOIN vectors v ON v.item_id = i.id
+         WHERE (?1 IS NULL OR i.subject = ?1) AND (?2 IS NULL OR i.namespace = ?2)
+         ORDER BY i.id ASC",
+        cols = ITEM_COLUMNS
+            .split(", ")
+            .map(|c| format!("i.{c} AS {c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let tenant = sel.tenant.as_str().to_string();
+    let subject = sel.subject.as_ref().map(|s| s.as_str().to_string());
+    let namespace = sel.namespace.as_ref().map(|n| n.as_str().to_string());
+
+    let mut stmt = conn.prepare(&sql).sql()?;
+    let rows = stmt
+        .query_map(params![subject, namespace], move |r| {
+            let item = row_to_item(r, &tenant)?;
+            let embedder: Option<String> = r.get("v_embedder")?;
+            let vector = match embedder {
+                Some(embedder) => {
+                    let dim: i64 = r.get("v_dim")?;
+                    let scale: f64 = r.get("v_scale")?;
+                    let q: Vec<u8> = r.get("v_q")?;
+                    Some(ExportVector {
+                        embedder,
+                        dim: dim as u16,
+                        scale: scale as f32,
+                        q_base64: base64::engine::general_purpose::STANDARD.encode(q),
+                    })
+                }
+                None => None,
+            };
+            Ok((item, vector))
+        })
+        .sql()?;
+
+    let mut scopes = Vec::new();
+    for row in rows {
+        let (item, vector) = row.sql()?;
+        if !scopes.contains(&item.scope) {
+            scopes.push(item.scope.clone());
+        }
+        out.push(ExportRecord::Item { item: Box::new(item), vector });
+    }
+
+    if sel.include_audit {
+        for scope in scopes {
+            let filter = AuditFilter { limit: 100_000, ..Default::default() };
+            for record in crate::audit::query(conn, &scope, &filter)? {
+                out.push(ExportRecord::Audit { record: Box::new(record) });
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+pub fn import(
+    conn: &mut Connection,
+    stream: ImportStream,
+) -> Result<ImportReport, BackendError> {
+    let tx = conn.transaction().map_err(|e| crate::tenant::storage_error(e, false))?;
+    let mut report = ImportReport::default();
+
+    for record in stream {
+        match record {
+            ExportRecord::Header { format_version, .. } => {
+                if format_version != FORMAT_VERSION {
+                    return Err(BackendError::MalformedImport(format!(
+                        "unsupported format version {format_version}"
+                    )));
+                }
+            }
+            ExportRecord::Item { item, vector } => {
+                let scope: Scope = item.scope.clone();
+                // Import is idempotent: an item already present is skipped
+                // rather than duplicated or overwritten.
+                if items::exists(&tx, &scope, &item.id)? {
+                    report.items_skipped_existing += 1;
+                    continue;
+                }
+                capacity::ensure_row(&tx, &scope)?;
+                items::insert(&tx, &item)?;
+                capacity::adjust(&tx, &scope, 1, item.byte_size() as i64)?;
+                report.items_imported += 1;
+
+                if let Some(v) = vector {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(&v.q_base64)
+                        .map_err(|e| BackendError::MalformedImport(e.to_string()))?;
+                    let q = QuantizedVector::from_bytes(
+                        memorysafe_core::EmbedderId::new(&v.embedder),
+                        v.dim,
+                        v.scale,
+                        &bytes,
+                    )
+                    .map_err(|e| BackendError::MalformedImport(e.to_string()))?;
+                    vectors::insert(&tx, &item.id, &scope, &q)?;
+                    report.vectors_imported += 1;
+                }
+            }
+            ExportRecord::Audit { record } => {
+                crate::audit::insert(&tx, &record)?;
+                report.audit_imported += 1;
+            }
+        }
+    }
+
+    tx.commit().map_err(|e| crate::tenant::storage_error(e, false))?;
+    Ok(report)
+}
+```
+
+Replace the last three placeholders in `lib.rs`:
+
+```rust
+    async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId)
+        -> Result<PurgeReport, BackendError>
+    {
+        let (tenant, subject) = (tenant.clone(), subject.clone());
+        self.tenants.with_write(&tenant, move |c| purge::subject(c, &subject)).await
+    }
+
+    async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError> {
+        let sel = sel.clone();
+        self.tenants
+            .with_conn(&sel.tenant.clone(), move |c| portability::export(c, &sel))
+            .await
+    }
+
+    async fn import(&self, stream: ImportStream) -> Result<ImportReport, BackendError> {
+        // Every record in a stream belongs to one tenant; take it from the
+        // first item and reject a stream that mixes tenants.
+        let tenant = stream
+            .iter()
+            .find_map(|r| match r {
+                ExportRecord::Item { item, .. } => Some(item.scope.tenant.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                BackendError::MalformedImport("stream contains no items".into())
+            })?;
+        if stream.iter().any(|r| matches!(
+            r, ExportRecord::Item { item, .. } if item.scope.tenant != tenant
+        )) {
+            return Err(BackendError::MalformedImport(
+                "a stream may not span tenants".into(),
+            ));
+        }
+        self.tenants.with_write(&tenant, move |c| portability::import(c, stream)).await
+    }
+```
+
+`ScopeSelector` needs `Clone`; confirm the derive from Task 14. Add `pub mod portability;` and `pub mod purge;`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend-sqlite && cargo clippy -p memorysafe-backend-sqlite --all-targets -- -D warnings`
+Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 22 conformance test names and passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-backend-sqlite/
+git commit -m "feat(sqlite): subject purge and portable export/import; full conformance passes"
+```
+
+---
