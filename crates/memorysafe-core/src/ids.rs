@@ -1,11 +1,20 @@
 use crate::error::CoreError;
 use serde::{Deserialize, Serialize};
 
-const MAX_COMPONENT_BYTES: usize = 256;
+// 240, not 255: the SQLite backend writes `<tenant>.db` plus SQLite's own
+// `-wal` and `-shm` sidecars, and every one of those must fit under NAME_MAX.
+const MAX_COMPONENT_BYTES: usize = 240;
 
 /// Scope components are used as SQLite filenames and SQL parameters, so the
-/// allowed alphabet is deliberately narrow: ASCII alphanumerics, `-`, `_`, `.`,
-/// with a leading `.` rejected to rule out `.` and `..`.
+/// allowed alphabet is deliberately narrow: lowercase ASCII alphanumerics,
+/// `-`, `_`, `.`, with a leading `.` rejected to rule out `.` and `..`.
+///
+/// Uppercase is rejected rather than folded. Tenant isolation is structural —
+/// one database file per tenant — so on a case-insensitive filesystem (default
+/// macOS APFS, default Windows NTFS, most SMB mounts) `Acme` and `acme` would
+/// be two distinct tenants sharing one file. Folding to lowercase would close
+/// the breach but silently merge two customers; rejecting makes the constraint
+/// visible at the API boundary and fails loudly instead.
 fn validate_component(field: &'static str, raw: &str) -> Result<(), CoreError> {
     if raw.is_empty() {
         return Err(CoreError::Empty { field });
@@ -20,7 +29,9 @@ fn validate_component(field: &'static str, raw: &str) -> Result<(), CoreError> {
         return Err(CoreError::IllegalChar { field, index: 0 });
     }
     for (index, byte) in raw.bytes().enumerate() {
-        let ok = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.');
+        let ok = byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'-' | b'_' | b'.');
         if !ok {
             return Err(CoreError::IllegalChar { field, index });
         }
@@ -131,8 +142,9 @@ mod tests {
         assert!(TenantId::new("").is_err());
         assert!(SubjectId::new("").is_err());
         assert!(Namespace::new("").is_err());
-        let long = "x".repeat(257);
+        let long = "x".repeat(241);
         assert!(TenantId::new(&long).is_err());
+        assert!(TenantId::new(&"x".repeat(240)).is_ok());
     }
 
     #[test]
@@ -148,5 +160,25 @@ mod tests {
     fn scope_key_is_stable_and_unambiguous() {
         let s = Scope::new("t1", "s1", "n1").unwrap();
         assert_eq!(s.key(), "t1\u{1f}s1\u{1f}n1");
+    }
+
+    #[test]
+    fn uppercase_is_rejected_so_tenants_cannot_collide_on_case_insensitive_disks() {
+        // `Acme` and `acme` would be distinct tenants sharing one `.db` file on
+        // APFS or NTFS. Structural isolation depends on this.
+        assert!(TenantId::new("Acme").is_err());
+        assert!(TenantId::new("ACME").is_err());
+        assert!(TenantId::new("acme").is_ok());
+        assert!(SubjectId::new("User42").is_err());
+        assert!(Namespace::new("CodingAgent").is_err());
+    }
+
+    #[test]
+    fn ulid_ids_parse_back_and_reject_garbage() {
+        let id = ItemId::new();
+        assert_eq!(ItemId::parse(id.as_str()).unwrap(), id);
+        assert!(ItemId::parse("not-a-ulid").is_err());
+        assert!(ItemId::parse("").is_err());
+        assert!(AuditId::parse(AuditId::new().as_str()).is_ok());
     }
 }

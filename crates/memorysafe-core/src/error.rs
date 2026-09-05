@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+// Eq is not derived because OutOfRange carries an f32, which does not implement Eq.
 #[derive(Debug, Error, PartialEq)]
 pub enum CoreError {
     #[error("{field} must not be empty")]
