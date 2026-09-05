@@ -2926,3 +2926,1547 @@ git commit -m "feat(embed): optional model2vec embedder behind a feature flag"
 ```
 
 ---
+
+## Task 14: Backend — the trait and its query/write types
+
+**Files:**
+- Create: `crates/memorysafe-backend/Cargo.toml`
+- Create: `crates/memorysafe-backend/src/lib.rs`
+- Create: `crates/memorysafe-backend/src/query.rs`
+- Create: `crates/memorysafe-backend/src/write.rs`
+- Create: `crates/memorysafe-backend/src/portability.rs`
+- Modify: `Cargo.toml` (workspace dependencies)
+
+**Interfaces:**
+- Consumes: all core types.
+- Produces: `BackendError`, `Backend` trait (exact signatures in the plan header), `CandidateQuery`, `HardFilters`, `Page`, `WriteTransaction`, `ItemWrite`, `MergeWrite`, `AppliedWrite`, `PurgeReport`, `ScopeSelector`, `ExportStream`, `ImportStream`, `ImportReport`, `ExportRecord`.
+
+**Spec constraints encoded here:** hard filters live in `CandidateQuery`, not in a post-filter; `WriteTransaction` bundles item + evictions + audit so a backend cannot apply them separately; `ItemWrite` carries the quantized vector so the backend never computes embeddings.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `crates/memorysafe-backend/src/query.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memorysafe_core::SensitivityLevel;
+
+    #[test]
+    fn default_filters_admit_nothing_above_internal() {
+        // Fail closed: a caller that forgets to set a ceiling gets the
+        // conservative one, not Restricted.
+        let f = HardFilters::default();
+        assert_eq!(f.sensitivity_ceiling, SensitivityLevel::Internal);
+        assert!(f.tags_any.is_empty());
+        assert!(f.kinds.is_empty());
+    }
+
+    #[test]
+    fn a_query_must_carry_a_vector_or_text_or_both() {
+        let empty = CandidateQuery {
+            embedding: None,
+            text: None,
+            filters: HardFilters::default(),
+            limit: 10,
+        };
+        assert!(!empty.is_valid());
+
+        let text_only = CandidateQuery {
+            embedding: None,
+            text: Some("cats".into()),
+            filters: HardFilters::default(),
+            limit: 10,
+        };
+        assert!(text_only.is_valid());
+    }
+
+    #[test]
+    fn pages_clamp_to_a_sane_maximum() {
+        assert_eq!(Page { offset: 0, limit: 100_000 }.effective_limit(), MAX_PAGE_LIMIT);
+        assert_eq!(Page { offset: 0, limit: 25 }.effective_limit(), 25);
+        assert_eq!(Page::default().limit, 50);
+    }
+}
+```
+
+Append to `crates/memorysafe-backend/src/write.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memorysafe_core::{Actor, AuditEvent, AuditRecord, Scope};
+
+    fn audit() -> AuditRecord {
+        AuditRecord::new(
+            Scope::new("t", "s", "n").unwrap(),
+            AuditEvent::Admitted,
+            vec![],
+            Actor::system(),
+        )
+    }
+
+    #[test]
+    fn a_write_transaction_always_carries_exactly_one_audit_record() {
+        let txn = WriteTransaction::new(Scope::new("t", "s", "n").unwrap(), audit());
+        assert!(txn.upsert.is_none());
+        assert!(txn.merge.is_none());
+        assert!(txn.evictions.is_empty());
+        assert_eq!(txn.audit.event, AuditEvent::Admitted);
+    }
+
+    #[test]
+    fn upsert_and_merge_are_mutually_exclusive() {
+        let mut txn = WriteTransaction::new(Scope::new("t", "s", "n").unwrap(), audit());
+        txn.merge = Some(MergeWrite {
+            target: memorysafe_core::ItemId::new(),
+            body: "merged".into(),
+            tags: vec![],
+            attrs: Default::default(),
+            vector: None,
+            byte_size: 6,
+        });
+        assert!(txn.is_valid());
+        txn.upsert = Some(ItemWrite {
+            item: None,
+            vector: None,
+        });
+        assert!(!txn.is_valid(), "a transaction may not both insert and merge");
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend`
+Expected: FAIL — no such package `memorysafe-backend`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-backend/Cargo.toml`:
+
+```toml
+[package]
+name = "memorysafe-backend"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memorysafe-core.workspace = true
+memorysafe-embed.workspace = true
+async-trait = "0.1.92"
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio = { version = "1.53.1", features = ["rt", "macros", "sync"] }
+
+[lints]
+workspace = true
+```
+
+Add to workspace `[workspace.dependencies]`:
+
+```toml
+memorysafe-backend = { path = "crates/memorysafe-backend" }
+```
+
+`crates/memorysafe-backend/src/query.rs`:
+
+```rust
+use memorysafe_core::SensitivityLevel;
+use memorysafe_core::Embedding;
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
+pub const MAX_PAGE_LIMIT: usize = 1000;
+
+/// Filters that MUST be applied inside the backend's own query. A policy may
+/// narrow a candidate set further but may never widen it, so anything
+/// security-relevant belongs here rather than in `compose`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HardFilters {
+    pub tags_any: Vec<String>,
+    pub kinds: Vec<String>,
+    #[serde(with = "time::serde::timestamp::option")]
+    pub occurred_after: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::timestamp::option")]
+    pub occurred_before: Option<OffsetDateTime>,
+    /// Items strictly above this level are excluded in SQL.
+    pub sensitivity_ceiling: SensitivityLevel,
+    /// Exclude items whose embedding has not been backfilled yet.
+    pub exclude_pending_embedding: bool,
+}
+
+impl Default for HardFilters {
+    fn default() -> Self {
+        Self {
+            tags_any: vec![],
+            kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
+            // Fail closed.
+            sensitivity_ceiling: SensitivityLevel::Internal,
+            exclude_pending_embedding: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateQuery {
+    pub embedding: Option<Embedding>,
+    pub text: Option<String>,
+    pub filters: HardFilters,
+    /// Over-fetch limit. The engine typically sets 5–10x the recall budget.
+    pub limit: usize,
+}
+
+impl CandidateQuery {
+    pub fn is_valid(&self) -> bool {
+        self.embedding.is_some() || self.text.as_ref().is_some_and(|t| !t.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Page {
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Self { offset: 0, limit: 50 }
+    }
+}
+
+impl Page {
+    pub fn effective_limit(&self) -> usize {
+        self.limit.min(MAX_PAGE_LIMIT)
+    }
+}
+```
+
+`crates/memorysafe-backend/src/write.rs`:
+
+```rust
+use memorysafe_core::{AuditRecord, ItemId, MemoryItem, Scope};
+use memorysafe_embed::QuantizedVector;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// An item plus its already-computed vector. Backends never embed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemWrite {
+    pub item: Option<MemoryItem>,
+    pub vector: Option<QuantizedVector>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeWrite {
+    pub target: ItemId,
+    pub body: String,
+    pub tags: Vec<String>,
+    pub attrs: BTreeMap<String, serde_json::Value>,
+    pub vector: Option<QuantizedVector>,
+    pub byte_size: u64,
+}
+
+/// One atomic unit of change. Item write, evictions, and the audit record
+/// commit together or not at all — the backend has no API for doing them
+/// separately.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteTransaction {
+    pub scope: Scope,
+    pub upsert: Option<ItemWrite>,
+    pub merge: Option<MergeWrite>,
+    pub evictions: Vec<ItemId>,
+    pub audit: AuditRecord,
+    pub idempotency_key: Option<String>,
+    pub payload_digest: Option<String>,
+}
+
+impl WriteTransaction {
+    pub fn new(scope: Scope, audit: AuditRecord) -> Self {
+        Self {
+            scope,
+            upsert: None,
+            merge: None,
+            evictions: vec![],
+            audit,
+            idempotency_key: None,
+            payload_digest: None,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !(self.upsert.is_some() && self.merge.is_some())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliedWrite {
+    pub item_id: Option<ItemId>,
+    pub audit_id: memorysafe_core::AuditId,
+    pub evicted: Vec<ItemId>,
+    /// True when an idempotency key matched and the stored outcome was
+    /// returned instead of applying anything.
+    pub replayed: bool,
+    pub replayed_outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeReport {
+    pub items_removed: u64,
+    pub vectors_removed: u64,
+    pub audit_rows_removed: u64,
+    pub audit_rows_preserved: u64,
+}
+```
+
+`crates/memorysafe-backend/src/portability.rs`:
+
+```rust
+use memorysafe_core::{AuditRecord, MemoryItem, Namespace, SubjectId, TenantId};
+use memorysafe_embed::QuantizedVector;
+use serde::{Deserialize, Serialize};
+
+/// Selects what to export. `None` on a level means "all of them".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeSelector {
+    pub tenant: TenantId,
+    pub subject: Option<SubjectId>,
+    pub namespace: Option<Namespace>,
+    pub include_audit: bool,
+}
+
+/// One line of the export stream. Newline-delimited JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "record", rename_all = "snake_case")]
+pub enum ExportRecord {
+    Header { format_version: u32, exported_at: i64 },
+    Item {
+        item: Box<MemoryItem>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vector: Option<ExportVector>,
+    },
+    Audit { record: Box<AuditRecord> },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportVector {
+    pub embedder: String,
+    pub dim: u16,
+    pub scale: f32,
+    /// Base64 of the int8 bytes.
+    pub q_base64: String,
+}
+
+impl ExportVector {
+    pub fn from_quantized(q: &QuantizedVector) -> Self {
+        use base64::Engine as _;
+        Self {
+            embedder: q.embedder.to_string(),
+            dim: q.dim,
+            scale: q.scale,
+            q_base64: base64::engine::general_purpose::STANDARD.encode(q.to_bytes()),
+        }
+    }
+}
+
+pub type ExportStream = Vec<ExportRecord>;
+pub type ImportStream = Vec<ExportRecord>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ImportReport {
+    pub items_imported: u64,
+    pub vectors_imported: u64,
+    pub audit_imported: u64,
+    pub items_skipped_existing: u64,
+}
+```
+
+Add `base64 = "0.22"` to `[workspace.dependencies]` and to `memorysafe-backend`'s `[dependencies]` as `base64.workspace = true`.
+
+`crates/memorysafe-backend/src/lib.rs`:
+
+```rust
+//! The storage seam. One trait covering persistence and retrieval, because
+//! pgvector searches inside the database and a separate index trait would
+//! bake the SQLite shape into the interface.
+
+pub mod conformance;
+pub mod portability;
+pub mod query;
+pub mod write;
+
+use memorysafe_core::{
+    AuditFilter, AuditId, AuditRecord, CapacityState, Embedding, ItemId, MemoryItem, ScopeStats,
+    Scope, ScoredCandidate, SubjectId, TenantId,
+};
+use thiserror::Error;
+
+pub use portability::{
+    ExportRecord, ExportStream, ExportVector, ImportReport, ImportStream, ScopeSelector,
+};
+pub use query::{CandidateQuery, HardFilters, MAX_PAGE_LIMIT, Page};
+pub use write::{AppliedWrite, ItemWrite, MergeWrite, PurgeReport, WriteTransaction};
+
+#[derive(Debug, Error)]
+pub enum BackendError {
+    #[error("storage failure: {message} (retryable: {retryable})")]
+    Storage { message: String, retryable: bool },
+    #[error("item {0} not found")]
+    ItemNotFound(ItemId),
+    #[error("merge target {0} does not exist")]
+    MergeTargetMissing(ItemId),
+    #[error("idempotency key reused with a different payload")]
+    IdempotencyConflict,
+    #[error("query is invalid: {0}")]
+    InvalidQuery(String),
+    #[error("transaction is invalid: {0}")]
+    InvalidTransaction(String),
+    #[error("vector uses embedder {got}, scope uses {expected}")]
+    EmbedderMismatch { got: String, expected: String },
+    #[error("import stream is malformed: {0}")]
+    MalformedImport(String),
+}
+
+#[async_trait::async_trait]
+pub trait Backend: Send + Sync {
+    async fn retrieve_candidates(
+        &self,
+        scope: &Scope,
+        query: &CandidateQuery,
+    ) -> Result<Vec<ScoredCandidate>, BackendError>;
+
+    async fn neighbours(
+        &self,
+        scope: &Scope,
+        embedding: &Embedding,
+        k: usize,
+    ) -> Result<Vec<ScoredCandidate>, BackendError>;
+
+    async fn capacity_state(&self, scope: &Scope) -> Result<CapacityState, BackendError>;
+
+    async fn scope_stats(&self, scope: &Scope) -> Result<ScopeStats, BackendError>;
+
+    async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError>;
+
+    async fn record_recall(&self, record: AuditRecord) -> Result<AuditId, BackendError>;
+
+    async fn get(&self, scope: &Scope, id: &ItemId)
+        -> Result<Option<MemoryItem>, BackendError>;
+
+    async fn list(&self, scope: &Scope, page: &Page)
+        -> Result<Vec<MemoryItem>, BackendError>;
+
+    async fn audit(&self, scope: &Scope, filter: &AuditFilter)
+        -> Result<Vec<AuditRecord>, BackendError>;
+
+    async fn purge_subject(
+        &self,
+        tenant: &TenantId,
+        subject: &SubjectId,
+    ) -> Result<PurgeReport, BackendError>;
+
+    async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
+
+    async fn import(&self, stream: ImportStream) -> Result<ImportReport, BackendError>;
+
+    /// Set a namespace's budget. Used by the conformance suite and by admin APIs.
+    async fn set_budget(
+        &self,
+        scope: &Scope,
+        budget: memorysafe_core::Budget,
+    ) -> Result<(), BackendError>;
+}
+```
+
+Create a stub `crates/memorysafe-backend/src/conformance/mod.rs` so the crate compiles:
+
+```rust
+//! The conformance suite. Every backend must pass it unmodified.
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend`
+Expected: PASS — 5 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Cargo.toml crates/memorysafe-backend/
+git commit -m "feat(backend): Backend trait with atomic write transactions and hard filters"
+```
+
+---
+
+## Task 15: Conformance — harness and isolation
+
+**Files:**
+- Modify: `crates/memorysafe-backend/src/conformance/mod.rs`
+- Create: `crates/memorysafe-backend/src/conformance/fixtures.rs`
+- Create: `crates/memorysafe-backend/src/conformance/isolation.rs`
+
+**Interfaces:**
+- Consumes: `Backend`, all core types, `DeterministicEmbedder`.
+- Produces: `BackendFactory` trait, `run_conformance_suite<F: BackendFactory>(factory: F)`, and fixture builders `fx::item(scope, body)`, `fx::admit_txn(scope, item, vector)`, `fx::embedder()`.
+
+**Why a factory:** each conformance test needs a pristine backend. The factory hands one out; the SQLite implementation returns a backend rooted in a fresh `TempDir`, and Plan 2's Postgres implementation returns one rooted in a fresh schema.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-backend/src/conformance/isolation.rs`:
+
+```rust
+use super::{BackendFactory, fx};
+use memorysafe_core::{Page, Scope};
+
+/// Two tenants writing identical content must never see each other's items.
+pub async fn tenants_are_isolated<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let a = Scope::new("tenant-a", "sub", "ns").unwrap();
+    let b = Scope::new("tenant-b", "sub", "ns").unwrap();
+
+    let item_a = fx::item(&a, "tenant a private note");
+    backend.apply(fx::admit_txn(&a, item_a.clone(), None)).await.unwrap();
+
+    let listed_b = backend.list(&b, &Page::default()).await.unwrap();
+    assert!(listed_b.is_empty(), "tenant b saw {} of tenant a's items", listed_b.len());
+
+    assert!(
+        backend.get(&b, &item_a.id).await.unwrap().is_none(),
+        "tenant b fetched tenant a's item by id"
+    );
+}
+
+/// Subjects within one tenant are the right-to-delete unit, so they must be
+/// separated just as strictly.
+pub async fn subjects_are_isolated<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let a = Scope::new("t", "subject-a", "ns").unwrap();
+    let b = Scope::new("t", "subject-b", "ns").unwrap();
+
+    let item_a = fx::item(&a, "subject a note");
+    backend.apply(fx::admit_txn(&a, item_a.clone(), None)).await.unwrap();
+
+    assert!(backend.list(&b, &Page::default()).await.unwrap().is_empty());
+    assert!(backend.get(&b, &item_a.id).await.unwrap().is_none());
+}
+
+/// Namespaces are the budget and retrieval-default unit within a subject.
+pub async fn namespaces_are_separated<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let a = Scope::new("t", "s", "ns-a").unwrap();
+    let b = Scope::new("t", "s", "ns-b").unwrap();
+
+    backend.apply(fx::admit_txn(&a, fx::item(&a, "in ns a"), None)).await.unwrap();
+    backend.apply(fx::admit_txn(&b, fx::item(&b, "in ns b"), None)).await.unwrap();
+
+    assert_eq!(backend.list(&a, &Page::default()).await.unwrap().len(), 1);
+    assert_eq!(backend.list(&b, &Page::default()).await.unwrap().len(), 1);
+}
+
+/// An audit query is scoped too — one subject's decisions are not another's.
+pub async fn audit_is_scoped<F: BackendFactory>(factory: &F) {
+    use memorysafe_core::AuditFilter;
+    let backend = factory.create().await;
+    let a = Scope::new("t", "subject-a", "ns").unwrap();
+    let b = Scope::new("t", "subject-b", "ns").unwrap();
+
+    backend.apply(fx::admit_txn(&a, fx::item(&a, "note"), None)).await.unwrap();
+
+    assert_eq!(backend.audit(&a, &AuditFilter::default()).await.unwrap().len(), 1);
+    assert!(backend.audit(&b, &AuditFilter::default()).await.unwrap().is_empty());
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend`
+Expected: FAIL — `cannot find trait BackendFactory`, `unresolved module fx`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-backend/src/conformance/fixtures.rs`:
+
+```rust
+use crate::write::{ItemWrite, WriteTransaction};
+use memorysafe_core::{
+    Actor, AuditEvent, AuditRecord, ItemId, ItemRef, MemoryItem, Protection, Scope,
+    SensitivityLevel, Source, SourceKind,
+};
+use memorysafe_embed::{DeterministicEmbedder, Embedder, QuantizedVector};
+use time::OffsetDateTime;
+
+/// The one embedder the whole suite uses. Deterministic, no model files.
+pub fn embedder() -> DeterministicEmbedder {
+    DeterministicEmbedder::new(256)
+}
+
+pub fn item(scope: &Scope, body: &str) -> MemoryItem {
+    MemoryItem {
+        id: ItemId::new(),
+        scope: scope.clone(),
+        body: body.to_string(),
+        kind: "fact".into(),
+        source: Source { kind: SourceKind::Agent, id: Some("conformance".into()) },
+        occurred_at: None,
+        created_at: OffsetDateTime::now_utc(),
+        tags: vec![],
+        attrs: Default::default(),
+        sensitivity: SensitivityLevel::Internal,
+        ttl: None,
+        protection: Protection::Normal,
+        pending_embedding: false,
+    }
+}
+
+pub fn item_with(
+    scope: &Scope,
+    body: &str,
+    kind: &str,
+    tags: &[&str],
+    sensitivity: SensitivityLevel,
+) -> MemoryItem {
+    let mut i = item(scope, body);
+    i.kind = kind.to_string();
+    i.tags = tags.iter().map(|t| t.to_string()).collect();
+    i.sensitivity = sensitivity;
+    i
+}
+
+pub fn vector_for(body: &str) -> QuantizedVector {
+    QuantizedVector::from_embedding(&embedder().embed(body).unwrap())
+}
+
+/// A transaction that admits one item, with its audit record already attached.
+pub fn admit_txn(
+    scope: &Scope,
+    item: MemoryItem,
+    vector: Option<QuantizedVector>,
+) -> WriteTransaction {
+    let audit = AuditRecord::new(
+        scope.clone(),
+        AuditEvent::Admitted,
+        vec![ItemRef::from_item(&item)],
+        Actor::system(),
+    );
+    let mut txn = WriteTransaction::new(scope.clone(), audit);
+    txn.upsert = Some(ItemWrite { item: Some(item), vector });
+    txn
+}
+
+/// Same, but embeds the body so the item is vector-searchable.
+pub fn admit_txn_embedded(scope: &Scope, item: MemoryItem) -> WriteTransaction {
+    let v = vector_for(&item.body);
+    admit_txn(scope, item, Some(v))
+}
+
+/// A transaction that evicts items without inserting anything.
+pub fn evict_txn(scope: &Scope, evictions: Vec<ItemId>) -> WriteTransaction {
+    let audit =
+        AuditRecord::new(scope.clone(), AuditEvent::Forgotten, vec![], Actor::system());
+    let mut txn = WriteTransaction::new(scope.clone(), audit);
+    txn.evictions = evictions;
+    txn
+}
+```
+
+`crates/memorysafe-backend/src/conformance/mod.rs`:
+
+```rust
+//! The conformance suite. Every backend must pass it unmodified.
+//!
+//! This is the load-bearing artifact of the two-backend design: without it,
+//! SQLite and Postgres drift within a month and the `Backend` trait becomes a
+//! lie. Backends call `run_conformance_suite` from their own integration test.
+
+pub mod fixtures;
+pub mod isolation;
+
+pub use fixtures as fx;
+
+use crate::Backend;
+use std::future::Future;
+
+/// Hands out a pristine backend per test. SQLite returns one rooted in a fresh
+/// `TempDir`; Postgres will return one rooted in a fresh schema.
+pub trait BackendFactory: Send + Sync {
+    type B: Backend;
+    fn create(&self) -> impl Future<Output = Self::B> + Send;
+}
+
+/// Runs every conformance test in order. Panics on the first failure with the
+/// test's own assertion message.
+pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) {
+    macro_rules! run {
+        ($($test:path),* $(,)?) => {
+            $(
+                eprintln!("conformance: {}", stringify!($test));
+                $test(factory).await;
+            )*
+        };
+    }
+
+    run!(
+        isolation::tenants_are_isolated,
+        isolation::subjects_are_isolated,
+        isolation::namespaces_are_separated,
+        isolation::audit_is_scoped,
+    );
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend && cargo clippy -p memorysafe-backend --all-targets -- -D warnings`
+Expected: PASS — the crate compiles and its own unit tests pass. The conformance functions have no backend to run against yet; Task 20 is where they first execute.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-backend/src/conformance/
+git commit -m "feat(backend): conformance harness, fixtures, and isolation tests"
+```
+
+---
+
+## Task 16: Conformance — atomicity and idempotency
+
+**Files:**
+- Create: `crates/memorysafe-backend/src/conformance/atomicity.rs`
+- Modify: `crates/memorysafe-backend/src/conformance/mod.rs`
+
+**Interfaces:**
+- Consumes: `BackendFactory`, `fx`.
+- Produces: `admit_evict_and_audit_commit_together`, `a_failed_transaction_leaves_no_trace`, `every_mutation_writes_exactly_one_audit_record`, `idempotent_writes_replay_the_original_outcome`, `idempotency_conflict_on_different_payload`.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-backend/src/conformance/atomicity.rs`:
+
+```rust
+use super::{BackendFactory, fx};
+use crate::BackendError;
+use memorysafe_core::{AuditFilter, ItemId, Page, Scope};
+
+/// The item insert, the evictions, and the audit row must land together.
+pub async fn admit_evict_and_audit_commit_together<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let old = fx::item(&scope, "the old memory");
+    backend.apply(fx::admit_txn(&scope, old.clone(), None)).await.unwrap();
+
+    let new = fx::item(&scope, "the new memory");
+    let mut txn = fx::admit_txn(&scope, new.clone(), None);
+    txn.evictions = vec![old.id.clone()];
+    let applied = backend.apply(txn).await.unwrap();
+
+    assert_eq!(applied.evicted, vec![old.id.clone()]);
+    assert!(backend.get(&scope, &old.id).await.unwrap().is_none(), "eviction did not happen");
+    assert!(backend.get(&scope, &new.id).await.unwrap().is_some(), "insert did not happen");
+
+    let audit = backend.audit(&scope, &AuditFilter::default()).await.unwrap();
+    assert_eq!(audit.len(), 2, "expected one audit row per apply");
+}
+
+/// A transaction naming a nonexistent merge target must change nothing.
+pub async fn a_failed_transaction_leaves_no_trace<F: BackendFactory>(factory: &F) {
+    use crate::write::MergeWrite;
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let existing = fx::item(&scope, "survivor");
+    backend.apply(fx::admit_txn(&scope, existing.clone(), None)).await.unwrap();
+    let audit_before = backend.audit(&scope, &AuditFilter::default()).await.unwrap().len();
+
+    let ghost = ItemId::new();
+    let mut txn = fx::admit_txn(&scope, fx::item(&scope, "doomed"), None);
+    txn.upsert = None;
+    txn.merge = Some(MergeWrite {
+        target: ghost,
+        body: "merged body".into(),
+        tags: vec![],
+        attrs: Default::default(),
+        vector: None,
+        byte_size: 11,
+    });
+    txn.evictions = vec![existing.id.clone()];
+
+    let err = backend.apply(txn).await.unwrap_err();
+    assert!(matches!(err, BackendError::MergeTargetMissing(_)), "got {err:?}");
+
+    assert!(
+        backend.get(&scope, &existing.id).await.unwrap().is_some(),
+        "a failed transaction still evicted an item"
+    );
+    let audit_after = backend.audit(&scope, &AuditFilter::default()).await.unwrap().len();
+    assert_eq!(audit_before, audit_after, "a failed transaction still wrote audit");
+}
+
+/// Invariant 4 from the spec, at the backend level.
+pub async fn every_mutation_writes_exactly_one_audit_record<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    for i in 0..5 {
+        backend
+            .apply(fx::admit_txn(&scope, fx::item(&scope, &format!("memory {i}")), None))
+            .await
+            .unwrap();
+    }
+    let items = backend.list(&scope, &Page::default()).await.unwrap();
+    backend.apply(fx::evict_txn(&scope, vec![items[0].id.clone()])).await.unwrap();
+
+    let audit = backend.audit(&scope, &AuditFilter { limit: 1000, ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(audit.len(), 6, "5 admits + 1 eviction should be 6 audit rows");
+}
+
+/// A retried write returns the original outcome instead of admitting a
+/// duplicate and evicting something to make room for it.
+pub async fn idempotent_writes_replay_the_original_outcome<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let item = fx::item(&scope, "written once");
+    let mut txn = fx::admit_txn(&scope, item.clone(), None);
+    txn.idempotency_key = Some("key-1".into());
+    txn.payload_digest = Some(item.digest());
+
+    let first = backend.apply(txn.clone()).await.unwrap();
+    assert!(!first.replayed);
+
+    // Same key, same payload, but a fresh item id — as a real retry would look.
+    let retry_item = {
+        let mut i = fx::item(&scope, "written once");
+        i.id = ItemId::new();
+        i
+    };
+    let mut retry = fx::admit_txn(&scope, retry_item, None);
+    retry.idempotency_key = Some("key-1".into());
+    retry.payload_digest = Some(item.digest());
+
+    let second = backend.apply(retry).await.unwrap();
+    assert!(second.replayed, "retry was not recognised as a replay");
+    assert_eq!(second.item_id, first.item_id, "replay returned a different item");
+
+    assert_eq!(
+        backend.list(&scope, &Page::default()).await.unwrap().len(),
+        1,
+        "the retry created a duplicate"
+    );
+}
+
+/// Reusing a key with a different payload is a conflict, not a silent replay.
+pub async fn idempotency_conflict_on_different_payload<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let first_item = fx::item(&scope, "original payload");
+    let mut txn = fx::admit_txn(&scope, first_item.clone(), None);
+    txn.idempotency_key = Some("key-2".into());
+    txn.payload_digest = Some(first_item.digest());
+    backend.apply(txn).await.unwrap();
+
+    let other = fx::item(&scope, "a completely different payload");
+    let mut conflicting = fx::admit_txn(&scope, other.clone(), None);
+    conflicting.idempotency_key = Some("key-2".into());
+    conflicting.payload_digest = Some(other.digest());
+
+    let err = backend.apply(conflicting).await.unwrap_err();
+    assert!(matches!(err, BackendError::IdempotencyConflict), "got {err:?}");
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend`
+Expected: FAIL — `unresolved module atomicity` in `mod.rs`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Add to `crates/memorysafe-backend/src/conformance/mod.rs`:
+
+```rust
+pub mod atomicity;
+```
+
+and extend the `run!` invocation in `run_conformance_suite`:
+
+```rust
+    run!(
+        isolation::tenants_are_isolated,
+        isolation::subjects_are_isolated,
+        isolation::namespaces_are_separated,
+        isolation::audit_is_scoped,
+        atomicity::admit_evict_and_audit_commit_together,
+        atomicity::a_failed_transaction_leaves_no_trace,
+        atomicity::every_mutation_writes_exactly_one_audit_record,
+        atomicity::idempotent_writes_replay_the_original_outcome,
+        atomicity::idempotency_conflict_on_different_payload,
+    );
+```
+
+`WriteTransaction` must derive `Clone` for the retry test — confirm the derive added in Task 14 is present.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend && cargo clippy -p memorysafe-backend --all-targets -- -D warnings`
+Expected: PASS — compiles clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-backend/src/conformance/
+git commit -m "feat(backend): conformance tests for atomicity and idempotency"
+```
+
+---
+
+## Task 17: Conformance — retrieval and capacity
+
+**Files:**
+- Create: `crates/memorysafe-backend/src/conformance/retrieval.rs`
+- Create: `crates/memorysafe-backend/src/conformance/capacity.rs`
+- Modify: `crates/memorysafe-backend/src/conformance/mod.rs`
+
+**Interfaces:**
+- Consumes: `BackendFactory`, `fx`.
+- Produces: `sensitivity_ceiling_is_enforced_in_the_query`, `tag_and_kind_filters_narrow_results`, `vector_search_ranks_by_similarity`, `keyword_search_finds_exact_terms`, `hybrid_beats_either_alone`, `pagination_is_stable`, `pending_embedding_items_are_excluded_when_asked`, `capacity_accounting_tracks_items_and_bytes`, `concurrent_admits_do_not_double_count`, `eviction_releases_capacity`.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-backend/src/conformance/retrieval.rs`:
+
+```rust
+use super::{BackendFactory, fx};
+use crate::query::{CandidateQuery, HardFilters};
+use memorysafe_core::{Page, Scope, SensitivityLevel};
+use memorysafe_embed::Embedder;
+
+fn query(text: &str, filters: HardFilters) -> CandidateQuery {
+    CandidateQuery {
+        embedding: Some(fx::embedder().embed(text).unwrap()),
+        text: Some(text.to_string()),
+        filters,
+        limit: 50,
+    }
+}
+
+/// The security-critical one: a restricted item must never leave the database
+/// for a caller cleared only to Personal.
+pub async fn sensitivity_ceiling_is_enforced_in_the_query<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    for (body, level) in [
+        ("public announcement about cats", SensitivityLevel::Public),
+        ("internal note about cats", SensitivityLevel::Internal),
+        ("personal detail about cats", SensitivityLevel::Personal),
+        ("restricted medical record about cats", SensitivityLevel::Restricted),
+    ] {
+        let item = fx::item_with(&scope, body, "fact", &[], level);
+        backend.apply(fx::admit_txn_embedded(&scope, item)).await.unwrap();
+    }
+
+    let filters = HardFilters {
+        sensitivity_ceiling: SensitivityLevel::Personal,
+        ..Default::default()
+    };
+    let hits = backend.retrieve_candidates(&scope, &query("cats", filters)).await.unwrap();
+
+    assert_eq!(hits.len(), 3, "expected Public, Internal, Personal only");
+    for h in &hits {
+        assert!(
+            h.item.sensitivity <= SensitivityLevel::Personal,
+            "leaked {:?}: {}",
+            h.item.sensitivity,
+            h.item.body
+        );
+    }
+}
+
+pub async fn tag_and_kind_filters_narrow_results<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let cases = [
+        ("alpha about cats", "fact", vec!["work"]),
+        ("beta about cats", "preference", vec!["work"]),
+        ("gamma about cats", "fact", vec!["home"]),
+    ];
+    for (body, kind, tags) in cases {
+        let item = fx::item_with(&scope, body, kind, &tags, SensitivityLevel::Internal);
+        backend.apply(fx::admit_txn_embedded(&scope, item)).await.unwrap();
+    }
+
+    let by_kind = HardFilters { kinds: vec!["fact".into()], ..Default::default() };
+    assert_eq!(
+        backend.retrieve_candidates(&scope, &query("cats", by_kind)).await.unwrap().len(),
+        2
+    );
+
+    let by_tag = HardFilters { tags_any: vec!["home".into()], ..Default::default() };
+    assert_eq!(
+        backend.retrieve_candidates(&scope, &query("cats", by_tag)).await.unwrap().len(),
+        1
+    );
+
+    let both = HardFilters {
+        kinds: vec!["fact".into()],
+        tags_any: vec!["work".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        backend.retrieve_candidates(&scope, &query("cats", both)).await.unwrap().len(),
+        1
+    );
+}
+
+pub async fn vector_search_ranks_by_similarity<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    for body in [
+        "the cat sat on the mat",
+        "the cat sat on a rug",
+        "quarterly revenue exceeded projections",
+    ] {
+        backend
+            .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, body)))
+            .await
+            .unwrap();
+    }
+
+    let probe = fx::embedder().embed("the cat sat on the mat").unwrap();
+    let hits = backend.neighbours(&scope, &probe, 3).await.unwrap();
+
+    assert_eq!(hits.len(), 3);
+    assert_eq!(hits[0].item.body, "the cat sat on the mat", "exact match should rank first");
+    assert!(
+        hits[0].relevance >= hits[1].relevance && hits[1].relevance >= hits[2].relevance,
+        "neighbours must come back sorted descending"
+    );
+    assert_eq!(hits[2].item.body, "quarterly revenue exceeded projections");
+}
+
+pub async fn keyword_search_finds_exact_terms<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // A rare token a hash embedder will not usefully cluster.
+    for body in ["the deployment used zstandard compression", "unrelated musings"] {
+        backend
+            .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, body)))
+            .await
+            .unwrap();
+    }
+
+    let q = CandidateQuery {
+        embedding: None,
+        text: Some("zstandard".into()),
+        filters: HardFilters::default(),
+        limit: 10,
+    };
+    let hits = backend.retrieve_candidates(&scope, &q).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].item.body.contains("zstandard"));
+    assert!(hits[0].keyword_score.is_some());
+    assert!(hits[0].vector_score.is_none());
+}
+
+/// FTS5 syntax characters in user text must not become query operators.
+pub async fn keyword_search_escapes_user_input<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+    backend
+        .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, "a normal memory")))
+        .await
+        .unwrap();
+
+    for hostile in ["\"", "OR 1=1", "a AND b", "NEAR/", "*", "(unbalanced"] {
+        let q = CandidateQuery {
+            embedding: None,
+            text: Some(hostile.to_string()),
+            filters: HardFilters::default(),
+            limit: 10,
+        };
+        // Must not error and must not match everything.
+        let hits = backend.retrieve_candidates(&scope, &q).await.unwrap();
+        assert!(hits.len() <= 1, "hostile input {hostile:?} matched {} rows", hits.len());
+    }
+}
+
+pub async fn hybrid_returns_both_signal_sources<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    for body in ["the cat sat on the mat", "zstandard compression details"] {
+        backend
+            .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, body)))
+            .await
+            .unwrap();
+    }
+
+    let hits = backend
+        .retrieve_candidates(&scope, &query("the cat sat on the mat", HardFilters::default()))
+        .await
+        .unwrap();
+
+    let exact = hits.iter().find(|h| h.item.body == "the cat sat on the mat").unwrap();
+    assert!(exact.vector_score.is_some(), "vector score missing");
+    assert!(exact.keyword_score.is_some(), "keyword score missing");
+    assert!(exact.relevance > 0.0);
+}
+
+/// Two pages must not overlap or drop rows.
+pub async fn pagination_is_stable<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    for i in 0..25 {
+        backend
+            .apply(fx::admit_txn(&scope, fx::item(&scope, &format!("memory {i:02}")), None))
+            .await
+            .unwrap();
+    }
+
+    let p1 = backend.list(&scope, &Page { offset: 0, limit: 10 }).await.unwrap();
+    let p2 = backend.list(&scope, &Page { offset: 10, limit: 10 }).await.unwrap();
+    let p3 = backend.list(&scope, &Page { offset: 20, limit: 10 }).await.unwrap();
+
+    assert_eq!((p1.len(), p2.len(), p3.len()), (10, 10, 5));
+
+    let mut ids: Vec<_> = p1.iter().chain(&p2).chain(&p3).map(|i| i.id.clone()).collect();
+    let total = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), total, "pages overlapped");
+    assert_eq!(total, 25, "pages dropped rows");
+}
+
+pub async fn pending_embedding_items_are_excluded_when_asked<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let mut pending = fx::item(&scope, "written while the embedder was down, about cats");
+    pending.pending_embedding = true;
+    backend.apply(fx::admit_txn(&scope, pending.clone(), None)).await.unwrap();
+    backend
+        .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, "a normal memory about cats")))
+        .await
+        .unwrap();
+
+    // Visible to review regardless.
+    assert_eq!(backend.list(&scope, &Page::default()).await.unwrap().len(), 2);
+
+    let filters = HardFilters { exclude_pending_embedding: true, ..Default::default() };
+    let hits = backend.retrieve_candidates(&scope, &query("cats", filters)).await.unwrap();
+    assert!(hits.iter().all(|h| !h.item.pending_embedding));
+}
+
+/// Vectors from a different embedder must be refused, not silently compared.
+pub async fn cross_model_vectors_are_rejected<F: BackendFactory>(factory: &F) {
+    use memorysafe_embed::DeterministicEmbedder;
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    backend
+        .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, "stored with the 256-dim model")))
+        .await
+        .unwrap();
+
+    let other = DeterministicEmbedder::new(384).embed("a probe from another model").unwrap();
+    let result = backend.neighbours(&scope, &other, 5).await;
+
+    match result {
+        Err(crate::BackendError::EmbedderMismatch { .. }) => {}
+        Ok(hits) => assert!(
+            hits.is_empty(),
+            "cross-model probe returned {} hits instead of erroring or returning nothing",
+            hits.len()
+        ),
+        Err(e) => panic!("unexpected error {e:?}"),
+    }
+}
+```
+
+`crates/memorysafe-backend/src/conformance/capacity.rs`:
+
+```rust
+use super::{BackendFactory, fx};
+use memorysafe_core::{Budget, Page, Scope};
+
+pub async fn capacity_accounting_tracks_items_and_bytes<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+    backend
+        .set_budget(&scope, Budget { max_items: Some(100), max_bytes: Some(100_000) })
+        .await
+        .unwrap();
+
+    let before = backend.capacity_state(&scope).await.unwrap();
+    assert_eq!(before.used_items, 0);
+    assert_eq!(before.used_bytes, 0);
+
+    let item = fx::item(&scope, "a memory of some length");
+    let size = item.byte_size();
+    backend.apply(fx::admit_txn(&scope, item, None)).await.unwrap();
+
+    let after = backend.capacity_state(&scope).await.unwrap();
+    assert_eq!(after.used_items, 1);
+    assert_eq!(after.used_bytes, size);
+    assert_eq!(after.budget.max_items, Some(100));
+}
+
+pub async fn eviction_releases_capacity<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+    backend.set_budget(&scope, Budget { max_items: Some(10), max_bytes: None }).await.unwrap();
+
+    for i in 0..3 {
+        backend
+            .apply(fx::admit_txn(&scope, fx::item(&scope, &format!("memory {i}")), None))
+            .await
+            .unwrap();
+    }
+    assert_eq!(backend.capacity_state(&scope).await.unwrap().used_items, 3);
+
+    let items = backend.list(&scope, &Page::default()).await.unwrap();
+    backend.apply(fx::evict_txn(&scope, vec![items[0].id.clone()])).await.unwrap();
+
+    let after = backend.capacity_state(&scope).await.unwrap();
+    assert_eq!(after.used_items, 2);
+    assert_eq!(after.used_bytes, items[1].byte_size() + items[2].byte_size());
+}
+
+/// The correctness detail the spec calls out: without a lock on the accounting
+/// row, concurrent admits both conclude there is room and the count drifts.
+pub async fn concurrent_admits_do_not_double_count<F: BackendFactory>(factory: &F) {
+    use std::sync::Arc;
+    let backend = Arc::new(factory.create().await);
+    let scope = Scope::new("t", "s", "n").unwrap();
+    backend.set_budget(&scope, Budget { max_items: Some(1000), max_bytes: None }).await.unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let b = Arc::clone(&backend);
+        let s = scope.clone();
+        handles.push(tokio::spawn(async move {
+            b.apply(fx::admit_txn(&s, fx::item(&s, &format!("concurrent {i}")), None)).await
+        }));
+    }
+    for h in handles {
+        h.await.unwrap().unwrap();
+    }
+
+    let state = backend.capacity_state(&scope).await.unwrap();
+    assert_eq!(state.used_items, 20, "capacity accounting drifted under concurrency");
+
+    let listed = backend.list(&scope, &Page { offset: 0, limit: 100 }).await.unwrap();
+    assert_eq!(listed.len() as u64, state.used_items, "accounting disagrees with reality");
+}
+
+pub async fn scope_stats_reflect_the_corpus<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    assert_eq!(backend.scope_stats(&scope).await.unwrap().item_count, 0);
+
+    for body in ["first memory", "second memory", "third memory"] {
+        backend
+            .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, body)))
+            .await
+            .unwrap();
+    }
+
+    let stats = backend.scope_stats(&scope).await.unwrap();
+    assert_eq!(stats.item_count, 3);
+    assert!(stats.total_bytes > 0);
+    assert!(stats.median_item_bytes > 0);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend`
+Expected: FAIL — `unresolved module retrieval` in `mod.rs`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Add to `crates/memorysafe-backend/src/conformance/mod.rs`:
+
+```rust
+pub mod capacity;
+pub mod retrieval;
+```
+
+and extend `run!`:
+
+```rust
+        retrieval::sensitivity_ceiling_is_enforced_in_the_query,
+        retrieval::tag_and_kind_filters_narrow_results,
+        retrieval::vector_search_ranks_by_similarity,
+        retrieval::keyword_search_finds_exact_terms,
+        retrieval::keyword_search_escapes_user_input,
+        retrieval::hybrid_returns_both_signal_sources,
+        retrieval::pagination_is_stable,
+        retrieval::pending_embedding_items_are_excluded_when_asked,
+        retrieval::cross_model_vectors_are_rejected,
+        capacity::capacity_accounting_tracks_items_and_bytes,
+        capacity::eviction_releases_capacity,
+        capacity::concurrent_admits_do_not_double_count,
+        capacity::scope_stats_reflect_the_corpus,
+```
+
+Add `tokio` with the `rt-multi-thread` feature to `memorysafe-backend` for `tokio::spawn` in the concurrency test:
+
+```toml
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend && cargo clippy -p memorysafe-backend --all-targets -- -D warnings`
+Expected: PASS — compiles clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-backend/
+git commit -m "feat(backend): conformance tests for retrieval, filters, and capacity"
+```
+
+---
+
+## Task 18: Conformance — lifecycle
+
+**Files:**
+- Create: `crates/memorysafe-backend/src/conformance/lifecycle.rs`
+- Modify: `crates/memorysafe-backend/src/conformance/mod.rs`
+
+**Interfaces:**
+- Consumes: `BackendFactory`, `fx`.
+- Produces: `audit_filter_narrows_by_event_and_time`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `export_import_round_trips_exactly`, `import_is_idempotent`.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-backend/src/conformance/lifecycle.rs`:
+
+```rust
+use super::{BackendFactory, fx};
+use crate::portability::ScopeSelector;
+use memorysafe_core::{AuditEvent, AuditFilter, Page, Scope, SubjectId, TenantId};
+
+pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    for i in 0..3 {
+        backend
+            .apply(fx::admit_txn(&scope, fx::item(&scope, &format!("memory {i}")), None))
+            .await
+            .unwrap();
+    }
+    let items = backend.list(&scope, &Page::default()).await.unwrap();
+    backend.apply(fx::evict_txn(&scope, vec![items[0].id.clone()])).await.unwrap();
+
+    let admits = backend
+        .audit(&scope, &AuditFilter { events: vec![AuditEvent::Admitted], ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(admits.len(), 3);
+    assert!(admits.iter().all(|r| r.event == AuditEvent::Admitted));
+
+    let forgets = backend
+        .audit(&scope, &AuditFilter { events: vec![AuditEvent::Forgotten], ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(forgets.len(), 1);
+
+    let limited = backend
+        .audit(&scope, &AuditFilter { limit: 2, ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 2);
+    assert!(limited[0].at >= limited[1].at, "audit must come back newest first");
+}
+
+/// Right-to-delete must be total for the subject.
+pub async fn purge_subject_removes_everything_for_that_subject<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let tenant = TenantId::new("t").unwrap();
+    let subject = SubjectId::new("doomed").unwrap();
+    let a = Scope::new("t", "doomed", "ns-a").unwrap();
+    let b = Scope::new("t", "doomed", "ns-b").unwrap();
+
+    for scope in [&a, &b] {
+        for i in 0..3 {
+            backend
+                .apply(fx::admit_txn_embedded(scope, fx::item(scope, &format!("memory {i}"))))
+                .await
+                .unwrap();
+        }
+    }
+
+    let report = backend.purge_subject(&tenant, &subject).await.unwrap();
+    assert_eq!(report.items_removed, 6);
+    assert_eq!(report.vectors_removed, 6);
+
+    assert!(backend.list(&a, &Page::default()).await.unwrap().is_empty());
+    assert!(backend.list(&b, &Page::default()).await.unwrap().is_empty());
+    assert_eq!(backend.capacity_state(&a).await.unwrap().used_items, 0);
+    assert_eq!(
+        report.audit_rows_removed + report.audit_rows_preserved,
+        6,
+        "every audit row must be accounted for as removed or preserved"
+    );
+}
+
+pub async fn purge_subject_leaves_other_subjects_intact<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let doomed = Scope::new("t", "doomed", "ns").unwrap();
+    let keeper = Scope::new("t", "keeper", "ns").unwrap();
+
+    backend.apply(fx::admit_txn(&doomed, fx::item(&doomed, "goes away"), None)).await.unwrap();
+    backend.apply(fx::admit_txn(&keeper, fx::item(&keeper, "stays"), None)).await.unwrap();
+
+    backend
+        .purge_subject(&TenantId::new("t").unwrap(), &SubjectId::new("doomed").unwrap())
+        .await
+        .unwrap();
+
+    assert!(backend.list(&doomed, &Page::default()).await.unwrap().is_empty());
+    assert_eq!(backend.list(&keeper, &Page::default()).await.unwrap().len(), 1);
+    assert_eq!(
+        backend.audit(&keeper, &AuditFilter::default()).await.unwrap().len(),
+        1,
+        "purging one subject destroyed another's audit"
+    );
+}
+
+/// Invariant 5 from the spec: export then import reproduces the corpus exactly.
+pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
+    let source = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    for (body, kind, tags) in [
+        ("first memory about cats", "fact", vec!["work"]),
+        ("second memory about dogs", "preference", vec!["home", "pets"]),
+        ("third memory about zstandard", "procedure", vec![]),
+    ] {
+        let item = fx::item_with(
+            &scope,
+            body,
+            kind,
+            &tags,
+            memorysafe_core::SensitivityLevel::Internal,
+        );
+        source.apply(fx::admit_txn_embedded(&scope, item)).await.unwrap();
+    }
+
+    let selector = ScopeSelector {
+        tenant: TenantId::new("t").unwrap(),
+        subject: None,
+        namespace: None,
+        include_audit: true,
+    };
+    let exported = source.export(&selector).await.unwrap();
+
+    let target = factory.create().await;
+    let report = target.import(exported.clone()).await.unwrap();
+    assert_eq!(report.items_imported, 3);
+    assert_eq!(report.vectors_imported, 3);
+
+    let mut before = source.list(&scope, &Page { offset: 0, limit: 100 }).await.unwrap();
+    let mut after = target.list(&scope, &Page { offset: 0, limit: 100 }).await.unwrap();
+    before.sort_by(|a, b| a.id.cmp(&b.id));
+    after.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(before, after, "round trip did not reproduce the items exactly");
+
+    // Vectors survived: the same probe ranks the same way on both sides.
+    use memorysafe_embed::Embedder;
+    let probe = fx::embedder().embed("cats").unwrap();
+    let src_hits = source.neighbours(&scope, &probe, 3).await.unwrap();
+    let tgt_hits = target.neighbours(&scope, &probe, 3).await.unwrap();
+    let ids = |v: &[memorysafe_core::ScoredCandidate]| {
+        v.iter().map(|c| c.item.id.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&src_hits), ids(&tgt_hits), "vector ranking changed across the round trip");
+}
+
+/// Importing the same stream twice must not duplicate anything.
+pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
+    let source = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+    source
+        .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, "only memory")))
+        .await
+        .unwrap();
+
+    let selector = ScopeSelector {
+        tenant: TenantId::new("t").unwrap(),
+        subject: None,
+        namespace: None,
+        include_audit: false,
+    };
+    let exported = source.export(&selector).await.unwrap();
+
+    let target = factory.create().await;
+    let first = target.import(exported.clone()).await.unwrap();
+    assert_eq!(first.items_imported, 1);
+
+    let second = target.import(exported).await.unwrap();
+    assert_eq!(second.items_imported, 0);
+    assert_eq!(second.items_skipped_existing, 1);
+    assert_eq!(target.list(&scope, &Page::default()).await.unwrap().len(), 1);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend`
+Expected: FAIL — `unresolved module lifecycle` in `mod.rs`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Add to `crates/memorysafe-backend/src/conformance/mod.rs`:
+
+```rust
+pub mod lifecycle;
+```
+
+and extend `run!`:
+
+```rust
+        lifecycle::audit_filter_narrows_by_event_and_time,
+        lifecycle::purge_subject_removes_everything_for_that_subject,
+        lifecycle::purge_subject_leaves_other_subjects_intact,
+        lifecycle::export_import_round_trips_exactly,
+        lifecycle::import_is_idempotent,
+```
+
+The suite now stands at **22 conformance tests**. This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend && cargo clippy -p memorysafe-backend --all-targets -- -D warnings`
+Expected: PASS — compiles clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-backend/
+git commit -m "feat(backend): conformance tests for audit, purge, and portability"
+```
+
+---
