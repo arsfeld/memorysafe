@@ -6688,7 +6688,7 @@ use memorysafe_backend::{
     BackendError, ExportRecord, ExportStream, ExportVector, ImportReport, ImportStream,
     ScopeSelector,
 };
-use memorysafe_core::{AuditFilter, Scope};
+use memorysafe_core::{AuditFilter, Protection, Scope};
 use memorysafe_embed::QuantizedVector;
 use rusqlite::{Connection, params};
 
@@ -6780,7 +6780,7 @@ pub fn import(
                     )));
                 }
             }
-            ExportRecord::Item { item, vector } => {
+            ExportRecord::Item { mut item, vector } => {
                 let scope: Scope = item.scope.clone();
                 // Import is idempotent: an item already present is skipped
                 // rather than duplicated or overwritten.
@@ -6788,6 +6788,22 @@ pub fn import(
                     report.items_skipped_existing += 1;
                     continue;
                 }
+                // `MemoryItem` has public fields and derives `Deserialize`, so
+                // an import stream can assert any value it likes for the two
+                // fields the engine is supposed to own. Neither is trusted here:
+                //
+                // `protection` — a stream claiming `Pinned` would create items
+                // no policy can ever evict, letting an import permanently fill a
+                // namespace and starve every later write with BudgetExhausted.
+                // Imported items enter as Normal; a caller re-pins deliberately
+                // through `protect`, which is audited.
+                //
+                // `sensitivity` — a stream claiming `Public` for a body full of
+                // credentials would bypass the detector and surface that body to
+                // a Public-clearance recall. The engine re-assesses on import
+                // (see `Engine::import` in Task 37); the backend refuses to
+                // lower whatever the engine resolved.
+                item.protection = Protection::Normal;
                 capacity::ensure_row(&tx, &scope)?;
                 items::insert(&tx, &item)?;
                 capacity::adjust(&tx, &scope, 1, item.byte_size() as i64)?;
@@ -11125,7 +11141,7 @@ git commit -m "feat(engine): four named audit retention profiles honoured on sub
 ```rust
 use memorysafe_backend::ScopeSelector;
 use memorysafe_backend_sqlite::SqliteBackend;
-use memorysafe_core::{Scope, TenantId};
+use memorysafe_core::{Protection, Scope, SensitivityLevel, TenantId};
 use memorysafe_embed::DeterministicEmbedder;
 use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
 use memorysafe_policy::BaselinePolicy;
@@ -11220,6 +11236,39 @@ async fn importing_the_same_stream_twice_changes_nothing_the_second_time() {
 }
 
 #[tokio::test]
+async fn an_import_cannot_downgrade_sensitivity_or_forge_a_pin() {
+    // An import stream is caller-supplied JSON and MemoryItem's fields are
+    // public, so it can assert anything. Neither claim is believed.
+    let e = engine();
+    let ndjson = format!(
+        "{}\n{}\n",
+        r#"{"record":"header","format_version":1,"exported_at":0}"#,
+        r#"{"record":"item","item":{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
+           "scope":{"tenant":"acme","subject":"user-42","namespace":"agent"},
+           "body":"the deploy api key is sk-abc123def456ghi789jkl012",
+           "kind":"fact","source":{"kind":"agent","id":null},"occurred_at":null,
+           "created_at":0,"tags":[],"attrs":{},"sensitivity":"public","ttl":null,
+           "protection":{"kind":"pinned"},"pending_embedding":false}}"#
+            .replace('\n', "")
+            .replace("           ", "")
+    );
+
+    e.import_ndjson(&ndjson).await.unwrap();
+    let stored = e.review(&scope(), &Default::default()).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].sensitivity,
+        SensitivityLevel::Restricted,
+        "import downgraded a credential to Public"
+    );
+    assert_eq!(
+        stored[0].protection,
+        Protection::Normal,
+        "import forged an unevictable pin"
+    );
+}
+
+#[tokio::test]
 async fn malformed_ndjson_is_rejected_with_a_useful_error() {
     let e = engine();
     let err = e.import_ndjson("{not json at all").await.unwrap_err();
@@ -11255,8 +11304,35 @@ impl Engine {
         Ok(self.backend.export(sel).await?)
     }
 
+    /// Imported items are re-assessed rather than trusted. An import stream is
+    /// caller-supplied JSON, and `MemoryItem`'s fields are public — so a stream
+    /// can claim `sensitivity: "public"` for a body full of credentials and, if
+    /// believed, that body would then satisfy a Public-clearance recall. The
+    /// backend already forces `protection` back to `Normal`; this recomputes the
+    /// sensitivity the same way a write would, and keeps whichever level is
+    /// higher so an import can never lower a stored classification.
     pub async fn import(&self, stream: ImportStream) -> Result<ImportReport, EngineError> {
-        Ok(self.backend.import(stream).await?)
+        let reassessed: ImportStream = stream
+            .into_iter()
+            .map(|record| match record {
+                ExportRecord::Item { mut item, vector } => {
+                    let candidate = memorysafe_core::Candidate {
+                        body: item.body.clone(),
+                        kind: item.kind.clone(),
+                        tags: item.tags.clone(),
+                        attrs: item.attrs.clone(),
+                        sensitivity_hint: None,
+                        embedding: None,
+                        byte_size: item.byte_size(),
+                    };
+                    let detected = memorysafe_policy::sensitivity::assess(&candidate).level;
+                    item.sensitivity = item.sensitivity.max(detected);
+                    ExportRecord::Item { item, vector }
+                }
+                other => other,
+            })
+            .collect();
+        Ok(self.backend.import(reassessed).await?)
     }
 
     /// The round-trip format: one JSON object per line.
