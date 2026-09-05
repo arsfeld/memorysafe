@@ -48,10 +48,12 @@ impl CapacityState {
 
     /// True when admitting `items`/`bytes` more would break the budget.
     ///
-    /// Argument order is (items, bytes) — both `u64`, so a transposition
-    /// compiles. Every call site in this workspace passes a literal `1` for
-    /// `items`, which makes the mistake visible at a glance; if a caller ever
-    /// needs a variable item count, give this a named-field argument instead.
+    /// Argument order is (items, bytes). Both are `u64`, so a transposition
+    /// compiles silently and checks each quantity against the wrong budget.
+    /// There is no compiler-enforced guard against that today; the intended
+    /// caller shape is `would_exceed(1, item.byte_size())`, admitting one item
+    /// at a time. If a caller ever needs a variable item count, replace these
+    /// positional parameters with a named-field argument before doing so.
     pub fn would_exceed(&self, items: u64, bytes: u64) -> bool {
         let items_over = self
             .budget
@@ -289,5 +291,60 @@ mod tests {
         assert_eq!(stats.total_bytes, 0);
         assert_eq!(stats.mean_neighbour_similarity, 0.0);
         assert_eq!(stats.median_item_bytes, 0);
+    }
+
+    #[test]
+    fn an_unbounded_budget_never_exceeds_and_has_no_pressure() {
+        let s = CapacityState {
+            budget: Budget::UNBOUNDED,
+            used_items: u64::MAX,
+            used_bytes: u64::MAX,
+        };
+        assert_eq!(s.pressure(), 0.0);
+        assert!(!s.would_exceed(u64::MAX, u64::MAX));
+        assert!(!s.budget.is_bounded());
+    }
+
+    #[test]
+    fn is_bounded_is_true_when_both_dimensions_are_set() {
+        // The one Budget shape no test exercised.
+        let both = Budget {
+            max_items: Some(1),
+            max_bytes: Some(1),
+        };
+        assert!(both.is_bounded());
+    }
+
+    #[test]
+    fn pressure_stays_accurate_at_multi_gigabyte_budgets() {
+        // `ratio` casts u64 -> f32, which loses integer precision above 2^24.
+        // Admission (`would_exceed`) is exact integer arithmetic and unaffected;
+        // this pins how far the *pressure signal* may drift at realistic scale.
+        let ten_gb: u64 = 10 * 1024 * 1024 * 1024;
+        let s = CapacityState {
+            budget: Budget {
+                max_items: None,
+                max_bytes: Some(ten_gb),
+            },
+            used_items: 0,
+            used_bytes: ten_gb / 4,
+        };
+        assert!(
+            (s.pressure() - 0.25).abs() < 1e-4,
+            "pressure drifted: {}",
+            s.pressure()
+        );
+
+        // The exact path stays exact at the same scale.
+        let exact = CapacityState {
+            budget: Budget {
+                max_items: None,
+                max_bytes: Some(ten_gb),
+            },
+            used_items: 0,
+            used_bytes: ten_gb - 1,
+        };
+        assert!(!exact.would_exceed(0, 1), "exact fit rejected at 10 GiB");
+        assert!(exact.would_exceed(0, 2), "overflow accepted at 10 GiB");
     }
 }
