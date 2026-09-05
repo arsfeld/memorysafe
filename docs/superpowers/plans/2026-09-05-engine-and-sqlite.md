@@ -4013,7 +4013,7 @@ pub enum ExportRecord {
         #[serde(skip_serializing_if = "Option::is_none")]
         vector: Option<ExportVector>,
     },
-    Audit { record: Box<AuditRecord> },
+    Audit { audit: Box<AuditRecord> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -7441,7 +7441,7 @@ pub fn export(
         for scope in scopes {
             let filter = AuditFilter { limit: 100_000, ..Default::default() };
             for record in crate::audit::query(conn, &scope, &filter)? {
-                out.push(ExportRecord::Audit { record: Box::new(record) });
+                out.push(ExportRecord::Audit { audit: Box::new(record) });
             }
         }
     }
@@ -7509,8 +7509,8 @@ pub fn import(
                     report.vectors_imported += 1;
                 }
             }
-            ExportRecord::Audit { record } => {
-                crate::audit::insert(&tx, &record)?;
+            ExportRecord::Audit { audit } => {
+                crate::audit::insert(&tx, &audit)?;
                 report.audit_imported += 1;
             }
         }
