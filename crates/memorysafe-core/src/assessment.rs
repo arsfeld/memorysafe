@@ -241,4 +241,51 @@ mod tests {
         };
         assert!(empty.best().is_none());
     }
+
+    #[test]
+    fn a_full_assessment_pins_its_stored_bytes() {
+        // The audit table stores this whole struct in its `assessment` column.
+        // A round trip alone proves only self-consistency: serialise and
+        // deserialise share the same code, so ANY symmetric rename round-trips
+        // perfectly while orphaning every row already on disk. Pin the literal
+        // bytes, which is the property stored data actually depends on.
+        let a = Assessment {
+            value: Score::clamped(0.73),
+            fragility: Score::clamped(0.31),
+            sensitivity: SensitivityAssessment {
+                level: SensitivityLevel::Personal,
+                categories: vec![SensitivityCategory::Pii, SensitivityCategory::Health],
+                confidence: Score::clamped(0.88),
+            },
+            redundancy: RedundancyAssessment {
+                score: Score::clamped(0.42),
+                near_duplicates: vec![(
+                    ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+                    Score::clamped(0.92),
+                )],
+            },
+            features: features! { "novelty" => 0.55, "stability" => 0.67 },
+            assessor: AssessorId::new("baseline", "0.1.0"),
+        };
+
+        let json = serde_json::to_string(&a).unwrap();
+        let back: Assessment = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back, a,
+            "a stored assessment did not survive the round trip"
+        );
+
+        let expected = concat!(
+            r#"{"value":0.73,"fragility":0.31,"sensitivity":{"level":"personal","#,
+            r#""categories":["pii","health"],"confidence":0.88},"redundancy":{"score":0.42,"#,
+            r#""near_duplicates":[["01ARZ3NDEKTSV4RRFFQ69G5FAV",0.92]]},"#,
+            r#""features":{"novelty":0.55,"stability":0.67},"#,
+            r#""assessor":{"name":"baseline","version":"0.1.0"}}"#
+        );
+        assert_eq!(json, expected, "the stored assessment format changed");
+
+        // And prove old bytes still parse — the actual compatibility question.
+        let from_disk: Assessment = serde_json::from_str(expected).unwrap();
+        assert_eq!(from_disk, a);
+    }
 }

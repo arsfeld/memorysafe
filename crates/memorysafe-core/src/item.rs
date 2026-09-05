@@ -271,4 +271,58 @@ mod tests {
         let back: MemoryItem = serde_json::from_str(&json).unwrap();
         assert_eq!(back, i);
     }
+
+    #[test]
+    fn a_full_memory_item_pins_its_stored_bytes() {
+        // The portable export archive stores these as newline-delimited JSON.
+        // A round trip alone proves only self-consistency: serialise and
+        // deserialise share the same code, so ANY symmetric rename round-trips
+        // perfectly while orphaning every row already on disk. Pin the literal
+        // bytes, which is the property stored data actually depends on.
+        let mut attrs = BTreeMap::new();
+        attrs.insert("category".to_string(), serde_json::json!("memory"));
+        attrs.insert("priority".to_string(), serde_json::json!(true));
+
+        let item = MemoryItem {
+            id: ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            scope: Scope::new("t", "s", "n").unwrap(),
+            body: "This is the memory content".to_string(),
+            kind: "note".to_string(),
+            source: Source {
+                kind: SourceKind::Human,
+                id: Some("user-123".to_string()),
+            },
+            occurred_at: Some(OffsetDateTime::from_unix_timestamp(500).unwrap()),
+            created_at: OffsetDateTime::from_unix_timestamp(1000).unwrap(),
+            tags: vec!["important".to_string(), "review".to_string()],
+            attrs,
+            sensitivity: SensitivityLevel::Personal,
+            ttl: Some(Duration::days(30)),
+            protection: Protection::Protected {
+                until: OffsetDateTime::from_unix_timestamp(2000).unwrap(),
+            },
+            pending_embedding: true,
+        };
+
+        let json = serde_json::to_string(&item).unwrap();
+        let back: MemoryItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back, item,
+            "a stored memory item did not survive the round trip"
+        );
+
+        let expected = concat!(
+            r#"{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","scope":{"tenant":"t","subject":"s","#,
+            r#""namespace":"n"},"body":"This is the memory content","kind":"note","#,
+            r#""source":{"kind":"human","id":"user-123"},"occurred_at":500,"#,
+            r#""created_at":1000,"tags":["important","review"],"attrs":{"category":"memory","#,
+            r#""priority":true},"sensitivity":"personal","ttl":[2592000,0],"#,
+            r#""protection":{"kind":"protected","until":2000},"pending_embedding":true}"#
+        );
+        assert_eq!(json, expected, "the stored memory item format changed");
+
+        // And prove old bytes still parse — the actual compatibility question.
+        let from_disk: MemoryItem = serde_json::from_str(expected).unwrap();
+        assert_eq!(from_disk, item);
+    }
 }
