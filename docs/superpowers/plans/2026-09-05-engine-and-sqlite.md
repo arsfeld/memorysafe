@@ -767,7 +767,8 @@ mod tests {
 
     #[test]
     fn scores_have_a_total_order() {
-        let mut v = vec![Score::clamped(0.5), Score::clamped(0.1), Score::clamped(0.9)];
+        // An array, not `vec!` — clippy::useless_vec denies the latter here.
+        let mut v = [Score::clamped(0.5), Score::clamped(0.1), Score::clamped(0.9)];
         v.sort();
         assert_eq!(v[0].get(), 0.1);
         assert_eq!(v[2].get(), 0.9);
