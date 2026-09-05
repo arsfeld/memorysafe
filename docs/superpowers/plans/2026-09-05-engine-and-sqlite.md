@@ -2021,8 +2021,8 @@ mod tests {
     fn item_ref_carries_a_digest_and_never_the_body() {
         let i = item("a secret diagnosis");
         let r = ItemRef::from_item(&i);
-        assert_eq!(r.id, i.id);
-        assert_eq!(r.digest, i.digest());
+        assert_eq!(*r.id(), i.id);
+        assert_eq!(r.digest(), i.digest());
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("secret"), "audit must not carry bodies: {json}");
     }
@@ -2048,11 +2048,44 @@ mod tests {
     }
 
     #[test]
+    fn the_builders_do_not_clobber_each_other() {
+        // `with_assessment` and `with_decision` each rebuild the record; a typo
+        // clearing the other's field would pass every other test here, because
+        // the golden test constructs its record with a struct literal.
+        let scope = Scope::new("t", "s", "n").unwrap();
+        let rec = AuditRecord::new(scope, AuditEvent::Admitted, vec![], Actor::system())
+            .with_assessment(sample_assessment())
+            .with_decision(sample_decision());
+        assert!(rec.assessment.is_some(), "with_decision cleared the assessment");
+        assert!(rec.decision.is_some(), "with_assessment cleared the decision");
+
+        // And in the opposite order.
+        let scope = Scope::new("t", "s", "n").unwrap();
+        let rec = AuditRecord::new(scope, AuditEvent::Admitted, vec![], Actor::system())
+            .with_decision(sample_decision())
+            .with_assessment(sample_assessment());
+        assert!(rec.assessment.is_some());
+        assert!(rec.decision.is_some());
+    }
+
+    #[test]
+    fn actor_kinds_serialize_as_snake_case() {
+        // `ApiKey` is the only variant where snake_case and lowercase diverge,
+        // so it is the only one that proves which strategy is in force.
+        assert_eq!(serde_json::to_string(&ActorKind::ApiKey).unwrap(), "\"api_key\"");
+        assert_eq!(serde_json::to_string(&ActorKind::Cli).unwrap(), "\"cli\"");
+        assert_eq!(Actor::system().kind, ActorKind::System);
+        assert!(Actor::system().id.is_none());
+    }
+
+    #[test]
     fn default_audit_filter_matches_everything() {
         let f = AuditFilter::default();
         assert!(f.events.is_empty());
         assert_eq!(f.limit, 100);
         assert!(f.since.is_none());
+        assert!(f.until.is_none());
+        assert!(f.item.is_none());
     }
 }
 ```
@@ -2112,17 +2145,36 @@ impl Actor {
     }
 }
 
-/// An item's identity in an audit row. Deliberately has no body field — the
-/// type system is what enforces "audit never stores bodies".
+/// An item's identity in an audit row: an id and a content digest, never the
+/// body.
+///
+/// Fields are private and `from_item` is the only constructor, matching how
+/// every other identity type in this crate is built. That closes the
+/// accidental path — `ItemRef { id, digest: item.body.clone() }` will not
+/// compile — but be precise about what it does not close: `Deserialize` can
+/// still produce an `ItemRef` holding arbitrary text, so audit JSON arriving
+/// from outside this process is not covered.
+///
+/// The guarantee is therefore structural for code in this workspace and
+/// conventional at the deserialization boundary. See also `Reason::detail`,
+/// which is free prose a policy writes and which no type can constrain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemRef {
-    pub id: ItemId,
-    pub digest: String,
+    id: ItemId,
+    digest: String,
 }
 
 impl ItemRef {
     pub fn from_item(item: &MemoryItem) -> Self {
         Self { id: item.id.clone(), digest: item.digest() }
+    }
+
+    pub fn id(&self) -> &ItemId {
+        &self.id
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
     }
 }
 
@@ -2168,6 +2220,11 @@ impl AuditRecord {
 pub struct AuditFilter {
     /// Empty means "all events".
     pub events: Vec<AuditEvent>,
+    // NOTE for the task that implements `Backend::audit`: `limit` defaults to
+    // 100 and carries no truncation signal, so a compliance query built from
+    // `AuditFilter::default()` silently stops at 100 rows with no way for the
+    // caller to know. Either surface a `truncated` flag on the result or make
+    // the caller choose explicitly before that method ships.
     pub item: Option<ItemId>,
     #[serde(with = "time::serde::timestamp::option")]
     pub since: Option<OffsetDateTime>,
