@@ -317,26 +317,35 @@ mod tests {
 
     #[test]
     fn pressure_stays_accurate_at_multi_gigabyte_budgets() {
-        // `ratio` casts u64 -> f32, which loses integer precision above 2^24.
-        // Admission (`would_exceed`) is exact integer arithmetic and unaffected;
-        // this pins how far the *pressure signal* may drift at realistic scale.
+        // `ratio` casts u64 -> f32, which stops representing consecutive
+        // integers exactly above 2^24. A fraction like 1/4 is exactly
+        // representable and would measure nothing, so this uses 1/3 — where
+        // real rounding error appears — and pins how far it may drift.
+        // Admission (`would_exceed`) is exact integer arithmetic and unaffected.
         let ten_gb: u64 = 10 * 1024 * 1024 * 1024;
+        let used = ten_gb / 3;
         let s = CapacityState {
             budget: Budget {
                 max_items: None,
                 max_bytes: Some(ten_gb),
             },
             used_items: 0,
-            used_bytes: ten_gb / 4,
+            used_bytes: used,
         };
+
+        let exact = used as f64 / ten_gb as f64;
+        let drift = (s.pressure() as f64 - exact).abs();
         assert!(
-            (s.pressure() - 0.25).abs() < 1e-4,
-            "pressure drifted: {}",
+            drift < 1e-6,
+            "pressure drifted {drift:e} at 10 GiB (pressure={}, exact={exact})",
             s.pressure()
         );
 
-        // The exact path stays exact at the same scale.
-        let exact = CapacityState {
+        // Tight enough that a 3-decimal rounding of the ratio would fail here.
+        assert!(drift < 5e-4);
+
+        // The exact integer path stays exact at the same scale.
+        let boundary = CapacityState {
             budget: Budget {
                 max_items: None,
                 max_bytes: Some(ten_gb),
@@ -344,7 +353,7 @@ mod tests {
             used_items: 0,
             used_bytes: ten_gb - 1,
         };
-        assert!(!exact.would_exceed(0, 1), "exact fit rejected at 10 GiB");
-        assert!(exact.would_exceed(0, 2), "overflow accepted at 10 GiB");
+        assert!(!boundary.would_exceed(0, 1), "exact fit rejected at 10 GiB");
+        assert!(boundary.would_exceed(0, 2), "overflow accepted at 10 GiB");
     }
 }
