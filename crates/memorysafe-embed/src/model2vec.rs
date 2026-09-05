@@ -33,6 +33,26 @@ impl Model2VecEmbedder {
     }
 }
 
+/// L2-normalises `v` in place and returns it, or reports a zero vector.
+///
+/// Quantization assumes unit vectors, so every `Embedder` must uphold that
+/// contract. Extracted from `embed` so it is directly unit-testable: `embed`
+/// itself is only reachable through a real `StaticModel`, which the hermetic
+/// suite has no access to.
+fn normalise(mut v: Vec<f32>) -> Result<Vec<f32>, EmbedError> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in &mut v {
+            *x /= norm;
+        }
+        Ok(v)
+    } else {
+        Err(EmbedError::Unavailable(
+            "model produced a zero vector".into(),
+        ))
+    }
+}
+
 impl Embedder for Model2VecEmbedder {
     fn id(&self) -> EmbedderId {
         self.id.clone()
@@ -46,25 +66,14 @@ impl Embedder for Model2VecEmbedder {
         if text.trim().is_empty() {
             return Err(EmbedError::EmptyInput);
         }
-        let mut v = self.model.encode_single(text);
+        let v = self.model.encode_single(text);
         if v.len() != self.dim as usize {
             return Err(EmbedError::DimensionMismatch {
                 got: v.len(),
                 expected: self.dim,
             });
         }
-        // Quantization assumes unit vectors; normalise here so every Embedder
-        // upholds the same contract.
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for x in &mut v {
-                *x /= norm;
-            }
-        } else {
-            return Err(EmbedError::Unavailable(
-                "model produced a zero vector".into(),
-            ));
-        }
+        let v = normalise(v)?;
         Ok(Embedding::new(v, self.id()))
     }
 }
@@ -79,6 +88,33 @@ mod tests {
             std::path::Path::new("/nonexistent/model"),
             "potion-base-8M",
         );
+        // Asserting on the variant alone passed even when the `path.exists()` guard
+        // was deleted, because the underlying loader's own "no such model" error also
+        // maps to `Unavailable`. Pin the guard's distinctive message so the test can
+        // only pass when *our* early return actually fired.
+        match err {
+            Err(EmbedError::Unavailable(msg)) => {
+                assert!(
+                    msg.contains("/nonexistent/model"),
+                    "expected the guard's own message naming the missing path, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Unavailable(_) naming the path, got {other:?}"),
+            Ok(_) => panic!("expected an error for a nonexistent model path"),
+        }
+    }
+
+    #[test]
+    fn normalise_scales_a_non_unit_vector_to_unit_length() {
+        let v = normalise(vec![3.0, 4.0]).unwrap();
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "norm was {norm}");
+        assert_eq!(v, vec![0.6, 0.8]);
+    }
+
+    #[test]
+    fn normalise_rejects_a_zero_vector() {
+        let err = normalise(vec![0.0, 0.0, 0.0]);
         assert!(matches!(err, Err(EmbedError::Unavailable(_))));
     }
 

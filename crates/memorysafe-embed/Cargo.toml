@@ -13,7 +13,10 @@ model2vec = ["dep:model2vec-rs"]
 memorysafe-core.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
-model2vec-rs = { version = "0.2.1", optional = true }
+model2vec-rs = { version = "0.2.1", optional = true, default-features = false, features = [
+    "onig",
+    "local-only",
+] }
 
 [lints]
 workspace = true

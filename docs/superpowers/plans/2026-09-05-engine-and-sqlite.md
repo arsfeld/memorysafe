@@ -3175,11 +3175,24 @@ model2vec = ["dep:model2vec-rs"]
 memorysafe-core.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
-model2vec-rs = { version = "0.2.1", optional = true }
+model2vec-rs = { version = "0.2.1", optional = true, default-features = false, features = [
+    "onig",
+    "local-only",
+] }
 
 [lints]
 workspace = true
 ```
+
+`model2vec-rs`'s default features are `["onig", "hf-hub"]`; `hf-hub` compiles in a
+HuggingFace Hub HTTP client and turns `StaticModel::from_pretrained` on any
+non-existent local path into a live network request (it treats the path string as a
+Hub repo id). That collides with this plan's write-path constraint of no network
+calls, so the dependency is pinned to `default-features = false` with `onig` (the
+tokenizer's required regex backend — `tokenizers` fails to compile with neither
+`onig` nor `fancy-regex` enabled) and `local-only` (the crate's own feature for
+refusing remote downloads, so a missing path fails with a purely local error instead
+of silently attempting one) instead of accepting the defaults.
 
 Add to the workspace `[workspace.dependencies]` in the root `Cargo.toml`:
 
