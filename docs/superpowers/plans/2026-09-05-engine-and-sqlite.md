@@ -775,6 +775,20 @@ mod tests {
     }
 
     #[test]
+    fn deserialization_cannot_bypass_the_range_invariant() {
+        // `Ord` and `Eq` on this type are sound only because no `Score` can
+        // hold NaN or a value outside [0,1]. Deserialization is the one path
+        // that does not go through a constructor, so it is validated too.
+        assert_eq!(serde_json::from_str::<Score>("0.5").unwrap().get(), 0.5);
+        assert!(serde_json::from_str::<Score>("2.5").is_err());
+        assert!(serde_json::from_str::<Score>("-0.1").is_err());
+        // Round-trip of a valid score is unaffected.
+        let s = Score::clamped(0.25);
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<Score>(&json).unwrap(), s);
+    }
+
+    #[test]
     fn features_macro_builds_a_map() {
         let f = features! { "redundancy" => 0.93, "neighbours" => 4.0 };
         assert_eq!(f.get("redundancy"), Some(&0.93));
@@ -811,9 +825,24 @@ macro_rules! features {
 }
 
 /// A value in `[0.0, 1.0]`. Never a bare `f32` anywhere in the API.
+///
+/// `Deserialize` goes through `TryFrom<f32>`, not a transparent passthrough.
+/// A derived transparent `Deserialize` would delegate to `f32`'s own impl and
+/// bypass both constructors, so a stored `2.5` or a NaN from a binary format
+/// would enter the type unchecked — and the hand-written `Ord` below, plus the
+/// `Eq` marker, are sound only while that cannot happen. Invalid stored data
+/// fails loudly rather than being silently corrected.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
+#[serde(try_from = "f32")]
 pub struct Score(f32);
+
+impl TryFrom<f32> for Score {
+    type Error = CoreError;
+    fn try_from(value: f32) -> Result<Self, Self::Error> {
+        Score::new(value)
+    }
+}
 
 impl Score {
     pub const ZERO: Score = Score(0.0);
