@@ -66,12 +66,15 @@ pub struct SensitivityAssessment {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RedundancyAssessment {
     pub score: Score,
-    /// Descending by similarity.
-    pub near_duplicates: Vec<(ItemId, f32)>,
+    /// Descending by similarity. `Score` rather than a raw `f32`: cosine spans
+    /// [-1, 1], but this list is filtered at `near_duplicate_floor` before it
+    /// is built, so a negative similarity — meaning "definitely not a
+    /// duplicate" — never belongs here.
+    pub near_duplicates: Vec<(ItemId, Score)>,
 }
 
 impl RedundancyAssessment {
-    pub fn best(&self) -> Option<(&ItemId, f32)> {
+    pub fn best(&self) -> Option<(&ItemId, Score)> {
         self.near_duplicates.first().map(|(id, s)| (id, *s))
     }
 }
@@ -159,5 +162,83 @@ mod tests {
         };
         assert_eq!(a.features.get("neighbour_count"), Some(&3.0));
         assert_eq!(a.assessor.to_string(), "baseline@0.1.0");
+    }
+
+    #[test]
+    fn ordinal_order_agrees_with_derived_ord() {
+        // Two independent representations of the same ordering: `Ord` from
+        // declaration order, `ordinal()` from a hand-written match. SQL filters
+        // use the ordinal; `raised_by` uses `Ord`. They must never drift.
+        for a in SensitivityLevel::ALL {
+            for b in SensitivityLevel::ALL {
+                assert_eq!(
+                    a.cmp(&b),
+                    a.ordinal().cmp(&b.ordinal()),
+                    "Ord and ordinal() disagree for {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raised_by_never_lowers_for_any_pair() {
+        for base in SensitivityLevel::ALL {
+            for hint in SensitivityLevel::ALL {
+                let out = base.raised_by(Some(hint));
+                assert!(out >= base, "{base:?} + hint {hint:?} lowered to {out:?}");
+                assert_eq!(out, base.max(hint));
+            }
+            assert_eq!(base.raised_by(Some(base)), base);
+            assert_eq!(base.raised_by(None), base);
+        }
+    }
+
+    #[test]
+    fn from_ordinal_rejects_hostile_database_values_without_panicking() {
+        for bad in [-1i64, i64::MIN, 5, 99, i64::MAX] {
+            assert_eq!(SensitivityLevel::from_ordinal(bad), None, "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn serde_forms_are_a_stored_wire_format() {
+        // Audit rows store these as JSON strings and query them as strings.
+        // Renaming a variant is a data-compatibility break, not a refactor.
+        assert_eq!(
+            serde_json::to_string(&SensitivityLevel::Public).unwrap(),
+            "\"public\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SensitivityLevel::Restricted).unwrap(),
+            "\"restricted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SensitivityCategory::Pii).unwrap(),
+            "\"pii\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SensitivityCategory::Credential).unwrap(),
+            "\"credential\""
+        );
+        let back: SensitivityLevel = serde_json::from_str("\"sensitive\"").unwrap();
+        assert_eq!(back, SensitivityLevel::Sensitive);
+    }
+
+    #[test]
+    fn best_returns_the_head_of_the_descending_list() {
+        let (a, b) = (ItemId::new(), ItemId::new());
+        let r = RedundancyAssessment {
+            score: Score::clamped(0.9),
+            near_duplicates: vec![(a.clone(), Score::clamped(0.9)), (b, Score::clamped(0.4))],
+        };
+        let (id, sim) = r.best().unwrap();
+        assert_eq!(*id, a);
+        assert_eq!(sim.get(), 0.9);
+
+        let empty = RedundancyAssessment {
+            score: Score::ZERO,
+            near_duplicates: vec![],
+        };
+        assert!(empty.best().is_none());
     }
 }
