@@ -4470,3 +4470,974 @@ git commit -m "feat(backend): conformance tests for audit, purge, and portabilit
 ```
 
 ---
+
+## Task 19: SQLite — schema and `TenantManager`
+
+**Files:**
+- Create: `crates/memorysafe-backend-sqlite/Cargo.toml`
+- Create: `crates/memorysafe-backend-sqlite/src/lib.rs`
+- Create: `crates/memorysafe-backend-sqlite/src/schema.rs`
+- Create: `crates/memorysafe-backend-sqlite/src/tenant.rs`
+- Modify: `Cargo.toml` (workspace dependencies)
+
+**Interfaces:**
+- Consumes: `TenantId`, `BackendError`.
+- Produces: `SqliteBackend::open(root: PathBuf) -> SqliteBackend`, `SqliteBackend::with_max_open(root, n)`, `TenantManager::with_conn<T>(tenant, f)`, `TenantManager::with_write<T>(tenant, f)`, `schema::SCHEMA_VERSION`, `schema::initialise(&Connection)`.
+
+**Design:** one database file per tenant, named `<tenant>.db` under the root. `TenantId` validation from Task 2 already forbids `/`, `..`, and control characters, so the name is safe as a path component. Reads run concurrently under WAL; writes for a given tenant are serialized through a per-tenant `tokio::sync::Mutex`, which is what makes the capacity accounting correct.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `crates/memorysafe-backend-sqlite/src/tenant.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memorysafe_core::TenantId;
+
+    #[tokio::test]
+    async fn each_tenant_gets_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = TenantManager::new(dir.path().to_path_buf(), 8);
+
+        let a = TenantId::new("tenant-a").unwrap();
+        let b = TenantId::new("tenant-b").unwrap();
+        mgr.with_conn(&a, |c| { c.execute_batch("CREATE TABLE probe(x)")?; Ok(()) }).await.unwrap();
+        mgr.with_conn(&b, |c| { c.execute_batch("CREATE TABLE probe(x)")?; Ok(()) }).await.unwrap();
+
+        assert!(dir.path().join("tenant-a.db").exists());
+        assert!(dir.path().join("tenant-b.db").exists());
+    }
+
+    #[tokio::test]
+    async fn the_schema_is_installed_on_first_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = TenantManager::new(dir.path().to_path_buf(), 8);
+        let t = TenantId::new("t").unwrap();
+
+        let version: i64 = mgr
+            .with_conn(&t, |c| {
+                Ok(c.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .parse()
+                .unwrap())
+            })
+            .await
+            .unwrap();
+        assert_eq!(version, crate::schema::SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn reopening_a_tenant_does_not_wipe_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = TenantId::new("t").unwrap();
+        {
+            let mgr = TenantManager::new(dir.path().to_path_buf(), 8);
+            mgr.with_conn(&t, |c| {
+                c.execute("INSERT INTO meta(key,value) VALUES('probe','kept')", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        let mgr = TenantManager::new(dir.path().to_path_buf(), 8);
+        let value: String = mgr
+            .with_conn(&t, |c| {
+                Ok(c.query_row("SELECT value FROM meta WHERE key='probe'", [], |r| r.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, "kept");
+    }
+
+    #[tokio::test]
+    async fn the_pool_evicts_but_stays_correct_beyond_its_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = TenantManager::new(dir.path().to_path_buf(), 2);
+
+        for i in 0..6 {
+            let t = TenantId::new(&format!("tenant-{i}")).unwrap();
+            mgr.with_conn(&t, |c| {
+                c.execute("INSERT INTO meta(key,value) VALUES('probe','v')", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        // The first tenant was evicted from the pool; its data must survive.
+        let t0 = TenantId::new("tenant-0").unwrap();
+        let value: String = mgr
+            .with_conn(&t0, |c| {
+                Ok(c.query_row("SELECT value FROM meta WHERE key='probe'", [], |r| r.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, "v");
+    }
+
+    #[tokio::test]
+    async fn writes_to_one_tenant_are_serialized() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(TenantManager::new(dir.path().to_path_buf(), 8));
+        let t = TenantId::new("t").unwrap();
+
+        mgr.with_write(&t, |c| {
+            c.execute_batch("CREATE TABLE counter(n INTEGER NOT NULL)")?;
+            c.execute("INSERT INTO counter(n) VALUES(0)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..25 {
+            let m = Arc::clone(&mgr);
+            let t = t.clone();
+            handles.push(tokio::spawn(async move {
+                // Read-modify-write: only correct if writes are serialized.
+                m.with_write(&t, |c| {
+                    let n: i64 = c.query_row("SELECT n FROM counter", [], |r| r.get(0))?;
+                    c.execute("UPDATE counter SET n = ?1", [n + 1])?;
+                    Ok(())
+                })
+                .await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        let n: i64 = mgr
+            .with_conn(&t, |c| Ok(c.query_row("SELECT n FROM counter", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(n, 25, "writes were not serialized");
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend-sqlite`
+Expected: FAIL — no such package `memorysafe-backend-sqlite`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-backend-sqlite/Cargo.toml`:
+
+```toml
+[package]
+name = "memorysafe-backend-sqlite"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memorysafe-core.workspace = true
+memorysafe-embed.workspace = true
+memorysafe-backend.workspace = true
+rusqlite = { version = "0.40.2", features = ["bundled", "time"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+async-trait = "0.1.92"
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+base64.workspace = true
+lru = "0.16"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true
+```
+
+Add to workspace `[workspace.dependencies]`:
+
+```toml
+memorysafe-backend-sqlite = { path = "crates/memorysafe-backend-sqlite" }
+```
+
+`crates/memorysafe-backend-sqlite/src/schema.rs`:
+
+```rust
+use rusqlite::Connection;
+
+pub const SCHEMA_VERSION: i64 = 1;
+
+const DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS items (
+  id                TEXT PRIMARY KEY,
+  subject           TEXT NOT NULL,
+  namespace         TEXT NOT NULL,
+  body              TEXT NOT NULL,
+  kind              TEXT NOT NULL,
+  source_kind       TEXT NOT NULL,
+  source_id         TEXT,
+  occurred_at       INTEGER,
+  created_at        INTEGER NOT NULL,
+  tags              TEXT NOT NULL,
+  attrs             TEXT NOT NULL,
+  sensitivity       INTEGER NOT NULL,
+  ttl_seconds       INTEGER,
+  protection        TEXT NOT NULL,
+  protected_until   INTEGER,
+  value_score       REAL NOT NULL DEFAULT 0.0,
+  fragility_score   REAL NOT NULL DEFAULT 0.0,
+  byte_size         INTEGER NOT NULL,
+  last_access       INTEGER,
+  access_count      INTEGER NOT NULL DEFAULT 0,
+  pending_embedding INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_items_scope      ON items(subject, namespace);
+CREATE INDEX IF NOT EXISTS idx_items_scope_sens ON items(subject, namespace, sensitivity);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+  body, tags, content='items', content_rowid='rowid', tokenize='unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
+  INSERT INTO items_fts(rowid, body, tags) VALUES (new.rowid, new.body, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, body, tags)
+    VALUES('delete', old.rowid, old.body, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE ON items BEGIN
+  INSERT INTO items_fts(items_fts, rowid, body, tags)
+    VALUES('delete', old.rowid, old.body, old.tags);
+  INSERT INTO items_fts(rowid, body, tags) VALUES (new.rowid, new.body, new.tags);
+END;
+
+CREATE TABLE IF NOT EXISTS vectors (
+  item_id   TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+  subject   TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  embedder  TEXT NOT NULL,
+  dim       INTEGER NOT NULL,
+  scale     REAL NOT NULL,
+  q         BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vectors_scope ON vectors(subject, namespace, embedder, dim);
+
+CREATE TABLE IF NOT EXISTS capacity (
+  subject    TEXT NOT NULL,
+  namespace  TEXT NOT NULL,
+  max_items  INTEGER,
+  max_bytes  INTEGER,
+  used_items INTEGER NOT NULL DEFAULT 0,
+  used_bytes INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (subject, namespace)
+);
+
+CREATE TABLE IF NOT EXISTS audit (
+  id         TEXT PRIMARY KEY,
+  at         INTEGER NOT NULL,
+  subject    TEXT NOT NULL,
+  namespace  TEXT NOT NULL,
+  event      TEXT NOT NULL,
+  items      TEXT NOT NULL,
+  assessment TEXT,
+  decision   TEXT,
+  actor      TEXT NOT NULL,
+  policy     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_scope_at ON audit(subject, namespace, at DESC);
+
+CREATE TABLE IF NOT EXISTS idempotency (
+  key            TEXT PRIMARY KEY,
+  subject        TEXT NOT NULL,
+  namespace      TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  outcome        TEXT NOT NULL,
+  at             INTEGER NOT NULL
+);
+"#;
+
+/// Applies pragmas and DDL. Idempotent — safe on every open.
+pub fn initialise(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.execute_batch(DDL)?;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [SCHEMA_VERSION.to_string()],
+    )?;
+    Ok(())
+}
+```
+
+`crates/memorysafe-backend-sqlite/src/tenant.rs`:
+
+```rust
+use crate::schema;
+use memorysafe_backend::BackendError;
+use memorysafe_core::TenantId;
+use rusqlite::Connection;
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Mutex as AsyncMutex;
+
+pub fn storage_error(e: impl std::fmt::Display, retryable: bool) -> BackendError {
+    BackendError::Storage { message: e.to_string(), retryable }
+}
+
+fn to_backend(e: rusqlite::Error) -> BackendError {
+    let retryable = matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy) | Some(rusqlite::ErrorCode::DatabaseLocked)
+    );
+    storage_error(e, retryable)
+}
+
+type Handle = Arc<StdMutex<Connection>>;
+
+/// Owns one SQLite file per tenant. Connections are pooled with an LRU so a
+/// large tenant count does not mean an equally large open-file count; write
+/// locks are held per tenant so capacity accounting cannot drift.
+pub struct TenantManager {
+    root: PathBuf,
+    pool: StdMutex<lru::LruCache<String, Handle>>,
+    write_locks: StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+}
+
+impl TenantManager {
+    pub fn new(root: PathBuf, max_open: usize) -> Self {
+        std::fs::create_dir_all(&root).expect("tenant root must be creatable");
+        let cap = NonZeroUsize::new(max_open.max(1)).expect("max_open >= 1");
+        Self {
+            root,
+            pool: StdMutex::new(lru::LruCache::new(cap)),
+            write_locks: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn handle(&self, tenant: &TenantId) -> Result<Handle, BackendError> {
+        let key = tenant.as_str().to_string();
+        {
+            let mut pool = self.pool.lock().expect("pool mutex");
+            if let Some(h) = pool.get(&key) {
+                return Ok(Arc::clone(h));
+            }
+        }
+        // `TenantId` validation forbids `/`, `..`, and control characters, so
+        // this is a safe path component by construction.
+        let path = self.root.join(format!("{key}.db"));
+        let conn = Connection::open(&path).map_err(to_backend)?;
+        schema::initialise(&conn).map_err(to_backend)?;
+        let handle: Handle = Arc::new(StdMutex::new(conn));
+        let mut pool = self.pool.lock().expect("pool mutex");
+        pool.put(key, Arc::clone(&handle));
+        Ok(handle)
+    }
+
+    fn write_lock(&self, tenant: &TenantId) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.write_locks.lock().expect("write-lock map mutex");
+        Arc::clone(
+            locks
+                .entry(tenant.as_str().to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+
+    /// Runs `f` on the tenant's connection off the async runtime. Concurrent
+    /// readers are fine under WAL.
+    pub async fn with_conn<T, F>(&self, tenant: &TenantId, f: F) -> Result<T, BackendError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, BackendError> + Send + 'static,
+    {
+        let handle = self.handle(tenant)?;
+        tokio::task::spawn_blocking(move || {
+            let mut conn = handle.lock().expect("connection mutex");
+            f(&mut conn)
+        })
+        .await
+        .map_err(|e| storage_error(e, false))?
+    }
+
+    /// Same, but holds the tenant's write lock for the whole closure. Every
+    /// mutating path must go through this.
+    pub async fn with_write<T, F>(&self, tenant: &TenantId, f: F) -> Result<T, BackendError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, BackendError> + Send + 'static,
+    {
+        let lock = self.write_lock(tenant);
+        let _guard = lock.lock().await;
+        self.with_conn(tenant, f).await
+    }
+}
+```
+
+`crates/memorysafe-backend-sqlite/src/lib.rs`:
+
+```rust
+//! SQLite backend: one database file per tenant.
+//!
+//! Isolation is structural rather than a query-layer invariant — backup is
+//! `cp`, tenant deletion is `rm`, and per-tenant encryption is a key per file.
+
+pub mod schema;
+pub mod tenant;
+
+use std::path::PathBuf;
+use tenant::TenantManager;
+
+pub struct SqliteBackend {
+    pub(crate) tenants: TenantManager,
+}
+
+impl SqliteBackend {
+    pub fn open(root: PathBuf) -> Self {
+        Self::with_max_open(root, 64)
+    }
+
+    pub fn with_max_open(root: PathBuf, max_open: usize) -> Self {
+        Self { tenants: TenantManager::new(root, max_open) }
+    }
+}
+```
+
+Note: `rusqlite::Error` must be convertible into `BackendError` for the `?` operator inside closures. Add to `tenant.rs`:
+
+```rust
+impl From<rusqlite::Error> for BackendErrorShim {
+    fn from(e: rusqlite::Error) -> Self {
+        BackendErrorShim(to_backend(e))
+    }
+}
+```
+
+Simpler and preferred: give the closures the return type `Result<T, BackendError>` and add this blanket conversion in `memorysafe-backend/src/lib.rs` instead — but `memorysafe-backend` must not depend on `rusqlite`. So define the conversion locally in the SQLite crate:
+
+```rust
+// crates/memorysafe-backend-sqlite/src/tenant.rs
+pub trait SqlResultExt<T> {
+    fn sql(self) -> Result<T, BackendError>;
+}
+
+impl<T> SqlResultExt<T> for rusqlite::Result<T> {
+    fn sql(self) -> Result<T, BackendError> {
+        self.map_err(to_backend)
+    }
+}
+```
+
+Every SQL call in Tasks 20–24 ends in `.sql()?` rather than a bare `?`. Update the test closures above accordingly (`c.execute(...).sql()?`).
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend-sqlite tenant`
+Expected: PASS — 5 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Cargo.toml crates/memorysafe-backend-sqlite/
+git commit -m "feat(sqlite): per-tenant database files, schema, and pooled connections"
+```
+
+---
+
+## Task 20: SQLite — items and audit
+
+**Files:**
+- Create: `crates/memorysafe-backend-sqlite/src/items.rs`
+- Create: `crates/memorysafe-backend-sqlite/src/audit.rs`
+- Create: `crates/memorysafe-backend-sqlite/tests/conformance.rs`
+- Modify: `crates/memorysafe-backend-sqlite/src/lib.rs`
+
+**Interfaces:**
+- Consumes: `TenantManager`, `SqlResultExt`, all core types.
+- Produces: `items::insert(&Connection, &MemoryItem)`, `items::get`, `items::list`, `items::delete`, `items::row_to_item`, `audit::insert`, `audit::query`, and a partial `Backend` impl covering `get`, `list`, `audit`, `record_recall`, plus a first `apply` that handles insert + eviction + audit.
+
+**Milestone:** the isolation and atomicity conformance tests execute for the first time.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-backend-sqlite/tests/conformance.rs`:
+
+```rust
+use memorysafe_backend::conformance::{BackendFactory, isolation};
+use memorysafe_backend_sqlite::SqliteBackend;
+use std::future::Future;
+
+/// Each test gets a backend rooted in its own `TempDir`. The directory is
+/// leaked deliberately: it must outlive the backend, and the OS reclaims it.
+struct SqliteFactory;
+
+impl BackendFactory for SqliteFactory {
+    type B = SqliteBackend;
+    fn create(&self) -> impl Future<Output = Self::B> + Send {
+        async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.keep();
+            SqliteBackend::open(path)
+        }
+    }
+}
+
+#[tokio::test]
+async fn tenants_are_isolated() {
+    isolation::tenants_are_isolated(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn subjects_are_isolated() {
+    isolation::subjects_are_isolated(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn namespaces_are_separated() {
+    isolation::namespaces_are_separated(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn audit_is_scoped() {
+    isolation::audit_is_scoped(&SqliteFactory).await;
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-backend-sqlite --test conformance`
+Expected: FAIL — `SqliteBackend: Backend is not satisfied`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-backend-sqlite/src/items.rs`:
+
+```rust
+use crate::tenant::SqlResultExt;
+use memorysafe_backend::{BackendError, Page};
+use memorysafe_core::{
+    ItemId, MemoryItem, Protection, Scope, SensitivityLevel, Source, SourceKind,
+};
+use rusqlite::{Connection, Row, params};
+use time::{Duration, OffsetDateTime};
+
+fn source_kind_str(k: SourceKind) -> &'static str {
+    match k {
+        SourceKind::Agent => "agent",
+        SourceKind::Session => "session",
+        SourceKind::Tool => "tool",
+        SourceKind::Human => "human",
+    }
+}
+
+fn source_kind_from(s: &str) -> SourceKind {
+    match s {
+        "session" => SourceKind::Session,
+        "tool" => SourceKind::Tool,
+        "human" => SourceKind::Human,
+        _ => SourceKind::Agent,
+    }
+}
+
+fn protection_parts(p: Protection) -> (&'static str, Option<i64>) {
+    match p {
+        Protection::Normal => ("normal", None),
+        Protection::Pinned => ("pinned", None),
+        Protection::Protected { until } => ("protected", Some(until.unix_timestamp())),
+    }
+}
+
+fn protection_from(kind: &str, until: Option<i64>) -> Protection {
+    match kind {
+        "pinned" => Protection::Pinned,
+        "protected" => match until.and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok()) {
+            Some(until) => Protection::Protected { until },
+            None => Protection::Normal,
+        },
+        _ => Protection::Normal,
+    }
+}
+
+pub const ITEM_COLUMNS: &str = "id, subject, namespace, body, kind, source_kind, source_id, \
+     occurred_at, created_at, tags, attrs, sensitivity, ttl_seconds, protection, \
+     protected_until, byte_size, pending_embedding";
+
+pub fn row_to_item(row: &Row<'_>, tenant: &str) -> rusqlite::Result<MemoryItem> {
+    let tags_json: String = row.get("tags")?;
+    let attrs_json: String = row.get("attrs")?;
+    let subject: String = row.get("subject")?;
+    let namespace: String = row.get("namespace")?;
+    let sensitivity: i64 = row.get("sensitivity")?;
+    let ttl: Option<i64> = row.get("ttl_seconds")?;
+    let protection: String = row.get("protection")?;
+    let protected_until: Option<i64> = row.get("protected_until")?;
+    let occurred: Option<i64> = row.get("occurred_at")?;
+    let created: i64 = row.get("created_at")?;
+    let pending: i64 = row.get("pending_embedding")?;
+
+    Ok(MemoryItem {
+        id: ItemId::parse(&row.get::<_, String>("id")?).expect("stored ids are valid ULIDs"),
+        scope: Scope::new(tenant, &subject, &namespace).expect("stored scopes are valid"),
+        body: row.get("body")?,
+        kind: row.get("kind")?,
+        source: Source {
+            kind: source_kind_from(&row.get::<_, String>("source_kind")?),
+            id: row.get("source_id")?,
+        },
+        occurred_at: occurred.and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok()),
+        created_at: OffsetDateTime::from_unix_timestamp(created)
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+        attrs: serde_json::from_str(&attrs_json).unwrap_or_default(),
+        sensitivity: SensitivityLevel::from_ordinal(sensitivity)
+            .unwrap_or(SensitivityLevel::Restricted),
+        ttl: ttl.map(Duration::seconds),
+        protection: protection_from(&protection, protected_until),
+        pending_embedding: pending != 0,
+    })
+}
+
+pub fn insert(conn: &Connection, item: &MemoryItem) -> Result<(), BackendError> {
+    let (protection, protected_until) = protection_parts(item.protection);
+    conn.execute(
+        "INSERT INTO items (id, subject, namespace, body, kind, source_kind, source_id,
+             occurred_at, created_at, tags, attrs, sensitivity, ttl_seconds, protection,
+             protected_until, byte_size, pending_embedding)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+        params![
+            item.id.as_str(),
+            item.scope.subject.as_str(),
+            item.scope.namespace.as_str(),
+            item.body,
+            item.kind,
+            source_kind_str(item.source.kind),
+            item.source.id,
+            item.occurred_at.map(|t| t.unix_timestamp()),
+            item.created_at.unix_timestamp(),
+            serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&item.attrs).unwrap_or_else(|_| "{}".into()),
+            item.sensitivity.ordinal(),
+            item.ttl.map(|d| d.whole_seconds()),
+            protection,
+            protected_until,
+            item.byte_size() as i64,
+            i64::from(item.pending_embedding),
+        ],
+    )
+    .sql()?;
+    Ok(())
+}
+
+pub fn get(conn: &Connection, scope: &Scope, id: &ItemId)
+    -> Result<Option<MemoryItem>, BackendError>
+{
+    let sql = format!(
+        "SELECT {ITEM_COLUMNS} FROM items
+         WHERE id = ?1 AND subject = ?2 AND namespace = ?3"
+    );
+    let mut stmt = conn.prepare(&sql).sql()?;
+    let tenant = scope.tenant.as_str().to_string();
+    let mut rows = stmt
+        .query_map(
+            params![id.as_str(), scope.subject.as_str(), scope.namespace.as_str()],
+            move |r| row_to_item(r, &tenant),
+        )
+        .sql()?;
+    match rows.next() {
+        Some(r) => Ok(Some(r.sql()?)),
+        None => Ok(None),
+    }
+}
+
+pub fn list(conn: &Connection, scope: &Scope, page: &Page)
+    -> Result<Vec<MemoryItem>, BackendError>
+{
+    // Ordered by id: ULIDs are lexicographically time-ordered, which makes
+    // pagination stable under concurrent inserts.
+    let sql = format!(
+        "SELECT {ITEM_COLUMNS} FROM items
+         WHERE subject = ?1 AND namespace = ?2
+         ORDER BY id ASC LIMIT ?3 OFFSET ?4"
+    );
+    let mut stmt = conn.prepare(&sql).sql()?;
+    let tenant = scope.tenant.as_str().to_string();
+    let rows = stmt
+        .query_map(
+            params![
+                scope.subject.as_str(),
+                scope.namespace.as_str(),
+                page.effective_limit() as i64,
+                page.offset as i64,
+            ],
+            move |r| row_to_item(r, &tenant),
+        )
+        .sql()?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().sql()
+}
+
+/// Returns the byte size of what was removed, for capacity accounting.
+pub fn delete(conn: &Connection, scope: &Scope, id: &ItemId) -> Result<u64, BackendError> {
+    let size: Option<i64> = conn
+        .query_row(
+            "SELECT byte_size FROM items WHERE id=?1 AND subject=?2 AND namespace=?3",
+            params![id.as_str(), scope.subject.as_str(), scope.namespace.as_str()],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(size) = size else { return Ok(0) };
+    conn.execute(
+        "DELETE FROM items WHERE id=?1 AND subject=?2 AND namespace=?3",
+        params![id.as_str(), scope.subject.as_str(), scope.namespace.as_str()],
+    )
+    .sql()?;
+    Ok(size as u64)
+}
+
+pub fn exists(conn: &Connection, scope: &Scope, id: &ItemId) -> Result<bool, BackendError> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM items WHERE id=?1 AND subject=?2 AND namespace=?3",
+            params![id.as_str(), scope.subject.as_str(), scope.namespace.as_str()],
+            |r| r.get(0),
+        )
+        .sql()?;
+    Ok(n > 0)
+}
+```
+
+`crates/memorysafe-backend-sqlite/src/audit.rs`:
+
+```rust
+use crate::tenant::SqlResultExt;
+use memorysafe_backend::BackendError;
+use memorysafe_core::{AuditFilter, AuditId, AuditRecord, Scope};
+use rusqlite::{Connection, params};
+
+pub fn insert(conn: &Connection, record: &AuditRecord) -> Result<AuditId, BackendError> {
+    let policy = record.decision.as_ref().map(|d| d.policy.to_string());
+    conn.execute(
+        "INSERT INTO audit (id, at, subject, namespace, event, items, assessment, decision,
+             actor, policy)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            record.id.as_str(),
+            record.at.unix_timestamp(),
+            record.scope.subject.as_str(),
+            record.scope.namespace.as_str(),
+            serde_json::to_string(&record.event).unwrap_or_default().trim_matches('"'),
+            serde_json::to_string(&record.items).unwrap_or_else(|_| "[]".into()),
+            record.assessment.as_ref().map(|a| serde_json::to_string(a).unwrap_or_default()),
+            record.decision.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+            serde_json::to_string(&record.actor).unwrap_or_default(),
+            policy,
+        ],
+    )
+    .sql()?;
+    Ok(record.id.clone())
+}
+
+pub fn query(conn: &Connection, scope: &Scope, filter: &AuditFilter)
+    -> Result<Vec<AuditRecord>, BackendError>
+{
+    let mut sql = String::from(
+        "SELECT id, at, subject, namespace, event, items, assessment, decision, actor
+         FROM audit WHERE subject = ?1 AND namespace = ?2",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(scope.subject.as_str().to_string()),
+        Box::new(scope.namespace.as_str().to_string()),
+    ];
+
+    if !filter.events.is_empty() {
+        let names: Vec<String> = filter
+            .events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap_or_default().trim_matches('"').to_string())
+            .collect();
+        let placeholders =
+            (0..names.len()).map(|i| format!("?{}", args.len() + i + 1)).collect::<Vec<_>>();
+        sql.push_str(&format!(" AND event IN ({})", placeholders.join(",")));
+        for n in names {
+            args.push(Box::new(n));
+        }
+    }
+    if let Some(since) = filter.since {
+        args.push(Box::new(since.unix_timestamp()));
+        sql.push_str(&format!(" AND at >= ?{}", args.len()));
+    }
+    if let Some(until) = filter.until {
+        args.push(Box::new(until.unix_timestamp()));
+        sql.push_str(&format!(" AND at <= ?{}", args.len()));
+    }
+    // Newest first; id breaks ties so ordering is total even at one-second
+    // resolution.
+    args.push(Box::new(filter.limit as i64));
+    sql.push_str(&format!(" ORDER BY at DESC, id DESC LIMIT ?{}", args.len()));
+
+    let tenant = scope.tenant.as_str().to_string();
+    let mut stmt = conn.prepare(&sql).sql()?;
+    let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(refs.as_slice(), move |r| {
+            let subject: String = r.get("subject")?;
+            let namespace: String = r.get("namespace")?;
+            let event_str: String = r.get("event")?;
+            let items_json: String = r.get("items")?;
+            let assessment: Option<String> = r.get("assessment")?;
+            let decision: Option<String> = r.get("decision")?;
+            let actor_json: String = r.get("actor")?;
+            let at: i64 = r.get("at")?;
+            Ok(AuditRecord {
+                id: AuditId::parse(&r.get::<_, String>("id")?).expect("stored audit ids"),
+                at: time::OffsetDateTime::from_unix_timestamp(at)
+                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
+                scope: Scope::new(&tenant, &subject, &namespace).expect("stored scope"),
+                event: serde_json::from_str(&format!("\"{event_str}\"")).expect("stored event"),
+                items: serde_json::from_str(&items_json).unwrap_or_default(),
+                assessment: assessment.and_then(|s| serde_json::from_str(&s).ok()),
+                decision: decision.and_then(|s| serde_json::from_str(&s).ok()),
+                actor: serde_json::from_str(&actor_json).expect("stored actor"),
+            })
+        })
+        .sql()?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().sql()
+}
+```
+
+Add a first `Backend` impl in `crates/memorysafe-backend-sqlite/src/lib.rs`. `apply` at this stage handles insert, evictions, and audit inside one transaction; vectors, merge, capacity, and idempotency arrive in Tasks 21–23. Every other method returns `Ok` defaults so the crate compiles and the isolation tests can run:
+
+```rust
+pub mod audit;
+pub mod items;
+
+use async_trait::async_trait;
+use memorysafe_backend::{
+    AppliedWrite, Backend, BackendError, CandidateQuery, ExportStream, ImportReport,
+    ImportStream, Page, PurgeReport, ScopeSelector, WriteTransaction,
+};
+use memorysafe_core::{
+    AuditFilter, AuditId, AuditRecord, Budget, CapacityState, Embedding, ItemId, MemoryItem,
+    Scope, ScopeStats, ScoredCandidate, SubjectId, TenantId,
+};
+
+#[async_trait]
+impl Backend for SqliteBackend {
+    async fn get(&self, scope: &Scope, id: &ItemId)
+        -> Result<Option<MemoryItem>, BackendError>
+    {
+        let (scope, id) = (scope.clone(), id.clone());
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| items::get(c, &scope, &id))
+            .await
+    }
+
+    async fn list(&self, scope: &Scope, page: &Page)
+        -> Result<Vec<MemoryItem>, BackendError>
+    {
+        let (scope, page) = (scope.clone(), *page);
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| items::list(c, &scope, &page))
+            .await
+    }
+
+    async fn audit(&self, scope: &Scope, filter: &AuditFilter)
+        -> Result<Vec<AuditRecord>, BackendError>
+    {
+        let (scope, filter) = (scope.clone(), filter.clone());
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| audit::query(c, &scope, &filter))
+            .await
+    }
+
+    async fn record_recall(&self, record: AuditRecord) -> Result<AuditId, BackendError> {
+        let tenant = record.scope.tenant.clone();
+        self.tenants.with_write(&tenant, move |c| audit::insert(c, &record)).await
+    }
+
+    async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError> {
+        if !txn.is_valid() {
+            return Err(BackendError::InvalidTransaction(
+                "a transaction may not both insert and merge".into(),
+            ));
+        }
+        let tenant = txn.scope.tenant.clone();
+        self.tenants
+            .with_write(&tenant, move |conn| {
+                let tx = conn.transaction().map_err(|e| tenant::storage_error(e, false))?;
+
+                let mut evicted = Vec::new();
+                for id in &txn.evictions {
+                    items::delete(&tx, &txn.scope, id)?;
+                    evicted.push(id.clone());
+                }
+
+                let mut item_id = None;
+                if let Some(w) = &txn.upsert
+                    && let Some(item) = &w.item
+                {
+                    items::insert(&tx, item)?;
+                    item_id = Some(item.id.clone());
+                }
+
+                let audit_id = audit::insert(&tx, &txn.audit)?;
+                tx.commit().map_err(|e| tenant::storage_error(e, false))?;
+
+                Ok(AppliedWrite {
+                    item_id,
+                    audit_id,
+                    evicted,
+                    replayed: false,
+                    replayed_outcome: None,
+                })
+            })
+            .await
+    }
+
+    // Implemented in Tasks 21-24.
+    async fn retrieve_candidates(&self, _s: &Scope, _q: &CandidateQuery)
+        -> Result<Vec<ScoredCandidate>, BackendError> { Ok(vec![]) }
+    async fn neighbours(&self, _s: &Scope, _e: &Embedding, _k: usize)
+        -> Result<Vec<ScoredCandidate>, BackendError> { Ok(vec![]) }
+    async fn capacity_state(&self, _s: &Scope) -> Result<CapacityState, BackendError> {
+        Ok(CapacityState { budget: Budget::UNBOUNDED, used_items: 0, used_bytes: 0 })
+    }
+    async fn scope_stats(&self, _s: &Scope) -> Result<ScopeStats, BackendError> {
+        Ok(ScopeStats::default())
+    }
+    async fn set_budget(&self, _s: &Scope, _b: Budget) -> Result<(), BackendError> { Ok(()) }
+    async fn purge_subject(&self, _t: &TenantId, _s: &SubjectId)
+        -> Result<PurgeReport, BackendError> {
+        Ok(PurgeReport {
+            items_removed: 0, vectors_removed: 0,
+            audit_rows_removed: 0, audit_rows_preserved: 0,
+        })
+    }
+    async fn export(&self, _s: &ScopeSelector) -> Result<ExportStream, BackendError> {
+        Ok(vec![])
+    }
+    async fn import(&self, _s: ImportStream) -> Result<ImportReport, BackendError> {
+        Ok(ImportReport::default())
+    }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-backend-sqlite --test conformance`
+Expected: PASS — 4 isolation tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-backend-sqlite/
+git commit -m "feat(sqlite): item and audit persistence; isolation conformance passes"
+```
+
+---
