@@ -77,18 +77,34 @@ impl MemoryItem {
         h.update(b"\x1f");
         for tag in &self.tags {
             h.update(tag.as_bytes());
-            h.update(b",");
+            // Unit separator, not a comma: `["a,b"]` and `["a", "b"]` would
+            // otherwise hash identically, and this digest is an item's identity
+            // in the audit trail.
+            h.update(b"\x1f");
         }
         h.finalize().to_hex().to_string()
     }
 
     /// Charged against `Budget::max_bytes`.
+    ///
+    /// Counts every variable-length field that costs a byte on disk. `subject`
+    /// and `namespace` are per-row columns in the SQLite backend, and
+    /// `source.id` is an unbounded caller-supplied string — omitting either
+    /// would let a caller consume real storage at zero charge and silently
+    /// overrun the namespace budget. `tenant` is deliberately excluded: it is
+    /// the database filename, not a column, so it costs nothing per row.
     pub fn byte_size(&self) -> u64 {
         let attrs = serde_json::to_string(&self.attrs)
             .map(|s| s.len())
             .unwrap_or(0);
         let tags: usize = self.tags.iter().map(|t| t.len()).sum();
-        (self.body.len() + self.kind.len() + attrs + tags + 64) as u64
+        let source_id = self.source.id.as_ref().map(|s| s.len()).unwrap_or(0);
+        let scope = self.scope.subject.as_str().len() + self.scope.namespace.as_str().len();
+        // 64 approximates the fixed-width fields: ULID, two timestamps, ttl,
+        // sensitivity ordinal, protection tag, and the pending flag.
+        const FIXED_OVERHEAD: usize = 64;
+        (self.body.len() + self.kind.len() + attrs + tags + source_id + scope + FIXED_OVERHEAD)
+            as u64
     }
 
     pub fn is_expired(&self, now: OffsetDateTime) -> bool {
@@ -130,6 +146,35 @@ mod tests {
         assert_eq!(item("hello").digest(), item("hello").digest());
         assert_ne!(item("hello").digest(), item("world").digest());
         assert_eq!(item("hello").digest().len(), 64); // blake3 hex
+
+        // kind and tags are hashed too — the doc comment claims it and the
+        // audit trail relies on it to tell two items apart.
+        let mut other_kind = item("hello");
+        other_kind.kind = "preference".into();
+        assert_ne!(
+            item("hello").digest(),
+            other_kind.digest(),
+            "kind is not hashed"
+        );
+
+        let mut tagged = item("hello");
+        tagged.tags = vec!["work".into()];
+        assert_ne!(
+            item("hello").digest(),
+            tagged.digest(),
+            "tags are not hashed"
+        );
+
+        // Tag lists must not collide across different groupings.
+        let mut joined = item("hello");
+        joined.tags = vec!["a,b".into()];
+        let mut split = item("hello");
+        split.tags = vec!["a".into(), "b".into()];
+        assert_ne!(
+            joined.digest(),
+            split.digest(),
+            "tag delimiter is ambiguous"
+        );
     }
 
     #[test]
@@ -138,13 +183,46 @@ mod tests {
         let large = item(&"a".repeat(1000));
         assert!(large.byte_size() > small.byte_size());
         assert!(small.byte_size() > 0);
+
+        // Every variable-length field must move the charge, or a caller can
+        // consume storage for free and overrun the budget.
+        let base = item("a").byte_size();
+
+        let mut tagged = item("a");
+        tagged.tags = vec!["a-fairly-long-tag-value".into()];
+        assert!(tagged.byte_size() > base, "tags are not charged");
+
+        let mut attributed = item("a");
+        attributed
+            .attrs
+            .insert("k".into(), serde_json::json!("a-long-attribute-value"));
+        assert!(attributed.byte_size() > base, "attrs are not charged");
+
+        let mut sourced = item("a");
+        sourced.source.id = Some("a".repeat(500));
+        assert!(sourced.byte_size() > base, "source.id is not charged");
+
+        let mut deep = item("a");
+        deep.scope = Scope::new("t", "a-long-subject-identifier", "a-long-namespace").unwrap();
+        assert!(deep.byte_size() > base, "scope columns are not charged");
+
+        let mut kinded = item("a");
+        kinded.kind = "a-much-longer-kind-name".into();
+        assert!(kinded.byte_size() > base, "kind is not charged");
     }
 
     #[test]
-    fn pinned_items_are_never_evictable() {
-        let now = OffsetDateTime::UNIX_EPOCH;
-        assert!(!Protection::Pinned.is_evictable(now));
-        assert!(Protection::Normal.is_evictable(now));
+    fn pinned_items_are_never_evictable_at_any_instant() {
+        // Pinning is absolute. A single-timestamp test would still pass for a
+        // regression like `Pinned => t.unix_timestamp() < 0`.
+        for ts in [i32::MIN as i64, -1, 0, 1, 1_700_000_000, i32::MAX as i64] {
+            let t = OffsetDateTime::from_unix_timestamp(ts).unwrap();
+            assert!(
+                !Protection::Pinned.is_evictable(t),
+                "pinned became evictable at {ts}"
+            );
+            assert!(Protection::Normal.is_evictable(t));
+        }
     }
 
     #[test]
@@ -154,5 +232,43 @@ mod tests {
         let past = OffsetDateTime::from_unix_timestamp(500).unwrap();
         assert!(!Protection::Protected { until: future }.is_evictable(now));
         assert!(Protection::Protected { until: past }.is_evictable(now));
+
+        // The boundary is inclusive: a window ending exactly now has expired.
+        assert!(Protection::Protected { until: now }.is_evictable(now));
+        let plus_one = OffsetDateTime::from_unix_timestamp(1001).unwrap();
+        assert!(!Protection::Protected { until: plus_one }.is_evictable(now));
+    }
+
+    #[test]
+    fn serde_forms_are_a_stored_wire_format() {
+        // Audit rows and the portable export archive both store these shapes.
+        // Changing a tag key or the timestamp encoding is a data-compatibility
+        // break, not a refactor.
+        assert_eq!(
+            serde_json::to_string(&Protection::Normal).unwrap(),
+            r#"{"kind":"normal"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Protection::Pinned).unwrap(),
+            r#"{"kind":"pinned"}"#
+        );
+        let until = OffsetDateTime::from_unix_timestamp(1000).unwrap();
+        assert_eq!(
+            serde_json::to_string(&Protection::Protected { until }).unwrap(),
+            r#"{"kind":"protected","until":1000}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceKind::Human).unwrap(),
+            r#""human""#
+        );
+        // Timestamps are Unix seconds, not RFC3339.
+        let i = item("wire format");
+        let json = serde_json::to_string(&i).unwrap();
+        assert!(
+            json.contains(r#""created_at":0"#),
+            "timestamp encoding changed: {json}"
+        );
+        let back: MemoryItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, i);
     }
 }
