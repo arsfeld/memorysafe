@@ -3600,7 +3600,8 @@ git commit -m "feat(backend): Backend trait with atomic write transactions and h
 
 ```rust
 use super::{BackendFactory, fx};
-use memorysafe_core::{Page, Scope};
+use crate::Page;
+use memorysafe_core::Scope;
 
 /// Two tenants writing identical content must never see each other's items.
 pub async fn tenants_are_isolated<F: BackendFactory>(factory: &F) {
@@ -3829,7 +3830,8 @@ git commit -m "feat(backend): conformance harness, fixtures, and isolation tests
 ```rust
 use super::{BackendFactory, fx};
 use crate::BackendError;
-use memorysafe_core::{AuditFilter, ItemId, Page, Scope};
+use crate::Page;
+use memorysafe_core::{AuditFilter, ItemId, Scope};
 
 /// The item insert, the evictions, and the audit row must land together.
 pub async fn admit_evict_and_audit_commit_together<F: BackendFactory>(factory: &F) {
@@ -4025,7 +4027,8 @@ git commit -m "feat(backend): conformance tests for atomicity and idempotency"
 ```rust
 use super::{BackendFactory, fx};
 use crate::query::{CandidateQuery, HardFilters};
-use memorysafe_core::{Page, Scope, SensitivityLevel};
+use crate::Page;
+use memorysafe_core::{Scope, SensitivityLevel};
 use memorysafe_embed::Embedder;
 
 fn query(text: &str, filters: HardFilters) -> CandidateQuery {
@@ -4279,7 +4282,8 @@ pub async fn cross_model_vectors_are_rejected<F: BackendFactory>(factory: &F) {
 
 ```rust
 use super::{BackendFactory, fx};
-use memorysafe_core::{Budget, Page, Scope};
+use crate::Page;
+use memorysafe_core::{Budget, Scope};
 
 pub async fn capacity_accounting_tracks_items_and_bytes<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
@@ -4440,7 +4444,8 @@ git commit -m "feat(backend): conformance tests for retrieval, filters, and capa
 ```rust
 use super::{BackendFactory, fx};
 use crate::portability::ScopeSelector;
-use memorysafe_core::{AuditEvent, AuditFilter, Page, Scope, SubjectId, TenantId};
+use crate::Page;
+use memorysafe_core::{AuditEvent, AuditFilter, Scope, SubjectId, TenantId};
 
 pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
@@ -4630,7 +4635,7 @@ and extend `run!`:
         lifecycle::import_is_idempotent,
 ```
 
-The suite now stands at **22 conformance tests**. This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified.
+The suite now stands at **27 conformance tests** (4 isolation + 5 atomicity + 9 retrieval + 4 capacity + 5 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -6674,7 +6679,7 @@ Add `pub mod capacity;` and `use rusqlite::params;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 22 conformance tests minus the 5 lifecycle ones, i.e. 17 conformance tests plus 12 unit tests, all ok.
+Expected: PASS — 27 conformance tests minus the 5 lifecycle ones, i.e. 22 conformance tests plus 12 unit tests, all ok.
 
 - [ ] **Step 5: Commit**
 
@@ -6697,7 +6702,7 @@ git commit -m "feat(sqlite): locked capacity accounting, merge, and idempotent w
 - Consumes: everything in the crate.
 - Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and a single `full_conformance_suite` test.
 
-**Milestone: the complete 22-test conformance suite passes.** From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
+**Milestone: the complete 27-test conformance suite passes.** From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6976,7 +6981,7 @@ Replace the last three placeholders in `lib.rs`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite && cargo clippy -p memorysafe-backend-sqlite --all-targets -- -D warnings`
-Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 22 conformance test names and passes.
+Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 27 conformance test names and passes.
 
 - [ ] **Step 5: Commit**
 
@@ -12158,7 +12163,7 @@ git commit -m "feat(engine): pending-embedding backfill and explicit re-embeddin
 - `cargo test --workspace --all-features` is green.
 - `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 - The CI purity job confirms `memorysafe-core` and `memorysafe-policy` pull in no I/O crates.
-- `SqliteBackend` passes all 22 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
+- `SqliteBackend` passes all 27 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
 - The five invariants pass at 64 proptest cases in release mode.
 - An engine can be constructed and driven end to end from a Rust test with no server, no network, and no model files.
 - No item is left permanently unsearchable: `pending_embedding` has a backfill path, and changing embedder is an explicit audited migration.
