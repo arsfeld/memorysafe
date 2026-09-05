@@ -2701,14 +2701,31 @@ mod tests {
             stats: ScopeStats::default(),
             now: OffsetDateTime::UNIX_EPOCH,
         };
-        let ws = p.compose(&req, &[], &compose_ctx).unwrap();
-        assert!(ws.items.is_empty());
+        // Non-empty input: an empty slice proves only that the method returns
+        // Ok, not that it can read its own parameters.
+        let candidate = ScoredCandidate {
+            item: sample_item(),
+            relevance: 0.75,
+            vector_score: Some(0.75),
+            keyword_score: None,
+            value: Score::clamped(0.6),
+            fragility: Score::clamped(0.2),
+            estimated_tokens: 12,
+        };
+        let ws = p.compose(&req, std::slice::from_ref(&candidate), &compose_ctx).unwrap();
+        assert!(ws.items.is_empty(), "AlwaysAdmit composes nothing by design");
         assert_eq!(compose_ctx.clone(), compose_ctx);
 
         let maintain_ctx = MaintainContext {
             scope: Scope::new("t", "s", "n").unwrap(),
-            batch: vec![],
-            remaining_after_batch: 0,
+            batch: vec![MaintenanceCandidate {
+                item: sample_item(),
+                value: Score::clamped(0.3),
+                fragility: Score::clamped(0.9),
+            }],
+            // Not the last page — a policy that only ever sees `true` here is
+            // never tested on the partial-view case it must handle.
+            is_final_batch: false,
             capacity: CapacityState {
                 budget: Budget::UNBOUNDED,
                 used_items: 0,
@@ -2719,6 +2736,8 @@ mod tests {
         };
         assert!(p.maintain(&maintain_ctx).unwrap().is_empty());
         assert_eq!(maintain_ctx.clone(), maintain_ctx);
+        assert_eq!(maintain_ctx.batch[0].fragility.get(), 0.9);
+        assert!(!maintain_ctx.is_final_batch);
     }
 
     #[test]
@@ -2831,22 +2850,36 @@ pub struct ComposeContext {
     pub now: OffsetDateTime,
 }
 
+/// An item offered to `maintain`, carrying the same `value`/`fragility` signal
+/// `AdmitContext::eviction_candidates` carries — capacity reclaim during
+/// maintenance is the same decision `admit` makes under pressure, and a policy
+/// handed bare `MemoryItem`s could only sort by age.
+///
+/// Deliberately NOT `ScoredCandidate`: that type carries `relevance`,
+/// `vector_score` and `keyword_score`, which are relative to a recall query.
+/// There is no query during maintenance, so the engine could only set them to
+/// zero — and a policy that sorted by `relevance` would silently rank every
+/// item identically. Omitting the fields makes that mistake unrepresentable
+/// rather than merely documented.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaintenanceCandidate {
+    pub item: MemoryItem,
+    pub value: Score,
+    pub fragility: Score,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaintainContext {
     pub scope: Scope,
-    /// One page of the scope's items, carrying the same `value`/`fragility`
-    /// signal `AdmitContext::eviction_candidates` carries — capacity reclaim
-    /// during maintenance is the same decision `admit` makes under pressure,
-    /// and a policy handed bare `MemoryItem`s could only sort by age.
-    ///
-    /// Maintenance is a resumable job; the engine pages through and calls
-    /// `maintain` per batch. `remaining_after_batch` says how much of the scope
-    /// this page does not cover, so a policy can tell a partial view from the
-    /// whole thing before evicting on the strength of it.
-    pub batch: Vec<ScoredCandidate>,
-    /// Items in this scope not included in `batch`. Zero means this is the
-    /// last page and the policy is seeing everything that is left.
-    pub remaining_after_batch: u64,
+    /// One page of the scope's items. Maintenance is a resumable job; the
+    /// engine pages through and calls `maintain` per batch.
+    pub batch: Vec<MaintenanceCandidate>,
+    /// True when this page is the last one. Derived from the same fact the
+    /// engine uses to stop paging (a short page means the end), NOT from
+    /// arithmetic over the capacity count — an item forgotten mid-run would
+    /// make such a count disagree with the paging position, and a policy would
+    /// evict on the strength of a number that had quietly floored to zero.
+    pub is_final_batch: bool,
     pub capacity: CapacityState,
     pub stats: ScopeStats,
     pub now: OffsetDateTime,
@@ -9051,13 +9084,13 @@ pub fn decisions(
     let mut over = after_expiry - max_items;
     // Rank by what it costs to lose the item, matching `admit`'s eviction
     // order, and fall back to age only to break ties.
-    let mut reclaimable: Vec<&ScoredCandidate> = ctx
+    let mut reclaimable: Vec<&MaintenanceCandidate> = ctx
         .batch
         .iter()
         .filter(|c| !expired.contains(&c.item.id) && c.item.protection.is_evictable(ctx.now))
         .collect();
     reclaimable.sort_by(|a, b| {
-        let cost = |c: &ScoredCandidate| c.value.get() * (1.0 - c.fragility.get()).max(0.0);
+        let cost = |c: &MaintenanceCandidate| c.value.get() * (1.0 - c.fragility.get()).max(0.0);
         cost(a)
             .total_cmp(&cost(b))
             .then_with(|| reclaim_rank(&a.item).cmp(&reclaim_rank(&b.item)))
@@ -10955,27 +10988,21 @@ impl Engine {
 
         let scanned = batch.len();
         let capacity = self.backend.capacity_state(scope).await?;
-        // Wrap into `ScoredCandidate` exactly as the write path does, so
-        // `maintain` ranks evictions on the same signal `admit` does.
-        let scored: Vec<ScoredCandidate> = batch
+        // A short page means there is nothing after it. This is the same fact
+        // `next_cursor` is derived from below, so the two cannot disagree.
+        let is_final_batch = scanned < MAINTAIN_BATCH;
+        let scored: Vec<MaintenanceCandidate> = batch
             .into_iter()
-            .map(|item| ScoredCandidate {
-                estimated_tokens: ((item.body.len() as f32 / 4.0).ceil() as u32).max(1),
-                relevance: 0.0,
-                vector_score: None,
-                keyword_score: None,
+            .map(|item| MaintenanceCandidate {
                 value: memorysafe_core::Score::clamped(0.5),
                 fragility: memorysafe_core::Score::clamped(0.5),
                 item,
             })
             .collect();
-        let remaining_after_batch = capacity
-            .used_items
-            .saturating_sub((offset + scanned) as u64);
         let ctx = MaintainContext {
             scope: scope.clone(),
             batch: scored,
-            remaining_after_batch,
+            is_final_batch,
             capacity,
             stats: self.backend.scope_stats(scope).await?,
             now: OffsetDateTime::now_utc(),
@@ -11033,7 +11060,7 @@ impl Engine {
 
         // Advance past what survived; forgotten rows have shifted the window.
         let next_offset = offset + scanned.saturating_sub(forgotten);
-        let next_cursor = if scanned < MAINTAIN_BATCH {
+        let next_cursor = if is_final_batch {
             None
         } else {
             Some(MaintainCursor { offset: next_offset })
