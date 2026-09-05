@@ -50,7 +50,11 @@ pub struct Assessed<'a> {
 }
 
 /// Everything `assess` may look at. Plain data; no handles, no closures.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serialisable so a production context can be captured to a file and replayed
+/// as a fixture against a new policy version — one of the reasons this trait is
+/// pure. Every field already derives serde; the context did not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssessContext {
     pub scope: Scope,
     /// Nearest neighbours in the scope, descending by similarity. Empty when
@@ -60,18 +64,23 @@ pub struct AssessContext {
     pub now: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmitContext {
     pub scope: Scope,
     pub capacity: CapacityState,
     /// Items the engine offers as evictable, cheapest-to-lose first. Already
     /// excludes pinned items and unexpired protection windows.
-    pub eviction_candidates: Vec<ScoredCandidate>,
+    ///
+    /// `MaintenanceCandidate`, not `ScoredCandidate`, for the same reason
+    /// `maintain` uses it: there is no recall query when the engine offers
+    /// eviction candidates, so `relevance` could only be zero and a policy
+    /// sorting by it would evict in arbitrary backend order.
+    pub eviction_candidates: Vec<MaintenanceCandidate>,
     pub stats: ScopeStats,
     pub now: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComposeContext {
     pub scope: Scope,
     pub stats: ScopeStats,
@@ -89,14 +98,14 @@ pub struct ComposeContext {
 /// zero — and a policy that sorted by `relevance` would silently rank every
 /// item identically. Omitting the fields makes that mistake unrepresentable
 /// rather than merely documented.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceCandidate {
     pub item: MemoryItem,
     pub value: Score,
     pub fragility: Score,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MaintainContext {
     pub scope: Scope,
     /// One page of the scope's items. Maintenance is a resumable job; the

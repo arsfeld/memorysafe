@@ -1,6 +1,6 @@
 use crate::assessment::Assessment;
 use crate::decision::Decision;
-use crate::ids::{AuditId, ItemId, Scope};
+use crate::ids::{AuditId, ItemId, Namespace, Scope, SubjectId};
 use crate::item::MemoryItem;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -96,10 +96,20 @@ pub struct AuditRecord {
 }
 
 impl AuditRecord {
-    pub fn new(scope: Scope, event: AuditEvent, items: Vec<ItemRef>, actor: Actor) -> Self {
+    /// `at` is supplied, not read from the wall clock: replaying an audit log
+    /// against a new policy version must produce comparable rows, and a
+    /// constructor that stamped `now_utc()` would make every replayed row
+    /// differ from the original.
+    pub fn new(
+        scope: Scope,
+        event: AuditEvent,
+        items: Vec<ItemRef>,
+        actor: Actor,
+        at: OffsetDateTime,
+    ) -> Self {
         Self {
             id: AuditId::new(),
-            at: OffsetDateTime::now_utc(),
+            at,
             scope,
             event,
             items,
@@ -125,10 +135,20 @@ pub struct AuditFilter {
     /// Empty means "all events".
     pub events: Vec<AuditEvent>,
     pub item: Option<ItemId>,
+    /// Narrow to one subject. Subject is the delete/export unit, so "produce
+    /// every audit row for subject X" is THE compliance query — and without
+    /// this field it is inexpressible, because after a purge the caller no
+    /// longer has the item ids to ask by.
+    pub subject: Option<SubjectId>,
+    pub namespace: Option<Namespace>,
     #[serde(with = "time::serde::timestamp::option")]
     pub since: Option<OffsetDateTime>,
     #[serde(with = "time::serde::timestamp::option")]
     pub until: Option<OffsetDateTime>,
+    /// Cursor. Rows are ordered by `AuditId`, a millisecond ULID and therefore
+    /// a total order — `at` is whole seconds and cannot separate rows written
+    /// in the same second, so a time-based cursor would repeat or skip them.
+    pub after: Option<AuditId>,
     // NOTE for the task that implements `Backend::audit`: `limit` defaults to
     // 100 and carries no truncation signal, so a compliance query built from
     // `AuditFilter::default()` silently stops at 100 rows with no way for the
@@ -142,8 +162,11 @@ impl Default for AuditFilter {
         Self {
             events: vec![],
             item: None,
+            subject: None,
+            namespace: None,
             since: None,
             until: None,
+            after: None,
             limit: 100,
         }
     }
@@ -202,6 +225,7 @@ mod tests {
                 kind: ActorKind::Agent,
                 id: Some("agent-7".into()),
             },
+            OffsetDateTime::from_unix_timestamp(1_000_000).unwrap(),
         );
         let json = serde_json::to_string(&rec).unwrap();
         assert!(
@@ -231,6 +255,9 @@ mod tests {
         assert!(f.since.is_none());
         assert!(f.until.is_none());
         assert!(f.item.is_none());
+        assert!(f.subject.is_none());
+        assert!(f.namespace.is_none());
+        assert!(f.after.is_none());
     }
 
     #[test]
@@ -268,6 +295,7 @@ mod tests {
                 assessor: AssessorId::new("test_assessor", "1.0.0"),
             }),
             decision: Some(Decision {
+                subject: None,
                 action: crate::decision::Action::Retain {
                     protection: crate::item::Protection::Normal,
                 },
@@ -301,7 +329,7 @@ mod tests {
             r#""assessment":{"value":0.85,"fragility":0.12,"sensitivity":{"level":"personal","#,
             r#""categories":["pii"],"confidence":0.95},"redundancy":{"score":0.05,"near_duplicates":[]},"#,
             r#""features":{"test_feature":1.5},"assessor":{"name":"test_assessor","version":"1.0.0"}},"#,
-            r#""decision":{"action":{"kind":"retain","protection":{"kind":"normal"}},"evictions":[],"#,
+            r#""decision":{"subject":null,"action":{"kind":"retain","protection":{"kind":"normal"}},"evictions":[],"#,
             r#""reasons":[{"code":"novel_content","detail":"novel content detected","evidence":{"similarity":0.1}}],"#,
             r#""policy":{"name":"default","version":"1.0.0"}},"#,
             r#""actor":{"kind":"agent","id":"agent-1"}}"#
@@ -338,6 +366,7 @@ mod tests {
         use crate::features;
 
         Decision {
+            subject: None,
             action: crate::decision::Action::Retain {
                 protection: crate::item::Protection::Normal,
             },
@@ -370,9 +399,15 @@ mod tests {
         // clearing the other's field would pass every other test here, because
         // the golden test constructs its record with a struct literal.
         let scope = Scope::new("t", "s", "n").unwrap();
-        let rec = AuditRecord::new(scope, AuditEvent::Admitted, vec![], Actor::system())
-            .with_assessment(sample_assessment())
-            .with_decision(sample_decision());
+        let rec = AuditRecord::new(
+            scope,
+            AuditEvent::Admitted,
+            vec![],
+            Actor::system(),
+            OffsetDateTime::from_unix_timestamp(1_000_000).unwrap(),
+        )
+        .with_assessment(sample_assessment())
+        .with_decision(sample_decision());
         // Equality, not `is_some()`: a builder that ignored its argument and
         // stored some other value would pass an is_some check.
         assert_eq!(rec.assessment.as_ref(), Some(&sample_assessment()));
@@ -385,9 +420,15 @@ mod tests {
 
         // And in the opposite order.
         let scope = Scope::new("t", "s", "n").unwrap();
-        let rec = AuditRecord::new(scope, AuditEvent::Forgotten, vec![], Actor::system())
-            .with_decision(sample_decision())
-            .with_assessment(sample_assessment());
+        let rec = AuditRecord::new(
+            scope,
+            AuditEvent::Forgotten,
+            vec![],
+            Actor::system(),
+            OffsetDateTime::from_unix_timestamp(1_000_000).unwrap(),
+        )
+        .with_decision(sample_decision())
+        .with_assessment(sample_assessment());
         assert_eq!(rec.assessment.as_ref(), Some(&sample_assessment()));
         assert_eq!(rec.decision.as_ref(), Some(&sample_decision()));
         assert_eq!(

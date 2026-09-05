@@ -85,6 +85,34 @@ impl MemoryItem {
         h.finalize().to_hex().to_string()
     }
 
+    /// The storage charge for a body plus its metadata. `MemoryItem::byte_size`
+    /// and the pre-admission `Candidate.byte_size` MUST both come from here —
+    /// if admission checks a smaller number than storage records, every write
+    /// overruns the budget by the difference, in the same direction, forever.
+    pub fn charge(
+        body: &str,
+        kind: &str,
+        tags: &[String],
+        attrs: &BTreeMap<String, serde_json::Value>,
+        source_id: Option<&str>,
+        subject: &str,
+        namespace: &str,
+    ) -> u64 {
+        let attrs_len = serde_json::to_string(attrs).map(|s| s.len()).unwrap_or(0);
+        let tags_len: usize = tags.iter().map(|t| t.len()).sum();
+        // 64 approximates the fixed-width fields: ULID, two timestamps, ttl,
+        // sensitivity ordinal, protection tag, and the pending flag.
+        const FIXED_OVERHEAD: usize = 64;
+        (body.len()
+            + kind.len()
+            + attrs_len
+            + tags_len
+            + source_id.map(str::len).unwrap_or(0)
+            + subject.len()
+            + namespace.len()
+            + FIXED_OVERHEAD) as u64
+    }
+
     /// Charged against `Budget::max_bytes`.
     ///
     /// Counts every variable-length field that costs a byte on disk. `subject`
@@ -94,17 +122,15 @@ impl MemoryItem {
     /// overrun the namespace budget. `tenant` is deliberately excluded: it is
     /// the database filename, not a column, so it costs nothing per row.
     pub fn byte_size(&self) -> u64 {
-        let attrs = serde_json::to_string(&self.attrs)
-            .map(|s| s.len())
-            .unwrap_or(0);
-        let tags: usize = self.tags.iter().map(|t| t.len()).sum();
-        let source_id = self.source.id.as_ref().map(|s| s.len()).unwrap_or(0);
-        let scope = self.scope.subject.as_str().len() + self.scope.namespace.as_str().len();
-        // 64 approximates the fixed-width fields: ULID, two timestamps, ttl,
-        // sensitivity ordinal, protection tag, and the pending flag.
-        const FIXED_OVERHEAD: usize = 64;
-        (self.body.len() + self.kind.len() + attrs + tags + source_id + scope + FIXED_OVERHEAD)
-            as u64
+        Self::charge(
+            &self.body,
+            &self.kind,
+            &self.tags,
+            &self.attrs,
+            self.source.id.as_deref(),
+            self.scope.subject.as_str(),
+            self.scope.namespace.as_str(),
+        )
     }
 
     pub fn is_expired(&self, now: OffsetDateTime) -> bool {
@@ -112,6 +138,16 @@ impl MemoryItem {
             Some(ttl) => self.created_at + ttl <= now,
             None => false,
         }
+    }
+
+    /// Whether retention REQUIRES this item be forgotten, overriding protection.
+    ///
+    /// `Protection::Pinned` makes `is_evictable` false unconditionally, so a
+    /// pinned item with a TTL would otherwise be unforgettable — letting any
+    /// caller's pin silently override a legal retention limit. Expiry dominates
+    /// protection; protection only governs eviction for capacity.
+    pub fn must_forget(&self, now: OffsetDateTime) -> bool {
+        self.is_expired(now)
     }
 }
 
@@ -324,5 +360,29 @@ mod tests {
         // And prove old bytes still parse — the actual compatibility question.
         let from_disk: MemoryItem = serde_json::from_str(expected).unwrap();
         assert_eq!(from_disk, item);
+    }
+
+    #[test]
+    fn expiry_dominates_pinning() {
+        // A pin is a capacity exemption, not a retention exemption. If pinning
+        // could defeat a TTL, any caller could opt out of a legal retention
+        // limit by pinning.
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let mut i = item("under a retention limit");
+        i.created_at = now - Duration::days(40);
+        i.ttl = Some(Duration::days(30));
+        i.protection = Protection::Pinned;
+
+        assert!(
+            !i.protection.is_evictable(now),
+            "pinning still blocks capacity eviction"
+        );
+        assert!(i.must_forget(now), "a pin overrode a retention limit");
+
+        let mut fresh = item("still within its limit");
+        fresh.created_at = now;
+        fresh.ttl = Some(Duration::days(30));
+        fresh.protection = Protection::Pinned;
+        assert!(!fresh.must_forget(now));
     }
 }

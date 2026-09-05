@@ -72,8 +72,13 @@ pub struct Eviction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeStrategy {
-    /// Append the new body to the target, union tags and attrs, keep the
-    /// earliest `occurred_at` and the latest `created_at`.
+    /// Append the new body to the target and union tags and attrs.
+    ///
+    /// Keeps the EARLIEST `occurred_at` and `created_at`, and the SHORTEST
+    /// remaining TTL. Keeping the latest `created_at` would push an item's
+    /// expiry forward on every merge, so an item under a retention limit would
+    /// never expire as long as anything merged into it. `sensitivity` takes the
+    /// maximum of the two — a merge must never downgrade a classification.
     AppendAndUnion,
     /// Replace the target's body with the new one, union tags and attrs.
     ReplaceBody,
@@ -94,6 +99,12 @@ pub enum Action {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
+    /// The item this decision is about. `None` means the admission candidate,
+    /// which has no id yet. `maintain` MUST set it: a maintenance decision with
+    /// no subject names nobody, so `Action::Retain { protection }` returned from
+    /// `maintain` — the way an expired protection window is released — would be
+    /// counted and never applied.
+    pub subject: Option<ItemId>,
     pub action: Action,
     pub evictions: Vec<Eviction>,
     pub reasons: Vec<Reason>,
@@ -103,6 +114,7 @@ pub struct Decision {
 impl Decision {
     pub fn retain(policy: PolicyId, reason: Reason) -> Self {
         Self {
+            subject: None,
             action: Action::Retain {
                 protection: Protection::Normal,
             },
@@ -114,6 +126,7 @@ impl Decision {
 
     pub fn reject(policy: PolicyId, reason: Reason) -> Self {
         Self {
+            subject: None,
             action: Action::Reject,
             evictions: vec![],
             reasons: vec![reason],
@@ -200,6 +213,7 @@ mod tests {
         // decision whose match is in `reasons`, and `||` short-circuits, so the
         // evictions branch is never evaluated — deleting it passes all of them.
         let d = Decision {
+            subject: None,
             action: Action::Retain {
                 protection: Protection::Normal,
             },
@@ -255,6 +269,7 @@ mod tests {
         // reads it back with serde_json. Nothing else here exercises Merge,
         // ReplaceBody, a populated evictions vector, or PolicyId on the wire.
         let d = Decision {
+            subject: Some(ItemId::parse("01M1SS3PMM9JP6G7R65XMKET6V").unwrap()),
             action: Action::Merge {
                 into: ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
                 strategy: MergeStrategy::ReplaceBody,
@@ -284,7 +299,8 @@ mod tests {
         // perfectly while orphaning every row already on disk. Pin the literal
         // bytes, which is the property stored data actually depends on.
         let expected = concat!(
-            r#"{"action":{"kind":"merge","into":"01ARZ3NDEKTSV4RRFFQ69G5FAV","#,
+            r#"{"subject":"01M1SS3PMM9JP6G7R65XMKET6V","#,
+            r#""action":{"kind":"merge","into":"01ARZ3NDEKTSV4RRFFQ69G5FAV","#,
             r#""strategy":"replace_body"},"#,
             r#""evictions":[{"item":"01BX5ZZKBKACTAV9WEVGEMMVRZ","#,
             r#""reason":{"code":"capacity_pressure","detail":"evicted to make room","#,
