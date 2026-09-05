@@ -1,4 +1,4 @@
-//! Embedding generation and int8 quantization.
+//! Embedding generation and vectors.
 
 pub mod test_embedder;
 
