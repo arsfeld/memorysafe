@@ -1,5 +1,5 @@
 use crate::error::CoreError;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
 /// Evidence numbers attached to a reason or an assessment. Ordered so that
@@ -16,7 +16,14 @@ macro_rules! features {
 }
 
 /// A value in `[0.0, 1.0]`. Never a bare `f32` anywhere in the API.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// `Deserialize` goes through `TryFrom<f32>`, not a transparent passthrough.
+/// A derived transparent `Deserialize` would delegate to `f32`'s own impl and
+/// bypass both constructors, so a stored `2.5` or a NaN from a binary format
+/// would enter the type unchecked — and the hand-written `Ord` below, plus the
+/// `Eq` marker, are sound only while that cannot happen. Invalid stored data
+/// fails loudly rather than being silently corrected.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct Score(f32);
 
@@ -49,7 +56,6 @@ impl Score {
 
 impl Eq for Score {}
 
-#[allow(clippy::derive_ord_xor_partial_ord)]
 impl Ord for Score {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Safe: the constructors exclude NaN.
@@ -62,6 +68,23 @@ impl Ord for Score {
 impl PartialOrd for Score {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl TryFrom<f32> for Score {
+    type Error = CoreError;
+    fn try_from(value: f32) -> Result<Self, Self::Error> {
+        Score::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for Score {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = f32::deserialize(deserializer)?;
+        Score::try_from(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -102,5 +125,19 @@ mod tests {
         let f = features! { "redundancy" => 0.93, "neighbours" => 4.0 };
         assert_eq!(f.get("redundancy"), Some(&0.93));
         assert_eq!(f.len(), 2);
+    }
+
+    #[test]
+    fn deserialization_cannot_bypass_the_range_invariant() {
+        // `Ord` and `Eq` on this type are sound only because no `Score` can
+        // hold NaN or a value outside [0,1]. Deserialization is the one path
+        // that does not go through a constructor, so it is validated too.
+        assert_eq!(serde_json::from_str::<Score>("0.5").unwrap().get(), 0.5);
+        assert!(serde_json::from_str::<Score>("2.5").is_err());
+        assert!(serde_json::from_str::<Score>("-0.1").is_err());
+        // Round-trip of a valid score is unaffected.
+        let s = Score::clamped(0.25);
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<Score>(&json).unwrap(), s);
     }
 }
