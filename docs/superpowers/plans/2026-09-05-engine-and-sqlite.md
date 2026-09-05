@@ -1174,6 +1174,34 @@ impl MemoryItem {
         h.finalize().to_hex().to_string()
     }
 
+    /// The storage charge for a body plus its metadata. `MemoryItem::byte_size`
+    /// and the pre-admission `Candidate.byte_size` MUST both come from here —
+    /// if admission checks a smaller number than storage records, every write
+    /// overruns the budget by the difference, in the same direction, forever.
+    pub fn charge(
+        body: &str,
+        kind: &str,
+        tags: &[String],
+        attrs: &BTreeMap<String, serde_json::Value>,
+        source_id: Option<&str>,
+        subject: &str,
+        namespace: &str,
+    ) -> u64 {
+        let attrs_len = serde_json::to_string(attrs).map(|s| s.len()).unwrap_or(0);
+        let tags_len: usize = tags.iter().map(|t| t.len()).sum();
+        // 64 approximates the fixed-width fields: ULID, two timestamps, ttl,
+        // sensitivity ordinal, protection tag, and the pending flag.
+        const FIXED_OVERHEAD: usize = 64;
+        (body.len()
+            + kind.len()
+            + attrs_len
+            + tags_len
+            + source_id.map(str::len).unwrap_or(0)
+            + subject.len()
+            + namespace.len()
+            + FIXED_OVERHEAD) as u64
+    }
+
     /// Charged against `Budget::max_bytes`.
     ///
     /// Counts every variable-length field that costs a byte on disk. `subject`
@@ -1183,15 +1211,15 @@ impl MemoryItem {
     /// overrun the namespace budget. `tenant` is deliberately excluded: it is
     /// the database filename, not a column, so it costs nothing per row.
     pub fn byte_size(&self) -> u64 {
-        let attrs = serde_json::to_string(&self.attrs).map(|s| s.len()).unwrap_or(0);
-        let tags: usize = self.tags.iter().map(|t| t.len()).sum();
-        let source_id = self.source.id.as_ref().map(|s| s.len()).unwrap_or(0);
-        let scope = self.scope.subject.as_str().len() + self.scope.namespace.as_str().len();
-        // 64 approximates the fixed-width fields: ULID, two timestamps, ttl,
-        // sensitivity ordinal, protection tag, and the pending flag.
-        const FIXED_OVERHEAD: usize = 64;
-        (self.body.len() + self.kind.len() + attrs + tags + source_id + scope + FIXED_OVERHEAD)
-            as u64
+        Self::charge(
+            &self.body,
+            &self.kind,
+            &self.tags,
+            &self.attrs,
+            self.source.id.as_deref(),
+            self.scope.subject.as_str(),
+            self.scope.namespace.as_str(),
+        )
     }
 
     pub fn is_expired(&self, now: OffsetDateTime) -> bool {
@@ -1199,6 +1227,16 @@ impl MemoryItem {
             Some(ttl) => self.created_at + ttl <= now,
             None => false,
         }
+    }
+
+    /// Whether retention REQUIRES this item be forgotten, overriding protection.
+    ///
+    /// `Protection::Pinned` makes `is_evictable` false unconditionally, so a
+    /// pinned item with a TTL would otherwise be unforgettable — letting any
+    /// caller's pin silently override a legal retention limit. Expiry dominates
+    /// protection; protection only governs eviction for capacity.
+    pub fn must_forget(&self, now: OffsetDateTime) -> bool {
+        self.is_expired(now)
     }
 }
 ```
@@ -1909,8 +1947,13 @@ pub struct Eviction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeStrategy {
-    /// Append the new body to the target, union tags and attrs, keep the
-    /// earliest `occurred_at` and the latest `created_at`.
+    /// Append the new body to the target and union tags and attrs.
+    ///
+    /// Keeps the EARLIEST `occurred_at` and `created_at`, and the SHORTEST
+    /// remaining TTL. Keeping the latest `created_at` would push an item's
+    /// expiry forward on every merge, so an item under a retention limit would
+    /// never expire as long as anything merged into it. `sensitivity` takes the
+    /// maximum of the two — a merge must never downgrade a classification.
     AppendAndUnion,
     /// Replace the target's body with the new one, union tags and attrs.
     ReplaceBody,
@@ -1926,6 +1969,12 @@ pub enum Action {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
+    /// The item this decision is about. `None` means the admission candidate,
+    /// which has no id yet. `maintain` MUST set it: a maintenance decision with
+    /// no subject names nobody, so `Action::Retain { protection }` returned from
+    /// `maintain` — the way an expired protection window is released — would be
+    /// counted and never applied.
+    pub subject: Option<ItemId>,
     pub action: Action,
     pub evictions: Vec<Eviction>,
     pub reasons: Vec<Reason>,
@@ -1935,6 +1984,7 @@ pub struct Decision {
 impl Decision {
     pub fn retain(policy: PolicyId, reason: Reason) -> Self {
         Self {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![],
             reasons: vec![reason],
@@ -1943,7 +1993,13 @@ impl Decision {
     }
 
     pub fn reject(policy: PolicyId, reason: Reason) -> Self {
-        Self { action: Action::Reject, evictions: vec![], reasons: vec![reason], policy }
+        Self {
+            subject: None,
+            action: Action::Reject,
+            evictions: vec![],
+            reasons: vec![reason],
+            policy,
+        }
     }
 
     pub fn has_reason(&self, code: ReasonCode) -> bool {
@@ -2200,10 +2256,20 @@ pub struct AuditRecord {
 }
 
 impl AuditRecord {
-    pub fn new(scope: Scope, event: AuditEvent, items: Vec<ItemRef>, actor: Actor) -> Self {
+    /// `at` is supplied, not read from the wall clock: replaying an audit log
+    /// against a new policy version must produce comparable rows, and a
+    /// constructor that stamped `now_utc()` would make every replayed row
+    /// differ from the original.
+    pub fn new(
+        scope: Scope,
+        event: AuditEvent,
+        items: Vec<ItemRef>,
+        actor: Actor,
+        at: OffsetDateTime,
+    ) -> Self {
         Self {
             id: AuditId::new(),
-            at: OffsetDateTime::now_utc(),
+            at,
             scope,
             event,
             items,
@@ -2228,6 +2294,16 @@ impl AuditRecord {
 pub struct AuditFilter {
     /// Empty means "all events".
     pub events: Vec<AuditEvent>,
+    /// Narrow to one subject. Subject is the delete/export unit, so "produce
+    /// every audit row for subject X" is THE compliance query — and without
+    /// this field it is inexpressible, because after a purge the caller no
+    /// longer has the item ids to ask by.
+    pub subject: Option<SubjectId>,
+    pub namespace: Option<Namespace>,
+    /// Cursor. Rows are ordered by `AuditId`, a millisecond ULID and therefore
+    /// a total order — `at` is whole seconds and cannot separate rows written
+    /// in the same second, so a time-based cursor would repeat or skip them.
+    pub after: Option<AuditId>,
     // NOTE for the task that implements `Backend::audit`: `limit` defaults to
     // 100 and carries no truncation signal, so a compliance query built from
     // `AuditFilter::default()` silently stops at 100 rows with no way for the
@@ -2243,7 +2319,16 @@ pub struct AuditFilter {
 
 impl Default for AuditFilter {
     fn default() -> Self {
-        Self { events: vec![], item: None, since: None, until: None, limit: 100 }
+        Self {
+            events: vec![],
+            subject: None,
+            namespace: None,
+            after: None,
+            item: None,
+            since: None,
+            until: None,
+            limit: 100,
+        }
     }
 }
 ```
@@ -2822,7 +2907,11 @@ pub struct Assessed<'a> {
 }
 
 /// Everything `assess` may look at. Plain data; no handles, no closures.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serialisable so a production context can be captured to a file and replayed
+/// as a fixture against a new policy version — one of the reasons this trait is
+/// pure. Every field already derives serde; the context did not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssessContext {
     pub scope: Scope,
     /// Nearest neighbours in the scope, descending by similarity. Empty when
@@ -2832,18 +2921,23 @@ pub struct AssessContext {
     pub now: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmitContext {
     pub scope: Scope,
     pub capacity: CapacityState,
     /// Items the engine offers as evictable, cheapest-to-lose first. Already
     /// excludes pinned items and unexpired protection windows.
-    pub eviction_candidates: Vec<ScoredCandidate>,
+    ///
+    /// `MaintenanceCandidate`, not `ScoredCandidate`, for the same reason
+    /// `maintain` uses it: there is no recall query when the engine offers
+    /// eviction candidates, so `relevance` could only be zero and a policy
+    /// sorting by it would evict in arbitrary backend order.
+    pub eviction_candidates: Vec<MaintenanceCandidate>,
     pub stats: ScopeStats,
     pub now: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComposeContext {
     pub scope: Scope,
     pub stats: ScopeStats,
@@ -2861,14 +2955,14 @@ pub struct ComposeContext {
 /// zero — and a policy that sorted by `relevance` would silently rank every
 /// item identically. Omitting the fields makes that mistake unrepresentable
 /// rather than merely documented.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceCandidate {
     pub item: MemoryItem,
     pub value: Score,
     pub fragility: Score,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MaintainContext {
     pub scope: Scope,
     /// One page of the scope's items. Maintenance is a resumable job; the
@@ -9026,10 +9120,9 @@ pub fn decisions(
 
     // 1. TTL expiry. Pinned items are exempt — pinning is absolute.
     for item in ctx.batch.iter().map(|c| &c.item) {
-        if item.protection == Protection::Pinned {
-            continue;
-        }
-        if item.is_expired(ctx.now) {
+        // No pinned-item exemption here: `must_forget` dominates protection, or
+        // a pin would silently override a retention limit.
+        if item.must_forget(ctx.now) {
             out.push(Decision {
                 action: Action::Reject,
                 evictions: vec![Eviction {
@@ -9060,6 +9153,7 @@ pub fn decisions(
             && until <= ctx.now
         {
             out.push(Decision {
+                subject: Some(item.id.clone()),
                 action: Action::Retain { protection: Protection::Normal },
                 evictions: vec![],
                 reasons: vec![Reason::new(
@@ -9821,7 +9915,18 @@ impl Engine {
             attrs: req.attrs.clone(),
             sensitivity_hint: req.sensitivity_hint,
             embedding: embedding.clone(),
-            byte_size: req.body.len() as u64,
+            // Same function `MemoryItem::byte_size` uses. A smaller estimate
+            // here would let every admitted item overrun the budget by the
+            // difference between what was checked and what is stored.
+            byte_size: MemoryItem::charge(
+                &req.body,
+                &req.kind,
+                &req.tags,
+                &req.attrs,
+                req.source.id.as_deref(),
+                req.scope.subject.as_str(),
+                req.scope.namespace.as_str(),
+            ),
         };
 
         // One I/O pass gathers everything the policy is allowed to see.
@@ -9867,7 +9972,17 @@ impl Engine {
                     created_at: now,
                     tags: req.tags.clone(),
                     attrs: req.attrs.clone(),
-                    sensitivity: assessment.sensitivity.level,
+                    // Applied by the ENGINE, not trusted from the policy. A
+                    // closed scorer that forgot to call `raised_by` would
+                    // silently downgrade a caller's declared `Restricted` to
+                    // its own detector's level, and the item would then satisfy
+                    // a lower `sensitivity_ceiling` — the leak the read path
+                    // exists to prevent, caused by an omission in the closed
+                    // crate.
+                    sensitivity: assessment
+                        .sensitivity
+                        .level
+                        .raised_by(req.sensitivity_hint),
                     ttl: req.ttl,
                     protection: *protection,
                     pending_embedding,
@@ -11024,6 +11139,7 @@ impl Engine {
         };
 
         let mut to_forget: Vec<ItemId> = Vec::new();
+        let mut to_release: Vec<(ItemId, Protection)> = Vec::new();
         let mut released = 0usize;
 
         for d in &decisions {
@@ -11037,14 +11153,22 @@ impl Engine {
                     to_forget.push(e.item.clone());
                 }
             }
-            if matches!(d.action, Action::Retain { protection: Protection::Normal })
+            // Actually apply the release. Counting it and moving on is how a
+            // protection window silently never expires.
+            if let (Some(id), Action::Retain { protection }) = (&d.subject, &d.action)
                 && d.evictions.is_empty()
             {
+                to_release.push((id.clone(), *protection));
                 released += 1;
             }
         }
 
         let forgotten = to_forget.len();
+
+        for (id, protection) in to_release {
+            // Reuse the audited protect path rather than hand-rolling a write.
+            self.protect(scope, &id, protection).await?;
+        }
 
         if !to_forget.is_empty() || released > 0 {
             let audit = AuditRecord::new(
