@@ -1,0 +1,26 @@
+name: ci
+on: [push, pull_request]
+env:
+  RUSTFLAGS: "-Dwarnings"
+  CARGO_TERM_COLOR: always
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features --workspace
+  purity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: memorysafe-core and memorysafe-policy must have no I/O dependencies
+        run: |
+          cargo tree -p memorysafe-core --edges normal --prefix none \
+            | grep -Ei '^(tokio|rusqlite|sqlx|reqwest|hyper) ' && exit 1
+          echo "core is I/O free"

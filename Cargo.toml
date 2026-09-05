@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97.1"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+memorysafe-core = { path = "crates/memorysafe-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+ulid = { version = "3.0.0", features = ["serde"] }
+time = { version = "0.3.55", features = ["serde", "macros"] }
+blake3 = "1.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
