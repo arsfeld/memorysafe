@@ -1,5 +1,6 @@
-//! Embedding generation and vectors.
+//! Embedding generation, int8 quantization, and vectors.
 
+pub mod quantize;
 pub mod test_embedder;
 
 use memorysafe_core::{EmbedderId, Embedding};
@@ -21,4 +22,5 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, text: &str) -> Result<Embedding, EmbedError>;
 }
 
+pub use quantize::{QuantizeError, QuantizedVector};
 pub use test_embedder::DeterministicEmbedder;
