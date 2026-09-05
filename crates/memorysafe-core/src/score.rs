@@ -9,6 +9,7 @@ pub type FeatureMap = BTreeMap<String, f64>;
 #[macro_export]
 macro_rules! features {
     ($($k:expr => $v:expr),* $(,)?) => {{
+        #[allow(unused_mut)]
         let mut m = $crate::score::FeatureMap::new();
         $( m.insert($k.to_string(), $v as f64); )*
         m

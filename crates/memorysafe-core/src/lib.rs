@@ -2,6 +2,7 @@
 
 pub mod assessment;
 pub mod capacity;
+pub mod decision;
 pub mod error;
 pub mod ids;
 pub mod item;
@@ -12,6 +13,7 @@ pub use assessment::{
     SensitivityLevel,
 };
 pub use capacity::{Budget, CapacityState, ScopeStats};
+pub use decision::{Action, Decision, Eviction, MergeStrategy, PolicyId, Reason, ReasonCode};
 pub use error::CoreError;
 pub use ids::{AuditId, ItemId, Namespace, Scope, SubjectId, TenantId};
 pub use item::{MemoryItem, Protection, Source, SourceKind};
