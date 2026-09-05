@@ -1,0 +1,19 @@
+[package]
+name = "memorysafe-embed"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+model2vec = ["dep:model2vec-rs"]
+
+[dependencies]
+memorysafe-core.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+model2vec-rs = { version = "0.2.1", optional = true }
+
+[lints]
+workspace = true
