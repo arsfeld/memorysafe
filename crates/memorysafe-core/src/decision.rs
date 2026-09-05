@@ -279,11 +279,25 @@ mod tests {
         let back: Decision = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d, "a stored decision did not survive the round trip");
 
-        // Spot-check the wire spellings the audit table is queried on.
-        assert!(json.contains(r#""kind":"merge""#), "{json}");
-        assert!(json.contains(r#""strategy":"replace_body""#), "{json}");
-        assert!(json.contains(r#""code":"capacity_pressure""#), "{json}");
-        assert_eq!(back.policy.to_string(), "baseline@0.1.0");
-        assert_eq!(back.reasons[0].detail, "folded into a close neighbour");
+        // A round trip alone proves only self-consistency: serialise and
+        // deserialise share the same code, so ANY symmetric rename round-trips
+        // perfectly while orphaning every row already on disk. Pin the literal
+        // bytes, which is the property stored data actually depends on.
+        let expected = concat!(
+            r#"{"action":{"kind":"merge","into":"01ARZ3NDEKTSV4RRFFQ69G5FAV","#,
+            r#""strategy":"replace_body"},"#,
+            r#""evictions":[{"item":"01BX5ZZKBKACTAV9WEVGEMMVRZ","#,
+            r#""reason":{"code":"capacity_pressure","detail":"evicted to make room","#,
+            r#""evidence":{"eviction_cost":0.02,"value":0.11}}}],"#,
+            r#""reasons":[{"code":"high_redundancy","#,
+            r#""detail":"folded into a close neighbour","#,
+            r#""evidence":{"similarity":0.95}}],"#,
+            r#""policy":{"name":"baseline","version":"0.1.0"}}"#
+        );
+        assert_eq!(json, expected, "the stored decision format changed");
+
+        // And prove old bytes still parse — the actual compatibility question.
+        let from_disk: Decision = serde_json::from_str(expected).unwrap();
+        assert_eq!(from_disk, d);
     }
 }
