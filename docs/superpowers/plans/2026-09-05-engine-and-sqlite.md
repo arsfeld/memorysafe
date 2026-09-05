@@ -1270,12 +1270,15 @@ pub struct SensitivityAssessment {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RedundancyAssessment {
     pub score: Score,
-    /// Descending by similarity.
-    pub near_duplicates: Vec<(ItemId, f32)>,
+    /// Descending by similarity. `Score` rather than a raw `f32`: cosine spans
+    /// [-1, 1], but this list is filtered at `near_duplicate_floor` before it
+    /// is built, so a negative similarity — meaning "definitely not a
+    /// duplicate" — never belongs here.
+    pub near_duplicates: Vec<(ItemId, Score)>,
 }
 
 impl RedundancyAssessment {
-    pub fn best(&self) -> Option<(&ItemId, f32)> {
+    pub fn best(&self) -> Option<(&ItemId, Score)> {
         self.near_duplicates.first().map(|(id, s)| (id, *s))
     }
 }
@@ -6920,6 +6923,7 @@ mod tests {
         let a = assess(&[candidate("a", 0.42), candidate("b", 0.81)], &cfg);
         assert_eq!(a.near_duplicates.len(), 2);
         assert!(a.near_duplicates[0].1 >= a.near_duplicates[1].1);
+        assert!((a.near_duplicates[0].1.get() - 0.81).abs() < 1e-6);
     }
 
     #[test]
@@ -7100,12 +7104,14 @@ pub fn assess(
     neighbours: &[ScoredCandidate],
     cfg: &BaselineConfig,
 ) -> RedundancyAssessment {
-    let mut near: Vec<(memorysafe_core::ItemId, f32)> = neighbours
+    let mut near: Vec<(memorysafe_core::ItemId, Score)> = neighbours
         .iter()
         .filter(|n| n.relevance >= cfg.near_duplicate_floor)
-        .map(|n| (n.item.id.clone(), n.relevance))
+        // Clamped, not `new`: the floor already excludes negatives, and a
+        // relevance marginally above 1.0 from f32 rounding must not error.
+        .map(|n| (n.item.id.clone(), Score::clamped(n.relevance)))
         .collect();
-    near.sort_by(|a, b| b.1.total_cmp(&a.1));
+    near.sort_by(|a, b| b.1.cmp(&a.1));
 
     let best = neighbours.iter().map(|n| n.relevance).fold(0.0f32, f32::max);
     RedundancyAssessment { score: Score::clamped(best), near_duplicates: near }
@@ -7864,7 +7870,7 @@ pub fn decide(
                         ReasonCode::HighRedundancy,
                         "folded into a closely related existing memory",
                         features! {
-                            "similarity" => similarity,
+                            "similarity" => similarity.get(),
                             "threshold" => cfg.merge_threshold,
                         },
                     )],
