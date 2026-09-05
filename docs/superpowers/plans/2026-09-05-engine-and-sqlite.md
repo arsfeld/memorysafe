@@ -1472,6 +1472,45 @@ mod tests {
     }
 
     #[test]
+    fn pressure_takes_the_max_in_both_directions() {
+        // Every other dual-bounded case here has bytes >= items, so a mutant
+        // that OVERWRITES with the byte ratio instead of taking the max would
+        // pass. This is the case that catches last-writer-wins.
+        let items_dominate = CapacityState {
+            budget: Budget { max_items: Some(100), max_bytes: Some(1000) },
+            used_items: 80, // 0.8  <- dominates
+            used_bytes: 200, // 0.2
+        };
+        assert!((items_dominate.pressure() - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_bytes_only_budget_is_still_enforced() {
+        // No test fed this Budget shape to pressure()/would_exceed(), so a bug
+        // nesting the byte check inside the item check would be invisible.
+        let s = CapacityState {
+            budget: Budget { max_items: None, max_bytes: Some(1000) },
+            used_items: 999_999,
+            used_bytes: 900,
+        };
+        assert!((s.pressure() - 0.9).abs() < 1e-6, "byte budget inert without max_items");
+        assert!(!s.would_exceed(1_000_000, 50));
+        assert!(s.would_exceed(0, 200));
+    }
+
+    #[test]
+    fn an_items_only_budget_ignores_bytes() {
+        let s = CapacityState {
+            budget: Budget { max_items: Some(10), max_bytes: None },
+            used_items: 5,
+            used_bytes: u64::MAX / 2,
+        };
+        assert!((s.pressure() - 0.5).abs() < 1e-6);
+        assert!(!s.would_exceed(5, u64::MAX / 2));
+        assert!(s.would_exceed(6, 0));
+    }
+
+    #[test]
     fn byte_pressure_counts_too() {
         let s = CapacityState {
             budget: Budget { max_items: Some(100), max_bytes: Some(1000) },
@@ -1552,6 +1591,11 @@ impl CapacityState {
     }
 
     /// True when admitting `items`/`bytes` more would break the budget.
+    ///
+    /// Argument order is (items, bytes) — both `u64`, so a transposition
+    /// compiles. Every call site in this workspace passes a literal `1` for
+    /// `items`, which makes the mistake visible at a glance; if a caller ever
+    /// needs a variable item count, give this a named-field argument instead.
     pub fn would_exceed(&self, items: u64, bytes: u64) -> bool {
         let items_over = self
             .budget
@@ -1572,6 +1616,14 @@ pub struct ScopeStats {
     pub total_bytes: u64,
     /// Mean pairwise cosine similarity of a sample, used to calibrate what
     /// "atypical" means in this particular corpus.
+    ///
+    /// **Meaningless below `item_count >= 2`** — there are no pairs to average,
+    /// and the `Default` of `0.0` is "no data", not "a corpus whose baseline
+    /// similarity sits at the floor". The engine recomputes this from the
+    /// neighbours it just fetched before handing it to a policy, so the default
+    /// only survives when a scope has no neighbours at all — the case where
+    /// fragility scoring already short-circuits to maximum. Any future consumer
+    /// that reads this directly must check `item_count` first.
     pub mean_neighbour_similarity: f32,
     pub median_item_bytes: u64,
 }
