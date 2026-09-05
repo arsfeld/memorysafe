@@ -3,7 +3,6 @@ use crate::capacity::{CapacityState, ScopeStats};
 use crate::decision::{Decision, PolicyId};
 use crate::embedding::Embedding;
 use crate::ids::Scope;
-use crate::item::MemoryItem;
 use crate::recall::{RecallRequest, ScoredCandidate, WorkingSet};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -35,7 +34,14 @@ pub struct Candidate {
 }
 
 /// A candidate paired with the assessment `assess` produced for it.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Borrows rather than owns, and deliberately does NOT derive `Clone`: a
+/// derived `Clone` here would copy the references, not the values, which is
+/// not what a reader expects from every other `Clone` in this module. The
+/// engine clones the owned `Candidate` and `Assessment` and rebuilds this
+/// struct inside its `catch_unwind` boundary, so nothing needs to clone the
+/// pair itself.
+#[derive(Debug, PartialEq)]
 pub struct Assessed<'a> {
     pub candidate: &'a Candidate,
     pub assessment: &'a Assessment,
@@ -73,15 +79,32 @@ pub struct ComposeContext {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaintainContext {
     pub scope: Scope,
-    /// One page of the scope's items. Maintenance is a resumable job; the
-    /// engine pages through and calls `maintain` per batch.
-    pub batch: Vec<MemoryItem>,
+    /// One page of the scope's items, carrying the same `value`/`fragility`
+    /// signal `AdmitContext::eviction_candidates` carries — capacity reclaim
+    /// during maintenance is the same decision `admit` makes under pressure,
+    /// and a policy handed bare `MemoryItem`s could only sort by age.
+    ///
+    /// Maintenance is a resumable job; the engine pages through and calls
+    /// `maintain` per batch. `remaining_after_batch` says how much of the scope
+    /// this page does not cover, so a policy can tell a partial view from the
+    /// whole thing before evicting on the strength of it.
+    pub batch: Vec<ScoredCandidate>,
+    /// Items in this scope not included in `batch`. Zero means this is the
+    /// last page and the policy is seeing everything that is left.
+    pub remaining_after_batch: u64,
     pub capacity: CapacityState,
     pub stats: ScopeStats,
     pub now: OffsetDateTime,
 }
 
 /// The seam. Pure: the engine performs all I/O and hands in everything above.
+///
+/// `Err` from any method means the CALL failed and the engine should fall back
+/// to a baseline policy. It does not mean "skip this item": `compose` reports
+/// per-candidate exclusions through `WorkingSet::omitted`, each with a reason,
+/// and `maintain` simply returns no `Decision` for an item it declines to act
+/// on. A policy that returns `Err` because one candidate of two hundred was
+/// unscoreable would discard the other hundred and ninety-nine.
 pub trait GovernancePolicy: Send + Sync {
     fn id(&self) -> PolicyId;
 
@@ -105,6 +128,7 @@ mod tests {
     use crate::assessment::{AssessorId, RedundancyAssessment, SensitivityAssessment};
     use crate::decision::{Reason, ReasonCode};
     use crate::features;
+    use crate::recall::{RecallBudget, RecallMode};
     use crate::score::Score;
     use crate::{Budget, CapacityState, Scope, ScopeStats};
     use time::OffsetDateTime;
@@ -214,5 +238,48 @@ mod tests {
         };
         let cloned = ctx.clone();
         assert_eq!(ctx, cloned);
+    }
+
+    #[test]
+    fn compose_and_maintain_are_reachable_through_the_trait() {
+        // Half the trait's surface had no test and neither of these two context
+        // types was ever constructed, so a wrong field or a non-Clone field
+        // would have been caught only by the signature still compiling.
+        let p: Box<dyn GovernancePolicy> = Box::new(AlwaysAdmit);
+
+        let req = RecallRequest {
+            scope: Scope::new("t", "s", "n").unwrap(),
+            query: Some("anything".into()),
+            tags_any: vec![],
+            kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
+            mode: RecallMode::WorkingSet,
+            budget: RecallBudget::default(),
+            sensitivity_ceiling: SensitivityLevel::Internal,
+        };
+        let compose_ctx = ComposeContext {
+            scope: Scope::new("t", "s", "n").unwrap(),
+            stats: ScopeStats::default(),
+            now: OffsetDateTime::UNIX_EPOCH,
+        };
+        let ws = p.compose(&req, &[], &compose_ctx).unwrap();
+        assert!(ws.items.is_empty());
+        assert_eq!(compose_ctx.clone(), compose_ctx);
+
+        let maintain_ctx = MaintainContext {
+            scope: Scope::new("t", "s", "n").unwrap(),
+            batch: vec![],
+            remaining_after_batch: 0,
+            capacity: CapacityState {
+                budget: Budget::UNBOUNDED,
+                used_items: 0,
+                used_bytes: 0,
+            },
+            stats: ScopeStats::default(),
+            now: OffsetDateTime::UNIX_EPOCH,
+        };
+        assert!(p.maintain(&maintain_ctx).unwrap().is_empty());
+        assert_eq!(maintain_ctx.clone(), maintain_ctx);
     }
 }
