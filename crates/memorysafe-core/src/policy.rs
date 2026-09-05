@@ -3,7 +3,9 @@ use crate::capacity::{CapacityState, ScopeStats};
 use crate::decision::{Decision, PolicyId};
 use crate::embedding::Embedding;
 use crate::ids::Scope;
+use crate::item::MemoryItem;
 use crate::recall::{RecallRequest, ScoredCandidate, WorkingSet};
+use crate::score::Score;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -76,22 +78,36 @@ pub struct ComposeContext {
     pub now: OffsetDateTime,
 }
 
+/// An item offered to `maintain`, carrying the same `value`/`fragility` signal
+/// `AdmitContext::eviction_candidates` carries — capacity reclaim during
+/// maintenance is the same decision `admit` makes under pressure, and a policy
+/// handed bare `MemoryItem`s could only sort by age.
+///
+/// Deliberately NOT `ScoredCandidate`: that type carries `relevance`,
+/// `vector_score` and `keyword_score`, which are relative to a recall query.
+/// There is no query during maintenance, so the engine could only set them to
+/// zero — and a policy that sorted by `relevance` would silently rank every
+/// item identically. Omitting the fields makes that mistake unrepresentable
+/// rather than merely documented.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaintenanceCandidate {
+    pub item: MemoryItem,
+    pub value: Score,
+    pub fragility: Score,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaintainContext {
     pub scope: Scope,
-    /// One page of the scope's items, carrying the same `value`/`fragility`
-    /// signal `AdmitContext::eviction_candidates` carries — capacity reclaim
-    /// during maintenance is the same decision `admit` makes under pressure,
-    /// and a policy handed bare `MemoryItem`s could only sort by age.
-    ///
-    /// Maintenance is a resumable job; the engine pages through and calls
-    /// `maintain` per batch. `remaining_after_batch` says how much of the scope
-    /// this page does not cover, so a policy can tell a partial view from the
-    /// whole thing before evicting on the strength of it.
-    pub batch: Vec<ScoredCandidate>,
-    /// Items in this scope not included in `batch`. Zero means this is the
-    /// last page and the policy is seeing everything that is left.
-    pub remaining_after_batch: u64,
+    /// One page of the scope's items. Maintenance is a resumable job; the
+    /// engine pages through and calls `maintain` per batch.
+    pub batch: Vec<MaintenanceCandidate>,
+    /// True when this page is the last one. Derived from the same fact the
+    /// engine uses to stop paging (a short page means the end), NOT from
+    /// arithmetic over the capacity count — an item forgotten mid-run would
+    /// make such a count disagree with the paging position, and a policy would
+    /// evict on the strength of a number that had quietly floored to zero.
+    pub is_final_batch: bool,
     pub capacity: CapacityState,
     pub stats: ScopeStats,
     pub now: OffsetDateTime,
@@ -128,6 +144,8 @@ mod tests {
     use crate::assessment::{AssessorId, RedundancyAssessment, SensitivityAssessment};
     use crate::decision::{Reason, ReasonCode};
     use crate::features;
+    use crate::ids::ItemId;
+    use crate::item::{MemoryItem, Protection, Source, SourceKind};
     use crate::recall::{RecallBudget, RecallMode};
     use crate::score::Score;
     use crate::{Budget, CapacityState, Scope, ScopeStats};
@@ -183,6 +201,27 @@ mod tests {
             neighbours: vec![],
             stats: ScopeStats::default(),
             now: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn sample_item() -> MemoryItem {
+        MemoryItem {
+            id: ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            scope: Scope::new("t", "s", "n").unwrap(),
+            body: "sample".into(),
+            kind: "test".into(),
+            tags: vec![],
+            attrs: Default::default(),
+            sensitivity: SensitivityLevel::Public,
+            occurred_at: None,
+            created_at: OffsetDateTime::from_unix_timestamp(0).unwrap(),
+            protection: Protection::Normal,
+            ttl: None,
+            pending_embedding: false,
+            source: Source {
+                kind: SourceKind::Agent,
+                id: Some("test".into()),
+            },
         }
     }
 
@@ -263,14 +302,37 @@ mod tests {
             stats: ScopeStats::default(),
             now: OffsetDateTime::UNIX_EPOCH,
         };
-        let ws = p.compose(&req, &[], &compose_ctx).unwrap();
-        assert!(ws.items.is_empty());
+
+        // Non-empty input: an empty slice proves only that the method returns
+        // Ok, not that it can read its own parameters.
+        let candidate = ScoredCandidate {
+            item: sample_item(),
+            relevance: 0.75,
+            vector_score: Some(0.75),
+            keyword_score: None,
+            value: Score::clamped(0.6),
+            fragility: Score::clamped(0.2),
+            estimated_tokens: 12,
+        };
+        let ws = p
+            .compose(&req, std::slice::from_ref(&candidate), &compose_ctx)
+            .unwrap();
+        assert!(
+            ws.items.is_empty(),
+            "AlwaysAdmit composes nothing by design"
+        );
         assert_eq!(compose_ctx.clone(), compose_ctx);
 
         let maintain_ctx = MaintainContext {
             scope: Scope::new("t", "s", "n").unwrap(),
-            batch: vec![],
-            remaining_after_batch: 0,
+            batch: vec![MaintenanceCandidate {
+                item: sample_item(),
+                value: Score::clamped(0.3),
+                fragility: Score::clamped(0.9),
+            }],
+            // Not the last page — a policy that only ever sees `true` here is
+            // never tested on the partial-view case it must handle.
+            is_final_batch: false,
             capacity: CapacityState {
                 budget: Budget::UNBOUNDED,
                 used_items: 0,
@@ -281,5 +343,7 @@ mod tests {
         };
         assert!(p.maintain(&maintain_ctx).unwrap().is_empty());
         assert_eq!(maintain_ctx.clone(), maintain_ctx);
+        assert_eq!(maintain_ctx.batch[0].fragility.get(), 0.9);
+        assert!(!maintain_ctx.is_final_batch);
     }
 }

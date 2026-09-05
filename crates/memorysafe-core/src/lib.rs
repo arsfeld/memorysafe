@@ -25,7 +25,7 @@ pub use ids::{AuditId, ItemId, Namespace, Scope, SubjectId, TenantId};
 pub use item::{MemoryItem, Protection, Source, SourceKind};
 pub use policy::{
     AdmitContext, AssessContext, Assessed, Candidate, ComposeContext, GovernancePolicy,
-    MaintainContext, PolicyError,
+    MaintainContext, MaintenanceCandidate, PolicyError,
 };
 pub use recall::{
     OMITTED_CAP, OmittedItem, RecallBudget, RecallMode, RecallRequest, ScoredCandidate,
