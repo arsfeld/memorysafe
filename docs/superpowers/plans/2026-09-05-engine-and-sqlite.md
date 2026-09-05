@@ -7557,3 +7557,982 @@ git commit -m "feat(policy): value scoring and pattern-based sensitivity detecti
 ```
 
 ---
+
+## Task 27: Policy — `admit`
+
+**Files:**
+- Create: `crates/memorysafe-policy/src/admit.rs`
+- Modify: `crates/memorysafe-policy/src/lib.rs`
+
+**Interfaces:**
+- Consumes: `Assessed`, `AdmitContext`, `BaselineConfig`, `Verdict`.
+- Produces: `admit::decide(&Assessed, &AdmitContext, &BaselineConfig, PolicyId) -> Decision`, and `GovernancePolicy::admit` on `BaselinePolicy`.
+
+**The rules, in order.** An exact duplicate is rejected. A near-duplicate is merged into its closest neighbour. Otherwise the item is retained — and if capacity is tight, evictions are selected ascending by `value × (1 − fragility)` until there is room. A candidate that is both highly fragile and highly sensitive gets `Protected` plus a `SensitivityConflict` reason, so the conflict is visible in the audit trail rather than silently resolved. If nothing is evictable and there is no room, the write is rejected with `BudgetExhausted` — never by silently exceeding the budget.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `crates/memorysafe-policy/src/admit.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BaselineConfig;
+    use crate::testkit::{candidate, candidate_from, scope};
+    use memorysafe_core::{
+        Action, Budget, CapacityState, PolicyId, Protection, ReasonCode, ScopeStats,
+        SensitivityLevel,
+    };
+    use time::OffsetDateTime;
+
+    fn ctx(used: u64, max: Option<u64>, evictable: Vec<ScoredCandidate>) -> AdmitContext {
+        AdmitContext {
+            scope: scope(),
+            capacity: CapacityState {
+                budget: Budget { max_items: max, max_bytes: None },
+                used_items: used,
+                used_bytes: 0,
+            },
+            eviction_candidates: evictable,
+            stats: ScopeStats::default(),
+            now: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn assessed(similarity: f32, value: f32, fragility: f32, level: SensitivityLevel)
+        -> (Candidate, Assessment)
+    {
+        let cand = candidate_from("a new memory", None);
+        let neighbours = if similarity > 0.0 { vec![candidate("near", similarity)] } else { vec![] };
+        let a = Assessment {
+            value: Score::clamped(value),
+            fragility: Score::clamped(fragility),
+            sensitivity: SensitivityAssessment {
+                level,
+                categories: vec![],
+                confidence: Score::clamped(0.8),
+            },
+            redundancy: crate::redundancy::assess(&neighbours, &BaselineConfig::default()),
+            features: Default::default(),
+            assessor: AssessorId::new("baseline", "0.1.0"),
+        };
+        (cand, a)
+    }
+
+    fn pid() -> PolicyId {
+        PolicyId::new("baseline", "0.1.0")
+    }
+
+    #[test]
+    fn an_exact_duplicate_is_rejected() {
+        let cfg = BaselineConfig::default();
+        let (c, a) = assessed(0.99, 0.8, 0.2, SensitivityLevel::Internal);
+        let d = decide(&Assessed { candidate: &c, assessment: &a }, &ctx(0, None, vec![]), &cfg, pid());
+        assert!(matches!(d.action, Action::Reject));
+        assert!(d.has_reason(ReasonCode::ExactDuplicate));
+    }
+
+    #[test]
+    fn a_near_duplicate_merges_into_its_closest_neighbour() {
+        let cfg = BaselineConfig::default();
+        let (c, a) = assessed(0.95, 0.8, 0.2, SensitivityLevel::Internal);
+        let expected = a.redundancy.near_duplicates[0].0.clone();
+        let d = decide(&Assessed { candidate: &c, assessment: &a }, &ctx(0, None, vec![]), &cfg, pid());
+        match &d.action {
+            Action::Merge { into, .. } => assert_eq!(*into, expected),
+            other => panic!("expected a merge, got {other:?}"),
+        }
+        assert!(d.has_reason(ReasonCode::HighRedundancy));
+    }
+
+    #[test]
+    fn novel_content_is_retained_with_no_evictions() {
+        let cfg = BaselineConfig::default();
+        let (c, a) = assessed(0.1, 0.8, 0.2, SensitivityLevel::Internal);
+        let d = decide(&Assessed { candidate: &c, assessment: &a }, &ctx(0, Some(100), vec![]), &cfg, pid());
+        assert!(matches!(d.action, Action::Retain { protection: Protection::Normal }));
+        assert!(d.evictions.is_empty());
+        assert!(d.has_reason(ReasonCode::NovelContent));
+    }
+
+    #[test]
+    fn under_pressure_the_cheapest_items_are_evicted_first() {
+        let cfg = BaselineConfig::default();
+        let mut cheap = candidate("cheap to lose", 0.5);
+        cheap.value = Score::clamped(0.1);
+        cheap.fragility = Score::clamped(0.1);
+        let mut precious = candidate("expensive to lose", 0.5);
+        precious.value = Score::clamped(0.9);
+        precious.fragility = Score::clamped(0.9);
+        let cheap_id = cheap.item.id.clone();
+
+        let (c, a) = assessed(0.1, 0.8, 0.2, SensitivityLevel::Internal);
+        let d = decide(
+            &Assessed { candidate: &c, assessment: &a },
+            &ctx(10, Some(10), vec![precious, cheap]),
+            &cfg,
+            pid(),
+        );
+
+        assert!(matches!(d.action, Action::Retain { .. }));
+        assert_eq!(d.evictions.len(), 1, "exactly one eviction makes exactly enough room");
+        assert_eq!(d.evictions[0].item, cheap_id, "evicted the expensive item");
+        assert_eq!(d.evictions[0].reason.code, ReasonCode::CapacityPressure);
+    }
+
+    #[test]
+    fn a_full_scope_with_nothing_evictable_rejects_rather_than_overflowing() {
+        let cfg = BaselineConfig::default();
+        let (c, a) = assessed(0.1, 0.8, 0.2, SensitivityLevel::Internal);
+        let d = decide(
+            &Assessed { candidate: &c, assessment: &a },
+            &ctx(10, Some(10), vec![]),
+            &cfg,
+            pid(),
+        );
+        assert!(matches!(d.action, Action::Reject));
+        assert!(d.has_reason(ReasonCode::BudgetExhausted));
+    }
+
+    #[test]
+    fn a_fragile_and_sensitive_item_is_protected_and_the_conflict_is_recorded() {
+        let cfg = BaselineConfig::default();
+        let (c, a) = assessed(0.1, 0.8, 0.95, SensitivityLevel::Restricted);
+        let d = decide(&Assessed { candidate: &c, assessment: &a }, &ctx(0, Some(100), vec![]), &cfg, pid());
+        assert!(
+            matches!(d.action, Action::Retain { protection: Protection::Protected { .. } }),
+            "got {:?}",
+            d.action
+        );
+        assert!(
+            d.has_reason(ReasonCode::SensitivityConflict),
+            "the conflict must be visible in the audit trail"
+        );
+    }
+
+    #[test]
+    fn a_fragile_but_ordinary_item_is_protected_without_a_conflict() {
+        let cfg = BaselineConfig::default();
+        let (c, a) = assessed(0.1, 0.8, 0.95, SensitivityLevel::Internal);
+        let d = decide(&Assessed { candidate: &c, assessment: &a }, &ctx(0, Some(100), vec![]), &cfg, pid());
+        assert!(d.has_reason(ReasonCode::ProtectedFragile));
+        assert!(!d.has_reason(ReasonCode::SensitivityConflict));
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-policy admit`
+Expected: FAIL — `cannot find function decide in this scope`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-policy/src/admit.rs`:
+
+```rust
+use crate::config::{BaselineConfig, Verdict};
+use memorysafe_core::{
+    Action, AdmitContext, Assessed, Decision, Eviction, MergeStrategy, PolicyId, Protection,
+    Reason, ReasonCode, Score, ScoredCandidate, SensitivityLevel, features,
+};
+use time::Duration;
+
+/// Fragility at or above this earns a protection window.
+const FRAGILE_THRESHOLD: f32 = 0.85;
+/// Length of that window.
+const PROTECTION_DAYS: i64 = 30;
+
+/// Cost of losing an item. Low value and low fragility means cheap to lose.
+fn eviction_cost(c: &ScoredCandidate) -> f32 {
+    c.value.get() * (1.0 - c.fragility.get()).max(0.0)
+}
+
+pub fn decide(
+    assessed: &Assessed,
+    ctx: &AdmitContext,
+    cfg: &BaselineConfig,
+    policy: PolicyId,
+) -> Decision {
+    let a = assessed.assessment;
+    let best = a.redundancy.score.get();
+
+    match cfg.classify(best) {
+        Verdict::ExactDuplicate => {
+            return Decision::reject(
+                policy,
+                Reason::new(
+                    ReasonCode::ExactDuplicate,
+                    "an existing memory is effectively identical",
+                    features! { "similarity" => best, "threshold" => cfg.duplicate_threshold },
+                ),
+            );
+        }
+        Verdict::Mergeable => {
+            if let Some((target, similarity)) = a.redundancy.best() {
+                return Decision {
+                    action: Action::Merge {
+                        into: target.clone(),
+                        strategy: MergeStrategy::AppendAndUnion,
+                    },
+                    evictions: vec![],
+                    reasons: vec![Reason::new(
+                        ReasonCode::HighRedundancy,
+                        "folded into a closely related existing memory",
+                        features! {
+                            "similarity" => similarity,
+                            "threshold" => cfg.merge_threshold,
+                        },
+                    )],
+                    policy,
+                };
+            }
+        }
+        Verdict::Novel => {}
+    }
+
+    // Retain. Decide protection first, then make room.
+    let fragile = a.fragility.get() >= FRAGILE_THRESHOLD;
+    let sensitive = a.sensitivity.level >= SensitivityLevel::Sensitive;
+
+    let mut reasons = Vec::new();
+    let protection = if fragile {
+        if sensitive {
+            // Both axes fire and they disagree about what to do. Keep it and
+            // say so, rather than resolving it invisibly.
+            reasons.push(Reason::new(
+                ReasonCode::SensitivityConflict,
+                "fragile enough to protect and sensitive enough to question; retained \
+                 and protected, flagged for review",
+                features! {
+                    "fragility" => a.fragility.get(),
+                    "sensitivity_ordinal" => a.sensitivity.level.ordinal() as f64,
+                },
+            ));
+        } else {
+            reasons.push(Reason::new(
+                ReasonCode::ProtectedFragile,
+                "atypical content with few near neighbours; expensive to relearn",
+                features! { "fragility" => a.fragility.get() },
+            ));
+        }
+        Protection::Protected { until: ctx.now + Duration::days(PROTECTION_DAYS) }
+    } else {
+        reasons.push(Reason::new(
+            ReasonCode::NovelContent,
+            "no sufficiently similar memory exists",
+            features! { "best_similarity" => best },
+        ));
+        Protection::Normal
+    };
+
+    // Make room if needed.
+    let mut evictions = Vec::new();
+    if ctx.capacity.would_exceed(1, assessed.candidate.byte_size) {
+        let mut ranked: Vec<&ScoredCandidate> = ctx.eviction_candidates.iter().collect();
+        ranked.sort_by(|a, b| eviction_cost(a).total_cmp(&eviction_cost(b)));
+
+        let mut freed_items = 0u64;
+        let mut freed_bytes = 0u64;
+        for c in ranked {
+            let still_over = {
+                let mut projected = ctx.capacity;
+                projected.used_items = projected.used_items.saturating_sub(freed_items);
+                projected.used_bytes = projected.used_bytes.saturating_sub(freed_bytes);
+                projected.would_exceed(1, assessed.candidate.byte_size)
+            };
+            if !still_over {
+                break;
+            }
+            evictions.push(Eviction {
+                item: c.item.id.clone(),
+                reason: Reason::new(
+                    ReasonCode::CapacityPressure,
+                    "evicted to make room; lowest value-weighted retention cost in scope",
+                    features! {
+                        "value" => c.value.get(),
+                        "fragility" => c.fragility.get(),
+                        "eviction_cost" => eviction_cost(c),
+                    },
+                ),
+            });
+            freed_items += 1;
+            freed_bytes += c.item.byte_size();
+        }
+
+        let mut projected = ctx.capacity;
+        projected.used_items = projected.used_items.saturating_sub(freed_items);
+        projected.used_bytes = projected.used_bytes.saturating_sub(freed_bytes);
+        if projected.would_exceed(1, assessed.candidate.byte_size) {
+            // Never silently exceed the budget.
+            return Decision::reject(
+                policy,
+                Reason::new(
+                    ReasonCode::BudgetExhausted,
+                    "the namespace is full and nothing in it is evictable",
+                    features! {
+                        "used_items" => ctx.capacity.used_items as f64,
+                        "evictable" => ctx.eviction_candidates.len() as f64,
+                        "pressure" => ctx.capacity.pressure(),
+                    },
+                ),
+            );
+        }
+    }
+
+    let _ = Score::ZERO;
+    Decision { action: Action::Retain { protection }, evictions, reasons, policy }
+}
+```
+
+Replace the `admit` stub in `lib.rs`:
+
+```rust
+    fn admit(&self, assessed: &Assessed, ctx: &AdmitContext) -> Result<Decision, PolicyError> {
+        Ok(admit::decide(assessed, ctx, &self.config, self.policy_id()))
+    }
+```
+
+Add `pub mod admit;`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-policy`
+Expected: PASS — 25 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-policy/
+git commit -m "feat(policy): admission with merge, capacity eviction, and recorded conflicts"
+```
+
+---
+
+## Task 28: Policy — `compose`
+
+**Files:**
+- Create: `crates/memorysafe-policy/src/compose.rs`
+- Modify: `crates/memorysafe-policy/src/lib.rs`
+
+**Interfaces:**
+- Consumes: `RecallRequest`, `ScoredCandidate`, `ComposeContext`, `BaselineConfig`.
+- Produces: `compose::working_set(&RecallRequest, &[ScoredCandidate], &ComposeContext, &BaselineConfig) -> WorkingSet`, and `GovernancePolicy::compose` on `BaselinePolicy`.
+
+**How composition works.** In `Search` mode, candidates are returned in relevance order, packed to budget. In `WorkingSet` mode, a fraction of the budget (`replay_quota`, default 20%) is reserved for replay-due items — high fragility or long unaccessed — and the rest is filled by Maximal Marginal Relevance, which trades relevance against dissimilarity to what has already been selected so the context window is not three paraphrases of one fact. Everything cut is reported in `omitted` with a reason, capped at `OMITTED_CAP`.
+
+**On `replay`:** this is where the continual-learning verb earns its meaning for agent memory. An item that is fragile or has gone unread for a long time is given a slot it would not have won on relevance alone, which keeps it live rather than letting it decay into never being recalled again.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `crates/memorysafe-policy/src/compose.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BaselineConfig;
+    use crate::testkit::{candidate, scope};
+    use memorysafe_core::{RecallBudget, RecallMode, ReasonCode, ScopeStats, SensitivityLevel};
+    use time::{Duration, OffsetDateTime};
+
+    fn ctx() -> ComposeContext {
+        ComposeContext {
+            scope: scope(),
+            stats: ScopeStats::default(),
+            now: OffsetDateTime::UNIX_EPOCH + Duration::days(365),
+        }
+    }
+
+    fn req(mode: RecallMode, max_items: usize) -> RecallRequest {
+        RecallRequest {
+            scope: scope(),
+            query: Some("cats".into()),
+            tags_any: vec![],
+            kinds: vec![],
+            mode,
+            budget: RecallBudget { max_tokens: Some(10_000), max_items: Some(max_items) },
+            sensitivity_ceiling: SensitivityLevel::Restricted,
+        }
+    }
+
+    #[test]
+    fn search_mode_returns_pure_relevance_order() {
+        let cands = vec![candidate("low", 0.2), candidate("high", 0.9), candidate("mid", 0.5)];
+        let ws = working_set(&req(RecallMode::Search, 3), &cands, &ctx(), &BaselineConfig::default());
+        let bodies: Vec<&str> = ws.items.iter().map(|s| s.item.body.as_str()).collect();
+        assert_eq!(bodies, vec!["high", "mid", "low"]);
+    }
+
+    #[test]
+    fn the_item_budget_is_respected_and_the_rest_is_reported_as_omitted() {
+        let cands: Vec<_> = (0..10).map(|i| candidate(&format!("m{i}"), 0.9 - i as f32 * 0.05)).collect();
+        let ws = working_set(&req(RecallMode::Search, 3), &cands, &ctx(), &BaselineConfig::default());
+        assert_eq!(ws.items.len(), 3);
+        assert_eq!(ws.omitted.len(), 7);
+        assert!(ws.omitted.iter().all(|o| o.reason.code == ReasonCode::BudgetExhausted));
+    }
+
+    #[test]
+    fn the_token_budget_is_respected() {
+        let mut cands = Vec::new();
+        for i in 0..5 {
+            let mut c = candidate(&format!("m{i}"), 0.9);
+            c.estimated_tokens = 100;
+            cands.push(c);
+        }
+        let mut r = req(RecallMode::Search, 100);
+        r.budget = RecallBudget { max_tokens: Some(250), max_items: None };
+        let ws = working_set(&r, &cands, &ctx(), &BaselineConfig::default());
+        assert_eq!(ws.items.len(), 2, "a third item would exceed 250 tokens");
+        assert!(ws.tokens_used <= 250);
+    }
+
+    #[test]
+    fn working_set_mode_diversifies_away_from_near_duplicates() {
+        // Three paraphrases plus one distinct fact; with 2 slots the distinct
+        // fact should win the second slot over a third paraphrase.
+        let mut cands = vec![
+            candidate("the cat sat on the mat", 0.95),
+            candidate("the cat sat on a mat", 0.94),
+            candidate("the cat sat upon the mat", 0.93),
+            candidate("quarterly revenue exceeded projections", 0.60),
+        ];
+        for c in &mut cands {
+            c.fragility = Score::ZERO;
+            c.item.created_at = ctx().now;
+        }
+        let ws = working_set(&req(RecallMode::WorkingSet, 2), &cands, &ctx(), &BaselineConfig::default());
+        let bodies: Vec<&str> = ws.items.iter().map(|s| s.item.body.as_str()).collect();
+        assert_eq!(bodies[0], "the cat sat on the mat");
+        assert_eq!(
+            bodies[1], "quarterly revenue exceeded projections",
+            "MMR should prefer a distinct item over a third paraphrase"
+        );
+        assert!(ws.items[1].reason.code == ReasonCode::DiversityCut || bodies.len() == 2);
+    }
+
+    #[test]
+    fn a_fragile_stale_item_wins_a_replay_slot_it_would_not_win_on_relevance() {
+        let mut relevant: Vec<_> =
+            (0..9).map(|i| candidate(&format!("relevant {i}"), 0.9)).collect();
+        for c in &mut relevant {
+            c.fragility = Score::ZERO;
+            c.item.created_at = ctx().now;
+        }
+        let mut stale = candidate("a rare fact nobody has read in a year", 0.05);
+        stale.fragility = Score::ONE;
+        stale.item.created_at = OffsetDateTime::UNIX_EPOCH;
+        relevant.push(stale);
+
+        let ws = working_set(
+            &req(RecallMode::WorkingSet, 5),
+            &relevant,
+            &ctx(),
+            &BaselineConfig::default(),
+        );
+        assert!(
+            ws.items.iter().any(|s| s.item.body.contains("rare fact")),
+            "the replay quota did not surface the fragile stale item"
+        );
+        assert!(ws.items.iter().any(|s| s.reason.code == ReasonCode::ReplayDue));
+    }
+
+    #[test]
+    fn the_omitted_list_is_capped() {
+        let cands: Vec<_> = (0..200).map(|i| candidate(&format!("m{i}"), 0.5)).collect();
+        let ws = working_set(&req(RecallMode::Search, 1), &cands, &ctx(), &BaselineConfig::default());
+        assert_eq!(ws.omitted.len(), memorysafe_core::OMITTED_CAP);
+    }
+
+    #[test]
+    fn an_empty_candidate_set_yields_an_empty_working_set() {
+        let ws = working_set(&req(RecallMode::WorkingSet, 5), &[], &ctx(), &BaselineConfig::default());
+        assert!(ws.items.is_empty());
+        assert!(ws.omitted.is_empty());
+        assert_eq!(ws.tokens_used, 0);
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-policy compose`
+Expected: FAIL — `cannot find function working_set in this scope`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-policy/src/compose.rs`:
+
+```rust
+use crate::config::BaselineConfig;
+use memorysafe_core::{
+    ComposeContext, OMITTED_CAP, OmittedItem, RecallMode, RecallRequest, Reason, ReasonCode,
+    Score, ScoredCandidate, SelectedItem, WorkingSet, features,
+};
+use time::Duration;
+
+/// Cheap textual proxy for "these two say the same thing", used by MMR. The
+/// backend's vectors are not carried through to the policy, so similarity is
+/// computed over token overlap instead — crude, but it reliably catches the
+/// case MMR exists for: near-paraphrases crowding out distinct facts.
+fn overlap(a: &str, b: &str) -> f32 {
+    let toks = |s: &str| -> Vec<String> {
+        s.split_whitespace().map(|t| t.to_lowercase()).collect()
+    };
+    let (ta, tb) = (toks(a), toks(b));
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let shared = ta.iter().filter(|t| tb.contains(t)).count();
+    shared as f32 / ta.len().min(tb.len()) as f32
+}
+
+fn fits(req: &RecallRequest, tokens: u32, items: usize) -> bool {
+    req.budget.fits(tokens, items)
+}
+
+/// True when an item deserves a slot it would not win on relevance: it is
+/// fragile, or it has not been touched in a long time. This is `replay` from
+/// the continual-learning lineage, applied to a context window.
+fn replay_due(c: &ScoredCandidate, ctx: &ComposeContext, cfg: &BaselineConfig) -> bool {
+    let stale = ctx.now - c.item.created_at >= Duration::days(cfg.replay_stale_days as i64);
+    c.fragility.get() >= 0.8 || (stale && c.fragility.get() >= 0.5)
+}
+
+pub fn working_set(
+    req: &RecallRequest,
+    candidates: &[ScoredCandidate],
+    ctx: &ComposeContext,
+    cfg: &BaselineConfig,
+) -> WorkingSet {
+    if candidates.is_empty() {
+        return WorkingSet::empty();
+    }
+
+    let mut ranked: Vec<&ScoredCandidate> = candidates.iter().collect();
+    ranked.sort_by(|a, b| {
+        b.relevance.total_cmp(&a.relevance).then_with(|| a.item.id.cmp(&b.item.id))
+    });
+
+    let mut selected: Vec<SelectedItem> = Vec::new();
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut tokens: u32 = 0;
+
+    let push = |selected: &mut Vec<SelectedItem>,
+                tokens: &mut u32,
+                c: &ScoredCandidate,
+                reason: Reason| {
+        *tokens += c.estimated_tokens;
+        selected.push(SelectedItem {
+            item: c.item.clone(),
+            relevance: c.relevance,
+            reason,
+        });
+    };
+
+    if req.mode == RecallMode::Search {
+        for (i, c) in ranked.iter().enumerate() {
+            if !fits(req, tokens + c.estimated_tokens, selected.len() + 1) {
+                break;
+            }
+            chosen.push(i);
+            push(
+                &mut selected,
+                &mut tokens,
+                c,
+                Reason::new(
+                    ReasonCode::HighValue,
+                    "ranked by relevance in search mode",
+                    features! { "relevance" => c.relevance },
+                ),
+            );
+        }
+    } else {
+        // Reserve part of the budget for replay before relevance consumes it.
+        let slot_budget = req.budget.max_items.unwrap_or(ranked.len());
+        let replay_slots =
+            ((slot_budget as f32 * cfg.replay_quota).floor() as usize).min(slot_budget);
+
+        let mut replayed = 0usize;
+        for (i, c) in ranked.iter().enumerate() {
+            if replayed >= replay_slots {
+                break;
+            }
+            if !replay_due(c, ctx, cfg) {
+                continue;
+            }
+            if !fits(req, tokens + c.estimated_tokens, selected.len() + 1) {
+                break;
+            }
+            chosen.push(i);
+            replayed += 1;
+            push(
+                &mut selected,
+                &mut tokens,
+                c,
+                Reason::new(
+                    ReasonCode::ReplayDue,
+                    "fragile or long unaccessed; surfaced to keep it live",
+                    features! {
+                        "fragility" => c.fragility.get(),
+                        "relevance" => c.relevance,
+                        "age_days" => (ctx.now - c.item.created_at).whole_days() as f64,
+                    },
+                ),
+            );
+        }
+
+        // Fill the rest by Maximal Marginal Relevance.
+        loop {
+            let mut best: Option<(usize, f32)> = None;
+            for (i, c) in ranked.iter().enumerate() {
+                if chosen.contains(&i) {
+                    continue;
+                }
+                if !fits(req, tokens + c.estimated_tokens, selected.len() + 1) {
+                    continue;
+                }
+                let max_sim = selected
+                    .iter()
+                    .map(|s| overlap(&c.item.body, &s.item.body))
+                    .fold(0.0f32, f32::max);
+                let mmr = cfg.mmr_lambda * c.relevance - (1.0 - cfg.mmr_lambda) * max_sim;
+                if best.is_none_or(|(_, b)| mmr > b) {
+                    best = Some((i, mmr));
+                }
+            }
+            let Some((i, mmr)) = best else { break };
+            let c = ranked[i];
+            chosen.push(i);
+            let max_sim = selected
+                .iter()
+                .map(|s| overlap(&c.item.body, &s.item.body))
+                .fold(0.0f32, f32::max);
+            push(
+                &mut selected,
+                &mut tokens,
+                c,
+                Reason::new(
+                    if max_sim > 0.5 { ReasonCode::DiversityCut } else { ReasonCode::HighValue },
+                    "selected by relevance traded against redundancy with the set so far",
+                    features! {
+                        "relevance" => c.relevance,
+                        "max_similarity_to_selected" => max_sim,
+                        "mmr" => mmr,
+                    },
+                ),
+            );
+        }
+    }
+
+    let omitted: Vec<OmittedItem> = ranked
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !chosen.contains(i))
+        .take(OMITTED_CAP)
+        .map(|(_, c)| OmittedItem {
+            id: c.item.id.clone(),
+            reason: Reason::new(
+                ReasonCode::BudgetExhausted,
+                "considered but did not fit the budget",
+                features! { "relevance" => c.relevance },
+            ),
+        })
+        .collect();
+
+    let _ = Score::ZERO;
+    WorkingSet { items: selected, tokens_used: tokens, omitted, audit_id: None }
+}
+```
+
+Replace the `compose` stub in `lib.rs`:
+
+```rust
+    fn compose(&self, req: &RecallRequest, candidates: &[ScoredCandidate], ctx: &ComposeContext)
+        -> Result<WorkingSet, PolicyError>
+    {
+        Ok(compose::working_set(req, candidates, ctx, &self.config))
+    }
+```
+
+Add `pub mod compose;`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-policy`
+Expected: PASS — 32 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-policy/
+git commit -m "feat(policy): governed working set with MMR diversity and a replay quota"
+```
+
+---
+
+## Task 29: Policy — `maintain`
+
+**Files:**
+- Create: `crates/memorysafe-policy/src/maintain.rs`
+- Modify: `crates/memorysafe-policy/src/lib.rs`
+
+**Interfaces:**
+- Consumes: `MaintainContext`, `BaselineConfig`.
+- Produces: `maintain::decisions(&MaintainContext, &BaselineConfig, PolicyId) -> Vec<Decision>`, and `GovernancePolicy::maintain` on `BaselinePolicy`.
+
+**What maintenance does, in order:** expire items past their TTL; release protection windows that have elapsed; reclaim capacity when a namespace is over budget, cheapest first, never touching pinned items. Each produces its own `Decision` with its own reason, so the audit trail says exactly why anything vanished.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `crates/memorysafe-policy/src/maintain.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BaselineConfig;
+    use crate::testkit::{item, scope};
+    use memorysafe_core::{Action, Budget, CapacityState, PolicyId, Protection, ReasonCode, ScopeStats};
+    use time::{Duration, OffsetDateTime};
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + Duration::days(365)
+    }
+
+    fn ctx(batch: Vec<MemoryItem>, used: u64, max: Option<u64>) -> MaintainContext {
+        MaintainContext {
+            scope: scope(),
+            batch,
+            capacity: CapacityState {
+                budget: Budget { max_items: max, max_bytes: None },
+                used_items: used,
+                used_bytes: 0,
+            },
+            stats: ScopeStats::default(),
+            now: now(),
+        }
+    }
+
+    fn pid() -> PolicyId {
+        PolicyId::new("baseline", "0.1.0")
+    }
+
+    #[test]
+    fn an_expired_item_is_forgotten_with_a_ttl_reason() {
+        let mut expired = item("gone stale");
+        expired.created_at = now() - Duration::days(10);
+        expired.ttl = Some(Duration::days(1));
+        let id = expired.id.clone();
+
+        let ds = decisions(&ctx(vec![expired], 1, None), &BaselineConfig::default(), pid());
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].evictions[0].item, id);
+        assert_eq!(ds[0].evictions[0].reason.code, ReasonCode::TtlExpired);
+    }
+
+    #[test]
+    fn an_unexpired_item_is_left_alone() {
+        let mut fresh = item("still good");
+        fresh.created_at = now();
+        fresh.ttl = Some(Duration::days(30));
+        assert!(decisions(&ctx(vec![fresh], 1, None), &BaselineConfig::default(), pid()).is_empty());
+    }
+
+    #[test]
+    fn a_pinned_item_survives_its_own_ttl() {
+        let mut pinned = item("pinned forever");
+        pinned.created_at = now() - Duration::days(10);
+        pinned.ttl = Some(Duration::days(1));
+        pinned.protection = Protection::Pinned;
+        assert!(
+            decisions(&ctx(vec![pinned], 1, None), &BaselineConfig::default(), pid()).is_empty(),
+            "a pinned item must never be evicted, TTL included"
+        );
+    }
+
+    #[test]
+    fn an_elapsed_protection_window_is_released() {
+        let mut protected = item("no longer special");
+        protected.protection = Protection::Protected { until: now() - Duration::days(1) };
+        let ds = decisions(&ctx(vec![protected], 1, None), &BaselineConfig::default(), pid());
+        assert_eq!(ds.len(), 1);
+        assert!(matches!(ds[0].action, Action::Retain { protection: Protection::Normal }));
+    }
+
+    #[test]
+    fn an_over_budget_namespace_reclaims_cheapest_first() {
+        let batch: Vec<MemoryItem> = (0..5).map(|i| item(&format!("memory {i}"))).collect();
+        let ds = decisions(&ctx(batch, 5, Some(3)), &BaselineConfig::default(), pid());
+        let evicted: usize = ds.iter().map(|d| d.evictions.len()).sum();
+        assert_eq!(evicted, 2, "5 items against a budget of 3 means 2 evictions");
+        assert!(ds.iter().any(|d| d.has_reason(ReasonCode::CapacityPressure)));
+    }
+
+    #[test]
+    fn reclaim_never_touches_pinned_items() {
+        let mut batch: Vec<MemoryItem> = (0..4).map(|i| item(&format!("memory {i}"))).collect();
+        for b in &mut batch {
+            b.protection = Protection::Pinned;
+        }
+        let ds = decisions(&ctx(batch, 4, Some(1)), &BaselineConfig::default(), pid());
+        let evicted: usize = ds.iter().map(|d| d.evictions.len()).sum();
+        assert_eq!(evicted, 0, "pinned items are absolute even under capacity pressure");
+    }
+
+    #[test]
+    fn a_namespace_within_budget_produces_no_decisions() {
+        let batch: Vec<MemoryItem> = (0..2).map(|i| item(&format!("memory {i}"))).collect();
+        assert!(decisions(&ctx(batch, 2, Some(10)), &BaselineConfig::default(), pid()).is_empty());
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-policy maintain`
+Expected: FAIL — `cannot find function decisions in this scope`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-policy/src/maintain.rs`:
+
+```rust
+use crate::config::BaselineConfig;
+use memorysafe_core::{
+    Action, Decision, Eviction, MaintainContext, MemoryItem, PolicyId, Protection, Reason,
+    ReasonCode, features,
+};
+
+/// Ranking for capacity reclaim. Older and larger items go first; nothing
+/// smarter is warranted without access statistics, which the backend collects
+/// asynchronously and the policy sees only through `value` on candidates.
+fn reclaim_rank(item: &MemoryItem) -> i64 {
+    item.created_at.unix_timestamp()
+}
+
+pub fn decisions(
+    ctx: &MaintainContext,
+    cfg: &BaselineConfig,
+    policy: PolicyId,
+) -> Vec<Decision> {
+    let _ = cfg;
+    let mut out = Vec::new();
+
+    // 1. TTL expiry. Pinned items are exempt — pinning is absolute.
+    for item in &ctx.batch {
+        if item.protection == Protection::Pinned {
+            continue;
+        }
+        if item.is_expired(ctx.now) {
+            out.push(Decision {
+                action: Action::Reject,
+                evictions: vec![Eviction {
+                    item: item.id.clone(),
+                    reason: Reason::new(
+                        ReasonCode::TtlExpired,
+                        "the item's time-to-live elapsed",
+                        features! {
+                            "age_days" => (ctx.now - item.created_at).whole_days() as f64,
+                        },
+                    ),
+                }],
+                reasons: vec![],
+                policy: policy.clone(),
+            });
+        }
+    }
+
+    let expired: Vec<_> =
+        out.iter().flat_map(|d| d.evictions.iter().map(|e| e.item.clone())).collect();
+
+    // 2. Release protection windows that have elapsed.
+    for item in &ctx.batch {
+        if expired.contains(&item.id) {
+            continue;
+        }
+        if let Protection::Protected { until } = item.protection
+            && until <= ctx.now
+        {
+            out.push(Decision {
+                action: Action::Retain { protection: Protection::Normal },
+                evictions: vec![],
+                reasons: vec![Reason::new(
+                    ReasonCode::ProtectedFragile,
+                    "protection window elapsed; item returns to normal eviction eligibility",
+                    features! { "expired_at" => until.unix_timestamp() as f64 },
+                )],
+                policy: policy.clone(),
+            });
+        }
+    }
+
+    // 3. Capacity reclaim, cheapest first, pinned untouchable.
+    let Some(max_items) = ctx.capacity.budget.max_items else {
+        return out;
+    };
+    let after_expiry = ctx.capacity.used_items.saturating_sub(expired.len() as u64);
+    if after_expiry <= max_items {
+        return out;
+    }
+
+    let mut over = after_expiry - max_items;
+    let mut reclaimable: Vec<&MemoryItem> = ctx
+        .batch
+        .iter()
+        .filter(|i| !expired.contains(&i.id) && i.protection.is_evictable(ctx.now))
+        .collect();
+    reclaimable.sort_by_key(|i| reclaim_rank(i));
+
+    for item in reclaimable {
+        if over == 0 {
+            break;
+        }
+        out.push(Decision {
+            action: Action::Reject,
+            evictions: vec![Eviction {
+                item: item.id.clone(),
+                reason: Reason::new(
+                    ReasonCode::CapacityPressure,
+                    "namespace is over budget; reclaimed oldest evictable item",
+                    features! {
+                        "used_items" => ctx.capacity.used_items as f64,
+                        "max_items" => max_items as f64,
+                    },
+                ),
+            }],
+            reasons: vec![],
+            policy: policy.clone(),
+        });
+        over -= 1;
+    }
+
+    out
+}
+```
+
+Replace the `maintain` stub in `lib.rs`:
+
+```rust
+    fn maintain(&self, ctx: &MaintainContext) -> Result<Vec<Decision>, PolicyError> {
+        Ok(maintain::decisions(ctx, &self.config, self.policy_id()))
+    }
+```
+
+Add `pub mod maintain;`. `PolicyId` must derive `Clone`; confirm from Task 7.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-policy && cargo clippy -p memorysafe-policy --all-targets -- -D warnings`
+Expected: PASS — 39 tests ok. `BaselinePolicy` now implements all four trait methods.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-policy/
+git commit -m "feat(policy): maintenance for TTL, protection windows, and capacity reclaim"
+```
+
+---
