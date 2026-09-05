@@ -7263,7 +7263,7 @@ mod tests {
     use super::*;
     use crate::config::BaselineConfig;
     use crate::testkit::candidate_from;
-    use memorysafe_core::{ScopeStats, SourceKind};
+    use memorysafe_core::ScopeStats;
 
     fn stats() -> ScopeStats {
         ScopeStats { item_count: 50, median_item_bytes: 100, ..Default::default() }
@@ -7289,7 +7289,6 @@ mod tests {
         human.attrs.insert("source_kind".into(), serde_json::json!("human"));
         let agent = candidate_from(text, None);
         assert!(score(&human, &stats(), &cfg) >= score(&agent, &stats(), &cfg));
-        let _ = SourceKind::Human;
     }
 
     #[test]
@@ -7728,7 +7727,7 @@ Expected: FAIL — `cannot find function decide in this scope`.
 use crate::config::{BaselineConfig, Verdict};
 use memorysafe_core::{
     Action, AdmitContext, Assessed, Decision, Eviction, MergeStrategy, PolicyId, Protection,
-    Reason, ReasonCode, Score, ScoredCandidate, SensitivityLevel, features,
+    Reason, ReasonCode, ScoredCandidate, SensitivityLevel, features,
 };
 use time::Duration;
 
@@ -7874,7 +7873,6 @@ pub fn decide(
         }
     }
 
-    let _ = Score::ZERO;
     Decision { action: Action::Retain { protection }, evictions, reasons, policy }
 }
 ```
@@ -8062,7 +8060,7 @@ Expected: FAIL — `cannot find function working_set in this scope`.
 use crate::config::BaselineConfig;
 use memorysafe_core::{
     ComposeContext, OMITTED_CAP, OmittedItem, RecallMode, RecallRequest, Reason, ReasonCode,
-    Score, ScoredCandidate, SelectedItem, WorkingSet, features,
+    ScoredCandidate, SelectedItem, WorkingSet, features,
 };
 use time::Duration;
 
@@ -8235,7 +8233,6 @@ pub fn working_set(
         })
         .collect();
 
-    let _ = Score::ZERO;
     WorkingSet { items: selected, tokens_used: tokens, omitted, audit_id: None }
 }
 ```
@@ -8408,10 +8405,11 @@ fn reclaim_rank(item: &MemoryItem) -> i64 {
 
 pub fn decisions(
     ctx: &MaintainContext,
-    cfg: &BaselineConfig,
+    // Unused by the baseline: TTL, protection windows, and reclaim need no
+    // thresholds. Kept in the signature because decay will.
+    _cfg: &BaselineConfig,
     policy: PolicyId,
 ) -> Vec<Decision> {
-    let _ = cfg;
     let mut out = Vec::new();
 
     // 1. TTL expiry. Pinned items are exempt — pinning is absolute.
@@ -10969,12 +10967,6 @@ Rewrite `Engine::purge_subject` in `mutate.rs` to honour the profile. The backen
         tenant: &TenantId,
         subject: &SubjectId,
     ) -> Result<Vec<memorysafe_core::Namespace>, EngineError> {
-        let probe = Scope {
-            tenant: tenant.clone(),
-            subject: subject.clone(),
-            namespace: memorysafe_core::Namespace::new("default")
-                .expect("default is a valid namespace"),
-        };
         let selector = memorysafe_backend::ScopeSelector {
             tenant: tenant.clone(),
             subject: Some(subject.clone()),
@@ -10995,7 +10987,6 @@ Rewrite `Engine::purge_subject` in `mutate.rs` to honour the profile. The backen
             .collect();
         namespaces.sort();
         namespaces.dedup();
-        let _ = probe;
         Ok(namespaces)
     }
 ```
@@ -11860,25 +11851,18 @@ impl Engine {
 }
 ```
 
-The per-item audit records above satisfy invariant 4 (one record per mutation) while `AuditEvent::Reembedded` makes the run queryable as a unit. The test asserting exactly one `Reembedded` record for a three-item scope therefore needs the run to be recorded once, not thrice — so collapse the per-item records into a single run record by moving the audit out of the loop:
+Keep the `AuditRecord` inside the loop, exactly as written above. Invariant 4 requires one audit
+record per mutation, and re-embedding one item is one mutation — collapsing the run into a single
+record would produce a tidier report by breaking the invariant the whole system rests on.
+`AuditEvent::Reembedded` is what makes the run queryable as a unit; the record count is what keeps
+it honest.
 
-```rust
-        // Replace the per-item AuditRecord construction with a neutral one:
-        let audit = AuditRecord::new(
-            scope.clone(),
-            AuditEvent::Reembedded,
-            vec![ItemRef::from_item(&updated)],
-            Actor { kind: ActorKind::System, id: None },
-        );
-```
-
-is correct as written — one mutation, one record — and the test's expectation of a single record holds only when the scope has one re-embedded item. Change the assertion in `a_scope_reembed_rewrites_every_vector_and_audits_the_run` to:
+That means a three-item scope produces three `Reembedded` records, so correct the assertion in
+`a_scope_reembed_rewrites_every_vector_and_audits_the_run`:
 
 ```rust
     assert_eq!(audit.len(), 3, "one audited mutation per re-embedded item");
 ```
-
-which keeps invariant 4 intact rather than bending it for a nicer-looking report.
 
 Add to `crates/memorysafe-engine/src/lib.rs`:
 
