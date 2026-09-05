@@ -2056,16 +2056,24 @@ mod tests {
         let rec = AuditRecord::new(scope, AuditEvent::Admitted, vec![], Actor::system())
             .with_assessment(sample_assessment())
             .with_decision(sample_decision());
-        assert!(rec.assessment.is_some(), "with_decision cleared the assessment");
-        assert!(rec.decision.is_some(), "with_assessment cleared the decision");
+        // Equality, not `is_some()`: a builder that ignored its argument and
+        // stored some other value would pass an is_some check.
+        assert_eq!(rec.assessment.as_ref(), Some(&sample_assessment()));
+        assert_eq!(rec.decision.as_ref(), Some(&sample_decision()));
+        // And it must return the SAME record, not a fresh one — a builder that
+        // rebuilt from scratch would lose these.
+        assert_eq!(rec.event, AuditEvent::Admitted);
+        assert_eq!(rec.actor, Actor::system());
+        assert_eq!(rec.scope.subject.as_str(), "s");
 
         // And in the opposite order.
         let scope = Scope::new("t", "s", "n").unwrap();
-        let rec = AuditRecord::new(scope, AuditEvent::Admitted, vec![], Actor::system())
+        let rec = AuditRecord::new(scope, AuditEvent::Forgotten, vec![], Actor::system())
             .with_decision(sample_decision())
             .with_assessment(sample_assessment());
-        assert!(rec.assessment.is_some());
-        assert!(rec.decision.is_some());
+        assert_eq!(rec.assessment.as_ref(), Some(&sample_assessment()));
+        assert_eq!(rec.decision.as_ref(), Some(&sample_decision()));
+        assert_eq!(rec.event, AuditEvent::Forgotten, "new() ignored its event argument");
     }
 
     #[test]
