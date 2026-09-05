@@ -832,15 +832,27 @@ macro_rules! features {
 /// would enter the type unchecked — and the hand-written `Ord` below, plus the
 /// `Eq` marker, are sound only while that cannot happen. Invalid stored data
 /// fails loudly rather than being silently corrected.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+// `transparent` and `try_from` conflict, so `Serialize` keeps `transparent`
+// (the wire format must stay a bare number — audit rows store these) and
+// `Deserialize` is hand-written to route through the validating constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(transparent)]
-#[serde(try_from = "f32")]
 pub struct Score(f32);
 
 impl TryFrom<f32> for Score {
     type Error = CoreError;
     fn try_from(value: f32) -> Result<Self, Self::Error> {
         Score::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for Score {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = f32::deserialize(deserializer)?;
+        Score::try_from(value).map_err(serde::de::Error::custom)
     }
 }
 
