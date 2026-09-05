@@ -46,12 +46,23 @@ impl Actor {
     }
 }
 
-/// An item's identity in an audit row. Deliberately has no body field — the
-/// type system is what enforces "audit never stores bodies".
+/// An item's identity in an audit row: an id and a content digest, never the
+/// body.
+///
+/// Fields are private and `from_item` is the only constructor, matching how
+/// every other identity type in this crate is built. That closes the
+/// accidental path — `ItemRef { id, digest: item.body.clone() }` will not
+/// compile — but be precise about what it does not close: `Deserialize` can
+/// still produce an `ItemRef` holding arbitrary text, so audit JSON arriving
+/// from outside this process is not covered.
+///
+/// The guarantee is therefore structural for code in this workspace and
+/// conventional at the deserialization boundary. See also `Reason::detail`,
+/// which is free prose a policy writes and which no type can constrain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemRef {
-    pub id: ItemId,
-    pub digest: String,
+    id: ItemId,
+    digest: String,
 }
 
 impl ItemRef {
@@ -60,6 +71,14 @@ impl ItemRef {
             id: item.id.clone(),
             digest: item.digest(),
         }
+    }
+
+    pub fn id(&self) -> &ItemId {
+        &self.id
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
     }
 }
 
@@ -110,6 +129,11 @@ pub struct AuditFilter {
     pub since: Option<OffsetDateTime>,
     #[serde(with = "time::serde::timestamp::option")]
     pub until: Option<OffsetDateTime>,
+    // NOTE for the task that implements `Backend::audit`: `limit` defaults to
+    // 100 and carries no truncation signal, so a compliance query built from
+    // `AuditFilter::default()` silently stops at 100 rows with no way for the
+    // caller to know. Either surface a `truncated` flag on the result or make
+    // the caller choose explicitly before that method ships.
     pub limit: usize,
 }
 
@@ -158,8 +182,8 @@ mod tests {
     fn item_ref_carries_a_digest_and_never_the_body() {
         let i = item("a secret diagnosis");
         let r = ItemRef::from_item(&i);
-        assert_eq!(r.id, i.id);
-        assert_eq!(r.digest, i.digest());
+        assert_eq!(*r.id(), i.id);
+        assert_eq!(r.digest(), i.digest());
         let json = serde_json::to_string(&r).unwrap();
         assert!(
             !json.contains("secret"),
@@ -205,6 +229,8 @@ mod tests {
         assert!(f.events.is_empty());
         assert_eq!(f.limit, 100);
         assert!(f.since.is_none());
+        assert!(f.until.is_none());
+        assert!(f.item.is_none());
     }
 
     #[test]
@@ -220,10 +246,12 @@ mod tests {
             at: OffsetDateTime::from_unix_timestamp(1234567890).unwrap(),
             scope: Scope::new("tenant1", "subject1", "namespace1").unwrap(),
             event: AuditEvent::Admitted,
-            items: vec![ItemRef {
-                id: ItemId::parse("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap(),
-                digest: "abc123def456".to_string(),
-            }],
+            items: vec![
+                serde_json::from_str(
+                    r#"{"id":"01BX5ZZKBKACTAV9WEVGEMMVRZ","digest":"abc123def456"}"#,
+                )
+                .unwrap(),
+            ],
             assessment: Some(Assessment {
                 value: crate::Score::clamped(0.85),
                 fragility: crate::Score::clamped(0.12),
@@ -279,5 +307,86 @@ mod tests {
             r#""actor":{"kind":"agent","id":"agent-1"}}"#
         );
         assert_eq!(json, expected, "audit record wire format changed");
+    }
+
+    fn sample_assessment() -> Assessment {
+        use crate::assessment::{
+            AssessorId, RedundancyAssessment, SensitivityAssessment, SensitivityCategory,
+        };
+        use crate::features;
+
+        Assessment {
+            value: crate::Score::clamped(0.85),
+            fragility: crate::Score::clamped(0.12),
+            sensitivity: SensitivityAssessment {
+                level: SensitivityLevel::Personal,
+                categories: vec![SensitivityCategory::Pii],
+                confidence: crate::Score::clamped(0.95),
+            },
+            redundancy: RedundancyAssessment {
+                score: crate::Score::clamped(0.05),
+                near_duplicates: vec![],
+            },
+            features: features! { "test_feature" => 1.5 },
+            assessor: AssessorId::new("test_assessor", "1.0.0"),
+        }
+    }
+
+    fn sample_decision() -> Decision {
+        use crate::decision::{PolicyId, Reason, ReasonCode};
+        use crate::features;
+
+        Decision {
+            action: crate::decision::Action::Retain {
+                protection: crate::item::Protection::Normal,
+            },
+            evictions: vec![],
+            reasons: vec![Reason::new(
+                ReasonCode::NovelContent,
+                "novel content detected",
+                features! { "similarity" => 0.1 },
+            )],
+            policy: PolicyId::new("default", "1.0.0"),
+        }
+    }
+
+    #[test]
+    fn actor_kinds_serialize_as_snake_case() {
+        // `ApiKey` is the only variant where snake_case and lowercase diverge,
+        // so it is the only one that proves which strategy is in force.
+        assert_eq!(
+            serde_json::to_string(&ActorKind::ApiKey).unwrap(),
+            "\"api_key\""
+        );
+        assert_eq!(serde_json::to_string(&ActorKind::Cli).unwrap(), "\"cli\"");
+        assert_eq!(Actor::system().kind, ActorKind::System);
+        assert!(Actor::system().id.is_none());
+    }
+
+    #[test]
+    fn the_builders_do_not_clobber_each_other() {
+        // `with_assessment` and `with_decision` each rebuild the record; a typo
+        // clearing the other's field would pass every other test here, because
+        // the golden test constructs its record with a struct literal.
+        let scope = Scope::new("t", "s", "n").unwrap();
+        let rec = AuditRecord::new(scope, AuditEvent::Admitted, vec![], Actor::system())
+            .with_assessment(sample_assessment())
+            .with_decision(sample_decision());
+        assert!(
+            rec.assessment.is_some(),
+            "with_decision cleared the assessment"
+        );
+        assert!(
+            rec.decision.is_some(),
+            "with_assessment cleared the decision"
+        );
+
+        // And in the opposite order.
+        let scope = Scope::new("t", "s", "n").unwrap();
+        let rec = AuditRecord::new(scope, AuditEvent::Admitted, vec![], Actor::system())
+            .with_decision(sample_decision())
+            .with_assessment(sample_assessment());
+        assert!(rec.assessment.is_some());
+        assert!(rec.decision.is_some());
     }
 }
