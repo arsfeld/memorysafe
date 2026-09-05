@@ -4,6 +4,7 @@ use crate::ids::{AuditId, ItemId, Scope};
 use crate::item::MemoryItem;
 use crate::score::Score;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 /// Cap on `WorkingSet::omitted`. A recall over a large corpus considers many
 /// candidates; the response must stay bounded.
@@ -47,6 +48,12 @@ pub struct RecallRequest {
     pub query: Option<String>,
     pub tags_any: Vec<String>,
     pub kinds: Vec<String>,
+    /// Bound recall to when the remembered thing happened. Both are pushed
+    /// into SQL as hard filters, below the policy, like every other filter
+    /// here — without them the backend's time-filter machinery would exist
+    /// but be unreachable from any caller.
+    pub occurred_after: Option<OffsetDateTime>,
+    pub occurred_before: Option<OffsetDateTime>,
     pub mode: RecallMode,
     pub budget: RecallBudget,
     /// The caller's clearance. Items above this level are excluded in SQL,
@@ -55,6 +62,17 @@ pub struct RecallRequest {
 }
 
 /// A retrieval hit before composition. `relevance` fuses vector and keyword.
+///
+/// `relevance`, `vector_score` and `keyword_score` are bare `f32`, deliberately
+/// breaking the crate's "never a bare `f32`" rule. `Score` is `[0,1]`; cosine
+/// spans `[-1,1]` and BM25 is unbounded, so wrapping these would make
+/// `Score::new` reject valid retrieval signal and `Score::clamped` destroy the
+/// magnitude a ranker needs. Contrast `RedundancyAssessment::near_duplicates`,
+/// which *can* use `Score` only because it is pre-filtered above a floor.
+/// `value` and `fragility` are genuine governance scores and stay `Score`.
+///
+/// Because these are `f32`, any sort on them must use `total_cmp` — a
+/// degenerate zero-vector cosine can produce NaN.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScoredCandidate {
     pub item: MemoryItem,
@@ -86,6 +104,10 @@ pub struct WorkingSet {
     /// Truncated to `OMITTED_CAP`.
     pub omitted: Vec<OmittedItem>,
     /// Set by the engine after `record_recall`; the policy leaves it `None`.
+    /// `None` means "not yet audited", and the type cannot distinguish that
+    /// from "audited" — so nothing stops an unaudited working set reaching a
+    /// caller. "Every recall is audited" is a product claim, so the engine
+    /// asserts this is `Some` at its public boundary (see the read-path task).
     pub audit_id: Option<AuditId>,
 }
 
