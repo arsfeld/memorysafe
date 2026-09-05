@@ -8,6 +8,7 @@ pub mod embedding;
 pub mod error;
 pub mod ids;
 pub mod item;
+pub mod policy;
 pub mod recall;
 pub mod score;
 
@@ -22,6 +23,10 @@ pub use embedding::{EmbedderId, Embedding};
 pub use error::CoreError;
 pub use ids::{AuditId, ItemId, Namespace, Scope, SubjectId, TenantId};
 pub use item::{MemoryItem, Protection, Source, SourceKind};
+pub use policy::{
+    AdmitContext, AssessContext, Assessed, Candidate, ComposeContext, GovernancePolicy,
+    MaintainContext, PolicyError,
+};
 pub use recall::{
     OMITTED_CAP, OmittedItem, RecallBudget, RecallMode, RecallRequest, ScoredCandidate,
     SelectedItem, WorkingSet,
