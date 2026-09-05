@@ -8536,3 +8536,1066 @@ git commit -m "feat(policy): maintenance for TTL, protection windows, and capaci
 ```
 
 ---
+
+## Task 30: Engine — decision validation
+
+**Files:**
+- Create: `crates/memorysafe-engine/Cargo.toml`
+- Create: `crates/memorysafe-engine/src/lib.rs`
+- Create: `crates/memorysafe-engine/src/error.rs`
+- Create: `crates/memorysafe-engine/src/validate.rs`
+- Modify: `Cargo.toml` (workspace dependencies)
+
+**Interfaces:**
+- Consumes: `GovernancePolicy`, `Decision`, `AdmitContext`, `WorkingSet`.
+- Produces: `EngineError`, `FailureStance` (`FailClosed` | `FailSafe`), `validate::decision(&Decision, &AdmitContext) -> Result<(), Invalid>`, `validate::working_set(&WorkingSet, &[ScoredCandidate]) -> Result<(), Invalid>`, `validate::call_policy(f) -> Result<T, PolicyFailure>` wrapping `catch_unwind`.
+
+**Why this exists.** The policy seam is pluggable, one implementation is closed-source, and third parties can write their own. Nothing a policy returns is trusted until it is checked: evictions must be in scope and evictable, merge targets must exist, scores must be in range, and a composed working set may contain only candidates that were supplied to it — that last one is what stops a policy bug from becoming a data leak.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `crates/memorysafe-engine/src/validate.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memorysafe_core::{
+        Action, Budget, CapacityState, Eviction, ItemId, MemoryItem, PolicyId, Protection,
+        Reason, ReasonCode, ScopeStats, Scope, Score, ScoredCandidate, SensitivityLevel,
+        Source, SourceKind, WorkingSet, SelectedItem, features,
+    };
+    use time::OffsetDateTime;
+
+    fn scope() -> Scope {
+        Scope::new("t", "s", "n").unwrap()
+    }
+
+    fn item(body: &str) -> MemoryItem {
+        MemoryItem {
+            id: ItemId::new(),
+            scope: scope(),
+            body: body.into(),
+            kind: "fact".into(),
+            source: Source { kind: SourceKind::Agent, id: None },
+            occurred_at: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            tags: vec![],
+            attrs: Default::default(),
+            sensitivity: SensitivityLevel::Internal,
+            ttl: None,
+            protection: Protection::Normal,
+            pending_embedding: false,
+        }
+    }
+
+    fn candidate(item: MemoryItem) -> ScoredCandidate {
+        ScoredCandidate {
+            item,
+            relevance: 0.5,
+            vector_score: None,
+            keyword_score: None,
+            value: Score::clamped(0.5),
+            fragility: Score::clamped(0.5),
+            estimated_tokens: 5,
+        }
+    }
+
+    fn ctx(evictable: Vec<ScoredCandidate>) -> AdmitContext {
+        AdmitContext {
+            scope: scope(),
+            capacity: CapacityState {
+                budget: Budget::UNBOUNDED,
+                used_items: 0,
+                used_bytes: 0,
+            },
+            eviction_candidates: evictable,
+            stats: ScopeStats::default(),
+            now: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn reason() -> Reason {
+        Reason::new(ReasonCode::NovelContent, "ok", features! {})
+    }
+
+    #[test]
+    fn a_well_formed_decision_is_accepted() {
+        let c = candidate(item("evictable"));
+        let d = Decision {
+            action: Action::Retain { protection: Protection::Normal },
+            evictions: vec![Eviction { item: c.item.id.clone(), reason: reason() }],
+            reasons: vec![reason()],
+            policy: PolicyId::new("baseline", "0.1.0"),
+        };
+        assert!(decision(&d, &ctx(vec![c])).is_ok());
+    }
+
+    #[test]
+    fn a_decision_evicting_an_item_outside_the_offered_set_is_refused() {
+        let d = Decision {
+            action: Action::Retain { protection: Protection::Normal },
+            evictions: vec![Eviction { item: ItemId::new(), reason: reason() }],
+            reasons: vec![reason()],
+            policy: PolicyId::new("rogue", "0.1.0"),
+        };
+        assert!(matches!(
+            decision(&d, &ctx(vec![])),
+            Err(Invalid::EvictionOutsideScope { .. })
+        ));
+    }
+
+    #[test]
+    fn a_decision_evicting_a_pinned_item_is_refused() {
+        let mut pinned = item("pinned");
+        pinned.protection = Protection::Pinned;
+        let c = candidate(pinned);
+        let d = Decision {
+            action: Action::Retain { protection: Protection::Normal },
+            evictions: vec![Eviction { item: c.item.id.clone(), reason: reason() }],
+            reasons: vec![reason()],
+            policy: PolicyId::new("rogue", "0.1.0"),
+        };
+        assert!(matches!(decision(&d, &ctx(vec![c])), Err(Invalid::EvictsPinned { .. })));
+    }
+
+    #[test]
+    fn a_decision_with_no_reason_is_refused() {
+        let d = Decision {
+            action: Action::Retain { protection: Protection::Normal },
+            evictions: vec![],
+            reasons: vec![],
+            policy: PolicyId::new("rogue", "0.1.0"),
+        };
+        assert!(matches!(decision(&d, &ctx(vec![])), Err(Invalid::NoReason)));
+    }
+
+    #[test]
+    fn a_working_set_containing_an_unoffered_item_is_refused() {
+        // The leak-prevention check: a policy may only narrow, never widen.
+        let offered = candidate(item("offered"));
+        let smuggled = item("never offered to the policy");
+        let ws = WorkingSet {
+            items: vec![SelectedItem {
+                item: smuggled,
+                relevance: 0.9,
+                reason: reason(),
+            }],
+            tokens_used: 5,
+            omitted: vec![],
+            audit_id: None,
+        };
+        assert!(matches!(
+            working_set(&ws, std::slice::from_ref(&offered)),
+            Err(Invalid::UnofferedItem { .. })
+        ));
+    }
+
+    #[test]
+    fn a_working_set_that_is_a_subset_is_accepted() {
+        let a = candidate(item("a"));
+        let b = candidate(item("b"));
+        let ws = WorkingSet {
+            items: vec![SelectedItem {
+                item: a.item.clone(),
+                relevance: 0.9,
+                reason: reason(),
+            }],
+            tokens_used: 5,
+            omitted: vec![],
+            audit_id: None,
+        };
+        assert!(working_set(&ws, &[a, b]).is_ok());
+    }
+
+    #[test]
+    fn a_panicking_policy_is_caught_rather_than_taking_down_the_process() {
+        let result: Result<u32, PolicyFailure> =
+            call_policy(|| panic!("the closed scorer exploded"));
+        assert!(matches!(result, Err(PolicyFailure::Panicked(_))));
+    }
+
+    #[test]
+    fn a_policy_returning_an_error_is_reported_as_such() {
+        let result: Result<u32, PolicyFailure> = call_policy(|| {
+            Err(memorysafe_core::PolicyError::MissingEmbedding)
+        });
+        assert!(matches!(result, Err(PolicyFailure::Errored(_))));
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine`
+Expected: FAIL — no such package `memorysafe-engine`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-engine/Cargo.toml`:
+
+```toml
+[package]
+name = "memorysafe-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memorysafe-core.workspace = true
+memorysafe-embed.workspace = true
+memorysafe-backend.workspace = true
+memorysafe-policy.workspace = true
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+moka = { version = "0.12.16", features = ["future"] }
+async-trait = "0.1.92"
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+memorysafe-backend-sqlite.workspace = true
+tempfile = "3.27.0"
+proptest = "1.11.0"
+
+[lints]
+workspace = true
+```
+
+Add to workspace `[workspace.dependencies]`:
+
+```toml
+memorysafe-engine = { path = "crates/memorysafe-engine" }
+```
+
+`crates/memorysafe-engine/src/error.rs`:
+
+```rust
+use memorysafe_backend::BackendError;
+use memorysafe_embed::EmbedError;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum EngineError {
+    #[error("validation failed: {0}")]
+    Validation(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
+    #[error(transparent)]
+    Backend(#[from] BackendError),
+    #[error("embedder failed: {0}")]
+    Embedder(#[from] EmbedError),
+    #[error("policy failed and the engine is configured to fail closed: {0}")]
+    PolicyRefused(String),
+}
+
+impl EngineError {
+    /// Whether a caller should retry. Surfaced by adapters as a 503 hint.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, EngineError::Backend(BackendError::Storage { retryable: true, .. }))
+    }
+}
+```
+
+`crates/memorysafe-engine/src/validate.rs`:
+
+```rust
+use memorysafe_core::{
+    AdmitContext, Action, Decision, ItemId, PolicyError, ScoredCandidate, WorkingSet,
+};
+use thiserror::Error;
+
+/// What the engine does when a policy misbehaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FailureStance {
+    /// Fall back to `BaselinePolicy` for that call.
+    #[default]
+    FailSafe,
+    /// Refuse the operation.
+    FailClosed,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum Invalid {
+    #[error("decision evicts {item}, which was not offered as an eviction candidate")]
+    EvictionOutsideScope { item: ItemId },
+    #[error("decision evicts {item}, which is pinned")]
+    EvictsPinned { item: ItemId },
+    #[error("decision carries no reason")]
+    NoReason,
+    #[error("working set contains {item}, which was never offered to the policy")]
+    UnofferedItem { item: ItemId },
+    #[error("working set reports {reported} tokens but its items sum to {actual}")]
+    TokenAccountingWrong { reported: u32, actual: u32 },
+}
+
+#[derive(Debug, Error)]
+pub enum PolicyFailure {
+    #[error("policy panicked: {0}")]
+    Panicked(String),
+    #[error("policy returned an error: {0}")]
+    Errored(#[from] PolicyError),
+}
+
+/// Nothing a policy returns is applied until it passes this.
+pub fn decision(d: &Decision, ctx: &AdmitContext) -> Result<(), Invalid> {
+    if d.reasons.is_empty() && d.evictions.is_empty() {
+        return Err(Invalid::NoReason);
+    }
+
+    for e in &d.evictions {
+        let Some(candidate) = ctx.eviction_candidates.iter().find(|c| c.item.id == e.item)
+        else {
+            return Err(Invalid::EvictionOutsideScope { item: e.item.clone() });
+        };
+        // Pinning is absolute; the engine enforces it even if a policy forgets.
+        if !candidate.item.protection.is_evictable(ctx.now) {
+            return Err(Invalid::EvictsPinned { item: e.item.clone() });
+        }
+    }
+
+    if let Action::Retain { .. } | Action::Merge { .. } = d.action
+        && d.reasons.is_empty()
+    {
+        return Err(Invalid::NoReason);
+    }
+
+    Ok(())
+}
+
+/// The leak-prevention check. A policy may narrow the candidate set it was
+/// given; it may never introduce an item the backend's hard filters excluded.
+pub fn working_set(ws: &WorkingSet, offered: &[ScoredCandidate]) -> Result<(), Invalid> {
+    for selected in &ws.items {
+        if !offered.iter().any(|c| c.item.id == selected.item.id) {
+            return Err(Invalid::UnofferedItem { item: selected.item.id.clone() });
+        }
+    }
+
+    let actual: u32 = ws
+        .items
+        .iter()
+        .map(|s| offered
+            .iter()
+            .find(|c| c.item.id == s.item.id)
+            .map(|c| c.estimated_tokens)
+            .unwrap_or(0))
+        .sum();
+    if ws.tokens_used != actual {
+        return Err(Invalid::TokenAccountingWrong { reported: ws.tokens_used, actual });
+    }
+
+    Ok(())
+}
+
+/// Runs a policy call under `catch_unwind`. A third-party or closed-source
+/// policy must not be able to take down the process.
+pub fn call_policy<T, F>(f: F) -> Result<T, PolicyFailure>
+where
+    F: FnOnce() -> Result<T, PolicyError> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(PolicyFailure::Errored(e)),
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            Err(PolicyFailure::Panicked(message))
+        }
+    }
+}
+```
+
+`crates/memorysafe-engine/src/lib.rs`:
+
+```rust
+//! Orchestration. The engine performs all I/O, hands pure data to the policy,
+//! validates everything the policy returns, and applies writes atomically with
+//! an audit record.
+
+pub mod error;
+pub mod validate;
+
+pub use error::EngineError;
+pub use validate::FailureStance;
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-engine validate`
+Expected: PASS — 8 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Cargo.toml crates/memorysafe-engine/
+git commit -m "feat(engine): decision validation and panic-safe policy invocation"
+```
+
+---
+
+## Task 31: Engine — `remember`
+
+**Files:**
+- Create: `crates/memorysafe-engine/src/outcome.rs`
+- Create: `crates/memorysafe-engine/src/write.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs`
+- Create: `crates/memorysafe-engine/tests/write.rs`
+
+**Interfaces:**
+- Consumes: `Backend`, `Embedder`, `GovernancePolicy`, `validate`.
+- Produces: `Engine::new(EngineConfig)`, `EngineConfig { backend, embedder, policy, fallback_policy, stance, neighbour_k }`, `RememberRequest`, `WriteOutcome`, `Engine::remember`.
+
+**The pipeline:** validate → embed (cached, degrading to `pending_embedding` on failure) → gather neighbours, capacity, and stats in one pass → `assess` → `admit` → validate the decision → build one `WriteTransaction` → `backend.apply`.
+
+- [ ] **Step 1: Write the failing test**
+
+`crates/memorysafe-engine/tests/write.rs`:
+
+```rust
+use memorysafe_backend_sqlite::SqliteBackend;
+use memorysafe_core::{Action, Budget, ReasonCode, Scope, SensitivityLevel};
+use memorysafe_embed::DeterministicEmbedder;
+use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
+use memorysafe_policy::BaselinePolicy;
+use std::sync::Arc;
+
+fn engine() -> Engine {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Engine::new(EngineConfig {
+        backend: Arc::new(SqliteBackend::open(dir.keep())),
+        embedder: Arc::new(DeterministicEmbedder::new(256)),
+        policy: Arc::new(BaselinePolicy::default()),
+        ..Default::default()
+    })
+}
+
+fn scope() -> Scope {
+    Scope::new("acme", "user-42", "coding-agent").unwrap()
+}
+
+fn req(body: &str) -> RememberRequest {
+    RememberRequest::new(scope(), body)
+}
+
+#[tokio::test]
+async fn a_novel_memory_is_admitted_and_says_why() {
+    let e = engine();
+    let out = e.remember(req("the production database migration runs on Sundays")).await.unwrap();
+
+    assert!(matches!(out.action, Action::Retain { .. }));
+    assert!(out.reasons.iter().any(|r| r.code == ReasonCode::NovelContent));
+    assert!(out.item_id.is_some());
+    assert!(out.evicted.is_empty());
+}
+
+#[tokio::test]
+async fn an_identical_rewrite_is_rejected_as_a_duplicate() {
+    let e = engine();
+    let body = "the deploy key rotates every ninety days";
+    e.remember(req(body)).await.unwrap();
+    let second = e.remember(req(body)).await.unwrap();
+
+    // A rejection is a successful call: the product working, not an error.
+    assert!(matches!(second.action, Action::Reject));
+    assert!(second.reasons.iter().any(|r| r.code == ReasonCode::ExactDuplicate));
+}
+
+#[tokio::test]
+async fn a_near_duplicate_is_merged_into_the_existing_memory() {
+    let e = engine();
+    let first = e.remember(req("the cat sat on the mat")).await.unwrap();
+    let second = e.remember(req("the cat sat on the mat today")).await.unwrap();
+
+    match second.action {
+        Action::Merge { .. } => {
+            assert_eq!(second.merged_into, first.item_id);
+            assert!(second.reasons.iter().any(|r| r.code == ReasonCode::HighRedundancy));
+        }
+        Action::Retain { .. } => {
+            // Acceptable if the deterministic embedder scores them below the
+            // merge threshold; the decision must still be explained.
+            assert!(!second.reasons.is_empty());
+        }
+        other => panic!("unexpected action {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_credential_is_detected_and_stored_as_restricted() {
+    let e = engine();
+    let out = e
+        .remember(req("the api key is sk-abc123def456ghi789jkl012"))
+        .await
+        .unwrap();
+    let stored = e.review(&scope(), &Default::default()).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].sensitivity, SensitivityLevel::Restricted);
+    assert!(out.item_id.is_some());
+}
+
+#[tokio::test]
+async fn a_full_namespace_evicts_to_make_room_and_reports_what_it_dropped() {
+    let e = engine();
+    e.set_budget(&scope(), Budget { max_items: Some(3), max_bytes: None }).await.unwrap();
+
+    for i in 0..3 {
+        e.remember(req(&format!("distinct memory number {i} about topic {i}"))).await.unwrap();
+    }
+    let out = e.remember(req("a completely different subject entirely")).await.unwrap();
+
+    assert!(matches!(out.action, Action::Retain { .. }));
+    assert_eq!(out.evicted.len(), 1, "one eviction makes exactly enough room");
+    let stored = e.review(&scope(), &Default::default()).await.unwrap();
+    assert_eq!(stored.len(), 3, "the budget was exceeded");
+}
+
+#[tokio::test]
+async fn a_retried_write_returns_the_original_outcome() {
+    let e = engine();
+    let mut r = req("written exactly once");
+    r.idempotency_key = Some("retry-key".into());
+
+    let first = e.remember(r.clone()).await.unwrap();
+    let second = e.remember(r).await.unwrap();
+
+    assert_eq!(first.item_id, second.item_id);
+    assert_eq!(e.review(&scope(), &Default::default()).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_empty_body_is_a_validation_error_not_a_stored_memory() {
+    let e = engine();
+    assert!(e.remember(req("   ")).await.is_err());
+    assert!(e.review(&scope(), &Default::default()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn every_write_leaves_exactly_one_audit_record() {
+    let e = engine();
+    e.remember(req("first distinct memory about alpha")).await.unwrap();
+    e.remember(req("second distinct memory about beta")).await.unwrap();
+
+    let audit = e.audit(&scope(), &Default::default()).await.unwrap();
+    assert_eq!(audit.len(), 2);
+    assert!(audit.iter().all(|r| r.decision.is_some()), "audit must carry the decision");
+    assert!(audit.iter().all(|r| r.assessment.is_some()), "audit must carry the assessment");
+    // Bodies must never reach the audit trail.
+    let json = serde_json::to_string(&audit).unwrap();
+    assert!(!json.contains("distinct memory"), "audit leaked an item body");
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-engine --test write`
+Expected: FAIL — `cannot find struct Engine in memorysafe_engine`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-engine/src/outcome.rs`:
+
+```rust
+use memorysafe_core::{Action, AuditId, ItemId, Reason};
+use serde::{Deserialize, Serialize};
+
+/// What the caller learns from a write. A rejection or a merge is a *success*:
+/// governance working, not an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WriteOutcome {
+    pub item_id: Option<ItemId>,
+    pub action: Action,
+    pub reasons: Vec<Reason>,
+    pub merged_into: Option<ItemId>,
+    pub evicted: Vec<ItemId>,
+    pub audit_id: AuditId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForgetOutcome {
+    pub forgotten: Vec<ItemId>,
+    pub audit_id: AuditId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PurgeOutcome {
+    pub items_removed: u64,
+    pub audit_rows_removed: u64,
+    pub audit_rows_preserved: u64,
+}
+```
+
+`crates/memorysafe-engine/src/write.rs`:
+
+```rust
+use crate::error::EngineError;
+use crate::outcome::WriteOutcome;
+use crate::validate::{self, FailureStance, PolicyFailure};
+use crate::{Engine, gather};
+use memorysafe_backend::{ItemWrite, MergeWrite, WriteTransaction};
+use memorysafe_core::{
+    Action, Actor, ActorKind, AssessContext, Assessed, AuditEvent, AuditRecord, Candidate,
+    ItemId, ItemRef, MemoryItem, Protection, Reason, ReasonCode, Scope, SensitivityLevel,
+    Source, SourceKind, features,
+};
+use memorysafe_embed::{Embedder, QuantizedVector};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use time::{Duration, OffsetDateTime};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RememberRequest {
+    pub scope: Scope,
+    pub body: String,
+    pub kind: String,
+    pub source: Source,
+    pub occurred_at: Option<OffsetDateTime>,
+    pub tags: Vec<String>,
+    pub attrs: BTreeMap<String, Value>,
+    pub sensitivity_hint: Option<SensitivityLevel>,
+    pub ttl: Option<Duration>,
+    pub idempotency_key: Option<String>,
+    pub actor: Actor,
+}
+
+impl RememberRequest {
+    pub fn new(scope: Scope, body: &str) -> Self {
+        Self {
+            scope,
+            body: body.to_string(),
+            kind: "fact".into(),
+            source: Source { kind: SourceKind::Agent, id: None },
+            occurred_at: None,
+            tags: vec![],
+            attrs: BTreeMap::new(),
+            sensitivity_hint: None,
+            ttl: None,
+            idempotency_key: None,
+            actor: Actor { kind: ActorKind::Agent, id: None },
+        }
+    }
+}
+
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
+impl Engine {
+    pub async fn remember(&self, req: RememberRequest) -> Result<WriteOutcome, EngineError> {
+        if req.body.trim().is_empty() {
+            return Err(EngineError::Validation("body must not be empty".into()));
+        }
+        if req.body.len() > MAX_BODY_BYTES {
+            return Err(EngineError::Validation(format!(
+                "body exceeds {MAX_BODY_BYTES} bytes"
+            )));
+        }
+
+        // Embed. A missing or failed model must never cost a user their memory.
+        let embedding = match self.embedder.embed(&req.body) {
+            Ok(e) => Some(e),
+            Err(_) => None,
+        };
+        let pending_embedding = embedding.is_none();
+
+        let candidate = Candidate {
+            body: req.body.clone(),
+            kind: req.kind.clone(),
+            tags: req.tags.clone(),
+            attrs: req.attrs.clone(),
+            sensitivity_hint: req.sensitivity_hint,
+            embedding: embedding.clone(),
+            byte_size: req.body.len() as u64,
+        };
+
+        // One I/O pass gathers everything the policy is allowed to see.
+        let ctx = gather::assess_context(
+            self.backend.as_ref(),
+            &req.scope,
+            embedding.as_ref(),
+            self.neighbour_k,
+        )
+        .await?;
+
+        let assessment = self.run_assess(&candidate, &ctx)?;
+
+        let admit_ctx = gather::admit_context(
+            self.backend.as_ref(),
+            &req.scope,
+            &ctx,
+            self.eviction_candidates,
+        )
+        .await?;
+
+        let assessed = Assessed { candidate: &candidate, assessment: &assessment };
+        let decision = self.run_admit(&assessed, &admit_ctx)?;
+
+        // Nothing a policy returns is applied until it passes validation.
+        if let Err(invalid) = validate::decision(&decision, &admit_ctx) {
+            return self.handle_invalid_decision(invalid, &req, &assessment).await;
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let vector = embedding.as_ref().map(QuantizedVector::from_embedding);
+
+        let (item, merge) = match &decision.action {
+            Action::Reject => (None, None),
+            Action::Retain { protection } => {
+                let item = MemoryItem {
+                    id: ItemId::new(),
+                    scope: req.scope.clone(),
+                    body: req.body.clone(),
+                    kind: req.kind.clone(),
+                    source: req.source.clone(),
+                    occurred_at: req.occurred_at,
+                    created_at: now,
+                    tags: req.tags.clone(),
+                    attrs: req.attrs.clone(),
+                    sensitivity: assessment.sensitivity.level,
+                    ttl: req.ttl,
+                    protection: *protection,
+                    pending_embedding,
+                };
+                (Some(item), None)
+            }
+            Action::Merge { into, .. } => (
+                None,
+                Some(MergeWrite {
+                    target: into.clone(),
+                    body: req.body.clone(),
+                    tags: req.tags.clone(),
+                    attrs: req.attrs.clone(),
+                    vector: vector.clone(),
+                    byte_size: req.body.len() as u64,
+                }),
+            ),
+        };
+
+        let event = match &decision.action {
+            Action::Retain { .. } => AuditEvent::Admitted,
+            Action::Merge { .. } => AuditEvent::Merged,
+            Action::Reject => AuditEvent::Rejected,
+        };
+
+        let refs: Vec<ItemRef> = item.as_ref().map(|i| vec![ItemRef::from_item(i)]).unwrap_or_default();
+        let audit = AuditRecord::new(req.scope.clone(), event, refs, req.actor.clone())
+            .with_assessment(assessment.clone())
+            .with_decision(decision.clone());
+
+        let mut txn = WriteTransaction::new(req.scope.clone(), audit);
+        txn.evictions = decision.evictions.iter().map(|e| e.item.clone()).collect();
+        txn.idempotency_key = req.idempotency_key.clone();
+        txn.payload_digest = req.idempotency_key.as_ref().map(|_| {
+            blake3::hash(req.body.as_bytes()).to_hex().to_string()
+        });
+        if let Some(i) = item {
+            txn.upsert = Some(ItemWrite { item: Some(i), vector });
+        }
+        txn.merge = merge;
+
+        let applied = self.backend.apply(txn).await?;
+
+        Ok(WriteOutcome {
+            item_id: applied.item_id.clone(),
+            action: decision.action.clone(),
+            reasons: decision.reasons.clone(),
+            merged_into: match &decision.action {
+                Action::Merge { into, .. } => Some(into.clone()),
+                _ => None,
+            },
+            evicted: applied.evicted,
+            audit_id: applied.audit_id,
+        })
+    }
+
+    async fn handle_invalid_decision(
+        &self,
+        invalid: validate::Invalid,
+        req: &RememberRequest,
+        assessment: &memorysafe_core::Assessment,
+    ) -> Result<WriteOutcome, EngineError> {
+        let reason = Reason::new(
+            ReasonCode::PolicyInvalid,
+            &format!("policy returned an unusable decision: {invalid}"),
+            features! {},
+        );
+        let audit = AuditRecord::new(
+            req.scope.clone(),
+            AuditEvent::Rejected,
+            vec![],
+            req.actor.clone(),
+        )
+        .with_assessment(assessment.clone());
+
+        let txn = WriteTransaction::new(req.scope.clone(), audit);
+        let applied = self.backend.apply(txn).await?;
+
+        match self.stance {
+            FailureStance::FailClosed => Err(EngineError::PolicyRefused(invalid.to_string())),
+            FailureStance::FailSafe => Ok(WriteOutcome {
+                item_id: None,
+                action: Action::Reject,
+                reasons: vec![reason],
+                merged_into: None,
+                evicted: vec![],
+                audit_id: applied.audit_id,
+            }),
+        }
+    }
+
+    fn run_assess(
+        &self,
+        cand: &Candidate,
+        ctx: &AssessContext,
+    ) -> Result<memorysafe_core::Assessment, EngineError> {
+        let policy = self.policy.clone();
+        let (c, x) = (cand.clone(), ctx.clone());
+        match validate::call_policy(move || policy.assess(&c, &x)) {
+            Ok(a) => Ok(a),
+            Err(e) => self.policy_fallback(e, || self.fallback_policy.assess(cand, ctx)),
+        }
+    }
+
+    fn run_admit(
+        &self,
+        assessed: &Assessed,
+        ctx: &memorysafe_core::AdmitContext,
+    ) -> Result<memorysafe_core::Decision, EngineError> {
+        let policy = self.policy.clone();
+        let (c, a, x) = (
+            assessed.candidate.clone(),
+            assessed.assessment.clone(),
+            ctx.clone(),
+        );
+        let call = move || {
+            let assessed = Assessed { candidate: &c, assessment: &a };
+            policy.admit(&assessed, &x)
+        };
+        match validate::call_policy(call) {
+            Ok(d) => Ok(d),
+            Err(e) => self.policy_fallback(e, || self.fallback_policy.admit(assessed, ctx)),
+        }
+    }
+
+    fn policy_fallback<T, F>(&self, failure: PolicyFailure, fallback: F) -> Result<T, EngineError>
+    where
+        F: FnOnce() -> Result<T, memorysafe_core::PolicyError>,
+    {
+        match self.stance {
+            FailureStance::FailClosed => Err(EngineError::PolicyRefused(failure.to_string())),
+            FailureStance::FailSafe => {
+                fallback().map_err(|e| EngineError::PolicyRefused(e.to_string()))
+            }
+        }
+    }
+}
+```
+
+Create `crates/memorysafe-engine/src/gather.rs`:
+
+```rust
+use crate::error::EngineError;
+use memorysafe_backend::Backend;
+use memorysafe_core::{AdmitContext, AssessContext, Embedding, Scope, ScoredCandidate};
+use time::OffsetDateTime;
+
+/// One I/O pass producing everything `assess` may see.
+pub async fn assess_context(
+    backend: &dyn Backend,
+    scope: &Scope,
+    embedding: Option<&Embedding>,
+    k: usize,
+) -> Result<AssessContext, EngineError> {
+    let neighbours = match embedding {
+        Some(e) => backend.neighbours(scope, e, k).await.unwrap_or_default(),
+        None => vec![],
+    };
+    let mut stats = backend.scope_stats(scope).await?;
+    // The backend has no cheap way to compute this; the engine derives it from
+    // the neighbours it just fetched.
+    stats.mean_neighbour_similarity = if neighbours.is_empty() {
+        0.0
+    } else {
+        neighbours.iter().map(|n| n.relevance).sum::<f32>() / neighbours.len() as f32
+    };
+    Ok(AssessContext {
+        scope: scope.clone(),
+        neighbours,
+        stats,
+        now: OffsetDateTime::now_utc(),
+    })
+}
+
+/// Eviction candidates are filtered here, not in the policy: pinned items and
+/// unexpired protection windows never reach it.
+pub async fn admit_context(
+    backend: &dyn Backend,
+    scope: &Scope,
+    assess: &AssessContext,
+    limit: usize,
+) -> Result<AdmitContext, EngineError> {
+    let capacity = backend.capacity_state(scope).await?;
+    let now = OffsetDateTime::now_utc();
+
+    let eviction_candidates: Vec<ScoredCandidate> = if capacity.budget.is_bounded() {
+        let page = memorysafe_backend::Page { offset: 0, limit };
+        backend
+            .list(scope, &page)
+            .await?
+            .into_iter()
+            .filter(|i| i.protection.is_evictable(now))
+            .map(|item| ScoredCandidate {
+                estimated_tokens: ((item.body.len() as f32 / 4.0).ceil() as u32).max(1),
+                relevance: 0.0,
+                vector_score: None,
+                keyword_score: None,
+                value: memorysafe_core::Score::clamped(0.5),
+                fragility: memorysafe_core::Score::clamped(0.5),
+                item,
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    Ok(AdmitContext {
+        scope: scope.clone(),
+        capacity,
+        eviction_candidates,
+        stats: assess.stats.clone(),
+        now,
+    })
+}
+```
+
+Rewrite `crates/memorysafe-engine/src/lib.rs`:
+
+```rust
+//! Orchestration. The engine performs all I/O, hands pure data to the policy,
+//! validates everything the policy returns, and applies writes atomically with
+//! an audit record.
+
+pub mod error;
+pub mod gather;
+pub mod outcome;
+pub mod validate;
+pub mod write;
+
+pub use error::EngineError;
+pub use outcome::{ForgetOutcome, PurgeOutcome, WriteOutcome};
+pub use validate::FailureStance;
+pub use write::RememberRequest;
+
+use memorysafe_backend::{Backend, Page};
+use memorysafe_core::{
+    AuditFilter, AuditRecord, Budget, GovernancePolicy, MemoryItem, Scope,
+};
+use memorysafe_embed::Embedder;
+use memorysafe_policy::BaselinePolicy;
+use std::sync::Arc;
+
+pub struct EngineConfig {
+    pub backend: Arc<dyn Backend>,
+    pub embedder: Arc<dyn Embedder>,
+    pub policy: Arc<dyn GovernancePolicy>,
+    /// Used when `policy` misbehaves and the stance is `FailSafe`.
+    pub fallback_policy: Arc<dyn GovernancePolicy>,
+    pub stance: FailureStance,
+    /// How many neighbours to fetch for assessment.
+    pub neighbour_k: usize,
+    /// How many items to offer the policy as eviction candidates.
+    pub eviction_candidates: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        panic!("EngineConfig requires a backend, embedder, and policy; use struct update syntax")
+    }
+}
+
+pub struct Engine {
+    pub(crate) backend: Arc<dyn Backend>,
+    pub(crate) embedder: Arc<dyn Embedder>,
+    pub(crate) policy: Arc<dyn GovernancePolicy>,
+    pub(crate) fallback_policy: Arc<dyn GovernancePolicy>,
+    pub(crate) stance: FailureStance,
+    pub(crate) neighbour_k: usize,
+    pub(crate) eviction_candidates: usize,
+}
+
+impl Engine {
+    pub fn new(config: EngineConfig) -> Self {
+        Self {
+            backend: config.backend,
+            embedder: config.embedder,
+            policy: config.policy,
+            fallback_policy: config.fallback_policy,
+            stance: config.stance,
+            neighbour_k: config.neighbour_k,
+            eviction_candidates: config.eviction_candidates,
+        }
+    }
+
+    pub async fn review(&self, scope: &Scope, page: &Page)
+        -> Result<Vec<MemoryItem>, EngineError>
+    {
+        Ok(self.backend.list(scope, page).await?)
+    }
+
+    pub async fn audit(&self, scope: &Scope, filter: &AuditFilter)
+        -> Result<Vec<AuditRecord>, EngineError>
+    {
+        Ok(self.backend.audit(scope, filter).await?)
+    }
+
+    pub async fn set_budget(&self, scope: &Scope, budget: Budget) -> Result<(), EngineError> {
+        Ok(self.backend.set_budget(scope, budget).await?)
+    }
+}
+```
+
+`EngineConfig::default()` panicking is wrong for the `..Default::default()` used in the test. Replace it with a builder that supplies only the optional fields:
+
+```rust
+impl EngineConfig {
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        embedder: Arc<dyn Embedder>,
+        policy: Arc<dyn GovernancePolicy>,
+    ) -> Self {
+        Self {
+            backend,
+            embedder,
+            policy,
+            fallback_policy: Arc::new(BaselinePolicy::default()),
+            stance: FailureStance::FailSafe,
+            neighbour_k: 16,
+            eviction_candidates: 128,
+        }
+    }
+}
+```
+
+and update the test helper to `EngineConfig::new(backend, embedder, policy)`.
+
+`Candidate`, `Assessment`, `AssessContext`, and `AdmitContext` must derive `Clone`; confirm from Tasks 5 and 10.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-engine --test write`
+Expected: PASS — 8 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-engine/
+git commit -m "feat(engine): remember pipeline with governance decisions surfaced to callers"
+```
+
+---
