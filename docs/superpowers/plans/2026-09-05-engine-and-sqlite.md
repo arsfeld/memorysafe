@@ -6803,3 +6803,757 @@ git commit -m "feat(sqlite): subject purge and portable export/import; full conf
 ```
 
 ---
+
+## Task 25: Policy — config, redundancy, and fragility
+
+**Files:**
+- Create: `crates/memorysafe-policy/Cargo.toml`
+- Create: `crates/memorysafe-policy/src/lib.rs`
+- Create: `crates/memorysafe-policy/src/config.rs`
+- Create: `crates/memorysafe-policy/src/redundancy.rs`
+- Create: `crates/memorysafe-policy/src/fragility.rs`
+- Modify: `Cargo.toml` (workspace dependencies)
+
+**Interfaces:**
+- Consumes: `GovernancePolicy` and its contexts, `ScoredCandidate`, `ScopeStats`.
+- Produces: `BaselineConfig` (with `Default`), `BaselinePolicy::new(BaselineConfig)`, `BaselinePolicy::default()`, `redundancy::assess(&[ScoredCandidate], &BaselineConfig)`, `fragility::score(&[ScoredCandidate], &ScopeStats)`.
+
+**Constraint:** this crate must not depend on `tokio`, `rusqlite`, or `memorysafe-backend`. The CI purity job asserts it.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `crates/memorysafe-policy/src/redundancy.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BaselineConfig;
+    use crate::testkit::candidate;
+
+    #[test]
+    fn no_neighbours_means_no_redundancy() {
+        let a = assess(&[], &BaselineConfig::default());
+        assert_eq!(a.score, Score::ZERO);
+        assert!(a.near_duplicates.is_empty());
+    }
+
+    #[test]
+    fn redundancy_is_the_best_neighbour_similarity() {
+        let cfg = BaselineConfig::default();
+        let a = assess(&[candidate("a", 0.42), candidate("b", 0.81), candidate("c", 0.10)], &cfg);
+        assert!((a.score.get() - 0.81).abs() < 1e-6);
+    }
+
+    #[test]
+    fn near_duplicates_come_back_sorted_descending() {
+        let cfg = BaselineConfig::default();
+        let a = assess(&[candidate("a", 0.42), candidate("b", 0.81)], &cfg);
+        assert_eq!(a.near_duplicates.len(), 2);
+        assert!(a.near_duplicates[0].1 >= a.near_duplicates[1].1);
+    }
+
+    #[test]
+    fn only_neighbours_above_the_floor_are_listed() {
+        let cfg = BaselineConfig { near_duplicate_floor: 0.5, ..Default::default() };
+        let a = assess(&[candidate("a", 0.81), candidate("b", 0.10)], &cfg);
+        assert_eq!(a.near_duplicates.len(), 1, "the 0.10 neighbour is not near-duplicate");
+    }
+
+    #[test]
+    fn classification_matches_the_documented_thresholds() {
+        let cfg = BaselineConfig::default();
+        assert_eq!(cfg.classify(0.99), Verdict::ExactDuplicate);
+        assert_eq!(cfg.classify(0.95), Verdict::Mergeable);
+        assert_eq!(cfg.classify(0.50), Verdict::Novel);
+        // Boundaries are inclusive at the threshold.
+        assert_eq!(cfg.classify(cfg.duplicate_threshold), Verdict::ExactDuplicate);
+        assert_eq!(cfg.classify(cfg.merge_threshold), Verdict::Mergeable);
+    }
+}
+```
+
+Append to `crates/memorysafe-policy/src/fragility.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::candidate;
+    use memorysafe_core::ScopeStats;
+
+    fn stats(mean: f32) -> ScopeStats {
+        ScopeStats { item_count: 100, mean_neighbour_similarity: mean, ..Default::default() }
+    }
+
+    #[test]
+    fn an_item_with_no_neighbours_is_maximally_fragile() {
+        // Nothing like it exists, so losing it loses the information entirely.
+        assert_eq!(score(&[], &stats(0.5)), Score::ONE);
+    }
+
+    #[test]
+    fn an_item_in_a_dense_neighbourhood_is_not_fragile() {
+        let dense = [candidate("a", 0.95), candidate("b", 0.93), candidate("c", 0.91)];
+        assert!(score(&dense, &stats(0.5)).get() < 0.2);
+    }
+
+    #[test]
+    fn an_atypical_item_is_more_fragile_than_a_typical_one() {
+        let atypical = [candidate("a", 0.20), candidate("b", 0.15)];
+        let typical = [candidate("a", 0.85), candidate("b", 0.80)];
+        assert!(score(&atypical, &stats(0.5)) > score(&typical, &stats(0.5)));
+    }
+
+    #[test]
+    fn fragility_is_calibrated_against_the_corpus_not_an_absolute() {
+        // The same neighbours mean different things in a tight corpus versus
+        // a diffuse one.
+        let neighbours = [candidate("a", 0.60), candidate("b", 0.55)];
+        let in_tight_corpus = score(&neighbours, &stats(0.85));
+        let in_diffuse_corpus = score(&neighbours, &stats(0.20));
+        assert!(
+            in_tight_corpus > in_diffuse_corpus,
+            "0.6 similarity is unusual in a tight corpus and ordinary in a diffuse one"
+        );
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-policy`
+Expected: FAIL — no such package `memorysafe-policy`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`crates/memorysafe-policy/Cargo.toml`:
+
+```toml
+[package]
+name = "memorysafe-policy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memorysafe-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true
+```
+
+Add to workspace `[workspace.dependencies]`:
+
+```toml
+memorysafe-policy = { path = "crates/memorysafe-policy" }
+```
+
+`crates/memorysafe-policy/src/config.rs`:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    ExactDuplicate,
+    Mergeable,
+    Novel,
+}
+
+/// Every threshold the baseline uses, in one place. Defaults are the values
+/// documented in the spec; tenants may override them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineConfig {
+    /// At or above this, reject the write as an exact duplicate.
+    pub duplicate_threshold: f32,
+    /// At or above this (but below `duplicate_threshold`), merge.
+    pub merge_threshold: f32,
+    /// Neighbours below this are not reported as near-duplicates.
+    pub near_duplicate_floor: f32,
+    /// Fraction of the recall budget reserved for replay of fragile or
+    /// long-unaccessed items.
+    pub replay_quota: f32,
+    /// MMR tradeoff: 1.0 is pure relevance, 0.0 is pure diversity.
+    pub mmr_lambda: f32,
+    /// Half-life in days for value decay during maintenance.
+    pub value_half_life_days: f32,
+    /// Weight of source trust in the value score.
+    pub source_trust_weight: f32,
+    /// Days without access before an item counts as replay-due.
+    pub replay_stale_days: f32,
+}
+
+impl Default for BaselineConfig {
+    fn default() -> Self {
+        Self {
+            duplicate_threshold: 0.98,
+            merge_threshold: 0.93,
+            near_duplicate_floor: 0.30,
+            replay_quota: 0.20,
+            mmr_lambda: 0.70,
+            value_half_life_days: 90.0,
+            source_trust_weight: 0.20,
+            replay_stale_days: 30.0,
+        }
+    }
+}
+
+impl BaselineConfig {
+    pub fn classify(&self, similarity: f32) -> Verdict {
+        if similarity >= self.duplicate_threshold {
+            Verdict::ExactDuplicate
+        } else if similarity >= self.merge_threshold {
+            Verdict::Mergeable
+        } else {
+            Verdict::Novel
+        }
+    }
+}
+```
+
+`crates/memorysafe-policy/src/redundancy.rs`:
+
+```rust
+use crate::config::BaselineConfig;
+use memorysafe_core::{RedundancyAssessment, Score, ScoredCandidate};
+
+pub use crate::config::Verdict;
+
+/// Redundancy is the similarity of the closest existing memory. Neighbours
+/// arrive sorted from the engine, but the sort is repeated here so the
+/// function is correct in isolation and testable with hand-built fixtures.
+pub fn assess(
+    neighbours: &[ScoredCandidate],
+    cfg: &BaselineConfig,
+) -> RedundancyAssessment {
+    let mut near: Vec<(memorysafe_core::ItemId, f32)> = neighbours
+        .iter()
+        .filter(|n| n.relevance >= cfg.near_duplicate_floor)
+        .map(|n| (n.item.id.clone(), n.relevance))
+        .collect();
+    near.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let best = neighbours.iter().map(|n| n.relevance).fold(0.0f32, f32::max);
+    RedundancyAssessment { score: Score::clamped(best), near_duplicates: near }
+}
+```
+
+`crates/memorysafe-policy/src/fragility.rs`:
+
+```rust
+use memorysafe_core::{Score, ScopeStats, ScoredCandidate};
+
+/// How costly this memory would be to lose.
+///
+/// An item with no near neighbours is irreplaceable: nothing else in the
+/// corpus carries the same information. An item sitting in a dense cluster is
+/// cheap to lose because its neighbours still say most of what it said.
+///
+/// The comparison is against the corpus's own mean similarity rather than an
+/// absolute — 0.6 similarity is unusual in a tightly clustered corpus and
+/// unremarkable in a diffuse one. This is the "rare class" notion from the
+/// continual-learning lineage, expressed in embedding space.
+pub fn score(neighbours: &[ScoredCandidate], stats: &ScopeStats) -> Score {
+    if neighbours.is_empty() {
+        return Score::ONE;
+    }
+
+    // Mean of the three closest neighbours: robust to a single outlier while
+    // still local.
+    let mut sims: Vec<f32> = neighbours.iter().map(|n| n.relevance).collect();
+    sims.sort_by(|a, b| b.total_cmp(a));
+    let k = sims.len().min(3);
+    let local_density: f32 = sims[..k].iter().sum::<f32>() / k as f32;
+
+    let baseline = stats.mean_neighbour_similarity.clamp(0.0, 1.0);
+    // How much sparser than typical this neighbourhood is, normalised by the
+    // headroom above the corpus mean.
+    let headroom = (1.0 - baseline).max(1e-3);
+    let relative_sparsity = ((baseline - local_density) / headroom + 1.0) / 2.0;
+
+    Score::clamped(relative_sparsity)
+}
+```
+
+`crates/memorysafe-policy/src/lib.rs`:
+
+```rust
+//! `BaselinePolicy` — the open-source governance policy.
+//!
+//! Simple and documented, not deliberately crippled. The proprietary policy
+//! earns its keep with learned scorers and cross-tenant calibration, not by
+//! this one being bad.
+
+pub mod config;
+pub mod fragility;
+pub mod redundancy;
+
+#[cfg(test)]
+pub(crate) mod testkit;
+
+pub use config::{BaselineConfig, Verdict};
+
+use memorysafe_core::PolicyId;
+
+pub const BASELINE_VERSION: &str = "0.1.0";
+
+pub struct BaselinePolicy {
+    pub config: BaselineConfig,
+}
+
+impl BaselinePolicy {
+    pub fn new(config: BaselineConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn policy_id(&self) -> PolicyId {
+        PolicyId::new("baseline", BASELINE_VERSION)
+    }
+}
+
+impl Default for BaselinePolicy {
+    fn default() -> Self {
+        Self::new(BaselineConfig::default())
+    }
+}
+```
+
+`crates/memorysafe-policy/src/testkit.rs`:
+
+```rust
+//! Fixture builders shared by this crate's unit tests.
+
+use memorysafe_core::{
+    ItemId, MemoryItem, Protection, Scope, Score, ScoredCandidate, SensitivityLevel, Source,
+    SourceKind,
+};
+use time::OffsetDateTime;
+
+pub fn scope() -> Scope {
+    Scope::new("t", "s", "n").expect("valid test scope")
+}
+
+pub fn item(body: &str) -> MemoryItem {
+    MemoryItem {
+        id: ItemId::new(),
+        scope: scope(),
+        body: body.to_string(),
+        kind: "fact".into(),
+        source: Source { kind: SourceKind::Agent, id: None },
+        occurred_at: None,
+        created_at: OffsetDateTime::UNIX_EPOCH,
+        tags: vec![],
+        attrs: Default::default(),
+        sensitivity: SensitivityLevel::Internal,
+        ttl: None,
+        protection: Protection::Normal,
+        pending_embedding: false,
+    }
+}
+
+pub fn candidate(body: &str, relevance: f32) -> ScoredCandidate {
+    ScoredCandidate {
+        item: item(body),
+        relevance,
+        vector_score: Some(relevance),
+        keyword_score: None,
+        value: Score::clamped(0.5),
+        fragility: Score::clamped(0.5),
+        estimated_tokens: 10,
+    }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-policy`
+Expected: PASS — 9 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Cargo.toml crates/memorysafe-policy/
+git commit -m "feat(policy): baseline config, redundancy, and corpus-calibrated fragility"
+```
+
+---
+
+## Task 26: Policy — value and sensitivity
+
+**Files:**
+- Create: `crates/memorysafe-policy/src/value.rs`
+- Create: `crates/memorysafe-policy/src/sensitivity.rs`
+- Modify: `crates/memorysafe-policy/src/lib.rs`
+
+**Interfaces:**
+- Consumes: `Candidate`, `BaselineConfig`, `ScopeStats`.
+- Produces: `value::score(&Candidate, &ScopeStats, &BaselineConfig)`, `sensitivity::assess(&Candidate)`, and `GovernancePolicy::assess` on `BaselinePolicy`.
+
+**On sensitivity detection:** the baseline uses pattern and lexicon detectors. It will miss things — that is stated plainly in the docs rather than hidden, and it is one of the places the proprietary scorer earns its price. The caller's `sensitivity_hint` may only raise the result, never lower it, which is enforced by `SensitivityLevel::raised_by` from Task 5.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `crates/memorysafe-policy/src/sensitivity.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::candidate_from;
+    use memorysafe_core::{SensitivityCategory, SensitivityLevel};
+
+    #[test]
+    fn ordinary_text_is_internal() {
+        let a = assess(&candidate_from("the deployment finished at noon", None));
+        assert_eq!(a.level, SensitivityLevel::Internal);
+        assert!(a.categories.is_empty());
+    }
+
+    #[test]
+    fn credentials_are_restricted() {
+        for text in [
+            "the api key is sk-abc123def456ghi789jkl012",
+            "password: hunter2correcthorse",
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+        ] {
+            let a = assess(&candidate_from(text, None));
+            assert_eq!(a.level, SensitivityLevel::Restricted, "missed credential in {text:?}");
+            assert!(a.categories.contains(&SensitivityCategory::Credential));
+        }
+    }
+
+    #[test]
+    fn health_language_is_sensitive() {
+        let a = assess(&candidate_from("patient was diagnosed with hypertension", None));
+        assert!(a.level >= SensitivityLevel::Sensitive);
+        assert!(a.categories.contains(&SensitivityCategory::Health));
+    }
+
+    #[test]
+    fn contact_details_are_personal() {
+        let a = assess(&candidate_from("reach them at someone@example.com", None));
+        assert!(a.level >= SensitivityLevel::Personal);
+        assert!(a.categories.contains(&SensitivityCategory::Pii));
+    }
+
+    #[test]
+    fn a_hint_raises_but_never_lowers() {
+        let raised = assess(&candidate_from(
+            "innocuous note",
+            Some(SensitivityLevel::Restricted),
+        ));
+        assert_eq!(raised.level, SensitivityLevel::Restricted);
+
+        let not_lowered = assess(&candidate_from(
+            "the api key is sk-abc123def456ghi789jkl012",
+            Some(SensitivityLevel::Public),
+        ));
+        assert_eq!(
+            not_lowered.level,
+            SensitivityLevel::Restricted,
+            "a caller hint must never lower a detected level"
+        );
+    }
+}
+```
+
+Append to `crates/memorysafe-policy/src/value.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BaselineConfig;
+    use crate::testkit::candidate_from;
+    use memorysafe_core::{ScopeStats, SourceKind};
+
+    fn stats() -> ScopeStats {
+        ScopeStats { item_count: 50, median_item_bytes: 100, ..Default::default() }
+    }
+
+    #[test]
+    fn substantive_content_beats_a_stub() {
+        let cfg = BaselineConfig::default();
+        let rich = score(
+            &candidate_from("the production database migration runs at 02:00 UTC on Sundays", None),
+            &stats(),
+            &cfg,
+        );
+        let thin = score(&candidate_from("ok", None), &stats(), &cfg);
+        assert!(rich > thin, "rich={rich:?} thin={thin:?}");
+    }
+
+    #[test]
+    fn a_human_source_outranks_an_agent_source_all_else_equal() {
+        let cfg = BaselineConfig::default();
+        let text = "the deadline moved to the fifteenth";
+        let mut human = candidate_from(text, None);
+        human.attrs.insert("source_kind".into(), serde_json::json!("human"));
+        let agent = candidate_from(text, None);
+        assert!(score(&human, &stats(), &cfg) >= score(&agent, &stats(), &cfg));
+        let _ = SourceKind::Human;
+    }
+
+    #[test]
+    fn an_explicit_caller_weight_is_honoured() {
+        let cfg = BaselineConfig::default();
+        let mut weighted = candidate_from("a short note", None);
+        weighted.attrs.insert("value_weight".into(), serde_json::json!(1.0));
+        let plain = candidate_from("a short note", None);
+        assert!(score(&weighted, &stats(), &cfg) > score(&plain, &stats(), &cfg));
+    }
+
+    #[test]
+    fn value_always_lands_in_range() {
+        let cfg = BaselineConfig::default();
+        for text in ["", "x", &"word ".repeat(5000)] {
+            let s = score(&candidate_from(text, None), &stats(), &cfg);
+            assert!((0.0..=1.0).contains(&s.get()), "{text:?} produced {s:?}");
+        }
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p memorysafe-policy`
+Expected: FAIL — `cannot find function assess in this scope`, `cannot find function candidate_from`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Add to `crates/memorysafe-policy/src/testkit.rs`:
+
+```rust
+use memorysafe_core::Candidate;
+
+pub fn candidate_from(
+    body: &str,
+    hint: Option<memorysafe_core::SensitivityLevel>,
+) -> Candidate {
+    Candidate {
+        body: body.to_string(),
+        kind: "fact".into(),
+        tags: vec![],
+        attrs: Default::default(),
+        sensitivity_hint: hint,
+        embedding: None,
+        byte_size: body.len() as u64,
+    }
+}
+```
+
+`crates/memorysafe-policy/src/sensitivity.rs`:
+
+```rust
+use memorysafe_core::{
+    Candidate, Score, SensitivityAssessment, SensitivityCategory, SensitivityLevel,
+};
+
+/// Lexicons are lowercase substrings. Crude and English-only — this is stated
+/// in the crate docs rather than hidden, and it is one of the places the
+/// proprietary scorer earns its price.
+const CREDENTIAL_MARKERS: &[&str] = &[
+    "password:", "passwd:", "api key", "api_key", "apikey", "secret_access_key",
+    "secret key", "private key", "-----begin", "bearer ", "authorization:",
+];
+const HEALTH_MARKERS: &[&str] = &[
+    "patient", "diagnos", "prescri", "symptom", "medication", "mg daily", "blood pressure",
+    "hypertension", "diabetes", "oncolog", "psychiatr", "therapy session",
+];
+const FINANCIAL_MARKERS: &[&str] =
+    &["account number", "routing number", "iban", "credit card", "salary", "net worth"];
+const LEGAL_MARKERS: &[&str] =
+    &["attorney-client", "privileged and confidential", "settlement agreement", "under seal"];
+
+fn looks_like_secret_token(text: &str) -> bool {
+    // A long unbroken run of key-ish characters with mixed case or digits.
+    text.split_whitespace().any(|t| {
+        let core = t.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        core.len() >= 20
+            && core.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            && core.chars().any(|c| c.is_ascii_digit())
+            && core.chars().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
+fn looks_like_email(text: &str) -> bool {
+    text.split_whitespace().any(|t| {
+        let at = t.find('@');
+        match at {
+            Some(i) => i > 0 && t[i + 1..].contains('.') && !t.ends_with('.'),
+            None => false,
+        }
+    })
+}
+
+fn looks_like_phone(text: &str) -> bool {
+    let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.len() >= 10
+        && text.chars().any(|c| matches!(c, '-' | '(' | ')' | '+'))
+}
+
+pub fn assess(cand: &Candidate) -> SensitivityAssessment {
+    let lower = cand.body.to_lowercase();
+    let mut categories = Vec::new();
+    let mut detected = SensitivityLevel::Internal;
+    let mut confidence = 0.5f32;
+
+    let has = |markers: &[&str]| markers.iter().any(|m| lower.contains(m));
+
+    if has(CREDENTIAL_MARKERS) || looks_like_secret_token(&cand.body) {
+        categories.push(SensitivityCategory::Credential);
+        detected = detected.max(SensitivityLevel::Restricted);
+        confidence = 0.9;
+    }
+    if has(HEALTH_MARKERS) {
+        categories.push(SensitivityCategory::Health);
+        detected = detected.max(SensitivityLevel::Sensitive);
+        confidence = confidence.max(0.7);
+    }
+    if has(FINANCIAL_MARKERS) {
+        categories.push(SensitivityCategory::Financial);
+        detected = detected.max(SensitivityLevel::Sensitive);
+        confidence = confidence.max(0.7);
+    }
+    if has(LEGAL_MARKERS) {
+        categories.push(SensitivityCategory::Legal);
+        detected = detected.max(SensitivityLevel::Sensitive);
+        confidence = confidence.max(0.7);
+    }
+    if looks_like_email(&cand.body) || looks_like_phone(&cand.body) {
+        categories.push(SensitivityCategory::Pii);
+        detected = detected.max(SensitivityLevel::Personal);
+        confidence = confidence.max(0.6);
+    }
+
+    SensitivityAssessment {
+        // The hint may only raise the level.
+        level: detected.raised_by(cand.sensitivity_hint),
+        categories,
+        confidence: Score::clamped(confidence),
+    }
+}
+```
+
+`crates/memorysafe-policy/src/value.rs`:
+
+```rust
+use crate::config::BaselineConfig;
+use memorysafe_core::{Candidate, ScopeStats, Score};
+
+/// Specificity proxy: length relative to the corpus median, saturating. A stub
+/// carries little; a paragraph usually carries more. Crude but stable, and it
+/// avoids needing corpus-wide token statistics on the write path.
+fn specificity(cand: &Candidate, stats: &ScopeStats) -> f32 {
+    let median = stats.median_item_bytes.max(50) as f32;
+    let ratio = cand.byte_size as f32 / median;
+    // Saturating curve: 1x median ≈ 0.5, 3x ≈ 0.75, diminishing after.
+    ratio / (1.0 + ratio)
+}
+
+/// Distinct-token fraction: repetitive filler scores lower than dense prose.
+fn lexical_density(cand: &Candidate) -> f32 {
+    let tokens: Vec<String> =
+        cand.body.split_whitespace().map(|t| t.to_lowercase()).collect();
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    let mut unique = tokens.clone();
+    unique.sort();
+    unique.dedup();
+    unique.len() as f32 / tokens.len() as f32
+}
+
+fn source_trust(cand: &Candidate) -> f32 {
+    match cand.attrs.get("source_kind").and_then(|v| v.as_str()) {
+        Some("human") => 1.0,
+        Some("tool") => 0.7,
+        Some("session") => 0.5,
+        _ => 0.5,
+    }
+}
+
+/// How useful this memory is likely to be. Explicit caller weight dominates
+/// when supplied, because the caller knows things the corpus does not.
+pub fn score(cand: &Candidate, stats: &ScopeStats, cfg: &BaselineConfig) -> Score {
+    if let Some(w) = cand.attrs.get("value_weight").and_then(|v| v.as_f64()) {
+        return Score::clamped(w as f32);
+    }
+
+    let content = 0.6 * specificity(cand, stats) + 0.4 * lexical_density(cand);
+    let trust = source_trust(cand);
+    let blended =
+        (1.0 - cfg.source_trust_weight) * content + cfg.source_trust_weight * trust;
+    Score::clamped(blended)
+}
+```
+
+Add `pub mod sensitivity;` and `pub mod value;` to `lib.rs`, and implement `assess`:
+
+```rust
+use memorysafe_core::{
+    AssessContext, Assessed, Assessment, AssessorId, AdmitContext, Candidate, ComposeContext,
+    Decision, GovernancePolicy, MaintainContext, PolicyError, RecallRequest, ScoredCandidate,
+    WorkingSet, features,
+};
+
+impl GovernancePolicy for BaselinePolicy {
+    fn id(&self) -> PolicyId {
+        self.policy_id()
+    }
+
+    fn assess(&self, cand: &Candidate, ctx: &AssessContext) -> Result<Assessment, PolicyError> {
+        let redundancy = redundancy::assess(&ctx.neighbours, &self.config);
+        let fragility = fragility::score(&ctx.neighbours, &ctx.stats);
+        let value = value::score(cand, &ctx.stats, &self.config);
+        let sensitivity = sensitivity::assess(cand);
+
+        Ok(Assessment {
+            features: features! {
+                "neighbour_count" => ctx.neighbours.len() as f64,
+                "best_similarity" => redundancy.score.get(),
+                "corpus_mean_similarity" => ctx.stats.mean_neighbour_similarity,
+                "corpus_item_count" => ctx.stats.item_count as f64,
+                "byte_size" => cand.byte_size as f64,
+                "has_embedding" => if cand.embedding.is_some() { 1.0 } else { 0.0 },
+            },
+            value,
+            fragility,
+            sensitivity,
+            redundancy,
+            assessor: AssessorId::new("baseline", BASELINE_VERSION),
+        })
+    }
+
+    // Implemented in Tasks 27-29.
+    fn admit(&self, _a: &Assessed, _ctx: &AdmitContext) -> Result<Decision, PolicyError> {
+        unimplemented!("Task 27")
+    }
+    fn compose(&self, _r: &RecallRequest, _c: &[ScoredCandidate], _ctx: &ComposeContext)
+        -> Result<WorkingSet, PolicyError> {
+        unimplemented!("Task 28")
+    }
+    fn maintain(&self, _ctx: &MaintainContext) -> Result<Vec<Decision>, PolicyError> {
+        unimplemented!("Task 29")
+    }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p memorysafe-policy`
+Expected: PASS — 18 tests ok.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/memorysafe-policy/
+git commit -m "feat(policy): value scoring and pattern-based sensitivity detection"
+```
+
+---
