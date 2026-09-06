@@ -2717,3 +2717,194 @@ pub async fn audit_aggregates_narrow_by_day_window_and_policy<F: BackendFactory>
     assert_eq!(both[0].day, 1);
     assert_eq!(both[0].policy.as_ref(), Some(&alpha1));
 }
+
+/// Every path that writes an audit row increments the aggregates.
+///
+/// **What this exists to survive, and it is a structural failure mode rather
+/// than a coding one.** The aggregate increment is a call that has to appear in
+/// every method that writes an audit row. A later task that *rewrites* one of
+/// those methods — the SQLite plan has one task write a partial `apply` and a
+/// later task replace it with the final form — inherits none of the earlier
+/// block's calls, and nothing notices. That happened: the increment lived in
+/// the partial `apply` and was absent from the final one, so the aggregate
+/// table would never have been written at all, and the failure would have
+/// surfaced two tasks later as three unrelated-looking test failures. Prose
+/// cannot prevent that, because the rewrite does not read the prose. This test
+/// can: it goes red at the task that drops the call.
+///
+/// **The implementation this rejects** is the same one on each path: a method
+/// that writes its audit row and returns. Three of the four sketches in the
+/// SQLite plan had exactly that shape at some point.
+///
+/// **Already covered, and deliberately not repeated here:** `apply` is pinned
+/// by `audit_aggregates_survive_a_cascading_purge`, which asserts three admits
+/// are counted before the purge, and again by
+/// `audit_aggregates_page_in_the_documented_order` and
+/// `audit_aggregates_narrow_by_day_window_and_policy`, whose whole corpora are
+/// written through it and whose counts are asserted exactly. This test covers
+/// the three that nothing else reaches: `record_recall`, `purge_subject`, and
+/// `import`. Adding `apply` here would add an obligation on a second backend
+/// for no discrimination.
+///
+/// **Vacuity.** "The count rose" is satisfied by a backend that increments the
+/// wrong key, or twice, so every assertion pins an **exact** delta rather than
+/// an inequality. It is also satisfied by rows that were already there, so each
+/// path asserts its event's count is zero first — and for the import leg, that
+/// the destination's aggregates are entirely empty before the stream arrives.
+/// The three paths use three different event classes, so a backend that
+/// increments the wrong one fails the path it belongs to as well as the one it
+/// borrowed from.
+pub async fn every_audit_writing_path_increments_the_aggregates<F: BackendFactory>(factory: &F) {
+    use memorysafe_core::ItemRef;
+
+    let backend = factory.create().await;
+    let tenant = TenantId::new("t").unwrap();
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // Total count across every aggregate row carrying `event`. Summed rather
+    // than read from one key, so a backend that splits the same event across
+    // several keys is still measured honestly — the assertion is about the
+    // increment happening, not about which key it landed in.
+    async fn counted<B: Backend>(backend: &B, tenant: &TenantId, event: AuditEvent) -> u64 {
+        backend
+            .audit_aggregates(
+                tenant,
+                &AuditAggregateFilter {
+                    limit: 1000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.key.event == event)
+            .map(|a| a.count)
+            .sum()
+    }
+
+    let item = fx::item(&scope, "a memory to recall and then erase");
+    backend
+        .apply(fx::admit_txn(&scope, item.clone(), None))
+        .await
+        .unwrap();
+
+    // --- record_recall -----------------------------------------------------
+    assert_eq!(
+        counted(&backend, &tenant, AuditEvent::Recalled).await,
+        0,
+        "record_recall: nothing has been recalled yet, so a later 'the count \
+         rose' assertion would be satisfied by a pre-existing row"
+    );
+    backend
+        .record_recall(AuditRecord::new(
+            scope.clone(),
+            AuditEvent::Recalled,
+            vec![ItemRef::from_item(&item)],
+            Actor::system(),
+            OffsetDateTime::UNIX_EPOCH,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        counted(&backend, &tenant, AuditEvent::Recalled).await,
+        1,
+        "record_recall wrote its audit row without incrementing the aggregates. \
+         Every path that writes an audit row increments exactly one aggregate \
+         row, in the same transaction — see the write rule in \
+         `memorysafe_backend::aggregates`"
+    );
+
+    // --- purge_subject -----------------------------------------------------
+    // A subject of its own, so the erasure does not disturb the corpus the
+    // other legs use. Aggregates are tenant-scoped and name no subject, so the
+    // count is visible from here regardless.
+    let doomed_scope = Scope::new("t", "doomed", "n").unwrap();
+    let doomed = SubjectId::new("doomed").unwrap();
+    backend
+        .apply(fx::admit_txn(
+            &doomed_scope,
+            fx::item(&doomed_scope, "erase me"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        counted(&backend, &tenant, AuditEvent::SubjectPurged).await,
+        0,
+        "purge_subject: no purge has run yet"
+    );
+    backend
+        .purge_subject(
+            &tenant,
+            &doomed,
+            PurgeCascade::Cascade,
+            fx::purge_record(&doomed_scope, AuditId::new(), Actor::system()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        counted(&backend, &tenant, AuditEvent::SubjectPurged).await,
+        1,
+        "purge_subject inserted its SubjectPurged record without incrementing \
+         the aggregates. That row's aggregate is the only evidence at tenant \
+         granularity that an erasure happened, once the detail row it \
+         summarises is itself swept by retention"
+    );
+
+    // --- import ------------------------------------------------------------
+    // Its own source and destination: importing into `backend` would collide
+    // on `AuditId`, which is the audit table's key.
+    let source = factory.create().await;
+    let source_scope = Scope::new("t", "s", "n").unwrap();
+    for body in ["first imported memory", "second imported memory"] {
+        source
+            .apply(fx::admit_txn(
+                &source_scope,
+                fx::item(&source_scope, body),
+                None,
+            ))
+            .await
+            .unwrap();
+    }
+    let stream = source
+        .export(&ScopeSelector {
+            tenant: tenant.clone(),
+            subject: None,
+            namespace: None,
+            include_audit: true,
+        })
+        .await
+        .unwrap();
+
+    let destination = factory.create().await;
+    assert_eq!(
+        destination
+            .audit_aggregates(
+                &tenant,
+                &AuditAggregateFilter {
+                    limit: 1000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "import: the destination must hold no aggregates at all before the \
+         stream arrives, or the assertion below measures the wrong thing"
+    );
+    let report = destination.import(&tenant, stream).await.unwrap();
+    assert_eq!(
+        report.audit_imported, 2,
+        "import: the two audit rows must actually have been imported, or the \
+         aggregate assertion below is about a stream that carried nothing"
+    );
+    assert_eq!(
+        counted(&destination, &tenant, AuditEvent::Admitted).await,
+        2,
+        "import wrote its audit rows without incrementing the aggregates. An \
+         ExportStream carries no aggregate records, so a destination that does \
+         not increment holds detail rows with no summary — and loses the \
+         history entirely at its first cascading purge"
+    );
+}

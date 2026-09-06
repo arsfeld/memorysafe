@@ -6288,11 +6288,12 @@ and extend `run!`:
         lifecycle::audit_aggregates_page_in_the_documented_order,
         lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row,
         lifecycle::audit_aggregates_narrow_by_day_window_and_policy,
+        lifecycle::every_audit_writing_path_increments_the_aggregates,
 ```
 
-The suite now stands at **49 conformance tests** (5 isolation + 6 atomicity + 13 retrieval + 4 capacity + 21 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified. **The authoritative list is `run_conformance_suite`'s own `run!` in `crates/memorysafe-backend/src/conformance/mod.rs`** — every `pub async fn` across the conformance modules must appear in it, and that correspondence is checked by enumeration before each of these contract commits, not by reading this document.
+The suite now stands at **50 conformance tests** (5 isolation + 6 atomicity + 13 retrieval + 4 capacity + 22 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified. **The authoritative list is `run_conformance_suite`'s own `run!` in `crates/memorysafe-backend/src/conformance/mod.rs`** — every `pub async fn` across the conformance modules must appear in it, and that correspondence is checked by enumeration before each of these contract commits, not by reading this document.
 
-Twenty-two of those were added after Tasks 17 and 18 shipped, by the contract tasks that changed `Backend::import`'s and `Backend::purge_subject`'s signatures, put access statistics on the ranking structs, stated the echo rule, and closed the gaps the trait's own doc comments admitted nothing enforced — the last point at which adding conformance tests and changing trait signatures cost nothing, because no `impl Backend` existed yet. They are listed in the `run!` snippets above so those snippets match the file rather than the day it was written:
+Twenty-three of those were added after Tasks 17 and 18 shipped, by the contract tasks that changed `Backend::import`'s and `Backend::purge_subject`'s signatures, put access statistics on the ranking structs, stated the echo rule, and closed the gaps the trait's own doc comments admitted nothing enforced — the last point at which adding conformance tests and changing trait signatures cost nothing, because no `impl Backend` existed yet. They are listed in the `run!` snippets above so those snippets match the file rather than the day it was written:
 `retrieval::list_orders_oldest_first_by_created_at`,
 `retrieval::list_tie_break_is_total_over_identical_timestamps`,
 `retrieval::neighbours_break_ties_before_truncating_at_k`,
@@ -6313,10 +6314,11 @@ Twenty-two of those were added after Tasks 17 and 18 shipped, by the contract ta
 `lifecycle::export_orders_the_stream_by_kind_then_by_id`,
 `lifecycle::audit_aggregates_page_in_the_documented_order`,
 `lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row`,
-`isolation::retrieval_never_crosses_a_scope_boundary`, and
-`lifecycle::audit_aggregates_narrow_by_day_window_and_policy`.
+`isolation::retrieval_never_crosses_a_scope_boundary`,
+`lifecycle::audit_aggregates_narrow_by_day_window_and_policy`, and
+`lifecycle::every_audit_writing_path_increments_the_aggregates`.
 
-**The fifteen most recent are not reproduced above.** Their text lives in
+**The sixteen most recent are not reproduced above.** Their text lives in
 `crates/memorysafe-backend/src/conformance/lifecycle.rs` and
 `.../atomicity.rs`, which are authoritative; a sketch of a test that already
 exists in the tree can only drift from it, and this document has now lost that
@@ -8664,7 +8666,7 @@ Add `pub mod capacity;` and `use rusqlite::params;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 49 conformance tests minus the 21 lifecycle ones, i.e. 28 conformance tests plus 12 unit tests, all ok.
+Expected: PASS — 50 conformance tests minus the 22 lifecycle ones, i.e. 28 conformance tests plus 12 unit tests, all ok.
 
 - [ ] **Step 5: Commit**
 
@@ -9217,7 +9219,7 @@ Replace the last four placeholders in `lib.rs`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite && cargo clippy -p memorysafe-backend-sqlite --all-targets -- -D warnings`
-Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 49 conformance test names and passes.
+Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 50 conformance test names and passes.
 
 - [ ] **Step 5: Commit**
 
@@ -14699,7 +14701,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 49 backend conformance tests, and the unit and integration suites of all six crates.
+Expected: PASS — the whole workspace green: 5 invariants, 50 backend conformance tests, and the unit and integration suites of all six crates.
 
 - [ ] **Step 5: Commit**
 
@@ -15089,7 +15091,7 @@ git commit -m "feat(engine): pending-embedding backfill and explicit re-embeddin
 - `cargo test --workspace --all-features` is green.
 - `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 - The CI purity job confirms `memorysafe-core` and `memorysafe-policy` pull in no I/O crates.
-- `SqliteBackend` passes all 49 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
+- `SqliteBackend` passes all 50 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
 - The five invariants pass at 64 proptest cases in release mode.
 - An engine can be constructed and driven end to end from a Rust test with no server, no network, and no model files.
 - No item is left permanently unsearchable: `pending_embedding` has a backfill path, and changing embedder is an explicit audited migration.

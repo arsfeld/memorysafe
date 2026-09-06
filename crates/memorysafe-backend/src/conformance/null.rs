@@ -340,6 +340,7 @@ async fn run_census() -> Vec<(&'static str, Verdict)> {
         super::lifecycle::audit_aggregates_page_in_the_documented_order,
         super::lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row,
         super::lifecycle::audit_aggregates_narrow_by_day_window_and_policy,
+        super::lifecycle::every_audit_writing_path_increments_the_aggregates,
     )
 }
 
@@ -374,7 +375,8 @@ const SUITE_LIST_SOURCE: &str = include_str!("mod.rs");
 /// Setup methods. **Excluded from check 3's intersection, deliberately and by
 /// name rather than by inference.**
 ///
-/// 45 of the 49 conformance tests call `apply` to build a corpus, so an
+/// 45 of the 49 conformance tests call `apply` to build a corpus (as of the
+/// census reading; the suite is now 50), so an
 /// intersection that counted it would be non-empty for almost any pair drawn
 /// from the suite — it would measure that both are tests, not that they cover
 /// a common surface. Any predicate of the form "what does this test touch"
@@ -511,6 +513,14 @@ struct Tolerance {
 /// assertion, 4 by panicking on an empty vec or a `None`, all of which are the
 /// right outcome.
 ///
+/// The suite has since reached 50. The fiftieth,
+/// `lifecycle::every_audit_writing_path_increments_the_aggregates`, was added
+/// after this census was taken and is **not** among the survivors: it fails
+/// against the null backend on its first delta assertion, since
+/// `audit_aggregates` returns an empty vec and the count never rises. The
+/// census figures above are left at the reading they were taken at rather than
+/// adjusted by arithmetic; retake them to update them.
+///
 /// Both survivors are *absence-shaped*: each asserts that something is not
 /// there, which an empty result satisfies for free. Neither is vacuous,
 /// because for each one a sibling test covers the presence case and that
@@ -562,7 +572,8 @@ const NULL_TOLERANT: &[Tolerance] = &[
 ///    run, which means real coverage exists.
 /// 3. **Near-mechanical.** The named `sharing_read_method` is one both tests
 ///    call. Intersecting over observation methods only —
-///    [`SETUP_METHODS`] are excluded because 45 of 49 tests call `apply`.
+///    [`SETUP_METHODS`] are excluded because 45 of 49 tests called `apply` at
+///    the census reading.
 ///    **Limit: this proves the two tests read the same surface, not that they
 ///    cover the same property.** Two tests can both call `list` about
 ///    entirely different things.
@@ -697,7 +708,7 @@ async fn the_census_measures_every_test_the_suite_runs() {
     );
     assert_eq!(
         suite.len(),
-        49,
+        50,
         "the suite's size changed; update the census record"
     );
 }
