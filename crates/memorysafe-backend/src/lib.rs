@@ -64,13 +64,17 @@ pub trait Backend: Send + Sync {
 
     async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, BackendError>;
 
-    /// Must impose a *total* order over the scope's items. Ordering by
-    /// timestamp alone is insufficient: a bulk import can leave many rows
-    /// with an identical `created_at`, and an unstable sort under
-    /// `LIMIT`/`OFFSET` paging can then return the same row on two pages
-    /// while silently dropping another. Break ties with a unique key such as
-    /// `id` so paging stays stable regardless of how many rows share a
-    /// timestamp.
+    /// Ordered ascending by `created_at`, ties broken by ascending `id`
+    /// (`id` is a ULID — itself a total, time-sortable order — so breaking
+    /// ties by it never contradicts the primary sort). This must be a
+    /// *total* order: ordering by timestamp alone is insufficient, since a
+    /// bulk import can leave many rows with an identical `created_at`, and
+    /// an unstable sort under `LIMIT`/`OFFSET` paging can then return the
+    /// same row on two pages while silently dropping another. Every backend
+    /// must use this same key and direction — SQLite paging ascending while
+    /// Postgres paged descending would each "conform" to a total order
+    /// stated without one, which is exactly the cross-backend drift this
+    /// suite exists to prevent.
     async fn list(&self, scope: &Scope, page: &Page) -> Result<Vec<MemoryItem>, BackendError>;
 
     async fn audit(

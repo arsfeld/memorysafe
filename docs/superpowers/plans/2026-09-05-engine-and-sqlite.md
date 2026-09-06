@@ -1759,10 +1759,10 @@ mod tests {
     fn reject_constructor_carries_its_reason() {
         let d = Decision::reject(
             PolicyId::new("baseline", "0.1.0"),
-            Reason::new(ReasonCode::ExactDuplicate, "cosine 0.99", features! { "sim" => 0.99 }),
+            Reason::new(ReasonCode::NearDuplicate, "cosine 0.99", features! { "sim" => 0.99 }),
         );
         assert!(matches!(d.action, Action::Reject));
-        assert!(d.has_reason(ReasonCode::ExactDuplicate));
+        assert!(d.has_reason(ReasonCode::NearDuplicate));
         assert_eq!(d.reasons[0].evidence.get("sim"), Some(&0.99));
     }
 
@@ -1911,7 +1911,7 @@ pub enum ReasonCode {
     NovelContent,
     HighValue,
     HighRedundancy,
-    ExactDuplicate,
+    NearDuplicate,
     CapacityPressure,
     ProtectedFragile,
     SensitivityCap,
@@ -4222,13 +4222,17 @@ pub trait Backend: Send + Sync {
     async fn get(&self, scope: &Scope, id: &ItemId)
         -> Result<Option<MemoryItem>, BackendError>;
 
-    /// Must impose a *total* order over the scope's items. Ordering by
-    /// timestamp alone is insufficient: a bulk import can leave many rows
-    /// with an identical `created_at`, and an unstable sort under
-    /// `LIMIT`/`OFFSET` paging can then return the same row on two pages
-    /// while silently dropping another. Break ties with a unique key such as
-    /// `id` so paging stays stable regardless of how many rows share a
-    /// timestamp.
+    /// Ordered ascending by `created_at`, ties broken by ascending `id`
+    /// (`id` is a ULID — itself a total, time-sortable order — so breaking
+    /// ties by it never contradicts the primary sort). This must be a
+    /// *total* order: ordering by timestamp alone is insufficient, since a
+    /// bulk import can leave many rows with an identical `created_at`, and
+    /// an unstable sort under `LIMIT`/`OFFSET` paging can then return the
+    /// same row on two pages while silently dropping another. Every backend
+    /// must use this same key and direction — SQLite paging ascending while
+    /// Postgres paged descending would each "conform" to a total order
+    /// stated without one, which is exactly the cross-backend drift this
+    /// suite exists to prevent.
     async fn list(&self, scope: &Scope, page: &Page)
         -> Result<Vec<MemoryItem>, BackendError>;
 
@@ -4432,6 +4436,19 @@ pub fn item_with(
     i
 }
 
+/// Same as `item`, but with a caller-supplied `created_at` instead of the
+/// fixed `UNIX_EPOCH` above. `item`'s timestamp is pinned so most conformance
+/// runs are deterministic and comparable, but that pin means many items tie
+/// under `ORDER BY created_at` — exactly the shape a real bulk import
+/// produces, and pagination must stay stable across it. Tests that need
+/// distinct, ordered timestamps (Task 17's `pagination_is_stable`) use this
+/// builder instead of forking `item` or reaching into its fields directly.
+pub fn item_at(scope: &Scope, body: &str, created_at: OffsetDateTime) -> MemoryItem {
+    let mut i = item(scope, body);
+    i.created_at = created_at;
+    i
+}
+
 pub fn vector_for(body: &str) -> QuantizedVector {
     QuantizedVector::from_embedding(&embedder().embed(body).unwrap())
 }
@@ -4471,6 +4488,24 @@ pub fn evict_txn(scope: &Scope, evictions: Vec<ItemId>) -> WriteTransaction {
         vec![],
         Actor::system(),
         OffsetDateTime::UNIX_EPOCH,
+    );
+    let mut txn = WriteTransaction::new(scope.clone(), audit);
+    txn.evictions = evictions;
+    txn
+}
+
+/// Same as `evict_txn`, but with a caller-supplied `at` instead of the fixed
+/// `UNIX_EPOCH` above — mirrors `item`/`item_at`. `evict_txn` itself stays
+/// pinned so Task 16's tests are unaffected; tests that need distinct,
+/// ordered eviction timestamps (Task 18's
+/// `audit_filter_narrows_by_event_and_time`) use this builder instead.
+pub fn evict_txn_at(scope: &Scope, evictions: Vec<ItemId>, at: OffsetDateTime) -> WriteTransaction {
+    let audit = AuditRecord::new(
+        scope.clone(),
+        AuditEvent::Forgotten,
+        vec![],
+        Actor::system(),
+        at,
     );
     let mut txn = WriteTransaction::new(scope.clone(), audit);
     txn.evictions = evictions;
@@ -4815,41 +4850,73 @@ fn query_with_limit(text: &str, filters: HardFilters, limit: usize) -> Candidate
 /// The security-critical one: a restricted item must never leave the database
 /// for a caller cleared only to Personal.
 ///
-/// The corpus here deliberately exceeds the query's `limit`, with the
-/// excluded items worded to dominate the ranking. That is not incidental:
-/// with a corpus smaller than `limit` (the original shape of this test — one
-/// item per level, `limit: 50`), a backend that applies the sensitivity
-/// ceiling inside its query and a backend that runs an unfiltered query and
-/// filters the ceiling out afterwards, in Rust, return byte-identical
-/// results, because nothing was ever truncated. The two strategies are
-/// indistinguishable and the test cannot tell a compliant backend from a
-/// dangerous one — which defeats the point of a test named for the ceiling
-/// being "enforced in the query". Do not "simplify" this back to one item
-/// per level; that silently removes the only thing this test actually
-/// checks.
+/// The corpus needs three properties, each closing a distinct way a ceiling
+/// bug could hide behind this test's original, weaker shape:
 ///
-/// Five `Restricted` items are worded to match the query text almost
-/// verbatim, so they rank at the very top for any reasonable vector or
-/// keyword scoring. Two admissible items mention the same topic only in
-/// passing, so they rank lower. Querying with `limit: 3` — fewer than the
-/// five `Restricted` items — means: a backend that ranks first and applies
-/// the sensitivity filter after `LIMIT` fills all 3 slots with `Restricted`
-/// rows and returns 0 allowed items; a backend that filters inside the query
-/// never considers the `Restricted` rows at all and returns exactly the 2
-/// items the caller is entitled to.
+/// 1. **It must exceed the query's `limit`, with the excluded items worded
+///    to dominate the ranking.** With a corpus smaller than `limit` (the
+///    original shape — one item per level, `limit: 50`), a backend that
+///    applies the ceiling inside its query and a backend that runs an
+///    unfiltered query and filters the ceiling out afterwards, in Rust,
+///    return byte-identical results, because nothing was ever truncated.
+///    The two strategies are indistinguishable and the test cannot tell a
+///    compliant backend from a dangerous one.
+/// 2. **The excluded pool must be large enough to survive a constant-factor
+///    over-fetch, not just a naive `SELECT *`.** `CandidateQuery::limit` is
+///    itself documented (`query.rs`) as an over-fetch knob the engine
+///    "typically sets 5-10x the recall budget," so a backend issuing
+///    `LIMIT limit * k` unfiltered and filtering afterwards is not a
+///    contrived worst case — it is the natural way to write a hybrid
+///    backend's per-arm fetch, and the original 5-item pool (corpus 7,
+///    `limit: 3`) fails to catch it: any `k >= 3` fetches the whole corpus
+///    unfiltered and returns the correct 2 rows regardless of where
+///    filtering happens. With 40 excluded items ranked 1..=40 and the 2
+///    admissible items ranked 41 and 42, reaching an admissible row needs
+///    `limit * k >= 41`, i.e. `k >= 14` at `limit: 3` — well past the
+///    documented 5-10x, so no plausible over-fetch factor leaks the
+///    diagnosis. Do not shrink this pool "for speed"; that is exactly the
+///    trim that would silently reopen this hole.
+/// 3. **The excluded pool must include a level immediately above the
+///    ceiling, not only one far above it.** A ceiling of `Personal`
+///    (ordinal 2) next to a corpus of only `Restricted` items (ordinal 4)
+///    cannot catch a backend whose SQL admits `level_ord <= ceiling_ord +
+///    1` — the single most likely off-by-one at the boundary — because
+///    ordinal 4 still fails that relaxed check exactly like the correct
+///    one (`level_ord <= ceiling_ord`). One `Sensitive` item (ordinal 3,
+///    immediately above the ceiling) among the top-ranked pool is wrongly
+///    admitted by an off-by-one query and correctly excluded by a
+///    compliant one, so both the count assertion and the per-item
+///    assertion below catch it.
+///
+/// The two admissible items share 4 of the query's 5 tokens — differing
+/// only in the discriminating first word ("restricted" vs. "public"/
+/// "personal") — rather than sharing only one token as the original
+/// wording did. That keeps their vector score well above any plausible
+/// recall floor in a hybrid backend's vector arm, so a failure here cannot
+/// be misdiagnosed as "ceiling applied after LIMIT" when it is really an
+/// unrelated recall-floor issue dropping a weakly-matching candidate.
 pub async fn sensitivity_ceiling_is_enforced_in_the_query<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
 
-    // Five distinct items (fresh `ItemId`s), identical wording, so each one
-    // ranks at the very top of this query.
-    for _ in 0..5 {
+    // 40 items, verbatim-identical to the query text, so every one of them
+    // ranks at the very top under any reasonable vector or keyword scorer.
+    // 39 are `Restricted` (ordinal 4); one is `Sensitive` (ordinal 3, the
+    // level immediately above the `Personal` ceiling) to catch an
+    // off-by-one at the boundary. See point 2 above for why 40, and point 3
+    // for why one of them is `Sensitive` rather than all `Restricted`.
+    for i in 0..40 {
+        let level = if i == 0 {
+            SensitivityLevel::Sensitive
+        } else {
+            SensitivityLevel::Restricted
+        };
         let item = fx::item_with(
             &scope,
             "restricted medical record about cats",
             "fact",
             &[],
-            SensitivityLevel::Restricted,
+            level,
         );
         backend
             .apply(fx::admit_txn_embedded(&scope, item))
@@ -4857,9 +4924,9 @@ pub async fn sensitivity_ceiling_is_enforced_in_the_query<F: BackendFactory>(fac
             .unwrap();
     }
     for (body, level) in [
-        ("a passing mention of cats", SensitivityLevel::Public),
+        ("public medical record about cats", SensitivityLevel::Public),
         (
-            "cats came up once in conversation",
+            "personal medical record about cats",
             SensitivityLevel::Personal,
         ),
     ] {
@@ -4885,9 +4952,10 @@ pub async fn sensitivity_ceiling_is_enforced_in_the_query<F: BackendFactory>(fac
     assert_eq!(
         hits.len(),
         2,
-        "expected exactly the 2 admissible items; fewer means the sensitivity \
-         ceiling was applied after LIMIT instead of inside the query, and the \
-         Restricted rows consumed the limit's slots"
+        "expected exactly the 2 admissible items; fewer means the ceiling was \
+         applied after LIMIT (or with too small an over-fetch margin) instead \
+         of inside the query, and more means a level above the ceiling — most \
+         likely Sensitive, at the ceiling+1 boundary — leaked through"
     );
     for h in &hits {
         assert!(
@@ -5015,7 +5083,11 @@ pub async fn keyword_search_finds_exact_terms<F: BackendFactory>(factory: &F) {
     assert!(hits[0].vector_score.is_none());
 }
 
-/// FTS5 syntax characters in user text must not become query operators.
+/// Syntax characters a keyword arm treats specially must not become query
+/// operators when they arrive as ordinary user text — whatever the
+/// backend's own search engine is (SQLite FTS5, Postgres full-text search,
+/// or anything else). Only the assertions below are the contract; nothing
+/// about them names one engine's syntax.
 ///
 /// The corpus here holds three items, not one. With only one item present —
 /// the original shape of this test — "matched everything" and "matched
@@ -5025,14 +5097,21 @@ pub async fn keyword_search_finds_exact_terms<F: BackendFactory>(factory: &F) {
 /// operator and match the whole scope. Three items make the two outcomes
 /// different sizes (`<= 1` vs. `3`), so an unescaped hostile string that
 /// turns into a match-everything query is actually caught.
+///
+/// None of the three bodies contains a standalone single-letter token.
+/// `"a AND b"` is one of the hostile inputs below; a keyword arm with
+/// AND-by-default semantics (FTS5's phrase escaping, Postgres's
+/// `plainto_tsquery`) treats it as an inert literal phrase and correctly
+/// matches nothing, but a *correctly escaped* arm with any-term OR
+/// semantics would still match every body containing a standalone `"a"`.
+/// The original corpus ("a normal memory" / "a third normal memory") had
+/// two such bodies, so it would fail this test for a compliant
+/// OR-semantics backend — the suite rejecting a correct implementation,
+/// which is worse than missing an incorrect one.
 pub async fn keyword_search_escapes_user_input<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
-    for body in [
-        "a normal memory",
-        "another normal memory",
-        "a third normal memory",
-    ] {
+    for body in ["alpha memory", "beta memory", "gamma memory"] {
         backend
             .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, body)))
             .await
@@ -5441,6 +5520,12 @@ and `run_conformance_suite` (which calls every test, including this one,
 through the same generic `F`). Every real backend owns its state outright
 and satisfies this trivially.
 
+`run_conformance_suite`'s doc comment must also say it needs a
+multi-threaded Tokio runtime (e.g. `#[tokio::test(flavor = "multi_thread")]`):
+`tokio::spawn` also runs under `current_thread`, but there tasks only
+interleave at `.await` points, so `concurrent_admits_do_not_double_count`'s
+attempt to provoke a genuine concurrent write race loses most of its bite.
+
 Add `tokio` with the `rt-multi-thread` feature to `memorysafe-backend` for `tokio::spawn` in the concurrency test:
 
 ```toml
@@ -5480,39 +5565,149 @@ use super::{BackendFactory, fx};
 use crate::portability::ScopeSelector;
 use crate::{Backend, Page};
 use memorysafe_core::{AuditEvent, AuditFilter, Scope, SubjectId, TenantId};
+use std::collections::BTreeSet;
+use time::{Duration, OffsetDateTime};
 
+/// Exercises every axis `AuditFilter` can narrow on: `events`, the
+/// `since`/`until` time window, and `limit` — including the newest-first
+/// ordering `limit` depends on.
+///
+/// An earlier draft of this test had three compounding defects, fixed here:
+///
+/// 1. **The time bound was never exercised**, despite the test's name —
+///    `since`/`until` sat unused. Fixed by querying a `since`/`until` window
+///    that must return a genuine strict subset of the four audit rows: not
+///    all of them, and not none.
+/// 2. **Every record shared one timestamp.** `fx::item`/`fx::evict_txn` both
+///    pin `UNIX_EPOCH`, so any ordering assertion over `at` held for *any*
+///    order, including oldest-first. Fixed by giving each of the four
+///    records its own timestamp, ten whole seconds apart — `at` stores
+///    whole seconds (see `AuditFilter::after`'s doc on why a time cursor
+///    can't separate same-second rows), so anything finer would not survive
+///    a real round trip through storage.
+/// 3. **The ordering assertion compared `at`**, the one field
+///    `memorysafe_core::AuditFilter` documents as unable to provide a total
+///    order: rows are ordered by `AuditId` instead, because "`at` is whole
+///    seconds and cannot separate rows written in the same second, so a
+///    time-based cursor would repeat or skip them." Fixed by asserting
+///    identity instead: the two rows returned under `limit: 2` must be the
+///    two most recently *written* rows, newest first — checked against the
+///    `AuditId`s the writes themselves returned, not against `at`.
 pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
 
-    for i in 0..3 {
-        backend
-            .apply(fx::admit_txn(&scope, fx::item(&scope, &format!("memory {i}")), None))
+    // Four records, ten whole seconds apart: three admits, then an eviction.
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let t1 = t0 + Duration::seconds(10);
+    let t2 = t0 + Duration::seconds(20);
+    let t3 = t0 + Duration::seconds(30);
+
+    let mut audit_ids = Vec::new();
+    for (i, at) in [t0, t1, t2].into_iter().enumerate() {
+        let applied = backend
+            .apply(fx::admit_txn(
+                &scope,
+                fx::item_at(&scope, &format!("memory {i}"), at),
+                None,
+            ))
             .await
             .unwrap();
+        audit_ids.push(applied.audit_id);
     }
+
+    // `list` orders ascending by `created_at`, so `items[0]` is the item
+    // admitted at `t0` — the oldest one.
     let items = backend.list(&scope, &Page::default()).await.unwrap();
-    backend.apply(fx::evict_txn(&scope, vec![items[0].id.clone()])).await.unwrap();
+    let evicted = backend
+        .apply(fx::evict_txn_at(&scope, vec![items[0].id.clone()], t3))
+        .await
+        .unwrap();
+    audit_ids.push(evicted.audit_id);
 
     let admits = backend
-        .audit(&scope, &AuditFilter { events: vec![AuditEvent::Admitted], ..Default::default() })
+        .audit(
+            &scope,
+            &AuditFilter {
+                events: vec![AuditEvent::Admitted],
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(admits.len(), 3);
     assert!(admits.iter().all(|r| r.event == AuditEvent::Admitted));
 
     let forgets = backend
-        .audit(&scope, &AuditFilter { events: vec![AuditEvent::Forgotten], ..Default::default() })
+        .audit(
+            &scope,
+            &AuditFilter {
+                events: vec![AuditEvent::Forgotten],
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(forgets.len(), 1);
 
+    // Time filter: a window strictly between the second and third admit's
+    // timestamps (5s..25s) admits exactly those two rows and excludes both
+    // the first admit (0s) and the eviction (30s) — a strict subset (2 of
+    // 4), so a backend that ignores the filter and returns everything, or
+    // one that returns nothing, both fail. The bounds are chosen off any
+    // record's exact timestamp so the test does not depend on whether
+    // `since`/`until` are inclusive or exclusive at the edges.
+    let since = t0 + Duration::seconds(5);
+    let until = t0 + Duration::seconds(25);
+    let windowed = backend
+        .audit(
+            &scope,
+            &AuditFilter {
+                since: Some(since),
+                until: Some(until),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        windowed.len(),
+        2,
+        "since/until must select a strict subset of the four rows, not all or none"
+    );
+    assert!(
+        windowed.iter().all(|r| r.at >= since && r.at <= until),
+        "a row outside [since, until] leaked through the time filter"
+    );
+    let windowed_ids: BTreeSet<_> = windowed.iter().map(|r| r.id.clone()).collect();
+    let expected_ids: BTreeSet<_> = [audit_ids[1].clone(), audit_ids[2].clone()]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        windowed_ids, expected_ids,
+        "since/until returned the wrong rows"
+    );
+
+    // Ordering: `limit: 2` must return the two most recently *written* rows,
+    // newest first. Checked by identity (the `AuditId`s the writes
+    // themselves returned), not by `at` — see point 3 above.
     let limited = backend
-        .audit(&scope, &AuditFilter { limit: 2, ..Default::default() })
+        .audit(
+            &scope,
+            &AuditFilter {
+                limit: 2,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(limited.len(), 2);
-    assert!(limited[0].at >= limited[1].at, "audit must come back newest first");
+    let limited_ids: Vec<_> = limited.iter().map(|r| r.id.clone()).collect();
+    assert_eq!(
+        limited_ids,
+        vec![audit_ids[3].clone(), audit_ids[2].clone()],
+        "audit must come back newest first: the eviction, then the third admit"
+    );
 }
 
 /// Right-to-delete must be total for the subject.
@@ -5526,7 +5721,10 @@ pub async fn purge_subject_removes_everything_for_that_subject<F: BackendFactory
     for scope in [&a, &b] {
         for i in 0..3 {
             backend
-                .apply(fx::admit_txn_embedded(scope, fx::item(scope, &format!("memory {i}"))))
+                .apply(fx::admit_txn_embedded(
+                    scope,
+                    fx::item(scope, &format!("memory {i}")),
+                ))
                 .await
                 .unwrap();
         }
@@ -5551,18 +5749,40 @@ pub async fn purge_subject_leaves_other_subjects_intact<F: BackendFactory>(facto
     let doomed = Scope::new("t", "doomed", "ns").unwrap();
     let keeper = Scope::new("t", "keeper", "ns").unwrap();
 
-    backend.apply(fx::admit_txn(&doomed, fx::item(&doomed, "goes away"), None)).await.unwrap();
-    backend.apply(fx::admit_txn(&keeper, fx::item(&keeper, "stays"), None)).await.unwrap();
-
     backend
-        .purge_subject(&TenantId::new("t").unwrap(), &SubjectId::new("doomed").unwrap())
+        .apply(fx::admit_txn(&doomed, fx::item(&doomed, "goes away"), None))
+        .await
+        .unwrap();
+    backend
+        .apply(fx::admit_txn(&keeper, fx::item(&keeper, "stays"), None))
         .await
         .unwrap();
 
-    assert!(backend.list(&doomed, &Page::default()).await.unwrap().is_empty());
-    assert_eq!(backend.list(&keeper, &Page::default()).await.unwrap().len(), 1);
+    backend
+        .purge_subject(
+            &TenantId::new("t").unwrap(),
+            &SubjectId::new("doomed").unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        backend
+            .list(&doomed, &Page::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
-        backend.audit(&keeper, &AuditFilter::default()).await.unwrap().len(),
+        backend.list(&keeper, &Page::default()).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        backend
+            .audit(&keeper, &AuditFilter::default())
+            .await
+            .unwrap()
+            .len(),
         1,
         "purging one subject destroyed another's audit"
     );
@@ -5575,7 +5795,11 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
 
     for (body, kind, tags) in [
         ("first memory about cats", "fact", vec!["work"]),
-        ("second memory about dogs", "preference", vec!["home", "pets"]),
+        (
+            "second memory about dogs",
+            "preference",
+            vec!["home", "pets"],
+        ),
         ("third memory about zstandard", "procedure", vec![]),
     ] {
         let item = fx::item_with(
@@ -5585,7 +5809,10 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
             &tags,
             memorysafe_core::SensitivityLevel::Internal,
         );
-        source.apply(fx::admit_txn_embedded(&scope, item)).await.unwrap();
+        source
+            .apply(fx::admit_txn_embedded(&scope, item))
+            .await
+            .unwrap();
     }
 
     let selector = ScopeSelector {
@@ -5601,11 +5828,32 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
     assert_eq!(report.items_imported, 3);
     assert_eq!(report.vectors_imported, 3);
 
-    let mut before = source.list(&scope, &Page { offset: 0, limit: 100 }).await.unwrap();
-    let mut after = target.list(&scope, &Page { offset: 0, limit: 100 }).await.unwrap();
+    let mut before = source
+        .list(
+            &scope,
+            &Page {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .unwrap();
+    let mut after = target
+        .list(
+            &scope,
+            &Page {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .unwrap();
     before.sort_by(|a, b| a.id.cmp(&b.id));
     after.sort_by(|a, b| a.id.cmp(&b.id));
-    assert_eq!(before, after, "round trip did not reproduce the items exactly");
+    assert_eq!(
+        before, after,
+        "round trip did not reproduce the items exactly"
+    );
 
     // Vectors survived: the same probe ranks the same way on both sides.
     use memorysafe_embed::Embedder;
@@ -5615,7 +5863,11 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
     let ids = |v: &[memorysafe_core::ScoredCandidate]| {
         v.iter().map(|c| c.item.id.clone()).collect::<Vec<_>>()
     };
-    assert_eq!(ids(&src_hits), ids(&tgt_hits), "vector ranking changed across the round trip");
+    assert_eq!(
+        ids(&src_hits),
+        ids(&tgt_hits),
+        "vector ranking changed across the round trip"
+    );
 }
 
 /// Importing the same stream twice must not duplicate anything.
@@ -5623,7 +5875,10 @@ pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
     let source = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
     source
-        .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, "only memory")))
+        .apply(fx::admit_txn_embedded(
+            &scope,
+            fx::item(&scope, "only memory"),
+        ))
         .await
         .unwrap();
 
@@ -5642,9 +5897,18 @@ pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
     let second = target.import(exported).await.unwrap();
     assert_eq!(second.items_imported, 0);
     assert_eq!(second.items_skipped_existing, 1);
-    assert_eq!(target.list(&scope, &Page::default()).await.unwrap().len(), 1);
+    assert_eq!(
+        target.list(&scope, &Page::default()).await.unwrap().len(),
+        1
+    );
 }
 ```
+
+**Three defects fixed in `audit_filter_narrows_by_event_and_time` above, relative to an earlier draft** (found during Task 18's implementation, before this test ever ran against a real backend):
+
+1. **The time bound was never exercised**, despite the test's name — `AuditFilter::since`/`until` sat unused. Fixed by querying a `since`/`until` window that returns a genuine strict subset of the four audit rows (2 of 4): not all of them, and not none.
+2. **Every record shared one timestamp.** `fx::item`/`fx::evict_txn` both pin `UNIX_EPOCH`, so an ordering assertion over `at` held for *any* order, including oldest-first. Fixed by giving each of the four records (three admits, one eviction) its own timestamp, ten whole seconds apart — `at` stores whole seconds, so anything finer would not survive a real round trip through storage. The three admits use `fx::item_at` (Task 17); the eviction uses a new `fx::evict_txn_at` (added to Task 15's fixtures block below, mirroring `item`/`item_at` — `evict_txn` itself is untouched so Task 16's tests are unaffected).
+3. **The ordering assertion compared `at`**, the one field `memorysafe_core::AuditFilter` documents as unable to provide a total order (rows are ordered by `AuditId` instead, because "`at` is whole seconds and cannot separate rows written in the same second, so a time-based cursor would repeat or skip them"). Fixed by asserting identity instead: the two rows returned under `limit: 2` are checked against the `AuditId`s the writes themselves returned (`AppliedWrite::audit_id`), not against `at`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -8080,11 +8344,11 @@ mod tests {
     #[test]
     fn classification_matches_the_documented_thresholds() {
         let cfg = BaselineConfig::default();
-        assert_eq!(cfg.classify(0.99), Verdict::ExactDuplicate);
+        assert_eq!(cfg.classify(0.99), Verdict::NearDuplicate);
         assert_eq!(cfg.classify(0.95), Verdict::Mergeable);
         assert_eq!(cfg.classify(0.50), Verdict::Novel);
         // Boundaries are inclusive at the threshold.
-        assert_eq!(cfg.classify(cfg.duplicate_threshold), Verdict::ExactDuplicate);
+        assert_eq!(cfg.classify(cfg.duplicate_threshold), Verdict::NearDuplicate);
         assert_eq!(cfg.classify(cfg.merge_threshold), Verdict::Mergeable);
     }
 }
@@ -8177,7 +8441,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    ExactDuplicate,
+    NearDuplicate,
     Mergeable,
     Novel,
 }
@@ -8223,7 +8487,7 @@ impl Default for BaselineConfig {
 impl BaselineConfig {
     pub fn classify(&self, similarity: f32) -> Verdict {
         if similarity >= self.duplicate_threshold {
-            Verdict::ExactDuplicate
+            Verdict::NearDuplicate
         } else if similarity >= self.merge_threshold {
             Verdict::Mergeable
         } else {
@@ -8238,6 +8502,7 @@ impl BaselineConfig {
 ```rust
 use crate::config::BaselineConfig;
 use memorysafe_core::{RedundancyAssessment, Score, ScoredCandidate};
+use std::cmp::Reverse;
 
 pub use crate::config::Verdict;
 
@@ -8255,7 +8520,7 @@ pub fn assess(
         // relevance marginally above 1.0 from f32 rounding must not error.
         .map(|n| (n.item.id.clone(), Score::clamped(n.relevance)))
         .collect();
-    near.sort_by(|a, b| b.1.cmp(&a.1));
+    near.sort_by_key(|x| Reverse(x.1));
 
     let best = neighbours.iter().map(|n| n.relevance).fold(0.0f32, f32::max);
     RedundancyAssessment { score: Score::clamped(best), near_duplicates: near }
@@ -8863,7 +9128,7 @@ mod tests {
         let (c, a) = assessed(0.99, 0.8, 0.2, SensitivityLevel::Internal);
         let d = decide(&Assessed { candidate: &c, assessment: &a }, &ctx(0, None, vec![]), &cfg, pid());
         assert!(matches!(d.action, Action::Reject));
-        assert!(d.has_reason(ReasonCode::ExactDuplicate));
+        assert!(d.has_reason(ReasonCode::NearDuplicate));
     }
 
     #[test]
@@ -8992,11 +9257,11 @@ pub fn decide(
     let best = a.redundancy.score.get();
 
     match cfg.classify(best) {
-        Verdict::ExactDuplicate => {
+        Verdict::NearDuplicate => {
             return Decision::reject(
                 policy,
                 Reason::new(
-                    ReasonCode::ExactDuplicate,
+                    ReasonCode::NearDuplicate,
                     "an existing memory is effectively identical",
                     features! { "similarity" => best, "threshold" => cfg.duplicate_threshold },
                 ),
@@ -10245,7 +10510,7 @@ async fn an_identical_rewrite_is_rejected_as_a_duplicate() {
 
     // A rejection is a successful call: the product working, not an error.
     assert!(matches!(second.action, Action::Reject));
-    assert!(second.reasons.iter().any(|r| r.code == ReasonCode::ExactDuplicate));
+    assert!(second.reasons.iter().any(|r| r.code == ReasonCode::NearDuplicate));
 }
 
 #[tokio::test]

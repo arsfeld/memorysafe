@@ -8,6 +8,7 @@ pub mod atomicity;
 pub mod capacity;
 pub mod fixtures;
 pub mod isolation;
+pub mod lifecycle;
 pub mod retrieval;
 
 pub use fixtures as fx;
@@ -42,6 +43,14 @@ pub trait BackendFactory: Send + Sync {
 /// `F::B: 'static` is required because `capacity::concurrent_admits_do_not_double_count`
 /// hands `Arc<F::B>` to `tokio::spawn`, which demands a `'static` future.
 /// Every real backend owns its state outright and satisfies this trivially.
+///
+/// Must be driven from a multi-threaded Tokio runtime (for example
+/// `#[tokio::test(flavor = "multi_thread")]`). `tokio::spawn` also runs
+/// under the `current_thread` flavor, but there tasks only interleave at
+/// `.await` points, so `capacity::concurrent_admits_do_not_double_count`'s
+/// attempt to provoke a genuine concurrent write race loses most of its
+/// bite — the lock-free accounting bug it exists to catch can hide on a
+/// single OS thread.
 pub async fn run_conformance_suite<F: BackendFactory>(factory: &F)
 where
     F::B: 'static,
@@ -78,5 +87,10 @@ where
         capacity::eviction_releases_capacity,
         capacity::concurrent_admits_do_not_double_count,
         capacity::scope_stats_reflect_the_corpus,
+        lifecycle::audit_filter_narrows_by_event_and_time,
+        lifecycle::purge_subject_removes_everything_for_that_subject,
+        lifecycle::purge_subject_leaves_other_subjects_intact,
+        lifecycle::export_import_round_trips_exactly,
+        lifecycle::import_is_idempotent,
     );
 }

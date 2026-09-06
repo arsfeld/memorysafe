@@ -32,7 +32,7 @@ pub enum ReasonCode {
     NovelContent,
     HighValue,
     HighRedundancy,
-    ExactDuplicate,
+    NearDuplicate,
     CapacityPressure,
     ProtectedFragile,
     SensitivityCap,
@@ -184,13 +184,13 @@ mod tests {
         let d = Decision::reject(
             PolicyId::new("baseline", "0.1.0"),
             Reason::new(
-                ReasonCode::ExactDuplicate,
+                ReasonCode::NearDuplicate,
                 "cosine 0.99",
                 features! { "sim" => 0.99 },
             ),
         );
         assert!(matches!(d.action, Action::Reject));
-        assert!(d.has_reason(ReasonCode::ExactDuplicate));
+        assert!(d.has_reason(ReasonCode::NearDuplicate));
         assert_eq!(d.reasons[0].evidence.get("sim"), Some(&0.99));
     }
 
