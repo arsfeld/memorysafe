@@ -8784,7 +8784,7 @@ git commit -m "feat(sqlite): locked capacity accounting, merge, and idempotent w
 - Consumes: everything in the crate.
 - Produces: `purge::subject`, `portability::export`, `portability::import`, `aggregates::query`, real `Backend::purge_subject`, `export`, `import`, `audit_aggregates`, and a single `full_conformance_suite` test.
 
-**Milestone: the complete 39-test conformance suite passes.** From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
+**Milestone: the complete 50-test conformance suite passes.** (Fifty, not thirty-nine: the suite grew during the contract tasks and this milestone was never propagated. The plan's own contract summary and its closing section both already said 50, so this was isolated staleness rather than disagreement. The authoritative count is `run_conformance_suite`'s `run!` list, which `the_census_measures_every_test_the_suite_runs` pins at exactly 50.) From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
 
 - [ ] **Step 1: Write the failing test**
 
