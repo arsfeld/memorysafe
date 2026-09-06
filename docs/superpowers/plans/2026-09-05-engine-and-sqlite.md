@@ -24,6 +24,8 @@ Every task's requirements implicitly include this section.
 - **Audit rows never contain item bodies** — only ids, content digests (BLAKE3 hex), and feature numbers.
 - **Tenant isolation is structural:** one SQLite file per tenant. No query may span tenants.
 - **TDD.** Every task writes a failing test first, watches it fail, then implements. Commit at the end of every task.
+- **When you change a test count, propagate it — whoever you are and whatever you are doing.** Every task's Step 4 states an expected count (`Expected: PASS — N tests ok`), and those counts are cumulative *per crate*: adding, removing or splitting a test in one task changes the expected count of **every later task that runs the same crate**, not just its own. Walk forward to the last task touching that crate and update each one. This is not hypothetical — Task 28 gained a test and Task 29's count stayed at the old total for a full round, which turns the one signal a task executor has that its step went right into noise it learns to ignore. The rule is deliberately addressed to the **action**, not to a role: the four extra tests in Task 25 were written by a policy author, routed by a coordinator and applied by a third party, and the count went uncorrected because the obligation had been worded as binding on *implementers* and none of the three was one. A rule whose trigger names a person or a document has a gap wherever the action happens outside it.
+- **When you assert a fact about this codebase, cite the symbol, and say whether you verified it or are relaying it.** Cite `Backend::purge_subject` or `fixtures::fx::admit_txn`, never a line number: this document's line numbers have drifted six times during execution and every citation made against them is now wrong, while a symbol survives any edit that does not delete it. The verified/relayed marking matters because an unmarked relayed claim reads exactly like a checked one, and the reader cannot tell which they are acting on. This binds the **act of claiming** — it reaches task reports, review findings, ledger entries and messages equally, not only the documents where a reader is obviously waiting.
 - **Lints:** `#![deny(warnings)]` in CI via `RUSTFLAGS="-Dwarnings"`, plus `cargo clippy --all-targets --all-features -- -D warnings`.
 - **`Score` is a newtype over `f32` clamped to `[0.0, 1.0]`.** Never a bare `f32`.
 - **Timestamps are `time::OffsetDateTime`,** stored as Unix seconds (`i64`) in SQLite.
@@ -126,6 +128,13 @@ Locking decomposition in before tasks. Each file has one responsibility.
 
 These names are referenced across tasks. Any deviation is a bug.
 
+**Signatures only.** Each method's *contract* lives on the trait itself
+(`memorysafe-backend/src/lib.rs`, `memorysafe-core/src/policy.rs`) and is not
+restated here, because restating is how it drifts: three sketches in this
+document carried `audit_aggregates`' pre-filter signature for a full round
+after the real trait had changed, one of them literal code a task execution
+would have copied and failed to compile.
+
 ```rust
 // memorysafe-core::policy
 #[allow(clippy::result_large_err)]
@@ -160,9 +169,10 @@ pub trait Backend: Send + Sync {
     async fn list(&self, scope: &Scope, page: &Page) -> Result<Vec<MemoryItem>, BackendError>;
     async fn audit(&self, scope: &Scope, filter: &AuditFilter)
         -> Result<Vec<AuditRecord>, BackendError>;
-    async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId)
+    async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId,
+        cascade: PurgeCascade, audit: AuditRecord)
         -> Result<PurgeReport, BackendError>;
-    async fn audit_aggregates(&self, tenant: &TenantId)
+    async fn audit_aggregates(&self, tenant: &TenantId, filter: &AuditAggregateFilter)
         -> Result<Vec<AuditAggregate>, BackendError>;
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
     async fn import(&self, destination: &TenantId, stream: ImportStream)
@@ -1775,6 +1785,7 @@ mod tests {
         // decision whose match is in `reasons`, and `||` short-circuits, so the
         // evictions branch is never evaluated — deleting it passes all of them.
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![Eviction {
                 item: ItemId::new(),
@@ -1816,6 +1827,7 @@ mod tests {
         // reads it back with serde_json. Nothing else here exercises Merge,
         // ReplaceBody, a populated evictions vector, or PolicyId on the wire.
         let d = Decision {
+            subject: None,
             action: Action::Merge {
                 into: ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
                 strategy: MergeStrategy::ReplaceBody,
@@ -1845,7 +1857,7 @@ mod tests {
         // perfectly while orphaning every row already on disk. Pin the literal
         // bytes, which is the property stored data actually depends on.
         let expected = concat!(
-            r#"{"action":{"kind":"merge","into":"01ARZ3NDEKTSV4RRFFQ69G5FAV","#,
+            r#"{"subject":null,"action":{"kind":"merge","into":"01ARZ3NDEKTSV4RRFFQ69G5FAV","#,
             r#""strategy":"replace_body"},"#,
             r#""evictions":[{"item":"01BX5ZZKBKACTAV9WEVGEMMVRZ","#,
             r#""reason":{"code":"capacity_pressure","detail":"evicted to make room","#,
@@ -4301,32 +4313,35 @@ pub trait Backend: Send + Sync {
     async fn audit(&self, scope: &Scope, filter: &AuditFilter)
         -> Result<Vec<AuditRecord>, BackendError>;
 
-    /// Erases a subject within a tenant. This is the *subject* erasure API and
-    /// the one with a conformance test; tenant erasure is an out-of-band
-    /// operator action with no method here — see `aggregates`' module doc.
+    /// Erases a subject within a tenant: items, vectors, idempotency records
+    /// and capacity accounting under either `cascade`; the subject's audit
+    /// detail only under `PurgeCascade::Cascade`. `audit` — the caller's
+    /// `SubjectPurged` record — is inserted either way, after the deletes and
+    /// in the same transaction, under the id it carries. Aggregates are never
+    /// touched. See the full contract on `Backend::purge_subject` in
+    /// `memorysafe-backend/src/lib.rs`, which carries why delete-before-insert
+    /// matters, what the engine no longer does around this call, and the
+    /// accounting equation on `PurgeReport`.
     async fn purge_subject(
         &self,
         tenant: &TenantId,
         subject: &SubjectId,
+        cascade: PurgeCascade,
+        audit: AuditRecord,
     ) -> Result<PurgeReport, BackendError>;
 
-    /// Every audit aggregate held for `tenant`, keyed by tenant + policy
-    /// version + event class + day bucket and by nothing finer. The whole
-    /// argument — why no subject, why no namespace, why days rather than
-    /// hours, what it costs, and what residual it accepts — lives in the
-    /// `aggregates` module doc.
-    ///
-    /// The consequence for an implementer: **a cascading `purge_subject` must
-    /// not delete aggregate rows.** They name no subject and no namespace, so
-    /// there is nothing in them for the purge to be erasing; storing them in,
-    /// or cascading them from, the audit detail table destroys the one
-    /// artifact designed to outlive the detail.
-    ///
-    /// Ordered ascending by `day`, then `policy.to_string()`, then the event's
-    /// serialised snake_case name.
+    /// Every audit aggregate held for `tenant` that matches `filter`, keyed by
+    /// tenant + policy version + event class + day bucket and by nothing
+    /// finer. The consequence for an implementer: **a cascading
+    /// `purge_subject` must not delete aggregate rows.** See the full contract
+    /// on `Backend::audit_aggregates` in `memorysafe-backend/src/lib.rs` and
+    /// the `aggregates` module doc beside it — the ordering, the cursor, the
+    /// truncation rule, and why there is no subject and no namespace all live
+    /// there rather than here.
     async fn audit_aggregates(
         &self,
         tenant: &TenantId,
+        filter: &AuditAggregateFilter,
     ) -> Result<Vec<AuditAggregate>, BackendError>;
 
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
@@ -5690,7 +5705,7 @@ git commit -m "feat(backend): conformance tests for retrieval, filters, and capa
 
 **Interfaces:**
 - Consumes: `BackendFactory`, `fx`.
-- Produces: `audit_filter_narrows_by_event_and_time`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `export_import_round_trips_exactly`, `import_is_idempotent`.
+- Produces: `audit_filter_narrows_by_event_and_time`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `export_import_round_trips_exactly`, `import_is_idempotent`. (Later contract tasks add eight more to this module — see the `run!` list at the end of this task.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -5700,7 +5715,10 @@ git commit -m "feat(backend): conformance tests for retrieval, filters, and capa
 use super::{BackendFactory, fx};
 use crate::portability::ScopeSelector;
 use crate::{Backend, Page};
-use memorysafe_core::{AuditEvent, AuditFilter, Scope, SubjectId, TenantId};
+use memorysafe_core::{
+    Actor, ActorKind, AuditEvent, AuditFilter, AuditId, AuditRecord, PurgeCascade, Scope,
+    SubjectId, TenantId,
+};
 use std::collections::BTreeSet;
 use time::{Duration, OffsetDateTime};
 
@@ -5750,27 +5768,33 @@ pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: 
     let t2 = t0 + Duration::seconds(20);
     let t_evict = t0 + Duration::seconds(15);
 
-    let mut audit_ids = Vec::new();
+    // All four audit ids are pinned literals, ascending, the eviction's last
+    // and largest — never `AuditRecord::new`'s generated ones, which are
+    // randomly ordered within a millisecond and made this test's verdict
+    // depend on how fast the backend writes. See `fx::AUDIT_ORDER_ULIDS`.
+    let audit_ids: Vec<AuditId> = fx::AUDIT_ORDER_ULIDS
+        .iter()
+        .map(|u| AuditId::parse(u).expect("literal must be a canonical ULID"))
+        .collect();
+
     for (i, at) in [t0, t1, t2].into_iter().enumerate() {
-        let applied = backend
-            .apply(fx::admit_txn(
-                &scope,
-                fx::item_at(&scope, &format!("memory {i}"), at),
-                None,
-            ))
-            .await
-            .unwrap();
-        audit_ids.push(applied.audit_id);
+        let mut txn = fx::admit_txn(
+            &scope,
+            fx::item_at(&scope, &format!("memory {i}"), at),
+            None,
+        );
+        txn.audit.id = audit_ids[i].clone();
+        let applied = backend.apply(txn).await.unwrap();
+        assert_eq!(applied.audit_id, audit_ids[i], "echo rule: see `Backend`");
     }
 
     // `list` orders ascending by `created_at`, so `items[0]` is the item
     // admitted at `t0` — the oldest one.
     let items = backend.list(&scope, &Page::default()).await.unwrap();
-    let evicted = backend
-        .apply(fx::evict_txn_at(&scope, vec![items[0].id.clone()], t_evict))
-        .await
-        .unwrap();
-    audit_ids.push(evicted.audit_id);
+    let mut evict = fx::evict_txn_at(&scope, vec![items[0].id.clone()], t_evict);
+    evict.audit.id = audit_ids[3].clone();
+    let evicted = backend.apply(evict).await.unwrap();
+    assert_eq!(evicted.audit_id, audit_ids[3], "echo rule: see `Backend`");
 
     let admits = backend
         .audit(
@@ -5896,7 +5920,15 @@ pub async fn purge_subject_removes_everything_for_that_subject<F: BackendFactory
         "the corpus must exist before the purge for the purge report to mean anything"
     );
 
-    let report = backend.purge_subject(&tenant, &subject).await.unwrap();
+    let report = backend
+        .purge_subject(
+            &tenant,
+            &subject,
+            PurgeCascade::Cascade,
+            fx::purge_record(&a, AuditId::new(), Actor::system()),
+        )
+        .await
+        .unwrap();
     assert_eq!(report.items_removed, 6);
     assert_eq!(report.vectors_removed, 6);
 
@@ -5932,6 +5964,8 @@ pub async fn purge_subject_leaves_other_subjects_intact<F: BackendFactory>(facto
         .purge_subject(
             &TenantId::new("t").unwrap(),
             &SubjectId::new("doomed").unwrap(),
+            PurgeCascade::Cascade,
+            fx::purge_record(&doomed, AuditId::new(), Actor::system()),
         )
         .await
         .unwrap();
@@ -6187,21 +6221,38 @@ and extend `run!`:
         lifecycle::audit_filter_narrows_by_event_and_time,
         lifecycle::purge_subject_removes_everything_for_that_subject,
         lifecycle::purge_subject_leaves_other_subjects_intact,
+        lifecycle::purge_subject_preserves_audit_when_asked,
+        lifecycle::purge_subject_persists_the_record_it_was_given,
+        lifecycle::apply_persists_the_audit_id_it_was_given,
+        lifecycle::record_recall_persists_the_audit_id_it_was_given,
+        lifecycle::import_preserves_every_audit_id,
         lifecycle::export_import_round_trips_exactly,
         lifecycle::import_is_idempotent,
         lifecycle::import_rejects_a_later_record_whose_tenant_disagrees,
+        lifecycle::import_rejects_a_foreign_audit_record_even_when_every_item_agrees,
         lifecycle::audit_aggregates_survive_a_cascading_purge,
 ```
 
-The suite now stands at **33 conformance tests** (4 isolation + 5 atomicity + 13 retrieval + 4 capacity + 7 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified.
+The suite now stands at **39 conformance tests** (4 isolation + 5 atomicity + 13 retrieval + 4 capacity + 13 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified. **The authoritative list is `run_conformance_suite`'s own `run!` in `crates/memorysafe-backend/src/conformance/mod.rs`** — every `pub async fn` across the conformance modules must appear in it, and that correspondence is checked by enumeration before each of these contract commits, not by reading this document.
 
-Six of those were added after Tasks 17 and 18 shipped, by the contract task that changed `Backend::import`'s signature and put access statistics on the ranking structs — the last point at which adding conformance tests and changing trait signatures cost nothing, because no `impl Backend` existed yet. They are listed in the `run!` snippets above so those snippets match the file rather than the day it was written:
+Twelve of those were added after Tasks 17 and 18 shipped, by the contract tasks that changed `Backend::import`'s and `Backend::purge_subject`'s signatures, put access statistics on the ranking structs, and stated the echo rule — the last point at which adding conformance tests and changing trait signatures cost nothing, because no `impl Backend` existed yet. They are listed in the `run!` snippets above so those snippets match the file rather than the day it was written:
 `retrieval::list_orders_oldest_first_by_created_at`,
 `retrieval::list_tie_break_is_total_over_identical_timestamps`,
 `retrieval::neighbours_break_ties_before_truncating_at_k`,
 `retrieval::recall_updates_access_statistics`,
-`lifecycle::import_rejects_a_later_record_whose_tenant_disagrees`, and
-`lifecycle::audit_aggregates_survive_a_cascading_purge`.
+`lifecycle::import_rejects_a_later_record_whose_tenant_disagrees`,
+`lifecycle::import_rejects_a_foreign_audit_record_even_when_every_item_agrees`,
+`lifecycle::audit_aggregates_survive_a_cascading_purge`,
+`lifecycle::purge_subject_preserves_audit_when_asked`,
+`lifecycle::purge_subject_persists_the_record_it_was_given`,
+`lifecycle::apply_persists_the_audit_id_it_was_given`,
+`lifecycle::record_recall_persists_the_audit_id_it_was_given`, and
+`lifecycle::import_preserves_every_audit_id`.
+
+**The five most recent are not reproduced above.** Their text lives in
+`crates/memorysafe-backend/src/conformance/lifecycle.rs`, which is authoritative; a
+sketch of a test that already exists in the tree can only drift from it, and this
+document has now lost that bet twice. Read them there.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -7063,12 +7114,12 @@ pub mod items;
 
 use async_trait::async_trait;
 use memorysafe_backend::{
-    AppliedWrite, Backend, BackendError, CandidateQuery, ExportStream, ImportReport,
-    ImportStream, Page, PurgeReport, ScopeSelector, WriteTransaction,
+    AppliedWrite, AuditAggregate, AuditAggregateFilter, Backend, BackendError, CandidateQuery,
+    ExportStream, ImportReport, ImportStream, Page, PurgeReport, ScopeSelector, WriteTransaction,
 };
 use memorysafe_core::{
     AuditFilter, AuditId, AuditRecord, Budget, CapacityState, Embedding, ItemId, MemoryItem,
-    Scope, ScopeStats, ScoredCandidate, SubjectId, TenantId,
+    PurgeCascade, Scope, ScopeStats, ScoredCandidate, SubjectId, TenantId,
 };
 
 #[async_trait]
@@ -7154,7 +7205,8 @@ impl Backend for SqliteBackend {
         Ok(ScopeStats::default())
     }
     async fn set_budget(&self, _s: &Scope, _b: Budget) -> Result<(), BackendError> { Ok(()) }
-    async fn purge_subject(&self, _t: &TenantId, _s: &SubjectId)
+    async fn purge_subject(&self, _t: &TenantId, _s: &SubjectId,
+        _c: PurgeCascade, _a: AuditRecord)
         -> Result<PurgeReport, BackendError> {
         Ok(PurgeReport {
             items_removed: 0, vectors_removed: 0,
@@ -7168,7 +7220,7 @@ impl Backend for SqliteBackend {
         -> Result<ImportReport, BackendError> {
         Ok(ImportReport::default())
     }
-    async fn audit_aggregates(&self, _t: &TenantId)
+    async fn audit_aggregates(&self, _t: &TenantId, _f: &AuditAggregateFilter)
         -> Result<Vec<AuditAggregate>, BackendError> {
         Ok(vec![])
     }
@@ -8283,7 +8335,7 @@ Add `pub mod capacity;` and `use rusqlite::params;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 33 conformance tests minus the 7 lifecycle ones, i.e. 26 conformance tests plus 12 unit tests, all ok.
+Expected: PASS — 39 conformance tests minus the 13 lifecycle ones, i.e. 26 conformance tests plus 12 unit tests, all ok.
 
 - [ ] **Step 5: Commit**
 
@@ -8306,7 +8358,7 @@ git commit -m "feat(sqlite): locked capacity accounting, merge, and idempotent w
 - Consumes: everything in the crate.
 - Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and a single `full_conformance_suite` test.
 
-**Milestone: the complete 33-test conformance suite passes.** From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
+**Milestone: the complete 39-test conformance suite passes.** From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -8348,27 +8400,60 @@ Expected: FAIL — `purge_subject_removes_everything_for_that_subject` panics: `
 ```rust
 use crate::tenant::SqlResultExt;
 use memorysafe_backend::{BackendError, PurgeReport};
-use memorysafe_core::SubjectId;
+use memorysafe_core::{AuditRecord, PurgeCascade, SubjectId};
 use rusqlite::{Connection, params};
 
 /// Right-to-delete for one subject. A first-class operation rather than a
 /// scan-and-delete loop: everything for the subject goes in one transaction
 /// across every namespace it owns.
-pub fn subject(conn: &mut Connection, subject: &SubjectId) -> Result<PurgeReport, BackendError> {
+///
+/// `cascade` decides the audit detail and nothing else; `audit` — the
+/// caller's `SubjectPurged` record — is inserted either way, after the
+/// deletes and inside this same transaction. See `Backend::purge_subject` for
+/// why the order and the single transaction are both load-bearing. Note the
+/// `audit_aggregates` table is absent from every statement below, deliberately:
+/// `lifecycle::audit_aggregates_survive_a_cascading_purge` fails the moment it
+/// joins the sweep.
+pub fn subject(
+    conn: &mut Connection,
+    subject: &SubjectId,
+    cascade: PurgeCascade,
+    audit: &AuditRecord,
+) -> Result<PurgeReport, BackendError> {
     let tx = conn.transaction().map_err(|e| crate::tenant::storage_error(e, false))?;
     let s = subject.as_str();
+
+    // Counted before anything is written. `audit_rows_removed +
+    // audit_rows_preserved` must equal the rows the subject held immediately
+    // before this call, and the record inserted at the end belongs to neither
+    // term — counting after the insert would put it in `preserved` and break
+    // the equation `PurgeReport` states.
+    let existing_audit = tx
+        .query_row(
+            "SELECT count(*) FROM audit WHERE subject = ?1",
+            params![s],
+            |r| r.get::<_, i64>(0),
+        )
+        .sql()? as u64;
 
     let vectors_removed =
         tx.execute("DELETE FROM vectors WHERE subject = ?1", params![s]).sql()? as u64;
     let items_removed =
         tx.execute("DELETE FROM items WHERE subject = ?1", params![s]).sql()? as u64;
-    // `balanced`, the default retention profile, cascades audit with the
-    // subject. Profiles that preserve it are applied by the engine, which
-    // rewrites the rows before calling this.
-    let audit_rows_removed =
-        tx.execute("DELETE FROM audit WHERE subject = ?1", params![s]).sql()? as u64;
+    let (audit_rows_removed, audit_rows_preserved) = match cascade {
+        PurgeCascade::Cascade => (
+            tx.execute("DELETE FROM audit WHERE subject = ?1", params![s]).sql()? as u64,
+            0,
+        ),
+        PurgeCascade::Preserve => (0, existing_audit),
+    };
     tx.execute("DELETE FROM idempotency WHERE subject = ?1", params![s]).sql()?;
     tx.execute("DELETE FROM capacity WHERE subject = ?1", params![s]).sql()?;
+
+    // Delete first, insert second — under `Cascade` the sweep above would
+    // otherwise delete this very row, and the purge would eat its own record.
+    // `audit::insert` writes `audit.id` verbatim: the echo rule on `Backend`.
+    crate::audit::insert(&tx, audit)?;
 
     tx.commit().map_err(|e| crate::tenant::storage_error(e, false))?;
 
@@ -8376,7 +8461,7 @@ pub fn subject(conn: &mut Connection, subject: &SubjectId) -> Result<PurgeReport
         items_removed,
         vectors_removed,
         audit_rows_removed,
-        audit_rows_preserved: 0,
+        audit_rows_preserved,
     })
 }
 ```
@@ -8582,11 +8667,14 @@ pub fn import(
 Replace the last three placeholders in `lib.rs`:
 
 ```rust
-    async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId)
+    async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId,
+        cascade: PurgeCascade, audit: AuditRecord)
         -> Result<PurgeReport, BackendError>
     {
         let (tenant, subject) = (tenant.clone(), subject.clone());
-        self.tenants.with_write(&tenant, move |c| purge::subject(c, &subject)).await
+        self.tenants
+            .with_write(&tenant, move |c| purge::subject(c, &subject, cascade, &audit))
+            .await
     }
 
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError> {
@@ -8626,7 +8714,7 @@ Replace the last three placeholders in `lib.rs`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite && cargo clippy -p memorysafe-backend-sqlite --all-targets -- -D warnings`
-Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 33 conformance test names and passes.
+Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 39 conformance test names and passes.
 
 - [ ] **Step 5: Commit**
 
@@ -9155,6 +9243,16 @@ pure" becomes enforceable:
 Run: `cargo test -p memorysafe-policy`
 Expected: PASS — 9 tests ok.
 
+> **This count is known stale: it is low by 8, and so is every policy count after it.**
+> The blocks above list 13 `#[test]` functions, and the comment closing `fragility.rs`'s
+> test module commissions 4 more by name (the mutation-killer set, which it states have
+> not been written anywhere yet). Executing this task as written therefore yields **17**,
+> not 9. The later `cargo test -p memorysafe-policy` counts inherit the same deficit:
+> Task 26's 18, Task 27's 25, Task 28's 33 and Task 29's 40 should read **26, 33, 41 and
+> 48**. The numbers are left uncorrected here because only this task's executor can
+> confirm 17 by running the crate; whoever confirms it must correct all five in one
+> change — see Global Constraints, "When you change a test count, propagate it".
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -9529,6 +9627,9 @@ impl GovernancePolicy for BaselinePolicy {
 Run: `cargo test -p memorysafe-policy`
 Expected: PASS — 18 tests ok.
 
+> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
+> corrected together, not one at a time.
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -9542,13 +9643,14 @@ git commit -m "feat(policy): value scoring and pattern-based sensitivity detecti
 
 **Files:**
 - Create: `crates/memorysafe-policy/src/admit.rs`
+- Create: `crates/memorysafe-policy/src/eviction.rs`
 - Modify: `crates/memorysafe-policy/src/lib.rs`
 
 **Interfaces:**
 - Consumes: `Assessed`, `AdmitContext`, `BaselineConfig`, `Verdict`.
-- Produces: `admit::decide(&Assessed, &AdmitContext, &BaselineConfig, PolicyId) -> Decision`, and `GovernancePolicy::admit` on `BaselinePolicy`.
+- Produces: `admit::decide(&Assessed, &AdmitContext, &BaselineConfig, PolicyId) -> Decision`, `eviction::cost(&MaintenanceCandidate) -> f32`, and `GovernancePolicy::admit` on `BaselinePolicy`.
 
-**The rules, in order.** At or above `duplicate_threshold` the write is rejected. At or above `merge_threshold` it is merged into its closest neighbour. Otherwise the item is retained — and if capacity is tight, evictions are selected ascending by `value × (1 − fragility)` until there is room. A candidate that is both highly fragile and highly sensitive gets `Protected` plus a `SensitivityConflict` reason, so the conflict is visible in the audit trail rather than silently resolved. If nothing is evictable and there is no room, the write is rejected with `BudgetExhausted` — never by silently exceeding the budget.
+**The rules, in order.** At or above `duplicate_threshold` the write is rejected. At or above `merge_threshold` it is merged into its closest neighbour. Otherwise the item is retained — and if capacity is tight, evictions are selected ascending by `eviction::cost` (`value × fragility`) until there is room: expected loss is value times the unrecoverable share, and eviction takes the smallest first. A candidate that is both highly fragile and highly sensitive gets `Protected` plus a `SensitivityConflict` reason, so the conflict is visible in the audit trail rather than silently resolved. If nothing is evictable and there is no room, the write is rejected with `BudgetExhausted` — never by silently exceeding the budget.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9559,14 +9661,19 @@ Append to `crates/memorysafe-policy/src/admit.rs`:
 mod tests {
     use super::*;
     use crate::config::BaselineConfig;
-    use crate::testkit::{candidate, candidate_from, scope};
+    use crate::testkit::{candidate, candidate_from, item, scope};
     use memorysafe_core::{
         Action, Budget, CapacityState, PolicyId, Protection, ReasonCode, ScopeStats,
         SensitivityLevel,
     };
     use time::OffsetDateTime;
 
-    fn ctx(used: u64, max: Option<u64>, evictable: Vec<ScoredCandidate>) -> AdmitContext {
+    // `evictable` is `Vec<MaintenanceCandidate>`, not `Vec<ScoredCandidate>`:
+    // it feeds `AdmitContext::eviction_candidates`, which carries no
+    // relevance because there is no recall query behind an eviction offer
+    // (see that field's doc). `candidate()` builds the other type and must
+    // not be used here.
+    fn ctx(used: u64, max: Option<u64>, evictable: Vec<MaintenanceCandidate>) -> AdmitContext {
         AdmitContext {
             scope: scope(),
             capacity: CapacityState {
@@ -9639,12 +9746,24 @@ mod tests {
     #[test]
     fn under_pressure_the_cheapest_items_are_evicted_first() {
         let cfg = BaselineConfig::default();
-        let mut cheap = candidate("cheap to lose", 0.5);
+        let mut cheap = MaintenanceCandidate {
+            item: item("cheap to lose"),
+            value: Score::clamped(0.5),
+            fragility: Score::clamped(0.5),
+            last_accessed_at: None,
+            access_count: 0,
+        };
         cheap.value = Score::clamped(0.1);
-        cheap.fragility = Score::clamped(0.1);
-        let mut precious = candidate("expensive to lose", 0.5);
+        cheap.fragility = Score::clamped(0.1); // eviction::cost = 0.1 * 0.1 = 0.01
+        let mut precious = MaintenanceCandidate {
+            item: item("expensive to lose"),
+            value: Score::clamped(0.5),
+            fragility: Score::clamped(0.5),
+            last_accessed_at: None,
+            access_count: 0,
+        };
         precious.value = Score::clamped(0.9);
-        precious.fragility = Score::clamped(0.9);
+        precious.fragility = Score::clamped(0.9); // eviction::cost = 0.9 * 0.9 = 0.81
         let cheap_id = cheap.item.id.clone();
 
         let (c, a) = assessed(0.1, 0.8, 0.2, SensitivityLevel::Internal);
@@ -9713,9 +9832,10 @@ Expected: FAIL — `cannot find function decide in this scope`.
 
 ```rust
 use crate::config::{BaselineConfig, Verdict};
+use crate::eviction;
 use memorysafe_core::{
-    Action, AdmitContext, Assessed, Decision, Eviction, MergeStrategy, PolicyId, Protection,
-    Reason, ReasonCode, ScoredCandidate, SensitivityLevel, features,
+    Action, AdmitContext, Assessed, Decision, Eviction, MaintenanceCandidate, MergeStrategy,
+    PolicyId, Protection, Reason, ReasonCode, SensitivityLevel, features,
 };
 use time::Duration;
 
@@ -9723,11 +9843,6 @@ use time::Duration;
 const FRAGILE_THRESHOLD: f32 = 0.85;
 /// Length of that window.
 const PROTECTION_DAYS: i64 = 30;
-
-/// Cost of losing an item. Low value and low fragility means cheap to lose.
-fn eviction_cost(c: &ScoredCandidate) -> f32 {
-    c.value.get() * (1.0 - c.fragility.get()).max(0.0)
-}
 
 pub fn decide(
     assessed: &Assessed,
@@ -9752,6 +9867,7 @@ pub fn decide(
         Verdict::Mergeable => {
             if let Some((target, similarity)) = a.redundancy.best() {
                 return Decision {
+                    subject: None,
                     action: Action::Merge {
                         into: target.clone(),
                         strategy: MergeStrategy::AppendAndUnion,
@@ -9810,8 +9926,8 @@ pub fn decide(
     // Make room if needed.
     let mut evictions = Vec::new();
     if ctx.capacity.would_exceed(1, assessed.candidate.byte_size) {
-        let mut ranked: Vec<&ScoredCandidate> = ctx.eviction_candidates.iter().collect();
-        ranked.sort_by(|a, b| eviction_cost(a).total_cmp(&eviction_cost(b)));
+        let mut ranked: Vec<&MaintenanceCandidate> = ctx.eviction_candidates.iter().collect();
+        ranked.sort_by(|a, b| eviction::cost(a).total_cmp(&eviction::cost(b)));
 
         let mut freed_items = 0u64;
         let mut freed_bytes = 0u64;
@@ -9833,7 +9949,7 @@ pub fn decide(
                     features! {
                         "value" => c.value.get(),
                         "fragility" => c.fragility.get(),
-                        "eviction_cost" => eviction_cost(c),
+                        "eviction_cost" => eviction::cost(c),
                     },
                 ),
             });
@@ -9861,7 +9977,27 @@ pub fn decide(
         }
     }
 
-    Decision { action: Action::Retain { protection }, evictions, reasons, policy }
+    Decision { subject: None, action: Action::Retain { protection }, evictions, reasons, policy }
+}
+```
+
+`crates/memorysafe-policy/src/eviction.rs`:
+
+```rust
+//! The cost model shared by `admit` (capacity pressure during a write) and
+//! `maintain` (capacity reclaim during a maintenance pass). Both rank the
+//! same kind of candidate by the same rule, so the rule lives once, here,
+//! rather than as two copies that agree today and diverge at the next
+//! correction.
+
+use memorysafe_core::MaintenanceCandidate;
+
+/// Expected cost of losing this item: value times the unrecoverable share.
+/// Eviction takes the smallest cost first, so a highly fragile item — one
+/// with no near neighbours to reconstruct it from — must cost MORE to lose
+/// than a redundant one, never less.
+pub fn cost(c: &MaintenanceCandidate) -> f32 {
+    c.value.get() * c.fragility.get()
 }
 ```
 
@@ -9873,12 +10009,15 @@ Replace the `admit` stub in `lib.rs`:
     }
 ```
 
-Add `pub mod admit;`.
+Add `pub mod admit;` and `pub mod eviction;`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy`
 Expected: PASS — 25 tests ok.
+
+> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
+> corrected together, not one at a time.
 
 - [ ] **Step 5: Commit**
 
@@ -9930,6 +10069,8 @@ mod tests {
             query: Some("cats".into()),
             tags_any: vec![],
             kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
             mode,
             budget: RecallBudget { max_tokens: Some(10_000), max_items: Some(max_items) },
             sensitivity_ceiling: SensitivityLevel::Restricted,
@@ -10019,6 +10160,52 @@ mod tests {
     }
 
     #[test]
+    fn an_old_but_recently_accessed_item_does_not_win_a_replay_slot() {
+        // The case the whole feature turns on: replay exists to resurface
+        // what is never recalled. Every other candidate in this module comes
+        // from `candidate()`, whose `last_accessed_at` is always `None` (see
+        // its own comment in `testkit.rs`) — so `replay_due`'s
+        // `last_accessed_at.unwrap_or(created_at)` fallback always takes the
+        // `unwrap_or` branch in every other test here, which is
+        // indistinguishable from a version that dropped `last_accessed_at`
+        // and read `created_at` unconditionally. A later "simplification"
+        // back to `created_at` alone would break none of them. This is the
+        // one fixture with a real `Some(_)`, and it exists to make exactly
+        // that regression detectable: old by creation, but not stale, because
+        // someone looked at it five days ago.
+        let mut relevant: Vec<_> =
+            (0..9).map(|i| candidate(&format!("relevant {i}"), 0.9)).collect();
+        for c in &mut relevant {
+            c.fragility = Score::ZERO;
+            c.item.created_at = ctx().now;
+        }
+        let mut old_but_used = candidate("an old fact someone checked five days ago", 0.05);
+        // >= 0.5 so it is eligible for a replay slot on staleness alone, but
+        // < 0.8 so the fragility-alone branch of `replay_due` cannot grant it
+        // one regardless of staleness — only the access-recency question
+        // decides this candidate.
+        old_but_used.fragility = Score::clamped(0.6);
+        old_but_used.item.created_at = OffsetDateTime::UNIX_EPOCH; // 365 days before `ctx().now`
+        old_but_used.last_accessed_at = Some(ctx().now - Duration::days(5)); // recently used
+        relevant.push(old_but_used);
+
+        let ws = working_set(
+            &req(RecallMode::WorkingSet, 5),
+            &relevant,
+            &ctx(),
+            &BaselineConfig::default(),
+        );
+        assert!(
+            ws.items
+                .iter()
+                .all(|s| !s.item.body.contains("five days ago")),
+            "an item accessed five days ago won a replay slot — its 365-day-old \
+             created_at was used for staleness instead of its recent \
+             last_accessed_at"
+        );
+    }
+
+    #[test]
     fn the_omitted_list_is_capped() {
         let cands: Vec<_> = (0..200).map(|i| candidate(&format!("m{i}"), 0.5)).collect();
         let ws = working_set(&req(RecallMode::Search, 1), &cands, &ctx(), &BaselineConfig::default());
@@ -10087,6 +10274,14 @@ fn replay_due(c: &ScoredCandidate, ctx: &ComposeContext, cfg: &BaselineConfig) -
     // fallback is a decision taken here, visibly, which is why
     // `last_accessed_at` is `None` rather than a backend-invented
     // `Some(created_at)` — the policy can see it is guessing.
+    //
+    // This fallback is only honest because `(last_accessed_at: None,
+    // access_count: 0)` is ruled to mean the item has never been accessed,
+    // definitively — not "unknown". An item never recalled since creation is
+    // genuinely stale since creation. If that ruling is ever revisited so
+    // `(None, 0)` can also mean "unknown", this line starts fabricating a
+    // recall that may never have been absent at all, and must be revisited
+    // with it.
     let since_access = c.last_accessed_at.unwrap_or(c.item.created_at);
     let stale = ctx.now - since_access >= Duration::days(cfg.replay_stale_days as i64);
     c.fragility.get() >= 0.8 || (stale && c.fragility.get() >= 0.5)
@@ -10252,7 +10447,10 @@ Add `pub mod compose;`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy`
-Expected: PASS — 32 tests ok.
+Expected: PASS — 33 tests ok.
+
+> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
+> corrected together, not one at a time.
 
 - [ ] **Step 5: Commit**
 
@@ -10296,6 +10494,9 @@ mod tests {
         MaintainContext {
             scope: scope(),
             batch,
+            // Every test here hands `decisions` the whole namespace in one
+            // page — there is no further page to wait for.
+            is_final_batch: true,
             capacity: CapacityState {
                 budget: Budget { max_items: max, max_bytes: None },
                 used_items: used,
@@ -10391,9 +10592,10 @@ Expected: FAIL — `cannot find function decisions in this scope`.
 
 ```rust
 use crate::config::BaselineConfig;
+use crate::eviction;
 use memorysafe_core::{
-    Action, Decision, Eviction, MaintainContext, MemoryItem, PolicyId, Protection, Reason,
-    ReasonCode, features,
+    Action, Decision, Eviction, MaintainContext, MaintenanceCandidate, MemoryItem, PolicyId,
+    Protection, Reason, ReasonCode, features,
 };
 
 /// Ranking for capacity reclaim. Older and larger items go first; nothing
@@ -10418,6 +10620,7 @@ pub fn decisions(
         // a pin would silently override a retention limit.
         if item.must_forget(ctx.now) {
             out.push(Decision {
+                subject: Some(item.id.clone()),
                 action: Action::Reject,
                 evictions: vec![Eviction {
                     item: item.id.clone(),
@@ -10478,9 +10681,8 @@ pub fn decisions(
         .filter(|c| !expired.contains(&c.item.id) && c.item.protection.is_evictable(ctx.now))
         .collect();
     reclaimable.sort_by(|a, b| {
-        let cost = |c: &MaintenanceCandidate| c.value.get() * (1.0 - c.fragility.get()).max(0.0);
-        cost(a)
-            .total_cmp(&cost(b))
+        eviction::cost(a)
+            .total_cmp(&eviction::cost(b))
             .then_with(|| reclaim_rank(&a.item).cmp(&reclaim_rank(&b.item)))
     });
 
@@ -10490,6 +10692,7 @@ pub fn decisions(
             break;
         }
         out.push(Decision {
+            subject: Some(item.id.clone()),
             action: Action::Reject,
             evictions: vec![Eviction {
                 item: item.id.clone(),
@@ -10525,7 +10728,10 @@ Add `pub mod maintain;`. `PolicyId` must derive `Clone`; confirm from Task 7.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy && cargo clippy -p memorysafe-policy --all-targets -- -D warnings`
-Expected: PASS — 39 tests ok. `BaselinePolicy` now implements all four trait methods.
+Expected: PASS — 40 tests ok. `BaselinePolicy` now implements all four trait methods.
+
+> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
+> corrected together, not one at a time.
 
 - [ ] **Step 5: Commit**
 
@@ -10560,9 +10766,9 @@ Append to `crates/memorysafe-engine/src/validate.rs`:
 mod tests {
     use super::*;
     use memorysafe_core::{
-        Action, Budget, CapacityState, Eviction, ItemId, MemoryItem, PolicyId, Protection,
-        Reason, ReasonCode, ScopeStats, Scope, Score, ScoredCandidate, SensitivityLevel,
-        Source, SourceKind, WorkingSet, SelectedItem, features,
+        Action, Budget, CapacityState, Eviction, ItemId, MaintenanceCandidate, MemoryItem,
+        PolicyId, Protection, Reason, ReasonCode, ScopeStats, Scope, Score, ScoredCandidate,
+        SensitivityLevel, Source, SourceKind, WorkingSet, SelectedItem, features,
     };
     use time::OffsetDateTime;
 
@@ -10602,7 +10808,22 @@ mod tests {
         }
     }
 
-    fn ctx(evictable: Vec<ScoredCandidate>) -> AdmitContext {
+    // `AdmitContext::eviction_candidates` is `Vec<MaintenanceCandidate>`, not
+    // `Vec<ScoredCandidate>` — that field carries no relevance because there
+    // is no recall query behind an eviction offer. `candidate()` above builds
+    // the other type, for the `working_set` tests below that genuinely need
+    // `&[ScoredCandidate]`; this is its counterpart for eviction candidates.
+    fn maintenance_candidate(item: MemoryItem) -> MaintenanceCandidate {
+        MaintenanceCandidate {
+            item,
+            value: Score::clamped(0.5),
+            fragility: Score::clamped(0.5),
+            last_accessed_at: None,
+            access_count: 0,
+        }
+    }
+
+    fn ctx(evictable: Vec<MaintenanceCandidate>) -> AdmitContext {
         AdmitContext {
             scope: scope(),
             capacity: CapacityState {
@@ -10622,8 +10843,9 @@ mod tests {
 
     #[test]
     fn a_well_formed_decision_is_accepted() {
-        let c = candidate(item("evictable"));
+        let c = maintenance_candidate(item("evictable"));
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![Eviction { item: c.item.id.clone(), reason: reason() }],
             reasons: vec![reason()],
@@ -10635,6 +10857,7 @@ mod tests {
     #[test]
     fn a_decision_evicting_an_item_outside_the_offered_set_is_refused() {
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![Eviction { item: ItemId::new(), reason: reason() }],
             reasons: vec![reason()],
@@ -10650,8 +10873,9 @@ mod tests {
     fn a_decision_evicting_a_pinned_item_is_refused() {
         let mut pinned = item("pinned");
         pinned.protection = Protection::Pinned;
-        let c = candidate(pinned);
+        let c = maintenance_candidate(pinned);
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![Eviction { item: c.item.id.clone(), reason: reason() }],
             reasons: vec![reason()],
@@ -10663,6 +10887,7 @@ mod tests {
     #[test]
     fn a_decision_with_no_reason_is_refused() {
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![],
             reasons: vec![],
@@ -11427,7 +11652,7 @@ Create `crates/memorysafe-engine/src/gather.rs`:
 ```rust
 use crate::error::EngineError;
 use memorysafe_backend::Backend;
-use memorysafe_core::{AdmitContext, AssessContext, Embedding, Scope, ScoredCandidate};
+use memorysafe_core::{AdmitContext, AssessContext, Embedding, MaintenanceCandidate, Scope};
 use time::OffsetDateTime;
 
 /// One I/O pass producing everything `assess` may see.
@@ -11468,28 +11693,30 @@ pub async fn admit_context(
     let capacity = backend.capacity_state(scope).await?;
     let now = OffsetDateTime::now_utc();
 
-    let eviction_candidates: Vec<ScoredCandidate> = if capacity.budget.is_bounded() {
+    let eviction_candidates: Vec<MaintenanceCandidate> = if capacity.budget.is_bounded() {
         let page = memorysafe_backend::Page { offset: 0, limit };
         backend
             .list(scope, &page)
             .await?
             .into_iter()
             .filter(|i| i.protection.is_evictable(now))
-            .map(|item| ScoredCandidate {
-                estimated_tokens: ((item.body.len() as f32 / 4.0).ceil() as u32).max(1),
-                relevance: 0.0,
-                vector_score: None,
-                keyword_score: None,
+            .map(|item| MaintenanceCandidate {
                 value: memorysafe_core::Score::clamped(0.5),
                 fragility: memorysafe_core::Score::clamped(0.5),
                 item,
                 // OPEN: `Backend::list` returns bare `MemoryItem`s, and the
                 // access statistics deliberately do not live on that type, so
-                // this path has no source for them. `(None, 0)` here means
-                // "unknown" but reads to a policy as "never recalled", which
-                // is the wrong answer for a frequently-recalled item offered
-                // for eviction. Before `admit` is allowed to weigh staleness,
-                // the listing path needs to carry the statistics — a `list`
+                // this path has no source for them. `(None, 0)` is NOT
+                // "unknown" here — the ruling recorded at compose's staleness
+                // fallback (see `replay_due` in Task 28) makes `(None, 0)`
+                // mean the item has never been accessed, definitively,
+                // everywhere this pair appears. Passing it for an item whose
+                // access history is merely unavailable therefore states
+                // something false, not merely something imprecise: a
+                // frequently-recalled item offered for eviction reads to the
+                // policy as indistinguishable from one nobody has ever
+                // touched. Before `admit` is allowed to weigh staleness, the
+                // listing path needs to carry the real statistics — a `list`
                 // that returns them beside each item, or a dedicated read.
                 // Flagged by the contract task that added these fields; not
                 // solved there.
@@ -11677,6 +11904,8 @@ fn recall(query: &str, ceiling: SensitivityLevel, max_items: usize) -> RecallReq
         query: Some(query.into()),
         tags_any: vec![],
         kinds: vec![],
+        occurred_after: None,
+        occurred_before: None,
         mode: RecallMode::WorkingSet,
         budget: RecallBudget { max_tokens: Some(4000), max_items: Some(max_items) },
         sensitivity_ceiling: ceiling,
@@ -11938,7 +12167,7 @@ git commit -m "feat(engine): recall pipeline with the sensitivity ceiling enforc
 
 **Interfaces:**
 - Consumes: `Backend::apply`, `Backend::purge_subject`, `Backend::get`.
-- Produces: `ForgetSelector` (`Ids(Vec<ItemId>)` | `Tag(String)` | `Kind(String)`), `Engine::forget`, `Engine::protect`, `Engine::purge_subject`.
+- Produces: `ForgetSelector` (`Ids(Vec<ItemId>)` | `Tag(String)` | `Kind(String)`), `Engine::forget`, `Engine::protect`, `Engine::purge_subject`, and its two private helpers `purge_scope` / `namespaces_of`.
 
 **Note:** `protect` is the only path that changes `MemoryItem::protection` outside admission, per the spec. It writes its own audit record so "why is this pinned?" is answerable from the trail alone.
 
@@ -12196,17 +12425,94 @@ impl Engine {
         })
     }
 
+    /// The `SubjectPurged` record is built **here**, not in the backend:
+    /// `Backend::purge_subject` inserts the record it is handed and mints
+    /// nothing (the echo rule on `Backend`), so the actor who ordered the
+    /// erasure is what ends up in the log.
+    ///
+    /// `PurgeCascade::Cascade` is hard-coded here — it is `balanced`, the
+    /// default profile's behaviour. Task 36 replaces this one expression with
+    /// `self.retention.retention().purge_cascade` and changes nothing else.
     pub async fn purge_subject(
         &self,
         tenant: &TenantId,
         subject: &SubjectId,
     ) -> Result<PurgeOutcome, EngineError> {
-        let report = self.backend.purge_subject(tenant, subject).await?;
+        let audit = AuditRecord::new(
+            self.purge_scope(tenant, subject).await?,
+            AuditEvent::SubjectPurged,
+            vec![],
+            Actor { kind: ActorKind::Human, id: None },
+            OffsetDateTime::now_utc(),
+        );
+        let report = self
+            .backend
+            .purge_subject(tenant, subject, PurgeCascade::Cascade, audit)
+            .await?;
         Ok(PurgeOutcome {
             items_removed: report.items_removed,
             audit_rows_removed: report.audit_rows_removed,
             audit_rows_preserved: report.audit_rows_preserved,
         })
+    }
+
+    /// Which namespace the `SubjectPurged` record is filed under. A subject
+    /// spans namespaces and an `AuditRecord` carries exactly one `Scope`, so
+    /// somebody has to choose; `Backend::purge_subject` states that it stores
+    /// the choice as given and never rewrites it, which is why the choice is
+    /// made here and made explicitly. The subject's lexicographically first
+    /// namespace, so the record lands beside the rows it is about — and
+    /// `_purged` when the subject owns no items at all (`Namespace` forbids a
+    /// leading dot but permits a leading underscore).
+    ///
+    /// **The fallback name is a plan-level choice, not a derived one**; a
+    /// Task 33 executor may pick differently, but must pick, and must say so
+    /// where the record is built.
+    async fn purge_scope(
+        &self,
+        tenant: &TenantId,
+        subject: &SubjectId,
+    ) -> Result<Scope, EngineError> {
+        let namespace = self
+            .namespaces_of(tenant, subject)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                memorysafe_core::Namespace::new("_purged").expect("literal is a valid namespace")
+            });
+        Ok(Scope { tenant: tenant.clone(), subject: subject.clone(), namespace })
+    }
+
+    /// Namespaces the subject owns, ascending. Derived from its items, which
+    /// is enough for v1: a namespace with no items has nothing for a purge to
+    /// be about.
+    async fn namespaces_of(
+        &self,
+        tenant: &TenantId,
+        subject: &SubjectId,
+    ) -> Result<Vec<memorysafe_core::Namespace>, EngineError> {
+        let selector = memorysafe_backend::ScopeSelector {
+            tenant: tenant.clone(),
+            subject: Some(subject.clone()),
+            namespace: None,
+            include_audit: false,
+        };
+        let mut namespaces: Vec<memorysafe_core::Namespace> = self
+            .backend
+            .export(&selector)
+            .await?
+            .into_iter()
+            .filter_map(|r| match r {
+                memorysafe_backend::ExportRecord::Item { item, .. } => {
+                    Some(item.scope.namespace)
+                }
+                _ => None,
+            })
+            .collect();
+        namespaces.sort();
+        namespaces.dedup();
+        Ok(namespaces)
     }
 }
 ```
@@ -12772,8 +13078,8 @@ git commit -m "feat(engine): content-addressed embedding cache and scope stats c
 - Create: `crates/memorysafe-engine/tests/retention.rs`
 
 **Interfaces:**
-- Consumes: `Backend::audit`, `Backend::purge_subject`.
-- Produces: `RetentionSpan`, `PurgeCascade`, `AuditRetention`, `RetentionProfile` (`Balanced` | `GdprStrict` | `HipaaRetain` | `Forensic`), `RetentionProfile::retention()`, `RetentionProfile::from_name(&str)`, and `Engine::purge_subject` honouring the configured profile.
+- Consumes: `Backend::purge_subject`, `memorysafe_core::PurgeCascade`.
+- Produces: `RetentionSpan`, `AuditRetention`, `RetentionProfile` (`Balanced` | `GdprStrict` | `HipaaRetain` | `Forensic`), `RetentionProfile::retention()`, `RetentionProfile::from_name(&str)`, and `Engine::purge_subject` honouring the configured profile.
 
 **The four profiles are the tested, documented surface.** Free-form overrides are permitted but unsupported — that is what keeps "configurable per tenant" from meaning an untestable matrix.
 
@@ -12926,15 +13232,12 @@ pub enum RetentionSpan {
     UntilSubjectPurge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PurgeCascade {
-    /// A subject purge removes that subject's audit rows too.
-    Cascade,
-    /// Audit rows survive the subject. Bodies never did, so what remains is
-    /// ids, digests, and feature numbers.
-    Preserve,
-}
+// `PurgeCascade` is **not** defined here. It is a parameter of
+// `Backend::purge_subject`, so it lives in `memorysafe-core` alongside
+// `AuditRecord` — `memorysafe-backend` may depend on core and not on the
+// engine. Re-exported so `AuditRetention` below and every engine caller can
+// name it without a second import path.
+pub use memorysafe_core::PurgeCascade;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRetention {
@@ -12998,7 +13301,9 @@ impl RetentionProfile {
 
 Add `retention: RetentionProfile` to `EngineConfig` (defaulting to `RetentionProfile::default()` in `EngineConfig::new`) and to `Engine`.
 
-Rewrite `Engine::purge_subject` in `mutate.rs` to honour the profile. The backend's `purge_subject` always cascades, so under `Preserve` the audit rows are read out first and reinserted after:
+Rewrite `Engine::purge_subject` in `mutate.rs` to honour the profile. `Preserve` is
+the *backend's* behaviour, selected by an argument — the engine reads no audit rows
+and replays none:
 
 ```rust
     pub async fn purge_subject(
@@ -13006,82 +13311,48 @@ Rewrite `Engine::purge_subject` in `mutate.rs` to honour the profile. The backen
         tenant: &TenantId,
         subject: &SubjectId,
     ) -> Result<PurgeOutcome, EngineError> {
+        let audit = AuditRecord::new(
+            self.purge_scope(tenant, subject).await?,
+            AuditEvent::SubjectPurged,
+            vec![],
+            Actor { kind: ActorKind::Human, id: None },
+            OffsetDateTime::now_utc(),
+        );
+        // The whole of this task's change to `mutate.rs`: the cascade comes
+        // from the configured profile instead of Task 33's hard-coded
+        // `PurgeCascade::Cascade`. Everything else — building the record,
+        // choosing its namespace, mapping the report — is untouched.
         let cascade = self.retention.retention().purge_cascade;
-
-        // Under Preserve, capture the audit rows before the backend cascades
-        // them away. Bodies were never in them, so what is kept is ids,
-        // digests, and feature numbers.
-        let preserved: Vec<AuditRecord> = if cascade == PurgeCascade::Preserve {
-            let mut all = Vec::new();
-            for namespace in self.namespaces_of(tenant, subject).await? {
-                let scope = Scope {
-                    tenant: tenant.clone(),
-                    subject: subject.clone(),
-                    namespace,
-                };
-                all.extend(
-                    self.backend
-                        .audit(&scope, &AuditFilter { limit: 100_000, ..Default::default() })
-                        .await?,
-                );
-            }
-            all
-        } else {
-            vec![]
-        };
-
-        let report = self.backend.purge_subject(tenant, subject).await?;
-
-        let mut restored = 0u64;
-        for record in preserved {
-            self.backend.record_recall(record).await?;
-            restored += 1;
-        }
-
+        let report = self
+            .backend
+            .purge_subject(tenant, subject, cascade, audit)
+            .await?;
         Ok(PurgeOutcome {
             items_removed: report.items_removed,
-            audit_rows_removed: if cascade == PurgeCascade::Preserve {
-                0
-            } else {
-                report.audit_rows_removed
-            },
-            audit_rows_preserved: restored,
+            audit_rows_removed: report.audit_rows_removed,
+            audit_rows_preserved: report.audit_rows_preserved,
         })
-    }
-
-    /// Namespaces the subject owns. Derived from its items, which is enough
-    /// for v1: a namespace with no items has no audit worth preserving.
-    async fn namespaces_of(
-        &self,
-        tenant: &TenantId,
-        subject: &SubjectId,
-    ) -> Result<Vec<memorysafe_core::Namespace>, EngineError> {
-        let selector = memorysafe_backend::ScopeSelector {
-            tenant: tenant.clone(),
-            subject: Some(subject.clone()),
-            namespace: None,
-            include_audit: false,
-        };
-        let mut namespaces: Vec<memorysafe_core::Namespace> = self
-            .backend
-            .export(&selector)
-            .await?
-            .into_iter()
-            .filter_map(|r| match r {
-                memorysafe_backend::ExportRecord::Item { item, .. } => {
-                    Some(item.scope.namespace)
-                }
-                _ => None,
-            })
-            .collect();
-        namespaces.sort();
-        namespaces.dedup();
-        Ok(namespaces)
     }
 ```
 
+**What this replaces, and why none of it may come back.** An earlier draft of this task
+implemented `Preserve` in the engine: read the subject's audit rows with a hard-coded
+`AuditFilter { limit: 100_000, .. }`, call a cascade-only `purge_subject`, then loop
+`record_recall(record)` to re-insert each row. `Backend::purge_subject`'s doc records
+the five defects that shape carried — the two worst being that `record_recall` also
+updates the referenced items' access statistics, so replaying historical
+`Admitted`/`Merged`/`Forgotten` rows moved live survivors' `last_accessed_at`
+*backwards* during an erasure; and that the read and the re-insert were two
+transactions, so a crash between them lost every row the profile existed to preserve.
+The 100_000 cap silently truncated, and `audit_rows_preserved` reported the truncated
+count as complete. The engine's report now passes the backend's numbers through
+unchanged, because the backend is the only party that knows them.
+
 Add `pub mod retention;` and
-`pub use retention::{AuditRetention, PurgeCascade, RetentionProfile, RetentionSpan};` to `lib.rs`.
+`pub use retention::{AuditRetention, RetentionProfile, RetentionSpan};` to `lib.rs`.
+`PurgeCascade` is re-exported from `retention.rs` (see below) but **defined in
+`memorysafe-core`**: it is a parameter of `Backend::purge_subject`, and
+`memorysafe-backend` may not depend on the engine.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -13551,6 +13822,8 @@ proptest! {
                     query: Some("memory concerning subject".into()),
                     tags_any: vec![],
                     kinds: vec![],
+                    occurred_after: None,
+                    occurred_before: None,
                     mode,
                     budget: RecallBudget { max_tokens: Some(8000), max_items: Some(50) },
                     sensitivity_ceiling: level,
@@ -13671,7 +13944,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 22 backend conformance tests, and the unit and integration suites of all six crates.
+Expected: PASS — the whole workspace green: 5 invariants, 39 backend conformance tests, and the unit and integration suites of all six crates.
 
 - [ ] **Step 5: Commit**
 
@@ -13803,6 +14076,8 @@ async fn backfill_makes_a_pending_item_vector_searchable() {
             query: Some("the cat sat on the mat during the outage".into()),
             tags_any: vec![],
             kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
             mode: RecallMode::WorkingSet,
             budget: RecallBudget { max_tokens: Some(2000), max_items: Some(5) },
             sensitivity_ceiling: SensitivityLevel::Restricted,
@@ -14059,7 +14334,7 @@ git commit -m "feat(engine): pending-embedding backfill and explicit re-embeddin
 - `cargo test --workspace --all-features` is green.
 - `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 - The CI purity job confirms `memorysafe-core` and `memorysafe-policy` pull in no I/O crates.
-- `SqliteBackend` passes all 33 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
+- `SqliteBackend` passes all 39 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
 - The five invariants pass at 64 proptest cases in release mode.
 - An engine can be constructed and driven end to end from a Rust test with no server, no network, and no model files.
 - No item is left permanently unsearchable: `pending_embedding` has a backfill path, and changing embedder is an explicit audited migration.

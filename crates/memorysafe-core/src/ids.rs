@@ -39,6 +39,15 @@ fn validate_component(field: &'static str, raw: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+// **Signature change here is not local.** `scope_component!` generates
+// `new(&str) -> Result<Self, CoreError>` and `as_str(&self) -> &str` for
+// `TenantId`, `SubjectId` and `Namespace`. Those signatures are inside a macro
+// body, so an external arity checker cannot read them off the source; it
+// resolves them from a hand-maintained table keyed by macro name. `TenantId::new`
+// alone has 66 call sites across the plan documents, so changing the arity or
+// the return type here invalidates all 66 at once and the table is the only
+// thing standing between that and a clean report. Change this macro's generated
+// signatures only together with that table.
 macro_rules! scope_component {
     ($name:ident, $field:literal) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -66,6 +75,12 @@ scope_component!(TenantId, "tenant");
 scope_component!(SubjectId, "subject");
 scope_component!(Namespace, "namespace");
 
+// **Signature change here is not local**, for the same reason as
+// `scope_component!` above: `ulid_id!` generates `new() -> Self`,
+// `parse(&str) -> Result<Self, CoreError>` and `as_str(&self) -> &str` for
+// `ItemId` and `AuditId`, all inside a macro body an external arity checker
+// cannot read. It resolves them from a hand-maintained table keyed by macro
+// name. Change these generated signatures only together with that table.
 macro_rules! ulid_id {
     ($name:ident) => {
         /// A ULID: a 48-bit millisecond timestamp followed by 80 bits of

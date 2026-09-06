@@ -479,9 +479,10 @@ pub trait Backend: Send + Sync {
     async fn list(&self, scope: &Scope, page: &Page) -> Result<Vec<MemoryItem>>;
     async fn audit(&self, scope: &Scope, filter: &AuditFilter) -> Result<Vec<AuditRecord>>;
 
-    async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId) -> Result<PurgeReport>;
+    async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId,
+                           cascade: PurgeCascade, audit: AuditRecord) -> Result<PurgeReport>;
     async fn export(&self, scope: &ScopeSelector) -> Result<ExportStream>;
-    async fn import(&self, stream: ImportStream) -> Result<ImportReport>;
+    async fn import(&self, destination: &TenantId, stream: ImportStream) -> Result<ImportReport>;
 }
 ```
 
@@ -558,7 +559,10 @@ backfilled but remains available to keyword retrieval and to `review`.
 - Sensitivity ceilings are enforced in the backend query, below the policy.
 - Audit rows never contain item bodies.
 - `purge_subject` is a first-class backend operation, not a scan-and-delete loop, and returns a
-  `PurgeReport` counting what was removed.
+  `PurgeReport` counting what was removed. It takes the cascade decision (`PurgeCascade`, from the
+  retention profile) and the `SubjectPurged` audit record as arguments, deletes before inserting
+  that record, and does both in one transaction — so an erasure can never lose the record of
+  itself, and the engine never reads or replays audit rows around it.
 - The proprietary policy crate is compiled without I/O capability; its inputs arrive entirely
   through context structs.
 

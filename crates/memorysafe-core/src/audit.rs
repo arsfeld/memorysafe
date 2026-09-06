@@ -82,6 +82,33 @@ impl ItemRef {
     }
 }
 
+/// What a subject purge does to that subject's **audit** rows. Items,
+/// vectors, idempotency records and capacity accounting go either way; this
+/// decides only the audit detail.
+///
+/// **An enum in `memorysafe-core`, not a `bool` on `Backend::purge_subject`.**
+/// It lives here rather than in the engine because it is a parameter of the
+/// backend trait, and `memorysafe-backend` may only depend on this crate. It
+/// is not a `bool` because the call site is
+/// `purge_subject(&tenant, &subject, cascade, audit)`: `true` there would say
+/// nothing about which way it cascades, and — worse — a `bool` swapped with a
+/// neighbouring argument is a type error only by luck, whereas swapping this
+/// one will not compile. The cost of the wrong value is a destroyed audit
+/// trail or an undeleted one, in the erasure path.
+///
+/// The retention profile that chooses between these lives in the engine
+/// (`RetentionProfile`, Task 36); the backend is handed the decision, never
+/// the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeCascade {
+    /// The subject's audit rows are deleted along with everything else.
+    Cascade,
+    /// The subject's audit rows survive the subject. Bodies were never in
+    /// them, so what remains is ids, digests, and feature numbers.
+    Preserve,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub id: AuditId,
@@ -247,6 +274,36 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AuditEvent::Recalled).unwrap(),
             "\"recalled\""
+        );
+    }
+
+    #[test]
+    fn purge_cascade_serializes_as_snake_case() {
+        // The wire form is load-bearing: `AuditRetention` (Task 36) is
+        // deserialized from tenant configuration, so a variant renamed on the
+        // wire silently turns a configured `preserve` into a parse error in
+        // the one path that erases a subject.
+        //
+        // Rejects: the plausible enum written without the
+        // `#[serde(rename_all = "snake_case")]` attribute every neighbour in
+        // this module carries — it would emit `"Cascade"`/`"Preserve"`.
+        //
+        // Vacuous if: `snake_case` and `lowercase` are indistinguishable for
+        // both variants, since each is a single lowercase word. This test
+        // pins the wire form, not the choice of rename strategy — see
+        // `actor_kinds_serialize_as_snake_case`, where `ApiKey` does separate
+        // the two.
+        assert_eq!(
+            serde_json::to_string(&PurgeCascade::Cascade).unwrap(),
+            "\"cascade\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PurgeCascade::Preserve).unwrap(),
+            "\"preserve\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PurgeCascade>("\"preserve\"").unwrap(),
+            PurgeCascade::Preserve
         );
     }
 

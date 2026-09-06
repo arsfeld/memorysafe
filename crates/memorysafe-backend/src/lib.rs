@@ -9,14 +9,14 @@ pub mod query;
 pub mod write;
 
 use memorysafe_core::{
-    AuditFilter, AuditId, AuditRecord, CapacityState, Embedding, ItemId, MemoryItem, Scope,
-    ScopeStats, ScoredCandidate, SubjectId, TenantId,
+    AuditFilter, AuditId, AuditRecord, CapacityState, Embedding, ItemId, MemoryItem, PurgeCascade,
+    Scope, ScopeStats, ScoredCandidate, SubjectId, TenantId,
 };
 use thiserror::Error;
 
 pub use aggregates::{
-    AggregateKey, AuditAggregate, SCORE_HISTOGRAM_BUCKETS, SCORE_HISTOGRAM_EDGES,
-    SCORE_HISTOGRAM_VERSION,
+    AggregateKey, AuditAggregate, AuditAggregateFilter, SCORE_HISTOGRAM_BUCKETS,
+    SCORE_HISTOGRAM_EDGES, SCORE_HISTOGRAM_VERSION,
 };
 pub use portability::{
     ExportRecord, ExportStream, ExportVector, FORMAT_VERSION, ImportReport, ImportStream,
@@ -45,6 +45,41 @@ pub enum BackendError {
     MalformedImport(String),
 }
 
+/// # The echo rule: a persisted audit row keeps the id it was given
+///
+/// **Every method on this trait that persists an audit row persists the
+/// `AuditId` it was handed, unchanged, and returns that same id.** Four
+/// methods do: [`Backend::apply`] (`txn.audit.id`), [`Backend::record_recall`]
+/// (`record.id`), [`Backend::import`] (each `ExportRecord::Audit`'s own id),
+/// and [`Backend::purge_subject`] (the `audit` argument's id). Each states the
+/// rule in one line and points here; this is where the reason lives.
+///
+/// **Why it is stated once, at the trait, rather than four times.** The damage
+/// is not per-method and does not add up per-method: a table whose ids come
+/// from three places is not three times worse than one whose ids come from
+/// two — it is a table where "order by id" has no single meaning at all.
+/// `AuditFilter::after` is a ULID cursor and `Backend::audit` pages by it, so
+/// one minting path anywhere makes the whole log's order, and therefore its
+/// pagination, unsound. Stating this per method invites closing three of four
+/// paths and reading the fourth as unconstrained, which is exactly the state
+/// this trait was in: `import`'s id provenance held only by implication from
+/// the byte-exact preservation rule — a second rule true only by derivation,
+/// with no test of its own and nothing to stop it silently ceasing to be
+/// implied.
+///
+/// **The minting boundary.** The rule governs rows the backend is *handed*.
+/// "Backends never mint ids" is an available reading of the sentence above and
+/// it is the wrong one: a backend that *originates* a row — one no caller
+/// supplied and no caller can name — mints that row's `AuditId` itself,
+/// because there is no given id to echo. What it may never do is replace an id
+/// it was given.
+///
+/// One conformance test per path pins this, all four in
+/// `conformance::lifecycle`:
+/// `apply_persists_the_audit_id_it_was_given`,
+/// `record_recall_persists_the_audit_id_it_was_given`,
+/// `import_preserves_every_audit_id`, and
+/// `purge_subject_persists_the_record_it_was_given`.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync {
     /// Ordered descending by `relevance`, ties broken by ascending `ItemId`.
@@ -94,6 +129,8 @@ pub trait Backend: Send + Sync {
 
     async fn scope_stats(&self, scope: &Scope) -> Result<ScopeStats, BackendError>;
 
+    /// Persists `txn.audit` under the id it already carries and returns that
+    /// id as `AppliedWrite::audit_id` — see the echo rule on this trait.
     async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError>;
 
     /// Writes the recall's audit row **and**, in the same transaction, updates
@@ -116,6 +153,9 @@ pub trait Backend: Send + Sync {
     /// Only the referenced items are touched. A backend that bumps every item
     /// in the scope makes `last_accessed_at` mean "the scope was read", which
     /// is not what the replay quota needs to know.
+    ///
+    /// The row is persisted under `record.id` and that id is what comes back —
+    /// see the echo rule on this trait.
     async fn record_recall(&self, record: AuditRecord) -> Result<AuditId, BackendError>;
 
     async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, BackendError>;
@@ -180,13 +220,73 @@ pub trait Backend: Send + Sync {
     /// and it is the one with a conformance test; tenant erasure is an
     /// out-of-band operator action with no method here — see the
     /// `aggregates` module doc for why, and for what survives.
+    ///
+    /// **What is deleted, under either `cascade`:** the subject's items, their
+    /// vectors, their idempotency records, and their capacity accounting, in
+    /// every namespace the subject owns. Audit *aggregates* are never deleted
+    /// — they name no subject and no namespace, so there is nothing in them
+    /// for this call to erase; `audit_aggregates` carries that argument.
+    ///
+    /// **What `cascade` decides:** the subject's audit detail rows.
+    /// [`PurgeCascade::Cascade`] deletes them; [`PurgeCascade::Preserve`]
+    /// keeps them. Bodies were never in them, so a preserved row is ids,
+    /// digests, and feature numbers.
+    ///
+    /// **`audit` is inserted either way, delete before insert, in one
+    /// transaction.** The record is the caller's `SubjectPurged` row and it is
+    /// written after the deletes, inside the same transaction, under the id it
+    /// carries (the echo rule on this trait). Three properties, each of which
+    /// a plausible implementation gets wrong on its own:
+    ///
+    /// - *Delete before insert.* A backend that inserted first and then swept
+    ///   the subject's audit rows under `Cascade` would delete its own
+    ///   `SubjectPurged` record — the purge eats the only evidence it ran.
+    /// - *One transaction.* A crash between the deletes and the insert must
+    ///   not be able to leave an erasure with no record of itself, or (under
+    ///   `Preserve`) a half-erased subject.
+    /// - *Either way.* `Preserve` does not mean "write nothing"; it means the
+    ///   *pre-existing* rows survive. The `SubjectPurged` row is written under
+    ///   both.
+    ///
+    /// The record's `scope` names the subject being purged; a subject spans
+    /// namespaces, so which of its namespaces the caller files the row under
+    /// is the caller's choice and the backend stores it as given, exactly as
+    /// `apply` stores `txn.audit.scope`. A backend may rely on
+    /// `audit.scope.tenant == *tenant` and `audit.scope.subject == *subject`
+    /// and is not required to check it; it must never rewrite either, for the
+    /// reason `import` gives — a rewritten audit row is a forged one.
+    ///
+    /// **The engine does not read or replay audit rows around this call.** An
+    /// earlier engine draft implemented `Preserve` by reading the subject's
+    /// audit rows with a hard-coded `AuditFilter { limit: 100_000, .. }`,
+    /// calling a cascade-only `purge_subject`, and re-inserting each row
+    /// through `record_recall`. Every part of that is now impossible by
+    /// signature, and each part was a defect: `record_recall` also updates
+    /// access statistics, so replaying `Admitted`/`Merged`/`Forgotten` rows
+    /// through it moved live items' `last_accessed_at` *backwards* to a
+    /// historical `record.at` during an erasure, double-counted the
+    /// aggregates that ride the audit write, spanned two transactions (a crash
+    /// between them lost every preserved row), and silently truncated at
+    /// 100_000 while reporting `audit_rows_preserved` as complete.
+    ///
+    /// **Accounting** is an equation, not a convention — see [`PurgeReport`].
     async fn purge_subject(
         &self,
         tenant: &TenantId,
         subject: &SubjectId,
+        cascade: PurgeCascade,
+        audit: AuditRecord,
     ) -> Result<PurgeReport, BackendError>;
 
-    /// Every audit aggregate held for `tenant`.
+    /// Every audit aggregate held for `tenant` that matches `filter`.
+    ///
+    /// Mirrors `audit`'s shape rather than inventing a second idiom for a
+    /// bounded, resumable read: `filter` carries `since`/`until` **day**
+    /// bounds, an optional `policy` narrowing, a `limit`, and an `after`
+    /// cursor. The feature's primary query is a day range against one policy
+    /// version — "how did behaviour change across policy 1.4" — which the
+    /// original `audit_aggregates(&self, tenant)`, unbounded, unpaginated and
+    /// unfilterable, could not express at all.
     ///
     /// Aggregates are keyed by tenant + policy version + event class + day
     /// bucket, and by nothing finer — see the `aggregates` module doc, which
@@ -198,17 +298,36 @@ pub trait Backend: Send + Sync {
     /// the audit detail table destroys the one artifact that was designed to
     /// outlive the detail.
     ///
-    /// Ordered ascending by `day`, then by `policy.to_string()`, then by the
-    /// event's serialised snake_case name — the two forms that are the
-    /// storage keys. Stating the order costs nothing now and stops the same
+    /// **Ordering.** Rows are ordered ascending by the full key — `day`, then
+    /// `policy` (`None` sorts before every `Some`, and two `Some`s compare by
+    /// `to_string()`), then the event's serialised snake_case name — so
+    /// resumption via `after` is over a total order, not merely a mostly-total
+    /// one. Stating the order costs nothing now and stops the same
     /// cross-backend drift `list` and `audit` each had to have pinned down
     /// after the fact.
+    ///
+    /// **The cursor.** `filter.after`, when set, continues a previous page:
+    /// the next page is restricted to keys strictly greater than it in the
+    /// order above. `AggregateKey` is a value comparable without existing —
+    /// it names a coordinate in the key space, not a pointer to a stored row.
+    /// That is precisely what makes it safe as a cursor here: it resumes
+    /// correctly even when the row it names has since expired under
+    /// `AuditRetention::aggregate`, whereas a row-id cursor would name
+    /// nothing once its row was gone and would make the log look exhausted
+    /// for a reason unrelated to the caller's query.
+    ///
+    /// **Truncation is detectable from the page size, exactly as `audit`
+    /// documents — there is no `truncated` flag.** An implementation must
+    /// return exactly `min(filter.limit, rows still matching after the
+    /// cursor)` — never fewer for an internal batch size and never more.
+    /// `returned.len() < filter.limit` means exhausted.
     ///
     /// Rows are produced by the write paths (Tasks 20 and 23) and expired by
     /// retention (Task 36). Neither is this method's business.
     async fn audit_aggregates(
         &self,
         tenant: &TenantId,
+        filter: &AuditAggregateFilter,
     ) -> Result<Vec<AuditAggregate>, BackendError>;
 
     /// `Header` first, then `Item`s ascending by `ItemId`, then `Audit`
@@ -239,6 +358,21 @@ pub trait Backend: Send + Sync {
     /// preserved exactly as written; only the tenant is checked, and it is
     /// checked rather than assigned.
     ///
+    /// **Atomicity.** `import` is all-or-nothing: either every record in
+    /// `stream` is applied or none are. A conformance test already requires
+    /// this — no partial import survives a rejected stream — but until now
+    /// nothing said so; the trait doc stated only that a disagreement
+    /// "rejects the whole import", which reads as a property of that one
+    /// rejection path rather than of `import` itself. This paragraph is the
+    /// general statement: a validation failure (a disagreeing tenant, a
+    /// missing or unsupported `Header`, a malformed record) must leave the
+    /// destination exactly as it was before the call. What this does **not**
+    /// cover is a mid-stream storage error on an otherwise-valid stream —
+    /// whether such a backend leaves partial writes behind is
+    /// under-determined by this contract; it must not silently report
+    /// success over a partial result, but the specific guarantee in that
+    /// case is out of scope here.
+    ///
     /// Because every record is compared against `destination`, records
     /// cannot disagree with *each other* either — a separate "the stream may
     /// not span tenants" check is strictly implied by this one and must not
@@ -252,6 +386,12 @@ pub trait Backend: Send + Sync {
     /// byte-exact. Different → the import is rejected, exactly as for an
     /// item. A scope is never rewritten to make a row fit: a rewritten audit
     /// row is a forged one.
+    ///
+    /// The row's `AuditId` is part of "byte-exact", but it is no longer left
+    /// to be *derived* from it: the echo rule on this trait states it
+    /// directly, alongside the three other paths that persist a row they were
+    /// handed. A rule true only by implication has no test of its own and
+    /// stops being implied the day the rule it hangs off is weakened.
     ///
     /// **Why this is not a `Scope` or a `ScopeSelector`.** Tenant is the
     /// authorisation unit and the isolation unit, and taking a `TenantId`

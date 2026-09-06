@@ -147,10 +147,25 @@ pub fn day_bucket(at: OffsetDateTime) -> i64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateKey {
     pub tenant: TenantId,
-    /// The policy that produced the events being counted. Both name and
-    /// version: "how did behaviour change when we shipped 1.4" is the question
-    /// aggregates exist to answer.
-    pub policy: PolicyId,
+    /// The policy that produced the events being counted, when one produced
+    /// them at all. Both name and version: "how did behaviour change when we
+    /// shipped 1.4" is the question aggregates exist to answer for the rows
+    /// that carry a version.
+    ///
+    /// **`Option`, not a mandatory `PolicyId`, and no sentinel string in its
+    /// place.** Most audit events have no decision behind them at all —
+    /// `SubjectPurged`, `Exported`, `Imported`, `Reembedded`,
+    /// `MaintenanceRun` and `Recalled` are never the result of a policy call,
+    /// and `AuditRecord::new` sets `decision: None` for every row until
+    /// `with_decision` is applied on top of it. A mandatory `PolicyId` would
+    /// be unsatisfiable for the majority of event classes. `None` is used
+    /// rather than `"none"` or `""` because two backends left to invent their
+    /// own sentinel would both pass a suite that only ever compares a backend
+    /// against itself, and unlike a sentinel, `None` cannot collide with a
+    /// real version string. Rows that do carry a policy still group by it —
+    /// "grouped by policy version" is unaffected by policy-less rows existing
+    /// alongside them.
+    pub policy: Option<PolicyId>,
     /// The event class being counted, e.g. `Admitted` or `Rejected`. Its
     /// serialised snake_case name is the storage key.
     pub event: AuditEvent,
@@ -160,6 +175,15 @@ pub struct AggregateKey {
 
 /// One aggregate row: how many events of this class the policy produced on
 /// this day, and how their scores were distributed.
+///
+/// **`sum(value_histogram) <= count`, and the same for `fragility_histogram`
+/// — never `==`, and this is stated because it would otherwise be
+/// undetermined.** The histograms count only rows that carry an
+/// `Assessment`; `count` counts every row matching the key, assessed or not.
+/// Without this stated, one backend could bucket a `0.0` for an
+/// assessment-less row and another could skip it entirely — both would
+/// "conform", and the two backends' distributions would be incomparable,
+/// which is the one thing an aggregate exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditAggregate {
     pub key: AggregateKey,
@@ -168,13 +192,69 @@ pub struct AuditAggregate {
     /// and means cannot be re-aggregated across days.
     pub count: u64,
     /// `Assessment::value` distribution, bucketed by [`score_bucket`].
+    /// `sum(value_histogram) <= count`: only assessed rows land in a bucket.
     pub value_histogram: [u64; SCORE_HISTOGRAM_BUCKETS],
-    /// `Assessment::fragility` distribution, bucketed the same way.
+    /// `Assessment::fragility` distribution, bucketed the same way, with the
+    /// same `sum(fragility_histogram) <= count` relationship to `count`.
     pub fragility_histogram: [u64; SCORE_HISTOGRAM_BUCKETS],
     /// The [`SCORE_HISTOGRAM_VERSION`] in force when this row was written.
     /// Stored per row: a series that spans a bump must be splittable, and a
     /// reader that cannot see the boundary would silently splice two scales.
     pub histogram_version: u32,
+}
+
+/// Filters and pages `Backend::audit_aggregates`, mirroring `AuditFilter`'s
+/// shape (see `memorysafe_core::AuditFilter`) so there is one idiom for a
+/// bounded, resumable read across this trait rather than two.
+///
+/// The primary query this exists to answer is a day range against one policy
+/// version — "how did behaviour change across policy 1.4" — which the
+/// original unfiltered, unpaginated `audit_aggregates(&self, tenant)` could
+/// not express at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditAggregateFilter {
+    /// Inclusive lower bound, in the same whole-UTC-day units as
+    /// `AggregateKey::day` and [`day_bucket`] — not a timestamp. `None` means
+    /// "from the earliest day held".
+    pub since: Option<i64>,
+    /// Inclusive upper bound, same units. `None` means "through the most
+    /// recent day held".
+    pub until: Option<i64>,
+    /// Narrow to one policy version. `None` matches every row regardless of
+    /// its `AggregateKey::policy`, policy-less rows included. There is
+    /// deliberately no way to ask for "policy-less rows only": they are not
+    /// what this feature's primary query, cross-version comparison, is about,
+    /// and `since`/`until`/`event` narrowing already reaches them.
+    pub policy: Option<PolicyId>,
+    /// Cursor. Continues a previous page: the next page is restricted to
+    /// keys strictly greater than this one in the order `Backend::audit_aggregates`
+    /// documents.
+    ///
+    /// An `AggregateKey` is a value comparable without existing — it names a
+    /// coordinate in the key space, not a pointer to a stored row. That is
+    /// what lets this cursor resume correctly even after the row it names has
+    /// expired under `AuditRetention::aggregate`: a row-id cursor would name
+    /// nothing once its row was gone, and a caller paging through would see
+    /// the log end early for a reason unrelated to their query.
+    pub after: Option<AggregateKey>,
+    /// Maximum rows to return. Same exhaustion rule as `AuditFilter::limit`
+    /// and `Backend::audit`: an implementation must return exactly
+    /// `min(limit, remaining)` — never fewer for an internal batch size and
+    /// never more — so `returned.len() < limit` alone means the log is
+    /// exhausted.
+    pub limit: usize,
+}
+
+impl Default for AuditAggregateFilter {
+    fn default() -> Self {
+        Self {
+            since: None,
+            until: None,
+            policy: None,
+            after: None,
+            limit: 100,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -263,7 +343,7 @@ mod tests {
         let scope = Scope::new("acme", "user-42", "medical").unwrap();
         let key = AggregateKey {
             tenant: scope.tenant.clone(),
-            policy: PolicyId::new("baseline", "1.0.0"),
+            policy: Some(PolicyId::new("baseline", "1.0.0")),
             event: AuditEvent::Admitted,
             day: day_bucket(OffsetDateTime::UNIX_EPOCH),
         };
@@ -294,7 +374,7 @@ mod tests {
         let row = AuditAggregate {
             key: AggregateKey {
                 tenant: TenantId::new("acme").unwrap(),
-                policy: PolicyId::new("baseline", "1.0.0"),
+                policy: Some(PolicyId::new("baseline", "1.0.0")),
                 event: AuditEvent::Rejected,
                 day: 19_000,
             },
@@ -308,5 +388,42 @@ mod tests {
         assert_eq!(back, row, "an aggregate row did not survive a round trip");
         assert_eq!(back.histogram_version, SCORE_HISTOGRAM_VERSION);
         assert_eq!(back.value_histogram.len(), SCORE_HISTOGRAM_BUCKETS);
+    }
+
+    #[test]
+    fn a_policy_less_aggregate_key_encodes_as_null_not_a_sentinel() {
+        // Most audit events have no decision behind them (`SubjectPurged`,
+        // `Exported`, `Imported`, `Reembedded`, `MaintenanceRun`, `Recalled`),
+        // and `AuditRecord::new` sets `decision: None` for every row until a
+        // decision is attached on top. `AggregateKey::policy` must therefore
+        // be satisfiable with no policy at all — and it must be `None`, not a
+        // backend-invented `"none"` or `""`: two backends inventing their own
+        // sentinel would both pass a suite that only ever compares a backend
+        // to itself, and a sentinel can collide with a real policy name in a
+        // way `None` structurally cannot.
+        let key = AggregateKey {
+            tenant: TenantId::new("acme").unwrap(),
+            policy: None,
+            event: AuditEvent::SubjectPurged,
+            day: 0,
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        assert!(
+            json.contains(r#""policy":null"#),
+            "a policy-less key must serialise its policy as null, not a \
+             sentinel string: {json}"
+        );
+        let back: AggregateKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.policy, None);
+    }
+
+    #[test]
+    fn default_audit_aggregate_filter_matches_everything_from_the_start() {
+        let f = AuditAggregateFilter::default();
+        assert!(f.since.is_none());
+        assert!(f.until.is_none());
+        assert!(f.policy.is_none());
+        assert!(f.after.is_none());
+        assert_eq!(f.limit, 100);
     }
 }
