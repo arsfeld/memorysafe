@@ -327,16 +327,17 @@ CREATE TABLE idempotency (
 | 27 | Policy: `admit` | |
 | 28 | Policy: `compose` | |
 | 29 | Policy: `maintain` | `BaselinePolicy` complete |
-| 30 | Engine: decision validation | `fail_closed` / `fail_safe` |
-| 31 | Engine: `remember` | Write pipeline end to end |
-| 32 | Engine: `recall` | Read pipeline end to end |
-| 33 | Engine: `forget`, `review`, `protect`, `purge_subject` | |
-| 34 | Engine: maintenance job | Resumable with cursor |
-| 35 | Engine: cache + invalidation | |
-| 36 | Engine: retention profiles | |
-| 37 | Engine: export/import orchestration | |
-| 38 | Proptest invariants | The five correctness properties |
-| 39 | Engine: re-embedding + backfill | `pending_embedding` items become searchable |
+| 30 | Policy: MMR set-coverage | Retires the split-coverage regression |
+| 31 | Engine: decision validation | `fail_closed` / `fail_safe` |
+| 32 | Engine: `remember` | Write pipeline end to end |
+| 33 | Engine: `recall` | Read pipeline end to end |
+| 34 | Engine: `forget`, `review`, `protect`, `purge_subject` | |
+| 35 | Engine: maintenance job | Resumable with cursor |
+| 36 | Engine: cache + invalidation | |
+| 37 | Engine: retention profiles | |
+| 38 | Engine: export/import orchestration | |
+| 39 | Proptest invariants | The five correctness properties |
+| 40 | Engine: re-embedding + backfill | `pending_embedding` items become searchable |
 
 ---
 
@@ -505,7 +506,7 @@ git commit -m "chore: scaffold cargo workspace and CI"
 
 `PURGED_COMPONENT` was added to `ids.rs` by a later contract commit, not by
 this task's sketch below: it is the reserved namespace a `SubjectPurged`
-record is filed under when the subject owned no items (Task 33's
+record is filed under when the subject owned no items (Task 34's
 `purge_scope`). Core does not reject the name — enforcement is Plan 3's, named
 in the constant's own doc comment, which is authoritative and not reproduced
 here.
@@ -8652,7 +8653,7 @@ pub fn import(
                 // `sensitivity` — a stream claiming `Public` for a body full of
                 // credentials would bypass the detector and surface that body to
                 // a Public-clearance recall. The engine re-assesses on import
-                // (see `Engine::import` in Task 37); the backend refuses to
+                // (see `Engine::import` in Task 38); the backend refuses to
                 // lower whatever the engine resolved.
                 item.protection = Protection::Normal;
                 capacity::ensure_row(&tx, &scope)?;
@@ -10773,8 +10774,82 @@ git commit -m "feat(policy): maintenance for TTL, protection windows, and capaci
 ```
 
 ---
+## Task 30: Policy — `compose::working_set` set-coverage
 
-## Task 30: Engine — decision validation
+**What changes.** `working_set`'s MMR fill currently takes `max` over pairwise
+`overlap(candidate, selected_i)` at two sites (`compose.rs:213-217` and the
+evidence computation that follows the selection). Replace both with coverage
+against the union of the selected set:
+
+    |A ∩ (B₁ ∪ B₂ ∪ … ∪ Bₙ)| / |A|
+
+maintained as a running token set updated when an item is pushed to `selected`,
+rather than recomputed per candidate. `overlap` currently re-tokenizes every
+selected body once per candidate at both sites; the union form is one candidate
+tokenization against a maintained set, so this is expected to be **cheaper as
+well as more correct** — confirm that rather than assuming it.
+
+**Why, and what it fixes.** Task 28 made `overlap` directional (`|A∩B|/|A|`),
+which is right and introduced a narrower regression: a candidate wholly covered
+by the selected set *taken together* but by no single selected item is scored at
+the max of its pairwise coverages, not at 1.00.
+
+    a = {x, y},  selected = [{x}, {y}]      truth = 1.00
+      old (min denominator, max)  = 1.00    correct BY ACCIDENT
+      current (|A∩B|/|A|, max)    = 0.50    WRONG
+      union                       = 1.00    correct by construction
+
+The characterization test added in Task 28 pins the **current wrong value**. This
+task replaces it with an assertion of the correct one and deletes the deferral
+note. Do not restore the `min` denominator to recover the old answer: the old
+formula returned 1.00 whenever *either* token set was a subset of the other, so
+`a = {x,y,z,w,v}` against `b = {x}` also gave 1.00 where the truth is 0.20. The
+old right answer came from a saturation that was wrong across a much larger
+class. **The repair is the union, never the revert.**
+
+**THIS TASK IS ATOMIC. The rename and the semantic change cannot be split.**
+`"max_similarity_to_selected"` (`compose.rs:279`) is *true today* — it is
+literally the max over selected — and becomes false only under union. So there
+is no "rename now, change semantics later" (the name goes wrong immediately) and
+no "change semantics now, rename later" (the name is wrong for the window in
+between). Land both in one commit. Suggested key:
+`"fraction_covered_by_selected"`.
+
+**Four costs, three of which are not inferable from the diff.**
+
+1. **The evidence key is audit-visible, so this is a schema change, not a
+   rename.** A durable record asserting something the mechanism does not do is
+   the same defect the `ExactDuplicate` → `NearDuplicate` rename fixed at
+   `3a504a3`; the project already has a ruling on this class — cite it.
+2. **`max_sim` feeds selection, not only tagging** (`compose.rs:217`, inside the
+   MMR score). Union ≥ max always, so diversity pressure rises **uniformly on
+   every candidate** and `mmr_lambda`'s default stops meaning what it was tuned
+   to mean. Revisit the default; do not assume it carries over.
+3. **`cfg.diversity_cut_similarity`** (`compose.rs:248`) is calibrated against
+   the max distribution too. More rows will tag `DiversityCut` unless its
+   default moves with it.
+4. **Fixture movement on every test with more than one selected item.** Unlike
+   Task 28's distinct-token change, which was measured at zero breakage, this
+   one moves numbers. **Derive every expected value independently, then run to
+   CONFIRM it — never let the run supply the number.** Running the rejected
+   implementation to *falsify* a fixture is required, not forbidden: build the
+   pairwise-max version, run it against each new assertion, and confirm the
+   assertion fails under it. The prohibition is on the compiler supplying an
+   expected value, not on using the compiler.
+
+**The deadline that matters is not a task number.** This must land before the
+first production audit write. Old rows keep the old key forever, so a reader
+spanning the change sees two vocabularies. Free now, permanently expensive
+after — and that stays true however the plan renumbers.
+
+**Test requirement.** The split-coverage case gets a real assertion, not a
+characterization comment: candidate `{x, y}` against selected `[{x}, {y}]`
+scores 1.00. Write it from this task text, not from the implementation.
+
+---
+
+
+## Task 31: Engine — decision validation
 
 **Files:**
 - Create: `crates/memorysafe-engine/Cargo.toml`
@@ -11202,7 +11277,7 @@ git commit -m "feat(engine): decision validation and panic-safe policy invocatio
 
 ---
 
-## Task 31: Engine — `remember`
+## Task 32: Engine — `remember`
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/outcome.rs`
@@ -11874,7 +11949,7 @@ impl EngineConfig {
 }
 ```
 
-`EngineConfig::new` is how every test in Tasks 31–39 builds an engine.
+`EngineConfig::new` is how every test in Tasks 32–40 builds an engine.
 
 `Candidate`, `Assessment`, `AssessContext`, and `AdmitContext` must derive `Clone`; confirm from Tasks 5 and 10.
 
@@ -11892,7 +11967,7 @@ git commit -m "feat(engine): remember pipeline with governance decisions surface
 
 ---
 
-## Task 32: Engine — `recall`
+## Task 33: Engine — `recall`
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/read.rs`
@@ -12208,7 +12283,7 @@ git commit -m "feat(engine): recall pipeline with the sensitivity ceiling enforc
 
 ---
 
-## Task 33: Engine — `forget`, `protect`, and `purge_subject`
+## Task 34: Engine — `forget`, `protect`, and `purge_subject`
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/mutate.rs`
@@ -12493,7 +12568,7 @@ impl Engine {
     /// method.
     ///
     /// `PurgeCascade::Cascade` is hard-coded here — it is `balanced`, the
-    /// default profile's behaviour. Task 36 replaces this one expression with
+    /// default profile's behaviour. Task 37 replaces this one expression with
     /// `self.retention.retention().purge_cascade` and changes nothing else.
     pub async fn purge_subject(
         &self,
@@ -12529,7 +12604,7 @@ impl Engine {
     /// leading underscore).
     ///
     /// **The fallback name is a plan-level choice, not a derived one**; a
-    /// Task 33 executor may pick differently, but must pick, and must say so
+    /// Task 34 executor may pick differently, but must pick, and must say so
     /// where the record is built.
     async fn purge_scope(
         &self,
@@ -12628,7 +12703,7 @@ git commit -m "feat(engine): forget, protect, and subject purge"
 
 ---
 
-## Task 34: Engine — resumable maintenance job
+## Task 35: Engine — resumable maintenance job
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/maintain.rs`
@@ -12935,7 +13010,7 @@ git commit -m "feat(engine): explicit resumable maintenance job with audited cha
 
 ---
 
-## Task 35: Engine — cache and invalidation
+## Task 36: Engine — cache and invalidation
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/cache.rs`
@@ -13153,7 +13228,7 @@ git commit -m "feat(engine): content-addressed embedding cache and scope stats c
 
 ---
 
-## Task 36: Engine — retention profiles
+## Task 37: Engine — retention profiles
 
 **`AuditRetention::aggregate` is enforced here.** It is the only span that applies to `audit_aggregates` rows; `detail` and `purge_cascade` govern the audit detail table and must not reach the aggregate table. An aggregate row expires on its own span or not at all.
 
@@ -13412,7 +13487,7 @@ and replays none:
             OffsetDateTime::now_utc(),
         );
         // The whole of this task's change to `mutate.rs`: the cascade comes
-        // from the configured profile instead of Task 33's hard-coded
+        // from the configured profile instead of Task 34's hard-coded
         // `PurgeCascade::Cascade`. Everything else — building the record,
         // choosing its namespace, mapping the report — is untouched.
         let cascade = self.retention.retention().purge_cascade;
@@ -13461,7 +13536,7 @@ git commit -m "feat(engine): four named audit retention profiles honoured on sub
 
 ---
 
-## Task 37: Engine — export and import orchestration
+## Task 38: Engine — export and import orchestration
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/portability.rs`
@@ -13773,7 +13848,7 @@ git commit -m "feat(engine): portable ndjson export/import plus a human-readable
 
 ---
 
-## Task 38: The five correctness invariants
+## Task 39: The five correctness invariants
 
 **Files:**
 - Create: `crates/memorysafe-engine/tests/invariants.rs`
@@ -14017,7 +14092,7 @@ Add the missing read-through accessor to `crates/memorysafe-engine/src/lib.rs`:
 
 Any invariant that then fails is a real defect, not a test problem. The two most likely, and their fixes:
 
-- **Capacity exceeded.** `Engine::remember` offers eviction candidates only when `capacity.budget.is_bounded()` (Task 31, `gather::admit_context`). Confirm the budget is read fresh per write rather than cached — `CacheConfig` caches `ScopeStats`, never `CapacityState`, and that distinction is load-bearing.
+- **Capacity exceeded.** `Engine::remember` offers eviction candidates only when `capacity.budget.is_bounded()` (Task 32, `gather::admit_context`). Confirm the budget is read fresh per write rather than cached — `CacheConfig` caches `ScopeStats`, never `CapacityState`, and that distinction is load-bearing.
 - **Audit count mismatch.** A rejected write must still write exactly one audit record. Confirm the `Action::Reject` branch in `remember` builds a `WriteTransaction` with no `upsert` and no `merge` but still passes its audit record through `backend.apply`.
 
 Add the invariants job to `.github/workflows/ci.yml`:
@@ -14048,7 +14123,7 @@ git commit -m "test(engine): the five correctness invariants as property tests"
 
 ---
 
-## Task 39: Engine — re-embedding and `pending_embedding` backfill
+## Task 40: Engine — re-embedding and `pending_embedding` backfill
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/reembed.rs`
@@ -14059,7 +14134,7 @@ git commit -m "test(engine): the five correctness invariants as property tests"
 - Consumes: `Backend::list`, `Backend::apply`, `Embedder`.
 - Produces: `ReembedCursor { offset: usize }`, `ReembedReport { scanned, embedded, still_pending, next_cursor }`, `Engine::backfill_embeddings(&Scope, Option<ReembedCursor>)`, `Engine::reembed_scope(&Scope, Option<ReembedCursor>)`.
 
-**Why this task exists.** Task 31 admits an item with `pending_embedding: true` when the embedder is unavailable — a missing model file must never cost a user their memory. But without a backfill path those items stay invisible to vector search forever, which turns a transient outage into permanent silent recall degradation. This is the other half of that decision.
+**Why this task exists.** Task 32 admits an item with `pending_embedding: true` when the embedder is unavailable — a missing model file must never cost a user their memory. But without a backfill path those items stay invisible to vector search forever, which turns a transient outage into permanent silent recall degradation. This is the other half of that decision.
 
 `reembed_scope` is the migration the spec calls for when a tenant changes embedding model: it re-embeds every item in the scope, not just the pending ones, and audits the run as `Reembedded`. Both are explicit, resumable, cursor-driven jobs for the same reason maintenance is — nothing changes unobserved.
 
@@ -14437,7 +14512,7 @@ git commit -m "feat(engine): pending-embedding backfill and explicit re-embeddin
 Two `AuditEvent` variants defined in Task 8 are deliberately unused in Plan 1, because nothing in
 this plan triggers them from outside the process:
 
-- `Exported` / `Imported` — Task 37 provides the mechanism, but an export is only a governance
+- `Exported` / `Imported` — Task 38 provides the mechanism, but an export is only a governance
   event worth recording when a *person or API caller* initiates it. The audit record belongs at
   the CLI and HTTP boundary, with the actor attached.
 - `PolicyChanged` — there is one policy in Plan 1. The event becomes meaningful once policy
