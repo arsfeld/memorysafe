@@ -90,7 +90,7 @@ pub fn decide(
     // want it — fragility alone would protect it forever regardless of
     // value, which is precisely the guarantee this gate's grace window is
     // not meant to extend past its own expiry.
-    let fragile = a.fragility.get() >= cfg.fragile_threshold;
+    let fragile = a.fragility.get() >= cfg.protection_fragile_threshold;
     let sensitive = a.sensitivity.level >= SensitivityLevel::Sensitive;
 
     let mut reasons = Vec::new();
@@ -479,9 +479,9 @@ mod tests {
     }
 
     // Boundary discipline: `duplicate_threshold`, `merge_threshold`, and
-    // `fragile_threshold` are all compared with `>=`. Every test above sits
-    // comfortably clear of a boundary; a `>=` regressed to `>` (or vice
-    // versa) would pass every one of them. These pin the boundary itself.
+    // `protection_fragile_threshold` are all compared with `>=`. Every test
+    // above sits comfortably clear of a boundary; a `>=` regressed to `>` (or
+    // vice versa) would pass every one of them. These pin the boundary itself.
 
     #[test]
     fn an_item_exactly_at_the_duplicate_threshold_is_rejected() {
@@ -529,7 +529,12 @@ mod tests {
     #[test]
     fn fragility_exactly_at_the_threshold_is_protected() {
         let cfg = BaselineConfig::default();
-        let (c, a) = assessed(0.1, 0.8, cfg.fragile_threshold, SensitivityLevel::Internal);
+        let (c, a) = assessed(
+            0.1,
+            0.8,
+            cfg.protection_fragile_threshold,
+            SensitivityLevel::Internal,
+        );
         let d = decide(
             &Assessed {
                 candidate: &c,
@@ -558,7 +563,7 @@ mod tests {
         let (c, a) = assessed(
             0.1,
             0.8,
-            cfg.fragile_threshold - 0.01,
+            cfg.protection_fragile_threshold - 0.01,
             SensitivityLevel::Internal,
         );
         let d = decide(
@@ -632,9 +637,9 @@ mod tests {
     // still-hardcoded literal that happens to match the default.
 
     #[test]
-    fn fragile_threshold_is_configurable() {
+    fn protection_fragile_threshold_is_configurable() {
         let cfg = BaselineConfig {
-            fragile_threshold: 0.5,
+            protection_fragile_threshold: 0.5,
             ..BaselineConfig::default()
         };
         // 0.6 is below the crate default (0.85) but above this config's 0.5.

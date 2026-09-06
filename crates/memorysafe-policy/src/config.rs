@@ -20,9 +20,50 @@ pub struct BaselineConfig {
     pub merge_threshold: f32,
     /// Neighbours below this are not reported as near-duplicates.
     pub near_duplicate_floor: f32,
+
+    // --- The fragility ladder ---
+    //
+    // Three gates key off fragility, at three different bars, spending three
+    // different kinds of budget. Documented together because the numbers
+    // only make sense side by side, and the parallel `*_fragile_threshold`
+    // naming exists to keep that visible rather than let three thresholds
+    // that started related drift into looking arbitrary and inviting someone
+    // to "unify" them:
+    //
+    //   | gate                              | value | action                             |
+    //   |-----------------------------------|-------|------------------------------------|
+    //   | `protection_fragile_threshold`    | 0.85  | block eviction outright (`admit`)  |
+    //   | `replay_fragile_threshold`        | 0.80  | spend a reserved replay slot,      |
+    //   |                                   |       | fragility alone                    |
+    //   | `replay_stale_fragile_threshold`  | 0.50  | spend a reserved replay slot,      |
+    //   |                                   |       | staleness corroborating            |
+    //
+    // The rule: the more corroborating evidence, the lower the fragility bar
+    // needs to be, and the bars differ because the actions differ in cost.
+    // Blocking an eviction is the most expensive and least reversible of the
+    // three — it can starve capacity reclaim outright — so it demands the
+    // highest bar and no corroborating evidence. Spending one of a handful of
+    // reserved replay slots is cheap and reversible at the next recall, so
+    // fragility alone justifies it at a lower bar. When staleness also
+    // independently argues the item is being lost track of, less fragility
+    // evidence is needed, because the second signal corroborates the same
+    // conclusion rather than standing alone. Do not collapse these into one
+    // number: they gate different actions at different costs, on purpose.
     /// `admit::decide`: fragility at or above this earns a retained item a
-    /// protection window rather than `Protection::Normal`.
-    pub fragile_threshold: f32,
+    /// protection window rather than `Protection::Normal` — the highest rung
+    /// of the fragility ladder documented above, since blocking an eviction
+    /// outright is the most expensive of the three actions and gets no
+    /// corroborating evidence.
+    pub protection_fragile_threshold: f32,
+    /// `compose::replay_due`: fragility at or above this alone reserves a
+    /// replay slot for the item, no staleness required — the middle rung of
+    /// the fragility ladder documented above.
+    pub replay_fragile_threshold: f32,
+    /// `compose::replay_due`: fragility at or above this, WITH staleness
+    /// corroborating, also reserves a replay slot — the lowest rung of the
+    /// fragility ladder documented above, reachable only alongside
+    /// independent evidence of long non-access.
+    pub replay_stale_fragile_threshold: f32,
     /// `admit::decide`: length, in whole days, of the protection window a
     /// fragile item is granted.
     pub protection_window_days: i64,
@@ -31,6 +72,13 @@ pub struct BaselineConfig {
     pub replay_quota: f32,
     /// MMR tradeoff: 1.0 is pure relevance, 0.0 is pure diversity.
     pub mmr_lambda: f32,
+    /// `compose::working_set`'s MMR fill: an item whose similarity to what is
+    /// already selected exceeds this is tagged `ReasonCode::DiversityCut`
+    /// rather than `ReasonCode::HighValue` in its evidence. Not a fragility
+    /// gate and not part of the ladder above — it never changes which item is
+    /// chosen, only how the choice is explained in the audit trail, so a
+    /// tenant override here is cosmetic rather than behavioural.
+    pub diversity_cut_similarity: f32,
     /// Half-life in days for value decay during maintenance.
     pub value_half_life_days: f32,
     /// Weight of source trust in the value score.
@@ -88,10 +136,13 @@ impl Default for BaselineConfig {
             duplicate_threshold: 0.98,
             merge_threshold: 0.93,
             near_duplicate_floor: 0.30,
-            fragile_threshold: 0.85,
+            protection_fragile_threshold: 0.85,
+            replay_fragile_threshold: 0.80,
+            replay_stale_fragile_threshold: 0.50,
             protection_window_days: 30,
             replay_quota: 0.20,
             mmr_lambda: 0.70,
+            diversity_cut_similarity: 0.50,
             value_half_life_days: 90.0,
             source_trust_weight: 0.20,
             replay_stale_days: 30.0,

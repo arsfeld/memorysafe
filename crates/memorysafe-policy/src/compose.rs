@@ -27,7 +27,19 @@ fn overlap(a: &str, b: &str) -> f32 {
         return 0.0;
     }
     let shared = ta.iter().filter(|t| tb.contains(t)).count();
-    shared as f32 / ta.len().min(tb.len()) as f32
+    // Clamped to `[0.0, 1.0]`: `shared` counts token OCCURRENCES in `a`
+    // against `b`'s membership (a multiset count, not a distinct-token/set
+    // intersection), so a token repeated within `a` more times than the
+    // denominator can push the raw ratio above 1.0 — e.g. `overlap("the the
+    // the", "the cat")` is `3 / 2 = 1.5` without this clamp. A distinct-token
+    // count would also bound this at 1.0 and is arguably the more faithful
+    // "similarity", but it changes the numeric result for every
+    // already-pinned fixture in this module's tests (several assert an exact
+    // value), whereas this clamp changes nothing for any value that was
+    // already in range. Fixing "unbounded" does not require also fixing
+    // "counts occurrences, not distinct tokens" — that is a separate, larger
+    // change this task did not ask for.
+    (shared as f32 / ta.len().min(tb.len()) as f32).min(1.0)
 }
 
 fn fits(req: &RecallRequest, tokens: u32, items: usize) -> bool {
@@ -36,17 +48,27 @@ fn fits(req: &RecallRequest, tokens: u32, items: usize) -> bool {
 
 /// True when an item deserves a slot it would not win on relevance: it is
 /// fragile, or it has not been touched in a long time. This is `replay` from
-/// the continual-learning lineage, applied to a context window.
+/// the continual-learning lineage, applied to a context window. The two
+/// thresholds below are the middle and lowest rungs of the fragility ladder
+/// documented on `BaselineConfig` (see `replay_fragile_threshold` and
+/// `replay_stale_fragile_threshold` there for the full rationale, alongside
+/// `protection_fragile_threshold`, the ladder's third rung, used by `admit`).
 ///
-/// **`fragility.get() >= 0.8` is not dead code**, even though today's only
-/// producer (`fragility::score`, fed by the engine) cannot exceed `0.5`: that
-/// ceiling is a defect in the *engine's* neighbour-fetch path (a different
-/// lane's fix, tracked separately), not a property of the `Score` type or of
-/// this function's contract. `compose` is a pure function of whatever
-/// `ScoredCandidate::fragility` it is handed — nothing here restricts it to
-/// values an engine has ever actually produced — so a future producer, or a
-/// hand-built fixture (see this module's own tests), can and does exercise
-/// this branch on its own, independent of the second disjunct.
+/// **`fragility.get() >= cfg.replay_fragile_threshold` is reachable today,
+/// not only from fixtures.** `fragility::score` returns `Score::ONE` outright
+/// when a candidate has no near neighbours at all (that function's own early
+/// return) — exactly the "nothing else like this exists in the corpus" case
+/// this branch exists to catch, and a real, current code path, not a
+/// hypothetical future producer. The "cannot exceed 0.5" ceiling on
+/// `fragility::score` — a defect in the *engine's* neighbour-fetch path,
+/// tracked separately — applies only to that function's non-empty-neighbours
+/// branch; it says nothing about the empty-neighbours branch, which this
+/// threshold is reachable through regardless of that defect. `compose` is
+/// also a pure function of whatever `ScoredCandidate::fragility` it is handed
+/// in any case — nothing here restricts it to values an engine has ever
+/// actually produced — so this branch remains independently exercisable via
+/// a hand-built fixture too (see this module's own tests), which was true
+/// before and is simply no longer the only path to it.
 fn replay_due(c: &ScoredCandidate, ctx: &ComposeContext, cfg: &BaselineConfig) -> bool {
     // Staleness is measured from the last *recall*, not from creation. The
     // replay quota exists to resurface what is never recalled, so an old item
@@ -61,7 +83,8 @@ fn replay_due(c: &ScoredCandidate, ctx: &ComposeContext, cfg: &BaselineConfig) -
     // `Some(created_at)` — the policy can see it is guessing.
     let since_access = c.last_accessed_at.unwrap_or(c.item.created_at);
     let stale = ctx.now - since_access >= Duration::days(cfg.replay_stale_days as i64);
-    c.fragility.get() >= 0.8 || (stale && c.fragility.get() >= 0.5)
+    c.fragility.get() >= cfg.replay_fragile_threshold
+        || (stale && c.fragility.get() >= cfg.replay_stale_fragile_threshold)
 }
 
 pub fn working_set(
@@ -119,6 +142,21 @@ pub fn working_set(
         let slot_budget = req.budget.max_items.unwrap_or(ranked.len());
         let replay_slots =
             ((slot_budget as f32 * cfg.replay_quota).floor() as usize).min(slot_budget);
+        // The `.min(slot_budget)` above makes this trivially true today, but
+        // it is also the load-bearing precondition of the equivalent-mutant
+        // proof at the replay loop's `fits` call below (the one that argues
+        // the item-count argument there can never be the blocker). A future
+        // edit to this derivation — e.g. basing the quota on `ranked.len()`
+        // instead of `slot_budget`, or dropping the `.min` — could silently
+        // invalidate that proof while every existing test stays green (an
+        // eviction-run of exactly this edit is what surfaced the risk: it
+        // returned 3 selected items for a 2-item budget). This assertion is
+        // the proof's tripwire, not a defence against a scenario reachable
+        // today.
+        debug_assert!(
+            replay_slots <= slot_budget,
+            "replay reservation must fit the item budget"
+        );
 
         let mut replayed = 0usize;
         for (i, c) in ranked.iter().enumerate() {
@@ -177,6 +215,20 @@ pub fn working_set(
                     .map(|s| overlap(&c.item.body, &s.item.body))
                     .fold(0.0f32, f32::max);
                 let mmr = cfg.mmr_lambda * c.relevance - (1.0 - cfg.mmr_lambda) * max_sim;
+                // `ScoredCandidate::relevance` is a bare, unclamped `f32` by
+                // its own contract, and warns a degenerate zero-vector cosine
+                // can be NaN — reachable from the real producer, not just a
+                // fixture. `total_cmp` (in the initial sort above) places a
+                // positive NaN first, and NaN then poisons every comparison
+                // against it: `is_none_or` seats it as `best` when `best` is
+                // still `None`, and `mmr > NaN` is `false` for every
+                // candidate that follows, so nothing could ever displace it.
+                // Skipping a non-finite `mmr` here, rather than only checking
+                // `c.relevance` for NaN, also excludes the (currently
+                // unreachable but not type-excluded) case of a NaN `max_sim`.
+                if !mmr.is_finite() {
+                    continue;
+                }
                 if best.is_none_or(|(_, b)| mmr > b) {
                     best = Some((i, mmr));
                 }
@@ -193,7 +245,7 @@ pub fn working_set(
                 &mut tokens,
                 c,
                 Reason::new(
-                    if max_sim > 0.5 {
+                    if max_sim > cfg.diversity_cut_similarity {
                         ReasonCode::DiversityCut
                     } else {
                         ReasonCode::HighValue
@@ -209,23 +261,49 @@ pub fn working_set(
         }
     }
 
-    // Truncated to `OMITTED_CAP` (see the constant's own doc comment). Note
-    // what this truncation does NOT do: there is no count of how many
-    // candidates were considered-and-cut beyond the cap, and no flag on
-    // `WorkingSet` marking that `omitted` is a prefix rather than the whole
-    // list. A caller cannot tell "37 were omitted" from "37 of the 4,000 that
-    // did not fit are shown" by inspecting `omitted.len()` alone — the same
-    // ambiguity a paged API has without a `has_more`/total-count field. This
-    // is reported upstream (task-28-report.md) rather than fixed here: the
-    // brief asks for the cap to exist, not for a truncation signal to be
-    // added to `WorkingSet`, and adding one is a wire-format change to a type
-    // multiple crates already consume.
-    let omitted: Vec<OmittedItem> = ranked
+    // `omitted` reports what THIS FUNCTION considered and cut — never items
+    // the backend already excluded before `compose` saw them (the sensitivity
+    // ceiling, scope, tag/kind filters, and any hard time-range filter are
+    // all applied in SQL, below the policy). `omitted.len()` is a count of
+    // policy-level exclusions, not "how many results existed in the scope
+    // minus how many came back".
+    //
+    // Sorted by descending relevance, ties broken by ascending `ItemId` (the
+    // same rule `ranked`'s own initial sort uses), and truncated to
+    // `OMITTED_CAP` (see that constant's own doc comment) AFTER sorting, not
+    // before: the omissions a caller most needs explained are the ones that
+    // nearly made it — a candidate cut at relevance 0.02 is unsurprising and
+    // needs no explanation, while one cut at 0.89 does. Truncating first (or
+    // not sorting at all) would let an arbitrary run of low-relevance filler
+    // crowd the near-misses out of a capped list. The sort is re-applied
+    // explicitly here, over the omitted subset alone, rather than relied on
+    // implicitly from `ranked` already being sorted that way (which it is,
+    // today) — so this ordering guarantee survives a future change to how
+    // `chosen` is tracked, rather than depending on an invariant a reader
+    // would have to trace back to the top of the function to find.
+    //
+    // A consequence worth stating plainly: `omitted` is NOT a representative
+    // sample of why things were cut. Surfacing the most-surprising omissions
+    // first, by construction, preserves which SPECIFIC omissions matter and
+    // discards the DISTRIBUTION of reasons across the full cut set — a scope
+    // where 900 candidates were cut for ordinary low relevance and 3 for
+    // being a near-duplicate would show only those 3 (or fewer, once
+    // truncated), not a proportional sample of the 900.
+    let mut omitted_candidates: Vec<&ScoredCandidate> = ranked
         .iter()
         .enumerate()
         .filter(|(i, _)| !chosen.contains(i))
+        .map(|(_, c)| *c)
+        .collect();
+    omitted_candidates.sort_by(|a, b| {
+        b.relevance
+            .total_cmp(&a.relevance)
+            .then_with(|| a.item.id.cmp(&b.item.id))
+    });
+    let omitted: Vec<OmittedItem> = omitted_candidates
+        .into_iter()
         .take(OMITTED_CAP)
-        .map(|(_, c)| OmittedItem {
+        .map(|c| OmittedItem {
             id: c.item.id.clone(),
             reason: Reason::new(
                 ReasonCode::BudgetExhausted,
@@ -389,17 +467,55 @@ mod tests {
             bodies[1], "quarterly revenue exceeded projections",
             "MMR should prefer a distinct item over a third paraphrase"
         );
-        assert!(ws.items[1].reason.code == ReasonCode::DiversityCut || bodies.len() == 2);
+        // NOT `DiversityCut`: this candidate has zero overlap with the
+        // selected seed, so `max_sim` is `0.0`, which is not above
+        // `diversity_cut_similarity` (`0.5`) — its reason is `HighValue`. The
+        // `DiversityCut`/`HighValue` boundary itself is covered by
+        // `mmr_reason_is_diversity_cut_only_strictly_above_the_half_similarity_threshold`;
+        // this assertion previously read
+        // `ws.items[1].reason.code == ReasonCode::DiversityCut || bodies.len() == 2`,
+        // which is vacuous — the second disjunct is guaranteed by the
+        // preceding `bodies` assertions and the request's 2-item budget, so
+        // it passed regardless of the (actually false) first disjunct and
+        // misdescribed which reason code this path produces.
+        assert_eq!(ws.items.len(), 2);
     }
 
     #[test]
     fn mmr_prefers_higher_relevance_when_similarity_is_tied_at_zero() {
         // Isolates the relevance term of the MMR trade: two remaining
         // candidates share the same (zero) similarity to what is already
-        // selected, so `(1 - lambda) * max_sim` contributes identically to
-        // both and only the `lambda * relevance` term can decide the winner.
-        // Rejects: a relevance term that is dropped, inverted, or replaced by
-        // tie-break order.
+        // selected, so `(1 - lambda) * max_sim` contributes identically
+        // (zero) to both regardless of the relevance term's shape.
+        //
+        // Rejects: the relevance term's SIGN being inverted. Verified: with
+        // `cfg.mmr_lambda * c.relevance` negated, this test fails (it picks
+        // "orange kettle bicycle horizon" instead) — the two candidates'
+        // correct mmr values are genuinely distinct here (0.7*0.7=0.49 vs
+        // 0.7*0.3=0.21), not a tie, so a sign flip changes which one is
+        // largest.
+        //
+        // Previously claimed, and now corrected after measuring: this does
+        // NOT reject a relevance term reshaped by any transform that is
+        // monotonically increasing in relevance and applied identically to
+        // every candidate. Verified for two such mutations, both of which
+        // leave every assertion in this test passing: zeroing the
+        // coefficient (`cfg.mmr_lambda * c.relevance` -> `0.0 * c.relevance`,
+        // which degenerates every candidate's mmr to the identical value
+        // `0.0` here since `max_sim` is zero for all three, so the tie is
+        // broken by `ranked`'s own relevance-sorted order — reproducing the
+        // right answer for the wrong reason), and `*` weakened to `+`
+        // (`cfg.mmr_lambda * c.relevance` -> `cfg.mmr_lambda + c.relevance`,
+        // which adds the same constant `mmr_lambda` to every candidate's mmr
+        // and so cannot change their relative order). Neither "dropped" nor
+        // "replaced by tie-break order" is an accurate description of a
+        // specific mutation; both were replaced above with what was actually
+        // measured. Closing this hole would mean giving the contested
+        // candidates a non-zero, UNEQUAL similarity to the seed instead of an
+        // identical zero, so the exact combination shape has to matter for
+        // either to win — a larger fixture change than this comment fix, not
+        // made here.
+        //
         // Vacuous if the two candidates' similarity to the seed differed —
         // pinned by the two `assert_eq!(overlap(...), 0.0)` guards below,
         // which fail this test outright if the fixture ever stops holding
@@ -493,6 +609,22 @@ mod tests {
         // Vacuous if `shared` were 0 or a multiple of the denominator —
         // pinned by the arithmetic in the comment, not by inspection alone.
         assert_eq!(overlap("a b c d", "a x"), 0.5);
+    }
+
+    #[test]
+    fn overlap_is_clamped_to_one_when_a_repeated_token_would_exceed_it() {
+        // Rejects: the missing `.min(1.0)` clamp on the final ratio.
+        // `shared` counts token OCCURRENCES in `a` against `b`'s membership,
+        // not distinct shared tokens, so a token repeated within `a` more
+        // times than `b`'s (shorter) token count pushes the raw ratio above
+        // 1.0: "the" appears three times in `a` and matches `b`'s single
+        // "the", giving `shared = 3` against `min(3, 2) = 2`, i.e. `1.5`
+        // before clamping.
+        // Vacuous if `shared <= ta.len().min(tb.len())` in the fixture, which
+        // is the ordinary (already-in-range) case every other `overlap` test
+        // in this module exercises — this is the one fixture in the module
+        // that forces the numerator past the denominator.
+        assert_eq!(overlap("the the the", "the cat"), 1.0);
     }
 
     #[test]
@@ -637,6 +769,40 @@ mod tests {
         assert_eq!(
             ws.items[0].item.id, small_id,
             "a `>` tie-break must keep the first-ranked candidate"
+        );
+    }
+
+    #[test]
+    fn mmr_fill_skips_a_candidate_with_a_nan_relevance_score() {
+        // Rejects: the missing `mmr.is_finite()` guard. `ScoredCandidate`'s
+        // own doc warns a degenerate zero-vector cosine can make `relevance`
+        // NaN. The initial `total_cmp`-based sort places a positive NaN
+        // FIRST in descending order, and without the guard `is_none_or`
+        // would seat it as `best` on its first (empty-`best`) iteration; from
+        // then on `mmr > NaN` is `false` for every real candidate that
+        // follows, so nothing can ever displace it — one NaN candidate wins
+        // the slot unconditionally, ahead of any genuinely relevant one.
+        // Vacuous if the NaN candidate were not ranked first, or if only one
+        // candidate existed — a real, ordinary candidate is included
+        // specifically to prove it wins the slot instead.
+        let mut nanny = candidate("a degenerate zero-vector match", 0.0);
+        nanny.relevance = f32::NAN;
+        nanny.fragility = Score::ZERO;
+        nanny.item.created_at = ctx().now;
+        let mut real = candidate("an ordinary relevant memory", 0.5);
+        real.fragility = Score::ZERO;
+        real.item.created_at = ctx().now;
+
+        let ws = working_set(
+            &req(RecallMode::WorkingSet, 1),
+            &[nanny, real],
+            &ctx(),
+            &BaselineConfig::default(),
+        );
+        assert_eq!(ws.items.len(), 1);
+        assert_eq!(
+            ws.items[0].item.body, "an ordinary relevant memory",
+            "a NaN-relevance candidate must not win a slot ahead of a real one"
         );
     }
 
@@ -855,6 +1021,59 @@ mod tests {
                 .iter()
                 .any(|s| s.reason.code == ReasonCode::ReplayDue)
         );
+    }
+
+    #[test]
+    fn omitted_items_are_ordered_by_descending_relevance_not_input_or_chosen_order() {
+        // Rejects: an `omitted` list built from `candidates`' original input
+        // order (or from `chosen`'s insertion order) instead of sorted by
+        // descending relevance — either would scramble the omitted list
+        // here, since neither matches relevance order, and this test's input
+        // order is deliberately NOT already sorted.
+        // Vacuous if `chosen` happened to be a contiguous prefix of the
+        // relevance-sorted order (the ordinary Search-mode case) — filtering
+        // a sorted sequence trivially preserves its order regardless of which
+        // implementation produced it, so this needs a WorkingSet-mode
+        // scenario where a low-relevance replay pick is chosen AHEAD of
+        // higher-relevance items that get cut, breaking that coincidence.
+        let cfg = BaselineConfig {
+            replay_quota: 0.5,
+            ..BaselineConfig::default()
+        };
+        let mut a = candidate("a highly relevant memory", 0.9);
+        a.fragility = Score::ZERO;
+        a.item.created_at = ctx().now;
+        let mut b = candidate("a moderately relevant memory", 0.8);
+        b.fragility = Score::ZERO;
+        b.item.created_at = ctx().now;
+        let b_id = b.item.id.clone();
+        let mut c = candidate("a less relevant memory", 0.7);
+        c.fragility = Score::ZERO;
+        c.item.created_at = ctx().now;
+        let c_id = c.item.id.clone();
+        let mut d = candidate("a rare fact nobody has read in a year", 0.1);
+        d.fragility = Score::ONE;
+        d.item.created_at = OffsetDateTime::UNIX_EPOCH;
+
+        // Deliberately not already sorted by relevance.
+        let cands = vec![c, a, d, b];
+        let ws = working_set(&req(RecallMode::WorkingSet, 2), &cands, &ctx(), &cfg);
+
+        // D wins the one reserved replay slot despite the lowest relevance;
+        // A wins the other slot on relevance. B and C are cut and must come
+        // back sorted descending: B (0.8) before C (0.7) — the reverse of
+        // this test's own input order for those two.
+        assert!(
+            ws.items
+                .iter()
+                .any(|s| s.reason.code == ReasonCode::ReplayDue)
+        );
+        assert_eq!(ws.omitted.len(), 2);
+        assert_eq!(
+            ws.omitted[0].id, b_id,
+            "the higher-relevance omission must come first"
+        );
+        assert_eq!(ws.omitted[1].id, c_id);
     }
 
     #[test]
