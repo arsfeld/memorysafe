@@ -11261,19 +11261,38 @@ pub fn decisions(
     }
 
     // 3. Capacity reclaim, cheapest first, pinned untouchable.
-    // **Byte budgets are NOT deferred here — they are half-implemented, and the
-    // missing half is this one.** `CapacityState::pressure` consults
-    // `max_bytes`, and `CapacityState::would_exceed` refuses an admission that
-    // would break it. Only reclaim ignores it. So a namespace configured with
-    // `max_bytes: Some(_)` and `max_items: None` reports pressure correctly,
-    // rejects writes once over, and **never reclaims** — it is permanently
+    // **Byte budgets are NOT deferred here — three of the four paths that read
+    // `max_bytes` implement them, and the missing one is this.** Enumerated,
+    // because the count is the argument and a smaller count reads as "barely
+    // started":
+    //
+    //   `Budget::is_bounded`        `capacity.rs:17`  true for a byte-only budget,
+    //                                                 and pinned by
+    //                                                 `standing_check_budget_is_bounded`
+    //   `CapacityState::pressure`   `capacity.rs:43`  reports it correctly
+    //   `CapacityState::would_exceed` `capacity.rs:64` refuses the admission
+    //   `maintain::capacity_reclaim` HERE              ignores it
+    //
+    // So a namespace with `max_bytes: Some(_)` and `max_items: None` reports
+    // pressure, refuses writes once over, and **never reclaims**. Permanently
     // stuck, not merely unbounded.
     //
-    // Do not write a comment here saying byte budgets are deferred: two of the
-    // three code paths implement them, and a reader who believes the deferral
-    // will not look for the liveness bug. Owned by the engine's retention and
-    // capacity work; until it lands, a byte-only budget is a misconfiguration
-    // the engine should reject rather than a supported shape.
+    // **And the stuckness is expensive, not passive.** The engine gathers
+    // eviction candidates only when `budget.is_bounded()`, which is true here —
+    // so it runs `Backend::list`, builds the candidate vector, hands it over,
+    // and this early return discards it. Work performed and silently thrown
+    // away on every write, with no decision and no audit row. From outside the
+    // namespace that looks like a system actively managing capacity.
+    // (`is_bounded`'s behaviour is asserted today; the engine's use of it
+    // arrives with the `remember` pipeline. The waste is latent until then and
+    // the stall is not.)
+    //
+    // Do not write a comment here saying byte budgets are deferred. **A reader
+    // who believes the deferral will not look for the liveness bug**, and a
+    // confident deferral note ends a look that silence would have invited.
+    // Owned by the engine's retention and capacity work; until it lands, a
+    // byte-only budget is a misconfiguration the engine should reject rather
+    // than a supported shape.
     let Some(max_items) = ctx.capacity.budget.max_items else {
         return out;
     };
