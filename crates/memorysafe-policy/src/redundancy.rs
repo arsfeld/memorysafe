@@ -14,7 +14,13 @@ pub fn assess(neighbours: &[ScoredCandidate], cfg: &BaselineConfig) -> Redundanc
         // relevance marginally above 1.0 from f32 rounding must not error.
         .map(|n| (n.item.id.clone(), Score::clamped(n.relevance)))
         .collect();
-    near.sort_by_key(|n| std::cmp::Reverse(n.1));
+    // Contract (`RedundancyAssessment::near_duplicates`'s own doc):
+    // "Descending by similarity, ties broken by ascending `ItemId`... anchor
+    // to this rule, not to 'whatever order the backend happened to return
+    // neighbours in'." `sort_by_key` is stable, so the `ItemId` must be part
+    // of the key itself — relying on input order to break a tie would anchor
+    // to the backend's order, exactly what the contract forbids.
+    near.sort_by_key(|n| (std::cmp::Reverse(n.1), n.0.clone()));
 
     let best = neighbours
         .iter()
@@ -31,6 +37,7 @@ mod tests {
     use super::*;
     use crate::config::BaselineConfig;
     use crate::testkit::candidate;
+    use memorysafe_core::ItemId;
 
     #[test]
     fn no_neighbours_means_no_redundancy() {
@@ -73,6 +80,41 @@ mod tests {
             a.near_duplicates.len(),
             1,
             "the 0.10 neighbour is not near-duplicate"
+        );
+    }
+
+    #[test]
+    fn ties_break_on_ascending_item_id_so_best_is_deterministic() {
+        // Contract (`RedundancyAssessment::near_duplicates`'s own doc):
+        // "Descending by similarity, ties broken by ascending `ItemId`" —
+        // this is what makes `best()` a deterministic merge target
+        // regardless of the order the backend happened to return neighbours
+        // in. The LARGER id is placed FIRST in the input, with an identical
+        // score: a stable sort that merely preserves input order on a tie
+        // would then report the wrong (larger-id-first) answer, so this
+        // fixture actually discriminates "reads ItemId" from "reads nothing,
+        // relies on stability" rather than passing either way.
+        let cfg = BaselineConfig::default();
+        let small_id = ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let large_id = ItemId::parse("01BX5ZZKBKACTAV9WEVGEMMVRZ").unwrap();
+
+        let mut arrives_first = candidate("a", 0.5);
+        arrives_first.item.id = large_id.clone();
+        let mut arrives_second = candidate("b", 0.5);
+        arrives_second.item.id = small_id.clone();
+
+        let a = assess(&[arrives_first, arrives_second], &cfg);
+
+        assert_eq!(a.near_duplicates.len(), 2);
+        assert_eq!(
+            a.near_duplicates[0].0, small_id,
+            "a tie must break on ascending ItemId, not input order"
+        );
+        assert_eq!(a.near_duplicates[1].0, large_id);
+        assert_eq!(
+            a.best().unwrap().0,
+            &small_id,
+            "best() must name the ascending-ItemId winner on a tie"
         );
     }
 
