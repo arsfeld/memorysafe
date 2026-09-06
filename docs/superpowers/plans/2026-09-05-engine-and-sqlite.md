@@ -9561,8 +9561,10 @@ license.workspace = true
 [dependencies]
 memorysafe-core.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 time.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
@@ -14418,7 +14420,7 @@ Add `pub mod retention;` and
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 44 tests ok.
+Expected: PASS — 43 tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -15005,7 +15007,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 50 backend conformance tests, and the unit and integration suites of all six crates.
+Expected: PASS — the whole workspace green: 5 invariants, 55 memorysafe-engine tests, 50 backend conformance tests, and the unit and integration suites of all six crates.
 
 - [ ] **Step 5: Commit**
 
@@ -15379,7 +15381,7 @@ pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine && cargo test --workspace --all-features`
-Expected: PASS — 57 engine tests ok, whole workspace green.
+Expected: PASS — 62 engine tests ok, whole workspace green.
 
 - [ ] **Step 5: Commit**
 

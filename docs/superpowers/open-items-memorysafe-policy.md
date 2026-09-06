@@ -38,13 +38,21 @@ high-fragility-but-now-low-value item can rank cheap to evict. Both behaviours
 are defensible in isolation; whether they should agree is a design question that
 predates these tasks and was never decided.
 
-**`serde_json` is declared under `[dependencies]` in `memorysafe-policy`, and
-every one of its 11 uses is in `value.rs` after that file's `#[cfg(test)]`.** The
-crate has no `[dev-dependencies]` section. A test-only crate under
-`[dependencies]` ships in the dependency graph of every downstream consumer.
-`memorysafe-core` (4 non-test uses) and `memorysafe-backend` (3) are genuine, so
-the remedy is local: move it. **It contradicts the plan's verbatim `Cargo.toml`
-block, so it needs a plan amendment alongside the edit** — not a silent fix.
+## Resolved
+
+**`serde_json` was declared under `[dependencies]` in `memorysafe-policy`, though
+every one of its 11 uses was in `value.rs` after that file's `#[cfg(test)]`.**
+Decided and fixed 2026-09-06. Both halves the ruling required were done together:
+`serde_json.workspace = true` moved out of `[dependencies]` and into a new
+`[dev-dependencies]` section in `crates/memorysafe-policy/Cargo.toml`, and Task
+25's verbatim `Cargo.toml` block in
+`docs/superpowers/plans/2026-09-05-engine-and-sqlite.md` was amended to match, so
+a later executor transcribing that block will not reintroduce the defect.
+`cargo tree -p memorysafe-policy --edges normal --depth 1` no longer lists
+`serde_json` as a direct dependency (the unbounded tree still shows it,
+transitively, via `memorysafe-core`'s own genuine non-test use, which this fix
+does not touch); `cargo test -p memorysafe-policy` still passes at 152 tests,
+which is the confirmation that the crate never needed it outside tests.
 
 ## Documentation gaps where the silence is the defect
 
