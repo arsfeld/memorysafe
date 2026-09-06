@@ -323,7 +323,7 @@ CREATE TABLE audit (
   policy     TEXT,
   PRIMARY KEY (tenant_id, id)
 ) PARTITION BY HASH (tenant_id);
-CREATE INDEX idx_audit_scope_at ON audit (tenant_id, subject, namespace, id DESC);
+CREATE INDEX idx_audit_scope_at ON audit (tenant_id, subject, namespace, at, id DESC);
 
 CREATE TABLE idempotency (
   tenant_id      TEXT NOT NULL,
@@ -1561,7 +1561,7 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
         "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw
            ON vectors USING hnsw (embedding vector_ip_ops)".into(),
         "CREATE INDEX IF NOT EXISTS idx_audit_scope_at
-           ON audit (tenant_id, subject, namespace, id DESC)".into(),
+           ON audit (tenant_id, subject, namespace, at, id DESC)".into(),
     ]);
 
     for table in TENANT_TABLES {
@@ -4332,11 +4332,24 @@ pub async fn export(
     }
 
     if sel.include_audit {
+        // Collect across every scope before sorting: `audit::query` returns
+        // each scope's rows newest-first (descending `AuditId`, per this
+        // commit's fix to that function), but `Backend::export`'s contract
+        // is one global run ascending by `AuditId` — appending each scope's
+        // descending run back to back would satisfy neither order.
+        //
+        // `limit: 100_000` truncates silently for a tenant with more audit
+        // rows than that — the same defect `AuditFilter::limit`'s doc
+        // comment warns about (see `crates/memorysafe-core/src/audit.rs`).
+        // Not resolved here.
+        let mut audit_rows = Vec::new();
         for scope in scopes {
             let filter = AuditFilter { limit: 100_000, ..Default::default() };
-            for record in audit::query(&mut *conn, &scope, &filter).await? {
-                out.push(ExportRecord::Audit { audit: Box::new(record) });
-            }
+            audit_rows.extend(audit::query(&mut *conn, &scope, &filter).await?);
+        }
+        audit_rows.sort_by(|a, b| a.id.cmp(&b.id));
+        for record in audit_rows {
+            out.push(ExportRecord::Audit { audit: Box::new(record) });
         }
     }
 

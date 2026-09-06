@@ -98,6 +98,14 @@ pub trait Backend: Send + Sync {
     /// doc comment in `memorysafe-core` rather than restating the reasoning
     /// here.
     ///
+    /// `filter.after`, when set, continues a previous page. Because the
+    /// list is descending, "after" names a *position* in that returned
+    /// order, not a point in time: the next page is restricted to
+    /// `id < after` (strictly smaller), not `id > after` — the temporal
+    /// reading would instead re-request rows already returned. Neither
+    /// draft `Backend::audit` implementation wires up `after` yet, so this
+    /// doc comment is the only place the direction is pinned down.
+    ///
     /// `filter.since` and `filter.until` are both **inclusive** bounds: a
     /// record timestamped exactly at either edge matches. The conformance
     /// suite's window test deliberately places both bounds off every
@@ -123,9 +131,10 @@ pub trait Backend: Send + Sync {
     /// backends exporting the same tenant with a different (or absent)
     /// order produce byte-different artifacts for identical data, so
     /// checksums do not match and a customer verifying a migration cannot.
-    /// `export_import_round_trips_exactly` id-sorts both sides before
-    /// comparing, so it cannot detect this divergence — this doc comment is
-    /// the only thing pinning the order down.
+    /// `export_import_round_trips_exactly` never inspects the export stream
+    /// itself — it compares `list` output after re-sorting both sides by
+    /// `ItemId`, so no conformance test observes the stream's order at all —
+    /// this doc comment is the only thing pinning it down.
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
 
     /// Order-tolerant: records may arrive in any order. This is deliberate

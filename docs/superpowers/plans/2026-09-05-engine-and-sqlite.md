@@ -267,7 +267,7 @@ CREATE TABLE audit (
   actor      TEXT NOT NULL,                   -- JSON
   policy     TEXT
 );
-CREATE INDEX idx_audit_scope_at ON audit(subject, namespace, at);
+CREATE INDEX idx_audit_scope_at ON audit(subject, namespace, at, id DESC);
 
 CREATE TABLE idempotency (
   key            TEXT PRIMARY KEY,
@@ -6362,7 +6362,7 @@ CREATE TABLE IF NOT EXISTS audit (
   actor      TEXT NOT NULL,
   policy     TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_audit_scope_at ON audit(subject, namespace, at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_scope_at ON audit(subject, namespace, at, id DESC);
 
 CREATE TABLE IF NOT EXISTS idempotency (
   key            TEXT PRIMARY KEY,
@@ -7288,7 +7288,13 @@ pub fn search(
         scored.push((item, score));
     }
 
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // Tie-break by ascending `ItemId` before truncating at `k`: this
+    // function is the over-fetch source for both `neighbours` (`k` is the
+    // caller's `k`) and `retrieve_candidates` (`k` is `query.limit * 4`), so
+    // an untied truncation here drops candidates nondeterministically
+    // upstream of fusion — a downstream tie-break on the fused set cannot
+    // recover a candidate this truncation already discarded.
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
     scored.truncate(k);
     Ok(scored)
 }
@@ -8283,11 +8289,24 @@ pub fn export(
     }
 
     if sel.include_audit {
+        // Collect across every scope before sorting: `audit::query` returns
+        // each scope's rows newest-first (descending `AuditId`, per this
+        // commit's fix to that function), but `Backend::export`'s contract
+        // is one global run ascending by `AuditId` — appending each scope's
+        // descending run back to back would satisfy neither order.
+        //
+        // `limit: 100_000` truncates silently for a tenant with more audit
+        // rows than that — the same defect `AuditFilter::limit`'s doc
+        // comment warns about (see `crates/memorysafe-core/src/audit.rs`).
+        // Not resolved here.
+        let mut audit_rows = Vec::new();
         for scope in scopes {
             let filter = AuditFilter { limit: 100_000, ..Default::default() };
-            for record in crate::audit::query(conn, &scope, &filter)? {
-                out.push(ExportRecord::Audit { audit: Box::new(record) });
-            }
+            audit_rows.extend(crate::audit::query(conn, &scope, &filter)?);
+        }
+        audit_rows.sort_by(|a, b| a.id.cmp(&b.id));
+        for record in audit_rows {
+            out.push(ExportRecord::Audit { audit: Box::new(record) });
         }
     }
 
@@ -8594,13 +8613,19 @@ mod tests {
         );
     }
 
-    // The tests above state this function's contract. Its arithmetic is
-    // additionally pinned by mutation-killer tests not reproduced here —
+    // The tests above state this function's contract. **Task 25 must also
+    // write** four mutation-killer tests pinning the arithmetic, not
+    // reproduced here because they would bury the contract tests above
+    // under linearity checks:
     // `the_sparser_branch_is_linear_between_the_baseline_and_zero`,
     // `the_denser_branch_is_linear_between_the_baseline_and_one`,
     // `typical_density_at_the_lower_extreme_scores_one_half_without_dividing_by_zero`,
-    // and `typical_density_at_the_upper_extreme_scores_one_half_without_dividing_by_zero`
-    // — see `crates/memorysafe-policy/src/fragility.rs`.
+    // and `typical_density_at_the_upper_extreme_scores_one_half_without_dividing_by_zero`.
+    // None of these four exist anywhere in this repository yet — they are
+    // not merely omitted from this listing, they have not been written.
+    // The "Do not fold the two branches" warning in `score`'s doc comment
+    // depends on the linearity pair among them to actually catch a
+    // regression; without writing them, that warning is unenforced prose.
 }
 ```
 
@@ -8707,13 +8732,17 @@ impl BaselineConfig {
 ```rust
 use crate::config::BaselineConfig;
 use memorysafe_core::{RedundancyAssessment, Score, ScoredCandidate};
-use std::cmp::Reverse;
 
 pub use crate::config::Verdict;
 
 /// Redundancy is the similarity of the closest existing memory. Neighbours
-/// arrive sorted from the engine, but the sort is repeated here so the
-/// function is correct in isolation and testable with hand-built fixtures.
+/// arrive sorted from the engine, but the sort is repeated here — with an
+/// explicit tie-break, not by relying on a stable sort to inherit order
+/// from an already-sorted input — so the function is correct in isolation
+/// and testable with hand-built fixtures given in any order. The tie-break
+/// (ascending `ItemId`) matches `RedundancyAssessment::near_duplicates`'s
+/// documented rule, so `best()` names a deterministic merge target
+/// regardless of the order `neighbours` arrived in.
 pub fn assess(
     neighbours: &[ScoredCandidate],
     cfg: &BaselineConfig,
@@ -8725,7 +8754,7 @@ pub fn assess(
         // relevance marginally above 1.0 from f32 rounding must not error.
         .map(|n| (n.item.id.clone(), Score::clamped(n.relevance)))
         .collect();
-    near.sort_by_key(|x| Reverse(x.1));
+    near.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let best = neighbours.iter().map(|n| n.relevance).fold(0.0f32, f32::max);
     RedundancyAssessment { score: Score::clamped(best), near_duplicates: near }
