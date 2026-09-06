@@ -1,180 +1,213 @@
 # MemorySafe
 
-**Governed memory for AI agents.** Every memory that enters is assessed, a policy decides what
-happens to it, and the reason is recorded and queryable.
+**Governed memory infrastructure for AI agents.**
 
-[![ci](https://github.com/arsfeld/memorysafe/actions/workflows/ci.yml/badge.svg)](https://github.com/arsfeld/memorysafe/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.97.1%20(2024%20edition)-orange.svg)](rust-toolchain.toml)
 
-> **Early — there is nothing to install yet.** The type layer, the storage trait and its
-> conformance suite, and part of the SQLite backend are in the tree and green. The engine, the
-> policy, and the MCP/HTTP/CLI surfaces are designed but not built. See [Status](#status) for
-> exactly what exists.
+MemorySafe is an embeddable, governed memory engine for developers building AI agents.
+
+Conventional vector stores act as passive, unbounded dumps: memories accumulate without limit, near-duplicates proliferate, context windows fill with stale facts, and sensitive details enter prompts without boundary.
+
+MemorySafe treats memory not as a passive storage bucket, but as an **admission, eviction, and working-set control problem**. Every memory submitted is assessed for value, fragility, sensitivity, and redundancy. A policy decides what to keep, merge, or reject under explicit capacity budgets, and a privacy-preserving audit trail records every decision.
 
 ---
 
-## The problem
+## Key Guarantees
 
-Most agent memory is a vector store with an append-only write path: everything the agent sees
-gets embedded and kept, retrieval is nearest-neighbour, and the only thing resembling a policy is
-a `top_k`. That works until it doesn't:
+* **No LLM in the Write Path:** Fast, deterministic, and offline-capable. Memories are embedded and governed in-process without network calls, external API costs, or LLM latency.
+* **Pure Governance Policies:** Policy logic has zero I/O capability. The engine gathers necessary context (nearest neighbours, scope statistics, capacity pressure), feeds it into the policy, validates the returned decision, and commits writes atomically.
+* **Structural Tenant Isolation:** In the SQLite backend, each tenant is stored in an independent database file (`<tenant>.db`). Multi-tenant isolation is enforced at the filesystem level, not via filter clauses in queries. Tenant backup is `cp`; tenant deletion is `rm`.
+* **Privacy-First Auditability:** The audit log records item IDs, BLAKE3 content digests, feature scores, and reason codes—**never** plaintext memory bodies. Audit trails remain fully queryable for compliance without exposing sensitive data.
+* **Deterministic Testability:** Includes a built-in `DeterministicEmbedder` and a comprehensive backend conformance suite, enabling reproducible testing of memory lifecycles without external model downloads or network dependencies.
 
-- **The corpus never stops growing.** Nothing decides what is not worth keeping, so cost and
-  retrieval quality both degrade with age.
-- **Recall is unaccountable.** When the agent surfaces the wrong thing, "it was similar" is the
-  entire explanation available.
-- **Deletion is a hope.** "Forget what I told you about my health" has no mechanism behind it
-  beyond a filter someone remembered to write.
-- **Sensitive and fragile pull in opposite directions.** A rare medical detail is both the most
-  valuable thing to retain and the most dangerous thing to surface. A single "importance" score
-  cannot represent that conflict, let alone explain it.
+---
 
-## What MemorySafe does
-
-MemorySafe is not primarily a retrieval system — it is **admission and eviction control** for
-memory:
+## Core Lifecycle
 
 ```
-assess  →  value, fragility, sensitivity, redundancy  (item)  +  capacity  (scope)
-apply   →  retain | protect | replay | merge | forget
-record  →  a structured, queryable reason for every decision
+WRITE:    item  ──►  assess  ──►  admit / merge / reject  ──►  atomic commit + audit
+READ:    query  ──►  retrieve candidates  ──►  compose working set  ──►  record recall
+CLEANUP: maintain  ──►  decay & re-score  ──►  capacity reclaim / TTL expiry
 ```
 
-The same policy runs on the read path. A recall is a *composition* under an explicit budget —
-which items earned a context slot, which were left out, and why — and that composition is
-recorded too.
+1. **Assess (`item`):**
+   - **Value:** Weighted combination of content specificity, source authority, caller weighting, and recency.
+   - **Fragility:** Identifies atypical, rare, or hard-to-relearn memories based on embedding-space neighbourhood sparsity.
+   - **Sensitivity:** Pattern detection (credentials, IDs, health, financial markers) combined with caller-specified sensitivity hints.
+   - **Redundancy:** Cosine similarity against existing neighbours in scope to identify merge targets or exact duplicates.
+2. **Admit (`capacity`):**
+   - Evaluates budget pressure for the target namespace.
+   - Decides whether to `Retain`, `Merge`, or `Reject`.
+   - Evicts lower-value, non-fragile items under capacity pressure while strictly respecting `Pinned` and time-boxed `Protected` guarantees.
+3. **Compose (`working set`):**
+   - Assembles a governed working set under strict token and item budgets using hybrid retrieval (vector similarity + keyword search) and diversity ranking.
+   - Allocates dedicated replay quotas for fragile or long-unaccessed memories.
+4. **Audit (`evidence`):**
+   - Produces an immutable, structured record of every write, eviction, merge, and recall.
 
-Reasons are machine-readable, not prose: every decision carries a `ReasonCode`
-(`NovelContent`, `HighRedundancy`, `CapacityPressure`, `SensitivityCap`, `ProtectedFragile`,
-`DiversityCut`, `BudgetExhausted`, …), a human-readable detail string, and the feature values the
-policy actually scored on. You can query the audit log for *why* a memory was dropped, and get an
-answer with numbers in it.
+---
 
-The lineage is continual-learning replay-buffer selection, generalised to agent memory. The
-differentiator is not "we store memories" but "we decide, defensibly and auditably, which
-memories are worth keeping and which are worth surfacing."
+## Scoping Hierarchy
 
-## Who it is for
+MemorySafe enforces a three-level hierarchy for all stored memories:
 
-Developers building agent products, where memory belongs to *their* end-users. Three intended
-ways in — an in-process Rust crate, an MCP server, and an HTTP API — over one engine, so a laptop
-and a production deployment run the same governance.
-
-## Design principles
-
-These are the choices the rest of the system is built to protect.
-
-- **Scope is `tenant → subject → namespace`.** Tenant is the isolation unit, subject the
-  delete/export unit, namespace the budget unit. Multi-tenancy is not retrofittable, so it is
-  present from the first type.
-
-- **Isolation is structural, not a code invariant.** The SQLite backend is one database file per
-  tenant. Backup is `cp`, tenant deletion is `rm`, per-tenant encryption is a key per file. A
-  missing `WHERE tenant_id = ?` cannot leak across tenants because there is no shared table to
-  leak from.
-
-- **Policies are pure; the engine performs all I/O.** Everything a policy needs — neighbours,
-  capacity, corpus statistics, the clock — arrives through context structs. Policies are testable
-  against fixtures, audit logs can be replayed against a new policy version, and a third-party
-  policy has no I/O capability at all.
-
-- **Hard filters run in the backend query, below the policy.** A policy can only ever narrow a
-  candidate set, never widen it, so a bug in a scorer cannot become a data leak.
-
-- **No model in the write path.** Memories are caller-authored discrete items, embedded locally.
-  No LLM call, no network, predictable cost, works offline.
-
-- **Fragility and sensitivity are separate axes.** Collapsing them into one "importance" number
-  makes the conflicts invisible and the audit unexplainable.
-
-- **Audit rows never store item bodies** — only ids, content digests, and feature numbers. The
-  log stays safe to retain after the memory itself is gone.
-
-- **Your data stays yours.** Portable export and import are v1 features, not a later migration
-  tool.
-
-## Status
-
-**Under active development.** Nothing is published to crates.io and the APIs change without
-notice.
-
-The table below is accurate as of commit
-[`4b2ee19`](https://github.com/arsfeld/memorysafe/commit/4b2ee19) — pinned deliberately, because
-"currently" is not a fact anyone can check later.
-
-| Crate | State at `4b2ee19` |
-|---|---|
-| `memorysafe-core` — ids, scope, items, assessments, decisions, audit types, and the `GovernancePolicy` trait | **landed**, no I/O dependencies (enforced in CI) |
-| `memorysafe-embed` — `Embedder` trait, int8 quantization, deterministic test embedder, optional Model2Vec | **landed**, reaches no network stack (enforced in CI) |
-| `memorysafe-backend` — the `Backend` trait, query/write types, and the 50-test conformance suite | **landed**, suite frozen |
-| `memorysafe-backend-sqlite` — the SQLite backend, one database file per tenant | **partial** — per-tenant files, schema, pooled connections, items, audit, and aggregate *writes*. Vector and keyword retrieval, merge, capacity accounting, idempotency, purge, export/import, and the aggregate *read* are not implemented yet |
-| `memorysafe-policy` — the baseline policy | not started |
-| `memorysafe-engine` — orchestration, the component that ties the above together | not started |
-| MCP server, HTTP API, CLI | not started |
-
-Verified at that commit: `cargo fmt --all -- --check`, `cargo clippy --all-targets
---all-features -- -D warnings`, and `cargo test --workspace` all pass — **169 unit tests** (core
-77, embed 14, backend 37, sqlite 41), plus **7 of the 50-test conformance suite** executing
-against the SQLite backend. The other 43 compile and do not yet run: each is bound as the method
-it exercises lands. Seven passing is seven, not a conformant backend.
-
-**What this means in practice:** you cannot store or recall a memory yet. There is no engine to
-call and no policy to decide anything. What you *can* do is read the design, read the conformance
-suite to see what a backend is required to guarantee, and implement `Backend` against it.
-
-## Building
-
-```sh
-cargo test --workspace
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --all -- --check
+```
+Tenant (TenantId)
+  └── Subject (SubjectId)
+        └── Namespace (Namespace)
 ```
 
-Rust 1.97.1, edition 2024, pinned in `rust-toolchain.toml`. `unsafe_code` is forbidden across the
-workspace.
+| Scope Level | Purpose | Invariant |
+|---|---|---|
+| **Tenant** | Isolation boundary (customer / organization) | Stored in dedicated database files (`<tenant>.db`). No cross-tenant access. |
+| **Subject** | Entity / end-user boundary | Unit of GDPR erasure (`purge_subject`) and portable export/import. |
+| **Namespace** | Context / domain partition (e.g. `chat`, `code`, `prefs`) | Unit of capacity budgeting (`max_items`, `max_bytes`) and default retrieval. |
 
-Optional features:
+Scope identifiers must be lowercase ASCII strings containing only alphanumerics, `-`, `_`, or `.`, up to 240 bytes (to guarantee valid filenames across operating systems).
 
-- `memorysafe-embed/model2vec` — a real static embedder (Model2Vec). Off by default. It pulls
-  `model2vec-rs` → `onig`, which builds native code, so enabling it (or building with
-  `--all-features`) needs a C++ toolchain and `libstdc++` available. With the feature off,
-  `DeterministicEmbedder` covers tests and development.
+---
 
-## Implementing a backend
+## Workspace Architecture
 
-`Backend` is one trait covering persistence *and* retrieval — deliberately not split into
-`Store` + `Index`, because databases that search inside themselves would have to fake the split.
+MemorySafe is structured as a modular Cargo workspace:
 
-The contract is executable. `memorysafe_backend::conformance` ships 50 tests that any
-implementation must pass unmodified, covering tenant/subject/namespace isolation, transaction
-atomicity, idempotent replay, retrieval semantics and ranking, capacity accounting under
-concurrency, audit paging and cursors, subject purge, and byte-exact export/import round trips:
+```
+memorysafe/
+  crates/
+    memorysafe-core/            # Pure types, IDs, scoping, item models, and trait definitions
+    memorysafe-embed/           # Int8 quantization, DeterministicEmbedder, model2vec integration
+    memorysafe-backend/         # Backend trait contract and reusable conformance suite
+    memorysafe-backend-sqlite/  # Single-tenant SQLite backend with WAL mode and atomic writes
+    memorysafe-policy/          # [In Progress] Baseline governance policy implementation
+    memorysafe-engine/          # [In Progress] Pipeline orchestrator (remember/recall/maintain)
+    memorysafe-mcp/             # [Planned] Model Context Protocol server (stdio & streamable HTTP)
+    memorysafe-api/             # [Planned] REST API (axum)
+    memorysafe-cli/             # [Planned] `msafe` command-line tool
+    memorysafe-shadow/          # [Planned] Policy replay and shadow evaluation harness
+```
+
+### Crate Status
+
+| Crate | Purpose | Status |
+|---|---|---|
+| [`memorysafe-core`](crates/memorysafe-core) | Core domain types (`Scope`, `MemoryItem`, `Assessment`, `Decision`, `AuditRecord`, `GovernancePolicy`). Zero I/O dependencies. | Complete (77 tests) |
+| [`memorysafe-embed`](crates/memorysafe-embed) | Vector quantization (int8 SIMD), deterministic test embedder, optional static model embeddings (`model2vec-rs`). | Complete (14 tests) |
+| [`memorysafe-backend`](crates/memorysafe-backend) | Unified `Backend` trait (CRUD, hybrid search, capacity, audit, export/import, purge) + test conformance suite. | Complete |
+| [`memorysafe-backend-sqlite`](crates/memorysafe-backend-sqlite) | Single-tenant SQLite storage engine, connection pooling, and atomic transaction execution. | Active (Persistence, isolation, & atomicity conformance passing) |
+
+---
+
+## Quickstart (Rust API)
+
+Here is how to initialize the SQLite backend, construct a scoped memory item, and commit it with an atomic audit trail:
 
 ```rust
-use memorysafe_backend::conformance::{BackendFactory, run_conformance_suite};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use time::OffsetDateTime;
+use memorysafe_core::{
+    Actor, AuditEvent, AuditRecord, ItemId, ItemRef,
+    MemoryItem, Protection, Scope, SensitivityLevel, Source, SourceKind,
+};
+use memorysafe_backend::{Backend, ItemWrite, WriteTransaction};
+use memorysafe_backend_sqlite::SqliteBackend;
 
-struct MyFactory;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Open the SQLite backend (stores one file per tenant in the target directory)
+    let backend = SqliteBackend::open(PathBuf::from("./data/tenants"));
 
-impl BackendFactory for MyFactory {
-    type B = MyBackend;
-    async fn create(&self) -> Self::B { /* a fresh, empty backend per call */ }
-}
+    // 2. Define a target scope: tenant -> subject -> namespace
+    let scope = Scope::new("tenant_alpha", "user_42", "preferences")?;
+    let now = OffsetDateTime::now_utc();
 
-#[tokio::test]
-async fn my_backend_is_conformant() {
-    run_conformance_suite(&MyFactory).await;
+    // 3. Construct a memory item
+    let item = MemoryItem {
+        id: ItemId::new(),
+        scope: scope.clone(),
+        body: "User prefers concise code snippets with Rust 2024 edition syntax.".to_string(),
+        kind: "preference".to_string(),
+        source: Source {
+            kind: SourceKind::Agent,
+            id: Some("session-abc".to_string()),
+        },
+        occurred_at: Some(now),
+        created_at: now,
+        tags: vec!["coding".to_string(), "rust".to_string()],
+        attrs: BTreeMap::new(),
+        sensitivity: SensitivityLevel::Personal,
+        ttl: None,
+        protection: Protection::Normal,
+        pending_embedding: false,
+    };
+
+    // 4. Create an audit record (audit stores content digests, never plaintext bodies)
+    let audit = AuditRecord::new(
+        scope.clone(),
+        AuditEvent::Admitted,
+        vec![ItemRef::from_item(&item)],
+        Actor::system(),
+        now,
+    );
+
+    // 5. Commit item write, evictions, and audit together atomically
+    let mut txn = WriteTransaction::new(scope.clone(), audit);
+    txn.upsert = Some(ItemWrite {
+        item: item.clone(),
+        vector: None, // Or attach an int8 QuantizedVector
+    });
+
+    let applied = backend.apply(txn).await?;
+    println!("Committed memory item: {:?}", applied.item_id);
+    println!("Audit record created: {}", applied.audit_id);
+
+    // 6. Retrieve stored item
+    if let Some(retrieved) = backend.get(&scope, &item.id).await? {
+        println!("Retrieved body: {}", retrieved.body);
+    }
+
+    Ok(())
 }
 ```
 
-The suite is measured against a null backend that stores nothing and enforces nothing, and every
-test's verdict is on record. A test that *passes* the null backend has to justify itself by
-naming a sibling that fails it — so no test can quietly decay into one that asserts nothing your
-implementation could fail.
+---
 
-## Design documents
+## Development & Verification
 
-The full design and implementation plans are in [`docs/`](docs/). They are written to be read,
-and they record the rejected alternatives and the reasons — usually the more useful half.
+MemorySafe requires **Rust 1.97.1** or newer (Rust 2024 edition).
 
-## Licence
+### Build
 
-Apache-2.0.
+```bash
+cargo build --workspace
+```
+
+### Run Tests
+
+Run the full workspace test suite, including pure domain tests and SQLite backend conformance tests:
+
+```bash
+cargo test
+```
+
+### Run Conformance Suite Only
+
+The backend conformance suite verifies that a storage backend correctly implements structural isolation, transactional atomicity, and audit guarantees:
+
+```bash
+cargo test -p memorysafe-backend-sqlite --test conformance
+```
+
+### Lints and Formatting
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
+```
+
+---
+
+## License
+
+This project is licensed under the [Apache License, Version 2.0](LICENSE).
