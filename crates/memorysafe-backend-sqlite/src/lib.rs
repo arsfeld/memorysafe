@@ -739,6 +739,48 @@ mod tests {
         );
     }
 
+    /// Fix-round finding I3: `neighbours` builds its own `HardFilters` — with
+    /// `sensitivity_ceiling` deliberately overridden to `Restricted` — rather
+    /// than reusing `HardFilters::default()` (fail-closed at `Internal`),
+    /// because `neighbours` carries no policy filters of its own and is used
+    /// for merge-target search, not a policy-gated recall. That choice was
+    /// argued in the task report but pinned by nothing: swapping the
+    /// `Restricted` override for `HardFilters::default()` survives the whole
+    /// workspace suite, because no other test here seeds an item above
+    /// `Internal` through `neighbours`.
+    ///
+    /// This seeds one item at `SensitivityLevel::Restricted` — the top of the
+    /// scale, and the level `HardFilters::default()`'s ceiling would exclude
+    /// — and asserts `neighbours` still returns it.
+    #[tokio::test]
+    async fn neighbours_does_not_apply_a_policy_sensitivity_ceiling() {
+        use memorysafe_embed::Embedder;
+
+        let b = backend();
+        let s = scope("s", "n");
+        let item = fx::item_with(
+            &s,
+            "a restricted memory the merge search must still see",
+            "fact",
+            &[],
+            memorysafe_core::SensitivityLevel::Restricted,
+        );
+        b.apply(fx::admit_txn_embedded(&s, item.clone()))
+            .await
+            .unwrap();
+
+        let probe = fx::embedder().embed(&item.body).unwrap();
+        let hits = b.neighbours(&s, &probe, 10).await.unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "neighbours must not apply a sensitivity ceiling of its own; a \
+             HardFilters::default() (fail-closed at Internal) would exclude \
+             this Restricted item"
+        );
+        assert_eq!(hits[0].item.id, item.id);
+    }
+
     /// `apply` is one transaction: a failure part-way through leaves no trace
     /// of any of it — not the eviction it had already performed, not the audit
     /// row, and not the aggregate increment.

@@ -387,6 +387,215 @@ mod tests {
         assert_eq!(hits[0].item.id, real.id);
     }
 
+    /// Fix-round finding: `ScoredCandidate::estimated_tokens` must come from
+    /// `item.body`, not another field of the same item — swapping in
+    /// `item.kind` (a short, near-constant string) survived the full
+    /// workspace suite before this test existed, since nothing compared the
+    /// reported estimate against the body's own length. The body and kind
+    /// here are picked with drastically different lengths so no coincidental
+    /// value collision could hide the swap.
+    #[test]
+    fn candidates_reports_estimated_tokens_from_the_body_not_another_field() {
+        let c = conn();
+        let scope = Scope::new("t", "s", "n").unwrap();
+
+        let long_body = "word ".repeat(100);
+        let mut item = fx::item(&scope, long_body.trim());
+        item.kind = "a".into();
+        embed_item(&c, &scope, &item);
+
+        let query = CandidateQuery {
+            embedding: Some(embedder().embed(&item.body).unwrap()),
+            text: None,
+            filters: HardFilters::default(),
+            limit: 1,
+        };
+        let hits = candidates(&c, &scope, &query).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].estimated_tokens,
+            estimate_tokens(&item.body),
+            "estimated_tokens did not match the item's own body"
+        );
+        assert!(
+            hits[0].estimated_tokens > 50,
+            "a ~500-byte body must not report a tiny token estimate (the \
+             1-byte kind would): got {}",
+            hits[0].estimated_tokens
+        );
+    }
+
+    /// Fix-round: the `(Some(v), None)` and `(None, Some(k))` arms of the
+    /// relevance `match` — a text-only or vector-only query — were unpinned:
+    /// nothing asserted `relevance` actually equals the sole available score
+    /// rather than, say, always `0.0` or a weighted value that silently
+    /// assumes the missing side is `0.0` instead of absent. Both ordinary
+    /// query shapes, both checked.
+    #[test]
+    fn relevance_equals_the_sole_score_on_a_single_signal_query() {
+        let c = conn();
+        let scope = Scope::new("t", "s", "n").unwrap();
+
+        let kw_item = fx::item(&scope, "a text-only match about narwhals");
+        crate::items::insert(&c, &kw_item).unwrap();
+        let kw_query = CandidateQuery {
+            embedding: None,
+            text: Some("narwhals".to_string()),
+            filters: HardFilters::default(),
+            limit: 10,
+        };
+        let kw_hits = candidates(&c, &scope, &kw_query).unwrap();
+        assert_eq!(kw_hits.len(), 1);
+        assert!(
+            kw_hits[0].vector_score.is_none(),
+            "a text-only query must not carry a vector score"
+        );
+        let k = kw_hits[0].keyword_score.expect("keyword score missing");
+        assert_eq!(
+            kw_hits[0].relevance, k,
+            "relevance on a text-only query must equal the sole keyword \
+             score exactly"
+        );
+
+        let vec_item = fx::item(&scope, "a vector-only match about narwhals");
+        embed_item(&c, &scope, &vec_item);
+        let vec_query = CandidateQuery {
+            embedding: Some(embedder().embed(&vec_item.body).unwrap()),
+            text: None,
+            filters: HardFilters::default(),
+            limit: 10,
+        };
+        let vec_hits = candidates(&c, &scope, &vec_query).unwrap();
+        assert_eq!(vec_hits.len(), 1);
+        assert!(
+            vec_hits[0].keyword_score.is_none(),
+            "a vector-only query must not carry a keyword score"
+        );
+        let v = vec_hits[0].vector_score.expect("vector score missing");
+        assert_eq!(
+            vec_hits[0].relevance, v,
+            "relevance on a vector-only query must equal the sole vector \
+             score exactly"
+        );
+    }
+
+    /// Fix-round finding I2: `keyword::search`'s `AccessStats` are dead in
+    /// every test that reaches `candidates` through the conformance suite,
+    /// because every one of those queries carries both an embedding and
+    /// text, so the vector arm always populates `merged`'s entry first and
+    /// the keyword arm's own `access` is discarded by `or_insert` finding the
+    /// entry already there. Confirmed by mutation: zeroing the keyword arm's
+    /// `access` before `or_insert` survives the full workspace suite. The
+    /// path is real — a text-only query (no `embedding`), or an embedder
+    /// mismatch, skips the vector arm entirely and the keyword arm is the
+    /// only source of access statistics.
+    ///
+    /// This test uses a **text-only** `CandidateQuery` (`embedding: None`) so
+    /// the vector arm never runs at all, and manually stamps `items.last_access`
+    /// / `items.access_count` (the same columns `record_recall` writes,
+    /// updated directly here since this is a raw-connection crate-local test)
+    /// before calling `candidates`, so the expected values are known and
+    /// distinct from the zero/`None` a dropped `access` would produce.
+    #[test]
+    fn candidates_reports_access_statistics_on_a_text_only_query() {
+        let c = conn();
+        let scope = Scope::new("t", "s", "n").unwrap();
+
+        let item = fx::item(&scope, "a text-only recall target about cats");
+        crate::items::insert(&c, &item).unwrap();
+        c.execute(
+            "UPDATE items SET access_count = 7, last_access = 555 WHERE id = ?1",
+            rusqlite::params![item.id.as_str()],
+        )
+        .unwrap();
+
+        let query = CandidateQuery {
+            embedding: None,
+            text: Some("cats".to_string()),
+            filters: HardFilters::default(),
+            limit: 10,
+        };
+        let hits = candidates(&c, &scope, &query).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].access_count, 7,
+            "the keyword arm's own access_count was not carried into the \
+             fused candidate"
+        );
+        assert_eq!(
+            hits[0].last_accessed_at,
+            Some(OffsetDateTime::from_unix_timestamp(555).unwrap()),
+            "the keyword arm's own last_accessed_at was not carried into the \
+             fused candidate"
+        );
+    }
+
+    /// Fix-round finding I1: `passes` (the Rust-side second check) sits
+    /// between `filter_sql` (the enforcement point) and every test that
+    /// reaches `candidates`, so a *widening* bug in `filter_sql`'s sensitivity
+    /// predicate — `i.sensitivity <= ?N` mutated to `<= ?N + 1`, admitting one
+    /// level above the ceiling — is caught by `passes` before any assertion
+    /// on `candidates`'s output can see it. Confirmed by mutation: with that
+    /// widening applied and `passes` intact, the full workspace suite stayed
+    /// green; only widening it *and* neutering `passes` together made
+    /// `sensitivity_ceiling_is_enforced_in_the_query` fail. `passes` is the
+    /// right design (defence-in-depth), but its presence means no test that
+    /// goes through `candidates` can tell "the SQL predicate is correct" from
+    /// "the SQL predicate is wrong but `passes` is covering for it".
+    ///
+    /// This test calls `keyword::search` and `vectors::search` **directly**,
+    /// below `passes`, so it observes `filter_sql`'s own output with nothing
+    /// in front of it. It checks the boundary specifically, both directions:
+    /// an item exactly *at* the ceiling must come back (rules out `<`, which
+    /// would incorrectly exclude it) and an item exactly *one level above*
+    /// must not (rules out `<= +1`, which would incorrectly admit it, and
+    /// rules out the predicate being dropped entirely).
+    #[test]
+    fn filter_sql_sensitivity_boundary_is_exact_on_both_arms() {
+        let c = conn();
+        let scope = Scope::new("t", "s", "n").unwrap();
+
+        let query_text = "boundary probe about cats";
+        let at_ceiling = fx::item_with(&scope, query_text, "fact", &[], SensitivityLevel::Personal);
+        let above_ceiling =
+            fx::item_with(&scope, query_text, "fact", &[], SensitivityLevel::Sensitive);
+        embed_item(&c, &scope, &at_ceiling);
+        embed_item(&c, &scope, &above_ceiling);
+
+        let filters = HardFilters {
+            sensitivity_ceiling: SensitivityLevel::Personal,
+            ..HardFilters::default()
+        };
+
+        let kw_hits = keyword::search(&c, &scope, query_text, &filters, 10).unwrap();
+        let kw_ids: Vec<_> = kw_hits.iter().map(|h| h.0.id.clone()).collect();
+        assert!(
+            kw_ids.contains(&at_ceiling.id),
+            "keyword::search excluded an item exactly at the ceiling — the \
+             predicate narrowed to `<` instead of `<=`"
+        );
+        assert!(
+            !kw_ids.contains(&above_ceiling.id),
+            "keyword::search admitted an item one level above the ceiling — \
+             the predicate widened past `<=`, or was dropped"
+        );
+
+        let probe = embedder().embed(query_text).unwrap();
+        let probe = QuantizedVector::from_embedding(&probe);
+        let vec_hits = vectors::search(&c, &scope, &probe, &filters, 10).unwrap();
+        let vec_ids: Vec<_> = vec_hits.iter().map(|h| h.0.id.clone()).collect();
+        assert!(
+            vec_ids.contains(&at_ceiling.id),
+            "vectors::search excluded an item exactly at the ceiling — the \
+             predicate narrowed to `<` instead of `<=`"
+        );
+        assert!(
+            !vec_ids.contains(&above_ceiling.id),
+            "vectors::search admitted an item one level above the ceiling — \
+             the predicate widened past `<=`, or was dropped"
+        );
+    }
+
     /// Mutant #10 in the task-22 dispatch notes: swapping which fusion slot a
     /// vector score and a keyword score land in. `hybrid_returns_both_signal_sources`
     /// (conformance) only checks both are `Some`, which a swap leaves true, so

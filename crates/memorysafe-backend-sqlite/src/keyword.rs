@@ -6,7 +6,16 @@
 //! `"`, `*`, `NEAR`, `AND`, `OR` and parentheses as operators, so raw text is
 //! both a query-injection risk (a crafted query can turn into `MATCH
 //! everything`) and a crash risk (an unbalanced `(` is a syntax error FTS5
-//! rejects outright).
+//! rejects outright) — both neutralised by quoting every term.
+//!
+//! A NUL byte is a separate hazard from FTS5's operators and is handled
+//! separately: SQLite reads the `MATCH` expression as a C string, so a NUL
+//! anywhere in it — including inside a fully-quoted, otherwise well-formed
+//! term — truncates the expression mid-string and FTS5 reports `unterminated
+//! string`. Quoting does not neutralise this the way it does `"`/`*`/`NEAR`/
+//! parentheses, so NUL bytes are stripped before quoting rather than quoted.
+//! This is availability, not injection: verified across every placement in a
+//! term, it always errors and never widens a match.
 
 use crate::items::{ITEM_COLUMNS, row_to_item};
 use crate::retrieve::filter_sql;
@@ -24,10 +33,16 @@ use rusqlite::Connection;
 /// OR-ed so a multi-word query behaves like "any of these", which is what
 /// hybrid retrieval wants — precision comes from the vector side.
 ///
-/// Returns `None` for empty or whitespace-only input, so a caller can skip
-/// the query entirely rather than asking FTS5 to match an empty expression.
+/// Returns `None` for empty, whitespace-only, or NUL-only input, so a caller
+/// can skip the query entirely rather than asking FTS5 to match an empty
+/// expression.
 pub fn escape_fts_query(raw: &str) -> Option<String> {
-    let terms: Vec<String> = raw
+    // Stripped before quoting, not quoted: see the module doc — a NUL inside
+    // a quoted term still truncates SQLite's C-string reading of the MATCH
+    // expression, so quoting alone does not neutralise it the way it does
+    // FTS5's own operator characters.
+    let cleaned: String = raw.chars().filter(|c| *c != '\0').collect();
+    let terms: Vec<String> = cleaned
         .split_whitespace()
         .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect();
@@ -149,6 +164,23 @@ mod tests {
         assert_eq!(escape_fts_query("\""), Some("\"\"\"\"".to_string()));
     }
 
+    /// Fix-round finding M1: `escape_fts_query`'s doc claims the "crash risk"
+    /// FTS5 operators pose is neutralised, but a NUL byte was not — SQLite
+    /// reads the MATCH expression as a C string, so a NUL inside an otherwise
+    /// well-formed, fully-quoted expression truncates it mid-string and FTS5
+    /// reports `unterminated string`. Stripped here so the claim in the doc
+    /// comment is actually true rather than aspirational.
+    #[test]
+    fn nul_bytes_are_stripped_rather_than_left_to_truncate_the_c_string() {
+        let out = escape_fts_query("say\0hi").expect("non-empty after stripping");
+        assert!(
+            !out.contains('\0'),
+            "a NUL byte survived into the FTS5 expression: {out:?}"
+        );
+        // And a NUL-only input is empty after stripping, same as whitespace.
+        assert_eq!(escape_fts_query("\0\0\0"), None);
+    }
+
     /// `search`'s row-to-score association must not scramble under multiple
     /// matches of differing strength — mutant #13 in the task-22 dispatch
     /// notes ("`keyword::search` returns the right rows with another row's
@@ -194,6 +226,27 @@ mod tests {
             hits[0].2,
             hits[1].2
         );
+    }
+
+    /// M1's other half: the stripped expression must actually reach SQLite
+    /// without erroring, not just look clean in isolation from
+    /// `escape_fts_query`. Confirmed against a real `items_fts` table:
+    /// unfixed, this call returns `Err(Storage { message: "unterminated
+    /// string", .. })`.
+    #[test]
+    fn search_does_not_error_on_a_query_containing_a_nul_byte() {
+        let c = conn();
+        let scope = memorysafe_core::Scope::new("t", "s", "n").unwrap();
+        let item = memorysafe_backend::conformance::fx::item(&scope, "alpha memory");
+        crate::items::insert(&c, &item).unwrap();
+
+        let result = search(&c, &scope, "alpha\0memory", &HardFilters::default(), 10);
+        if let Err(e) = result {
+            panic!(
+                "a NUL byte in the query text errored rather than being \
+                 treated as inert text: {e}"
+            );
+        }
     }
 
     fn conn() -> Connection {
