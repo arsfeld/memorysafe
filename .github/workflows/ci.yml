@@ -19,10 +19,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
+      # `memorysafe-policy` is named here and NOT in the loop on purpose: it does
+      # not exist yet, and the plan schedules its addition for the task that
+      # creates it. Adding it early does not fail — it reports a green pass for a
+      # nonexistent crate, because the pipe below discards `cargo tree`'s exit
+      # status. Hence the capture.
       - name: memorysafe-core and memorysafe-policy must have no I/O dependencies
         run: |
-          for c in memorysafe-core memorysafe-policy; do
-            cargo tree -p "$c" --edges normal --prefix none \
+          for c in memorysafe-core; do
+            # Capture first. Piping `cargo tree` straight into `grep` throws its
+            # exit status away: the pipeline takes grep's, and grep's "no match"
+            # 1 short-circuits the `&& exit 1` so the echo runs. `set -o pipefail`
+            # does not help — it returns the RIGHTMOST non-zero status, which is
+            # grep's 1, indistinguishable from a genuine no-match. So any tool
+            # failure, not only a missing package, would report a pass it never
+            # performed.
+            out=$(cargo tree -p "$c" --edges normal --prefix none) \
+              || { echo "cargo tree failed for $c"; exit 1; }
+            printf '%s\n' "$out" \
               | grep -Ei '^(tokio|rusqlite|sqlx|reqwest|hyper|hf-hub|ureq) ' && exit 1
             echo "$c is I/O free"
           done
@@ -37,6 +51,8 @@ jobs:
       # redundant with the test; the test is the one that is conditional.
       - name: memorysafe-embed must reach no network stack, with every feature on
         run: |
-          cargo tree -p memorysafe-embed --all-features --edges normal --prefix none \
+          out=$(cargo tree -p memorysafe-embed --all-features --edges normal --prefix none) \
+            || { echo "cargo tree failed for memorysafe-embed"; exit 1; }
+          printf '%s\n' "$out" \
             | grep -Ei '^(reqwest|hyper|hf-hub|ureq|native-tls|rustls) ' && exit 1
           echo "embed reaches no network stack under --all-features"

@@ -9768,10 +9768,31 @@ pure" becomes enforceable:
       - name: memorysafe-core and memorysafe-policy must have no I/O dependencies
         run: |
           for crate in memorysafe-core memorysafe-policy; do
-            cargo tree -p "$crate" --edges normal --prefix none \
-              | grep -Ei '^(tokio|rusqlite|sqlx|reqwest|hyper) ' && exit 1
+            # Capture before grepping. Piping `cargo tree` straight into `grep`
+            # discards its exit status — the pipeline takes grep's, and grep's
+            # "no match" 1 short-circuits the `&& exit 1`, so the echo runs and
+            # the step reports a pass it never performed. Measured: adding a
+            # crate that does not exist prints `error: package ID specification
+            # … did not match any packages` on stderr AND `is I/O free` on
+            # stdout, exit 0. `set -o pipefail` does not fix it: it returns the
+            # RIGHTMOST non-zero status, which is grep's 1, indistinguishable
+            # from a genuine no-match. This applies to any tool failure, not
+            # only a missing package.
+            out=$(cargo tree -p "$crate" --edges normal --prefix none) \
+              || { echo "cargo tree failed for $crate"; exit 1; }
+            printf '%s\n' "$out" \
+              | grep -Ei '^(tokio|rusqlite|sqlx|reqwest|hyper|hf-hub|ureq) ' && exit 1
             echo "$crate is I/O free"
           done
+```
+
+**`hf-hub` and `ureq` are in the pattern because they are the crates the network
+constraint is actually about**, and the original list named `tokio`, `rusqlite`, `sqlx`,
+`reqwest` and `hyper` without them. A sibling step already asserts `memorysafe-embed`
+reaches no network stack under `--all-features`, which is the structural half of "no
+network call in the write path"; this step is the policy-purity half.
+
+```yaml
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
