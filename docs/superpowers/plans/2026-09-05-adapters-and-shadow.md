@@ -936,7 +936,7 @@ git commit -m "feat(auth): tenant-scoped API keys and a reserved admin scope"
   `Engine::purge_subject`.
 
 **`Engine::purge_subject` gains an `Actor` here, and this is the task that closes
-that gap.** Plan 1 Task 34 builds the `SubjectPurged` record in the engine — the
+that gap.** Plan 1 Task 35 builds the `SubjectPurged` record in the engine — the
 backend inserts what it is handed and mints nothing — but writes
 `Actor { kind: ActorKind::Human, id: None }`, an anonymous human carrying no more
 identity than `Actor::system()`. Plan 1 recorded the deferral pointing here, so the
@@ -1409,7 +1409,7 @@ impl Engine {
         actor: &Actor,
     ) -> Result<ImportReport, EngineError> {
         // `Engine::import_ndjson` takes the destination tenant explicitly (Plan
-        // 1 Task 38); this wrapper already has the authorised one in hand, so
+        // 1 Task 39); this wrapper already has the authorised one in hand, so
         // it passes it rather than letting the payload name its own target.
         let report = self.import_ndjson(ndjson, tenant).await?;
         self.record_admin_event(
