@@ -9,6 +9,8 @@ pub mod capacity;
 pub mod fixtures;
 pub mod isolation;
 pub mod lifecycle;
+#[cfg(test)]
+mod null;
 pub mod retrieval;
 
 pub use fixtures as fx;
