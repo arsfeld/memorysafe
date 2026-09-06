@@ -8,9 +8,20 @@ use memorysafe_core::{
 use std::collections::BTreeSet;
 use time::{Duration, OffsetDateTime};
 
-/// Exercises every axis `AuditFilter` can narrow on: `events`, the
+/// Exercises four of the eight axes `AuditFilter` can narrow on: `events`, the
 /// `since`/`until` time window, and `limit` — including the newest-first
-/// ordering `limit` depends on.
+/// ordering `limit` depends on. `after` has its own test
+/// (`audit_pages_by_the_after_cursor_without_repeating_a_row`).
+///
+/// **`item`, `subject` and `namespace` are narrowed on by nothing in this
+/// suite**, and this sentence said "every axis" until that was checked against
+/// the struct. `subject` is the consequential one: `AuditFilter::subject`'s own
+/// doc calls "produce every audit row for subject X" THE compliance query and
+/// says it is inexpressible without the field — yet `Backend::audit`'s doc,
+/// which is what binds implementers, says nothing about any of the three, and
+/// no test here would catch a backend that ignores them. Closing it needs a
+/// contract sentence on the trait (they narrow *within* the scope and may never
+/// widen past it) before a test can assert anything.
 ///
 /// An earlier draft of this test had defects, fixed here:
 ///
