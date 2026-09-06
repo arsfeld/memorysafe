@@ -19,14 +19,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
-      # `memorysafe-policy` is named here and NOT in the loop on purpose: it does
-      # not exist yet, and the plan schedules its addition for the task that
-      # creates it. Adding it early does not fail — it reports a green pass for a
-      # nonexistent crate, because the pipe below discards `cargo tree`'s exit
-      # status. Hence the capture.
+      # `memorysafe-policy` IS in the loop now: the crate exists (Task 25), so
+      # naming it checks something. It was previously named here and held out
+      # deliberately, because a nonexistent crate reports a GREEN PASS rather
+      # than an error — see the capture below, which is what makes that
+      # impossible.
       - name: memorysafe-core and memorysafe-policy must have no I/O dependencies
         run: |
-          for c in memorysafe-core; do
+          for c in memorysafe-core memorysafe-policy; do
             # Capture first. Piping `cargo tree` straight into `grep` throws its
             # exit status away: the pipeline takes grep's, and grep's "no match"
             # 1 short-circuits the `&& exit 1` so the echo runs. `set -o pipefail`

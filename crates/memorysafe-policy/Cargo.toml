@@ -1,0 +1,15 @@
+[package]
+name = "memorysafe-policy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memorysafe-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true
