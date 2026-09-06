@@ -11,12 +11,23 @@ use memorysafe_core::{ScopeStats, Score, ScoredCandidate};
 /// unremarkable in a diffuse one. This is the "rare class" notion from the
 /// continual-learning lineage, expressed in embedding space.
 ///
-/// A neighbourhood exactly as dense as `stats.mean_neighbour_similarity`
-/// scores exactly `0.5`; sparser-than-typical scores above `0.5` and
-/// denser-than-typical scores below it. Downstream policy code reads that
-/// midpoint directly (a fixed `0.5`/`0.8` threshold means "at least as sparse
-/// as typical" / "much sparser than typical"), so it is this function's
-/// contract, not an implementation detail.
+/// `0.5` means corpus-typical density: a neighbourhood exactly as dense as
+/// `stats.mean_neighbour_similarity` scores exactly `0.5`. Each side of that
+/// midpoint is normalised by its OWN room, not by a shared denominator —
+/// sparser-than-typical by the room below the baseline (`baseline` itself),
+/// denser-than-typical by the room above it (`1.0 - baseline`). That keeps
+/// both `0.0` and `1.0` reachable at every baseline: normalising both sides
+/// by the same (upward) room would shrink the reachable ceiling as the
+/// baseline moves down — an item with literally no similar neighbours could
+/// then never reach maximum fragility in a diffuse corpus — so a fixed
+/// downstream threshold like "`>= 0.8` = much sparser than typical" would
+/// mean different things, or be unreachable outright, in different corpora.
+/// Do not fold the two branches back into one symmetric-looking expression;
+/// that shared-denominator shape was the actual defect this one fixes.
+///
+/// Downstream policy code reads the `0.5` midpoint and higher thresholds
+/// directly, so this mapping is this function's contract, not an
+/// implementation detail.
 ///
 /// **Precondition:** `stats.mean_neighbour_similarity` must already be a
 /// meaningful corpus-level baseline in the sense of `ScopeStats`'s own doc
@@ -35,13 +46,34 @@ pub fn score(neighbours: &[ScoredCandidate], stats: &ScopeStats) -> Score {
     let mut sims: Vec<f32> = neighbours.iter().map(|n| n.relevance).collect();
     sims.sort_by(|a, b| b.total_cmp(a));
     let k = sims.len().min(3);
-    let local_density: f32 = sims[..k].iter().sum::<f32>() / k as f32;
+    // Cosine can be negative; clamping alongside `baseline` below is what
+    // makes each branch's division safe BY CONSTRUCTION rather than by an
+    // epsilon floor (see the branch comments). This discards no real signal:
+    // neighbours anti-correlated with the item are exactly the "as sparse as
+    // it gets" case, which should map to `local_density = 0.0` regardless of
+    // how negative the raw cosine got.
+    let local_density: f32 = (sims[..k].iter().sum::<f32>() / k as f32).clamp(0.0, 1.0);
 
     let baseline = stats.mean_neighbour_similarity.clamp(0.0, 1.0);
-    // How much sparser than typical this neighbourhood is, normalised by the
-    // headroom above the corpus mean.
-    let headroom = (1.0 - baseline).max(1e-3);
-    let relative_sparsity = ((baseline - local_density) / headroom + 1.0) / 2.0;
+
+    // Each side of the `0.5` (corpus-typical) midpoint is normalised by its
+    // OWN room — see the doc comment above for why.
+    let relative_sparsity = if local_density < baseline {
+        // Sparser than typical, normalised by the room below the baseline.
+        // Reachable only when `baseline > 0` (`local_density >= 0` and
+        // `local_density < baseline`), so this division is never by zero.
+        0.5 + 0.5 * (baseline - local_density) / baseline
+    } else if local_density > baseline {
+        // Denser than typical, normalised by the room above it. Reachable
+        // only when `baseline < 1` (`local_density <= 1` and
+        // `local_density > baseline`), so this division is never by zero.
+        0.5 - 0.5 * (local_density - baseline) / (1.0 - baseline)
+    } else {
+        // Exactly typical. Kept as its own case rather than falling into
+        // either branch above: `local_density == baseline` at the extremes
+        // (both `0.0` or both `1.0`) would otherwise divide by zero there.
+        0.5
+    };
 
     Score::clamped(relative_sparsity)
 }
@@ -123,6 +155,65 @@ mod tests {
         let denser = [candidate("a", 0.8)];
         assert!(score(&sparser, &stats(baseline)).get() > 0.5);
         assert!(score(&denser, &stats(baseline)).get() < 0.5);
+    }
+
+    #[test]
+    fn an_isolated_item_reaches_maximum_fragility_even_in_a_diffuse_corpus() {
+        // Regression guard: a shared-denominator rescale (normalising the
+        // sparser-than-typical side by the *upward* room, `1.0 - baseline`,
+        // instead of its own downward room) caps the reachable ceiling below
+        // 1.0 at any baseline under 0.5 — an item with literally no similar
+        // neighbours could never be judged maximally fragile in a diffuse
+        // corpus, no matter how isolated it actually is. At baseline 0.2 that
+        // broken shape returns 0.625; the correct shape must still reach the
+        // true ceiling.
+        let baseline = 0.2;
+        let no_similar_neighbours = [candidate("a", 0.0)];
+        assert_eq!(score(&no_similar_neighbours, &stats(baseline)).get(), 1.0);
+    }
+
+    #[test]
+    fn the_sparser_branch_is_linear_between_the_baseline_and_zero() {
+        // A point exactly halfway between corpus-typical (0.5) and total
+        // dissimilarity (1.0, at `local_density = 0`) must itself land
+        // exactly halfway, at 0.75. The ordering test above only proves
+        // sparser-than-typical scores *somewhere* above 0.5; this pins the
+        // branch's actual coefficient at an interior point, where an
+        // over-scaled or mis-signed term is not masked by the final clamp.
+        let baseline = 0.5;
+        let midpoint = [candidate("a", baseline / 2.0)];
+        assert_eq!(score(&midpoint, &stats(baseline)).get(), 0.75);
+    }
+
+    #[test]
+    fn the_denser_branch_is_linear_between_the_baseline_and_one() {
+        // The mirror image: halfway between corpus-typical (0.5) and a
+        // perfect match (0.0, at `local_density = 1.0`) must land exactly
+        // halfway, at 0.25.
+        let baseline = 0.5;
+        let midpoint = [candidate("a", (baseline + 1.0) / 2.0)];
+        assert_eq!(score(&midpoint, &stats(baseline)).get(), 0.25);
+    }
+
+    #[test]
+    fn typical_density_at_the_lower_extreme_scores_one_half_without_dividing_by_zero() {
+        // `baseline == local_density == 0.0` is exactly the corner case the
+        // third (`else`) branch exists for: folding this equality into
+        // either neighbouring branch (`<=` instead of `<`, say) would divide
+        // 0.0 by 0.0 there instead of taking this arm.
+        let baseline = 0.0;
+        let at_baseline = [candidate("a", 0.0)];
+        assert_eq!(score(&at_baseline, &stats(baseline)).get(), 0.5);
+    }
+
+    #[test]
+    fn typical_density_at_the_upper_extreme_scores_one_half_without_dividing_by_zero() {
+        // The mirror image at the other extreme: `baseline == local_density
+        // == 1.0` must not fall into the denser branch, which would divide
+        // 0.0 by 0.0 there.
+        let baseline = 1.0;
+        let at_baseline = [candidate("a", 1.0)];
+        assert_eq!(score(&at_baseline, &stats(baseline)).get(), 0.5);
     }
 
     #[test]
