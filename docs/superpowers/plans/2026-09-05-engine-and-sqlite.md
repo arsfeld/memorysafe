@@ -8539,6 +8539,34 @@ pub fn stats(conn: &Connection, scope: &Scope) -> Result<ScopeStats, BackendErro
 }
 ```
 
+**First, delete the interim merge refusal from `Backend::apply`.** It is not in this
+plan's text because it was added during the items-and-audit task's review, and it is the
+first thing this task must remove:
+
+```rust
+// DELETE THIS — the whole block, and the comment above it.
+if txn.merge.is_some() {
+    return Err(BackendError::Storage {
+        message: "merge is not implemented in this build; refusing rather than \
+                  applying the rest of the transaction and reporting success"
+            .into(),
+        retryable: false,
+    });
+}
+```
+
+It exists because `WriteTransaction::is_valid` accepts a merge-only transaction, so without
+it `apply` performed the evictions, wrote the audit row, incremented the aggregate,
+committed, and returned `Ok` for a merge that never happened. Two crate-local tests pin it
+— `a_merge_is_refused_whole_rather_than_applied_in_part` and
+`a_refused_merge_never_opens_the_tenant_database` — and **both must be deleted with it**,
+since they assert an interim behaviour this task replaces.
+
+Leaving the guard in place fails `atomicity::a_failed_transaction_leaves_no_trace` in a way
+that reads as a merge bug: the test asserts `BackendError::MergeTargetMissing` and the guard
+returns `BackendError::Storage`, so the diagnosis points at `items::merge` rather than at a
+refusal that never let it run.
+
 Add `items::merge` to `items.rs`:
 
 ```rust
