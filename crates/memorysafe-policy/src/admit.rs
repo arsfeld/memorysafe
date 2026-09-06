@@ -64,6 +64,32 @@ pub fn decide(
     }
 
     // Retain. Decide protection first, then make room.
+    //
+    // The gate below keys on fragility ALONE — value plays no part, unlike
+    // `eviction::cost`, which weights fragility BY value. That is a
+    // deliberate asymmetry, not an inconsistency to resolve by making this
+    // gate value-aware too.
+    //
+    // Protection is a time-boxed hedge against value misestimation, not a
+    // verdict on the item's worth. The value estimate `a.value` carries here
+    // is the least trustworthy it will ever be: it was just computed from
+    // ingest-time signal alone, before the item has had any chance to prove
+    // itself through reuse. Gating protection on that number would let a
+    // single bad early estimate permanently mis-sort an irreplaceable item
+    // into the cheap-to-evict tier before its value ever had a chance to be
+    // measured properly. Fragility, by contrast, IS trustworthy this early —
+    // it is a fact about the corpus (how many near neighbours exist right
+    // now), not a prediction about the future — so it is what the grace
+    // window is keyed on.
+    //
+    // `eviction::cost`'s value-weighting is the opposite case, correctly:
+    // once the protection window has expired, the item has had time in the
+    // corpus for its value to be re-estimated on better information, and a
+    // worthless-but-irreplaceable item ranking cheap to evict there is the
+    // right answer, not a bug. You cannot get it back, but you also do not
+    // want it — fragility alone would protect it forever regardless of
+    // value, which is precisely the guarantee this gate's grace window is
+    // not meant to extend past its own expiry.
     let fragile = a.fragility.get() >= cfg.fragile_threshold;
     let sensitive = a.sensitivity.level >= SensitivityLevel::Sensitive;
 
