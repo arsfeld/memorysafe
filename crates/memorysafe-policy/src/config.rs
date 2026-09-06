@@ -31,6 +31,40 @@ pub struct BaselineConfig {
     pub source_trust_weight: f32,
     /// Days without access before an item counts as replay-due.
     pub replay_stale_days: f32,
+    /// `value::source_trust` for an explicit `source_kind: "human"`.
+    pub source_trust_human: f32,
+    /// `value::source_trust` for an explicit `source_kind: "tool"`.
+    pub source_trust_tool: f32,
+    /// `value::source_trust` for `source_kind: "session"`, unset, or
+    /// anything else unrecognised — the neutral default.
+    pub source_trust_default: f32,
+    /// `value::score`'s content-signal tradeoff: 1.0 is pure specificity
+    /// (length relative to the corpus median), 0.0 is pure lexical density.
+    pub content_specificity_weight: f32,
+    /// `value::specificity`'s floor under a scope's reported median item
+    /// size, guarding the ratio when a scope has too little data (or a
+    /// degenerate `0`) for the median to mean anything yet — see
+    /// `ScopeStats::median_item_bytes`'s own caveat.
+    pub specificity_median_floor_bytes: u64,
+    /// Minimum length of an unbroken alphanumeric-ish run for
+    /// `sensitivity::looks_like_secret_token` to treat it as the shape of a
+    /// bearer token or API key.
+    pub credential_token_min_len: usize,
+    /// Minimum digit count for `sensitivity::looks_like_phone` to treat a
+    /// body as containing a phone number.
+    pub phone_digit_min_count: usize,
+    /// `sensitivity::assess`'s confidence when a credential pattern or
+    /// token shape is detected.
+    pub sensitivity_credential_confidence: f32,
+    /// `sensitivity::assess`'s confidence for a health, financial, or legal
+    /// lexicon match.
+    pub sensitivity_category_confidence: f32,
+    /// `sensitivity::assess`'s confidence for a detected email or phone
+    /// number.
+    pub sensitivity_pii_confidence: f32,
+    /// `sensitivity::assess`'s confidence when nothing is detected — also
+    /// the floor every other confidence above is maxed against.
+    pub sensitivity_baseline_confidence: f32,
 }
 
 impl Default for BaselineConfig {
@@ -44,6 +78,17 @@ impl Default for BaselineConfig {
             value_half_life_days: 90.0,
             source_trust_weight: 0.20,
             replay_stale_days: 30.0,
+            source_trust_human: 1.0,
+            source_trust_tool: 0.7,
+            source_trust_default: 0.5,
+            content_specificity_weight: 0.6,
+            specificity_median_floor_bytes: 50,
+            credential_token_min_len: 20,
+            phone_digit_min_count: 10,
+            sensitivity_credential_confidence: 0.9,
+            sensitivity_category_confidence: 0.7,
+            sensitivity_pii_confidence: 0.6,
+            sensitivity_baseline_confidence: 0.5,
         }
     }
 }

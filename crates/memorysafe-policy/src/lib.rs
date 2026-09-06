@@ -52,7 +52,7 @@ impl GovernancePolicy for BaselinePolicy {
         let redundancy = redundancy::assess(&ctx.neighbours, &self.config);
         let fragility = fragility::score(&ctx.neighbours, &ctx.stats);
         let value = value::score(cand, &ctx.stats, &self.config);
-        let sensitivity = sensitivity::assess(cand);
+        let sensitivity = sensitivity::assess(cand, &self.config);
 
         Ok(Assessment {
             features: features! {
