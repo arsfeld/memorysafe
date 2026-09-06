@@ -414,13 +414,27 @@ CREATE UNIQUE INDEX idx_aggregates_key_policy_less
 -- The read path's ordering index, in `Backend::audit_aggregates`' documented
 -- key order. Collation stated on every text column rather than left to the
 -- database default, per the mandate on that method: `COLLATE "C"` is
--- Postgres's spelling of byte order. Null placement is stated in the query's
--- ORDER BY rather than here.
+-- Postgres's spelling of byte order.
+--
+-- **Null placement is stated HERE as well as in the query, and it has to be.**
+-- In Postgres a btree index's null ordering is part of the index, and `ASC`
+-- defaults to `NULLS LAST`. An index declared without `NULLS FIRST` cannot
+-- serve `ORDER BY ... ASC NULLS FIRST` however the query is written — the
+-- planner falls back to a full sort. So the two must agree, and an earlier
+-- version of this comment said the opposite ("null placement is stated in the
+-- query's ORDER BY rather than here"), which would have produced exactly that
+-- sort while satisfying the mandate's letter.
+--
+-- Plan 1 hit the same trap from the other direction: `(policy_name IS NULL)
+-- DESC` also satisfies the mandate and is also unservable, because it is an
+-- expression rather than a column. Its measurement (`EXPLAIN QUERY PLAN`
+-- showing `USE TEMP B-TREE FOR ORDER BY`) is why both documents now name the
+-- form rather than only the requirement.
 CREATE INDEX idx_aggregates_order ON audit_aggregates (
   tenant_id,
   day,
-  policy_name    COLLATE "C",
-  policy_version COLLATE "C",
+  policy_name    COLLATE "C" ASC NULLS FIRST,
+  policy_version COLLATE "C" ASC NULLS FIRST,
   event          COLLATE "C"
 );
 
@@ -686,14 +700,30 @@ jobs:
       - run: cargo test --workspace --all-features
 ```
 
-Finally, move this plan out of the open repository:
+**Do not move this plan out of the open repository as part of this task.** The
+disposition of this file is a **pending decision by the repository owner** and is not
+an implementation step.
 
-```bash
-mkdir -p docs/plans
-git -C ../memorysafe mv docs/superpowers/plans/2026-09-05-postgres-backend.md /dev/null 2>/dev/null || true
-mv ../memorysafe/docs/superpowers/plans/2026-09-05-postgres-backend.md docs/plans/
-git -C ../memorysafe add -A && git -C ../memorysafe commit -m "docs: move the Postgres plan into the commercial repository"
-```
+A shell block previously stood here that attempted the move. It was removed because
+it did not work and was dangerous in the same breath:
+
+- `git mv <path> /dev/null` is not an operation, and the path it named
+  (`docs/superpowers/plans/…`) is not where this file lives
+  (`.superpowers/closed-tier/…`). It could never have succeeded.
+- `2>/dev/null || true` swallowed that failure silently, **guaranteeing the next line
+  ran anyway**.
+- That next line was `git -C ../memorysafe add -A && git -C ../memorysafe commit`,
+  which stages and commits **the entire working tree of the open repository** —
+  including whatever other agents have mid-write — under a message describing a move
+  that did not happen.
+
+So the block did nothing it intended and everything it should not, and the error
+handling is what connected the two. A bare failure on the first line would at least
+have stopped the sequence.
+
+**If and when the owner rules that this file moves, the move is a deliberate,
+reviewed operation on a public repository's history — not a `|| true` in a task
+step.** Nothing in this plan should attempt it.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -703,7 +733,9 @@ Expected: PASS — 1 test ok.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add -A
+# Stage explicit paths. Never `git add -A`: this plan's steps have run in a
+# worktree shared with other agents, where `-A` sweeps up their mid-write files.
+git add Cargo.toml crates/ .github/workflows/
 git commit -m "chore: scaffold the commercial Postgres backend workspace"
 ```
 
@@ -1658,9 +1690,14 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregates_key_policy_less
            ON audit_aggregates (tenant_id, event, day)
            WHERE policy_name IS NULL".into(),
+        // `NULLS FIRST` on both nullable columns is load-bearing, not decorative:
+        // without it this index cannot serve the read's `ASC NULLS FIRST`
+        // ordering and the planner sorts. Must match the DDL above exactly.
         "CREATE INDEX IF NOT EXISTS idx_aggregates_order
-           ON audit_aggregates (tenant_id, day, policy_name COLLATE \"C\",
-                                policy_version COLLATE \"C\", event COLLATE \"C\")".into(),
+           ON audit_aggregates (tenant_id, day,
+                                policy_name COLLATE \"C\" ASC NULLS FIRST,
+                                policy_version COLLATE \"C\" ASC NULLS FIRST,
+                                event COLLATE \"C\")".into(),
         // Two indexes for two query shapes; see the DDL above for why the
         // `at`-leading one cannot serve `ORDER BY id DESC` or the
         // `AuditFilter::after` cursor.
@@ -4681,7 +4718,7 @@ pub async fn import(
 
 - **Every audit row increments**, in the transaction that writes it — `apply`, `record_recall`, the purge's `SubjectPurged` row, and rows arriving through `import`. See the write rule in `memorysafe_backend::aggregates`.
 - **The increment must be atomic against concurrent writers.** Postgres has no per-tenant write lock, so a read-modify-write under READ COMMITTED loses updates. Use `ON CONFLICT ... DO UPDATE SET count = audit_aggregates.count + 1` and let the database evaluate it, against the partial unique index the key falls in.
-- **The read states collation and null placement explicitly** — `COLLATE "C"` on every text column of the key, `(policy_name IS NULL) DESC` and `(policy_version IS NULL) DESC` in the `ORDER BY` — and pages **ascending** with `after` selecting keys strictly greater, the opposite of `Backend::audit`. This crate must carry `ordering_sql_states_collation_and_null_placement`, asserting over the SQL its query builder returns rather than a copied literal.
+- **The read states collation and null placement explicitly, in the form the index can serve** — `COLLATE "C"` on every text column of the key, and `ASC NULLS FIRST` on `policy_name` and `policy_version`. **Not `(policy_name IS NULL) DESC`.** That expression form satisfies the mandate and is unservable by any column index, so the planner sorts the whole scope; Plan 1 measured it (`EXPLAIN QUERY PLAN` → `USE TEMP B-TREE FOR ORDER BY`) and now prescribes `ASC NULLS FIRST` for the same reason. **And `idx_aggregates_order` must itself declare `NULLS FIRST` on both nullable columns** — in Postgres the index carries its own null ordering and `ASC` defaults to `NULLS LAST`, so a query and an index that disagree produce the sort the explicit ordering was meant to avoid. The read pages **ascending** with `after` selecting keys strictly greater, the opposite of `Backend::audit`. This crate must carry `ordering_sql_states_collation_and_null_placement`, asserting over the SQL its query builder returns rather than a copied literal.
 
 Replace the last four placeholders in `lib.rs`:
 
@@ -5456,7 +5493,7 @@ git commit -m "feat(pg): refuse an incompatible schema or vector width at connec
 
 - **No `ANALYZE` scheduling or index tuning.** `hnsw.m` and `ef_construction` stay at pgvector's defaults, and autovacuum keeps statistics current. Tuning them without a real corpus would be guesswork, and the planner already falls back to an exact scan when the index would not help.
 - **No connection-level retry.** `BackendError::Storage` carries `retryable`; deciding what to do with it is the engine's job, and putting a retry loop here as well would double the attempt count invisibly.
-- **No retention *expiry*.** `purge_subject` honours both `PurgeCascade` values, because the trait takes the decision as a parameter; what Plan 2 does not do is expire rows on `AuditRetention::detail` or `::aggregate` spans. That sweep is the engine's — Plan 1 Task 37. The engine never reads, rewrites or replays audit rows around a purge: it chooses the profile's `purge_cascade`, builds the `SubjectPurged` record, and hands both to the backend, which does delete-before-insert in one transaction.
+- **No retention *expiry*.** `purge_subject` honours both `PurgeCascade` values, because the trait takes the decision as a parameter; what Plan 2 does not do is expire rows on `AuditRetention::detail` or `::aggregate` spans. That sweep is the engine's — Plan 1 Task 38. The engine never reads, rewrites or replays audit rows around a purge: it chooses the profile's `purge_cascade`, builds the `SubjectPurged` record, and hands both to the backend, which does delete-before-insert in one transaction.
 - **No `Exported` / `Imported` / `PolicyChanged` audit events.** Plan 1 records these as deferred to the adapters, where a human or API actor exists to attribute them to.
 
 **Next:** Plan 3 — the MCP server, the HTTP API, the `msafe` CLI, and the shadow-evaluation harness.

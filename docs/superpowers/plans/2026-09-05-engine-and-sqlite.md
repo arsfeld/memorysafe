@@ -378,16 +378,17 @@ CREATE INDEX idx_aggregates_order ON audit_aggregates(
 | 28 | Policy: `compose` | |
 | 29 | Policy: `maintain` | `BaselinePolicy` complete |
 | 30 | Policy: MMR set-coverage | Retires the split-coverage regression |
-| 31 | Engine: decision validation | `fail_closed` / `fail_safe` |
-| 32 | Engine: `remember` | Write pipeline end to end |
-| 33 | Engine: `recall` | Read pipeline end to end |
-| 34 | Engine: `forget`, `review`, `protect`, `purge_subject` | |
-| 35 | Engine: maintenance job | Resumable with cursor |
-| 36 | Engine: cache + invalidation | |
-| 37 | Engine: retention profiles | |
-| 38 | Engine: export/import orchestration | |
-| 39 | Proptest invariants | The five correctness properties |
-| 40 | Engine: re-embedding + backfill | `pending_embedding` items become searchable |
+| 31 | Policy: byte-budget reclaim | Closes the admit/maintain divergence |
+| 32 | Engine: decision validation | `fail_closed` / `fail_safe` |
+| 33 | Engine: `remember` | Write pipeline end to end |
+| 34 | Engine: `recall` | Read pipeline end to end |
+| 35 | Engine: `forget`, `review`, `protect`, `purge_subject` | |
+| 36 | Engine: maintenance job | Resumable with cursor |
+| 37 | Engine: cache + invalidation | |
+| 38 | Engine: retention profiles | |
+| 39 | Engine: export/import orchestration | |
+| 40 | Proptest invariants | The five correctness properties |
+| 41 | Engine: re-embedding + backfill | `pending_embedding` items become searchable |
 
 ---
 
@@ -556,7 +557,7 @@ git commit -m "chore: scaffold cargo workspace and CI"
 
 `PURGED_COMPONENT` was added to `ids.rs` by a later contract commit, not by
 this task's sketch below: it is the reserved namespace a `SubjectPurged`
-record is filed under when the subject owned no items (Task 34's
+record is filed under when the subject owned no items (Task 35's
 `purge_scope`). Core does not reject the name — enforcement is Plan 3's, named
 in the constant's own doc comment, which is authoritative and not reproduced
 here.
@@ -6369,7 +6370,9 @@ git commit -m "feat(backend): conformance tests for audit, purge, and portabilit
 
 **The policy is two columns, not one rendered string, and this is a correctness constraint rather than a layout preference.** `PolicyId`'s `Display` is `{name}@{version}` and neither field is constrained, so `("a@b", "c")` and `("a", "b@c")` both render `"a@b@c"`. A single rendered key column would merge two distinct policies' counts into one row — a lost count, unrecoverable, in the artifact designed to outlive the detail rows. `lifecycle::audit_aggregates_page_in_the_documented_order` carries that exact pair and fails on a merged row. Note that the `audit` detail table's own `policy` column *is* the rendered form: that is a display and filter convenience, nothing keys on it, and nothing in Plan 1 reads it — do not derive the aggregate key from it.
 
-**The ordering index states its collation explicitly on every text column.** `Backend::audit_aggregates` mandates that every ordering over a text column states its collation and every ordering over a nullable column states null placement, neither relying on a dialect default. `COLLATE BINARY` is SQLite's spelling of byte order; Postgres's is `COLLATE "C"`. `policy_name` and `policy_version` are nullable and must sort NULL first. State it in the query — `ORDER BY (policy_name IS NULL) DESC, ...` — rather than relying on any default; the point of the mandate is that a reader can see the choice was made, and it holds whatever the default turns out to be. (*Recollection, unverified in this environment: SQLite treats NULL as smallest and would agree by default. That is why the mandate is semantic — if the recollection is wrong, the explicit clause is still right.*) `ordering_sql_states_collation_and_null_placement` is where that is asserted, and it lives in the purge-and-portability task, where the query builder it must read is written — not with the retrieval tasks. The two columns `items.last_access` and `items.access_count` are also read for the first time from Task 21 onward; they have been declared since this task and unread until now.
+**The ordering index states its collation explicitly on every text column.** `Backend::audit_aggregates` mandates that every ordering over a text column states its collation and every ordering over a nullable column states null placement, neither relying on a dialect default. `COLLATE BINARY` is SQLite's spelling of byte order; Postgres's is `COLLATE "C"`. `policy_name` and `policy_version` are nullable and must sort NULL first. State it in the query — **`ORDER BY … ASC NULLS FIRST`** — rather than relying on any default; the point of the mandate is that a reader can see the choice was made, and it holds whatever the default turns out to be.
+
+**Use `NULLS FIRST`, not `(policy_name IS NULL) DESC`, and the reason is not style.** Both satisfy the mandate — an earlier version of this paragraph prescribed the expression form — but `EXPLAIN QUERY PLAN` shows the expression form takes a **full sort** because it orders by a computed value the index cannot serve, while `ASC NULLS FIRST` uses `idx_aggregates_order`. Measured, not recollected. **A mandate with two satisfying forms gets satisfied by whichever is written first**, so this one names the form; the general clause on `Backend::audit_aggregates` stays semantic because the *spelling* differs by dialect (`COLLATE BINARY` here, `COLLATE "C"` in Postgres) and only the *requirement* transfers. `ordering_sql_states_collation_and_null_placement` is where that is asserted, and it lives in the purge-and-portability task, where the query builder it must read is written — not with the retrieval tasks. The two columns `items.last_access` and `items.access_count` are also read for the first time from Task 21 onward; they have been declared since this task and unread until now.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -8957,7 +8960,7 @@ pub fn import(
                 // `sensitivity` — a stream claiming `Public` for a body full of
                 // credentials would bypass the detector and surface that body to
                 // a Public-clearance recall. The engine re-assesses on import
-                // (see `Engine::import` in Task 38); the backend refuses to
+                // (see `Engine::import` in Task 39); the backend refuses to
                 // lower whatever the engine resolved.
                 item.protection = Protection::Normal;
                 capacity::ensure_row(&tx, &scope)?;
@@ -11035,7 +11038,7 @@ it, and an embedding. Reusing `admit`'s applier unchanged will lose all three.
   rows are not rewritten: a scope is never rewritten to make a row fit, and the
   merge record is what makes the item's disappearance explicable.
 
-**Task 35 (engine — resumable maintenance job) must apply `Action::Merge` and
+**Task 36 (engine — resumable maintenance job) must apply `Action::Merge` and
 must carry its own test for it.** That sentence is a cross-reference, and a
 cross-reference transfers the contract and not the coverage — every instance of
 this construct audited in this codebase has left the second side untested. Task
@@ -11127,9 +11130,16 @@ mod tests {
             1,
             "expiry dominates pinning: a pinned item past its TTL must still be forgotten"
         );
+        // Assert the REASON, not the action. `Action` has exactly three
+        // variants — `Retain`, `Merge`, `Reject` — and there is no `Forget`.
+        // The intent was always that a caller can tell a retention expiry from
+        // a capacity reclaim, and `ReasonCode` is where that distinction lives.
+        // Do not add an `Action::Forget` to make this read better: the enum is
+        // a stored wire format with audit-key implications and an applier in
+        // the engine's maintenance job, so the variant is a design decision.
         assert!(
-            matches!(out[0].action, Action::Forget { .. }),
-            "the decision must be Forget, not an eviction — the reason a caller sees              must say the retention limit expired, not that capacity was reclaimed"
+            out[0].has_reason(ReasonCode::TtlExpired),
+            "the reason must name the retention limit, not capacity pressure"
         );
     }
 
@@ -11261,19 +11271,66 @@ pub fn decisions(
     }
 
     // 3. Capacity reclaim, cheapest first, pinned untouchable.
-    // **Byte budgets are NOT deferred here — they are half-implemented, and the
-    // missing half is this one.** `CapacityState::pressure` consults
-    // `max_bytes`, and `CapacityState::would_exceed` refuses an admission that
-    // would break it. Only reclaim ignores it. So a namespace configured with
-    // `max_bytes: Some(_)` and `max_items: None` reports pressure correctly,
-    // rejects writes once over, and **never reclaims** — it is permanently
+    // **Byte budgets are NOT deferred here — three of the four paths that read
+    // `max_bytes` implement them, and the missing one is this.** Enumerated,
+    // because the count is the argument and a smaller count reads as "barely
+    // started":
+    //
+    //   `Budget::is_bounded`        `capacity.rs:17`  true for a byte-only budget,
+    //                                                 and pinned by
+    //                                                 `standing_check_budget_is_bounded`
+    //   `CapacityState::pressure`   `capacity.rs:43`  reports it correctly
+    //   `CapacityState::would_exceed` `capacity.rs:64` refuses the admission
+    //   `maintain::capacity_reclaim` HERE              ignores it
+    //
+    // **And one path enforces byte budgets WITHOUT reading the field**, which is a
+    // separate enumeration and was conflated with the one above twice:
+    //
+    //   `admit`'s make-room loop    `admit.rs:153-182` tracks `freed_bytes`/`used_bytes`
+    //                                                  and EVICTS to fit — it never
+    //                                                  names `max_bytes`, it asks
+    //                                                  `would_exceed`, which is already
+    //                                                  counted above. Pinned by
+    //                                                  `a_byte_only_budget_frees_enough_
+    //                                                  room_after_one_eviction`.
+    //
+    // **"Reads the field" and "behaviour depends on byte budgets" are different
+    // questions and the answer differs.** Three read it; a fourth enforces it through
+    // one of those three; `capacity_reclaim` does neither. An enumeration tells you
+    // what matches the pattern, not what the pattern means — which is the failure it
+    // cannot protect against, and the one that produced two wrong counts here.
+    //
+    // So a namespace with `max_bytes: Some(_)` and `max_items: None` reports
+    // pressure, refuses writes once over, and **never reclaims**. Permanently
     // stuck, not merely unbounded.
     //
-    // Do not write a comment here saying byte budgets are deferred: two of the
-    // three code paths implement them, and a reader who believes the deferral
-    // will not look for the liveness bug. Owned by the engine's retention and
-    // capacity work; until it lands, a byte-only budget is a misconfiguration
-    // the engine should reject rather than a supported shape.
+    // **And the stuckness is expensive, not passive.** The engine gathers
+    // eviction candidates only when `budget.is_bounded()`, which is true here —
+    // so it runs `Backend::list`, builds the candidate vector, hands it over,
+    // and this early return discards it. Work performed and silently thrown
+    // away on every write, with no decision and no audit row. From outside the
+    // namespace that looks like a system actively managing capacity.
+    // (`is_bounded`'s behaviour is asserted today; the engine's use of it
+    // arrives with the `remember` pipeline. The waste is latent until then and
+    // the stall is not.)
+    //
+    // **So this is not a half-implemented feature. It is the two entry points
+    // of one policy disagreeing about whether byte budgets are enforced.**
+    // Admission-time pressure evicts to make room for a byte budget; scheduled
+    // maintenance never reclaims for one. Same namespace, same config, opposite
+    // behaviour depending on which path touches it — `eviction::cost`'s
+    // divergence a level up: not a formula copied twice, but one question
+    // answered twice differently.
+    //
+    // **The fix is to make reclaim match `admit`, not to reject the config.**
+    // An earlier version of this comment called a byte-only budget "a
+    // misconfiguration the engine should reject rather than a supported shape".
+    // That was false — `admit` supports it and has a test named for it, so
+    // rejecting it would break a working path.
+    //
+    // Do not write a comment here saying byte budgets are deferred. **A reader
+    // who believes the deferral will not look for the divergence**, and a
+    // confident deferral note ends a look that silence would have invited.
     let Some(max_items) = ctx.capacity.budget.max_items else {
         return out;
     };
@@ -11427,8 +11484,98 @@ scores 1.00. Write it from this task text, not from the implementation.
 
 ---
 
+## Task 31: Policy — byte-budget reclaim
 
-## Task 31: Engine — decision validation
+**Files:**
+- Modify: `crates/memorysafe-policy/src/maintain.rs`
+
+**Interfaces:**
+- Consumes: `CapacityState`, `Budget`, `MemoryItem::byte_size`.
+- Produces: no new symbols — `capacity_reclaim` gains a dimension.
+
+**The defect this closes is a disagreement, not a gap.** Four of the five paths
+that read `Budget::max_bytes` honour it and one ignores it:
+
+    `Budget::is_bounded`          `capacity.rs:17`     true for a byte-only budget
+    `CapacityState::pressure`     `capacity.rs:43`     reports it
+    `CapacityState::would_exceed` `capacity.rs:64`     refuses the admission
+    `admit`'s make-room loop      `admit.rs:153-182`   accumulates `freed_bytes`, EVICTS to fit
+    `maintain::capacity_reclaim`  `maintain.rs`        returns early on `max_items` alone
+
+So **admission-time pressure evicts to make room for a byte budget and scheduled
+maintenance never reclaims for one** — same namespace, same config, opposite
+behaviour depending on which entry point touches it. A namespace with
+`max_bytes: Some(_)` and `max_items: None` reports pressure, refuses writes once
+over, gathers eviction candidates on every write (the engine gathers whenever
+`budget.is_bounded()`, which is true here), and discards them. **Permanently
+stuck while looking actively managed**, and the wasted gather is what an
+operator notices before the stall.
+
+**This is `eviction::cost`'s divergence one level up: not a formula copied
+twice, but one question answered twice differently.** We retired that one by
+making a second site *call* the first rather than re-derive it, and the same
+move is available here.
+
+- [ ] **Step 1: Write the failing tests**
+
+Four cases. Derive every expected value from the fixture before running, then
+run only to confirm — and falsify each against the current early return.
+
+1. **Byte-only budget over its limit reclaims.** `max_items: None`,
+   `max_bytes: Some(n)`, `used_bytes > n`. Assert a decision is produced and
+   carries `ReasonCode::CapacityPressure`. **Falsify:** this is exactly the case
+   the current code returns `Vec::new()` for, so it must fail before the fix.
+2. **Mixed budget, only the byte dimension over.** `max_items` satisfied,
+   `max_bytes` exceeded. Rejects an implementation that keeps the `max_items`
+   early return and adds bytes only inside it.
+3. **Mixed budget, only the item dimension over.** The existing behaviour, pinned
+   so the fix cannot regress it.
+4. **This run's own expiries count against bytes.** `capacity_reclaim` already
+   subtracts `expired` from `used_items` before deciding, on the reasoning that
+   counting from `used_items` alone reclaims live items to free space that was
+   about to be free anyway. **The same reasoning applies to bytes and the same
+   subtraction is required** — sum `byte_size()` over the expired set. A fixture
+   where the expiries alone bring the namespace under its byte budget must
+   produce no reclaim decision.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expect 1, 2 and 4 to fail and 3 to pass.
+
+- [ ] **Step 3: Implement**
+
+`capacity_reclaim` consults both dimensions. **Do not write a second byte
+accounting.** `admit`'s make-room loop already answers "how many bytes does
+evicting this candidate free" — `c.item.byte_size()`, accumulated — and this
+must use the same accessor, not a parallel computation over the same field. If a
+shared helper is the natural shape, extract it and have both call it; if it is
+one method call, call it. **Two implementations of one question is the defect
+this task exists to close, and adding a second one here would close it in the
+letter and reopen it in the spirit.**
+
+Ranking is unchanged: `eviction::cost` first, `reclaim_rank` as the tie-break.
+Bytes decide *how many* to reclaim, never *which*.
+
+**Two things not to do.**
+
+**Do not reject byte-only budgets.** An earlier version of this analysis called
+them "a misconfiguration the engine should reject rather than a supported
+shape." That was false — `admit` supports them and
+`a_byte_only_budget_frees_enough_room_after_one_eviction` pins the support. A
+reader arriving at "just reject the config" needs to see it considered and
+refuted, which is why it is recorded here rather than deleted.
+
+**Do not defer this to the engine.** The divergence is between two functions in
+`memorysafe-policy`; nothing about it needs a backend.
+
+**Deadline: the first byte-only budget an operator configures**, which is
+available the moment the engine ships and is not protected by any task number.
+Pre-v1 nothing is stuck today; the exposure begins at the first real config.
+
+---
+
+
+## Task 32: Engine — decision validation
 
 **Files:**
 - Create: `crates/memorysafe-engine/Cargo.toml`
@@ -11856,7 +12003,7 @@ git commit -m "feat(engine): decision validation and panic-safe policy invocatio
 
 ---
 
-## Task 32: Engine — `remember`
+## Task 33: Engine — `remember`
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/outcome.rs`
@@ -12528,7 +12675,7 @@ impl EngineConfig {
 }
 ```
 
-`EngineConfig::new` is how every test in Tasks 32–40 builds an engine.
+`EngineConfig::new` is how every test in Tasks 33–41 builds an engine.
 
 `Candidate`, `Assessment`, `AssessContext`, and `AdmitContext` must derive `Clone`; confirm from Tasks 5 and 10.
 
@@ -12546,7 +12693,7 @@ git commit -m "feat(engine): remember pipeline with governance decisions surface
 
 ---
 
-## Task 33: Engine — `recall`
+## Task 34: Engine — `recall`
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/read.rs`
@@ -12862,7 +13009,7 @@ git commit -m "feat(engine): recall pipeline with the sensitivity ceiling enforc
 
 ---
 
-## Task 34: Engine — `forget`, `protect`, and `purge_subject`
+## Task 35: Engine — `forget`, `protect`, and `purge_subject`
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/mutate.rs`
@@ -13147,7 +13294,7 @@ impl Engine {
     /// method.
     ///
     /// `PurgeCascade::Cascade` is hard-coded here — it is `balanced`, the
-    /// default profile's behaviour. Task 37 replaces this one expression with
+    /// default profile's behaviour. Task 38 replaces this one expression with
     /// `self.retention.retention().purge_cascade` and changes nothing else.
     pub async fn purge_subject(
         &self,
@@ -13183,7 +13330,7 @@ impl Engine {
     /// leading underscore).
     ///
     /// **The fallback name is a plan-level choice, not a derived one**; a
-    /// Task 34 executor may pick differently, but must pick, and must say so
+    /// Task 35 executor may pick differently, but must pick, and must say so
     /// where the record is built.
     async fn purge_scope(
         &self,
@@ -13282,7 +13429,7 @@ git commit -m "feat(engine): forget, protect, and subject purge"
 
 ---
 
-## Task 35: Engine — resumable maintenance job
+## Task 36: Engine — resumable maintenance job
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/maintain.rs`
@@ -13604,7 +13751,7 @@ git commit -m "feat(engine): explicit resumable maintenance job with audited cha
 
 ---
 
-## Task 36: Engine — cache and invalidation
+## Task 37: Engine — cache and invalidation
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/cache.rs`
@@ -13822,7 +13969,7 @@ git commit -m "feat(engine): content-addressed embedding cache and scope stats c
 
 ---
 
-## Task 37: Engine — retention profiles
+## Task 38: Engine — retention profiles
 
 **`AuditRetention::aggregate` is enforced here.** It is the only span that applies to `audit_aggregates` rows; `detail` and `purge_cascade` govern the audit detail table and must not reach the aggregate table. An aggregate row expires on its own span or not at all.
 
@@ -14081,7 +14228,7 @@ and replays none:
             OffsetDateTime::now_utc(),
         );
         // The whole of this task's change to `mutate.rs`: the cascade comes
-        // from the configured profile instead of Task 34's hard-coded
+        // from the configured profile instead of Task 35's hard-coded
         // `PurgeCascade::Cascade`. Everything else — building the record,
         // choosing its namespace, mapping the report — is untouched.
         let cascade = self.retention.retention().purge_cascade;
@@ -14130,7 +14277,7 @@ git commit -m "feat(engine): four named audit retention profiles honoured on sub
 
 ---
 
-## Task 38: Engine — export and import orchestration
+## Task 39: Engine — export and import orchestration
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/portability.rs`
@@ -14442,7 +14589,7 @@ git commit -m "feat(engine): portable ndjson export/import plus a human-readable
 
 ---
 
-## Task 39: The five correctness invariants
+## Task 40: The five correctness invariants
 
 **Files:**
 - Create: `crates/memorysafe-engine/tests/invariants.rs`
@@ -14686,7 +14833,7 @@ Add the missing read-through accessor to `crates/memorysafe-engine/src/lib.rs`:
 
 Any invariant that then fails is a real defect, not a test problem. The two most likely, and their fixes:
 
-- **Capacity exceeded.** `Engine::remember` offers eviction candidates only when `capacity.budget.is_bounded()` (Task 32, `gather::admit_context`). Confirm the budget is read fresh per write rather than cached — `CacheConfig` caches `ScopeStats`, never `CapacityState`, and that distinction is load-bearing.
+- **Capacity exceeded.** `Engine::remember` offers eviction candidates only when `capacity.budget.is_bounded()` (Task 33, `gather::admit_context`). Confirm the budget is read fresh per write rather than cached — `CacheConfig` caches `ScopeStats`, never `CapacityState`, and that distinction is load-bearing.
 - **Audit count mismatch.** A rejected write must still write exactly one audit record. Confirm the `Action::Reject` branch in `remember` builds a `WriteTransaction` with no `upsert` and no `merge` but still passes its audit record through `backend.apply`.
 
 Add the invariants job to `.github/workflows/ci.yml`:
@@ -14717,7 +14864,7 @@ git commit -m "test(engine): the five correctness invariants as property tests"
 
 ---
 
-## Task 40: Engine — re-embedding and `pending_embedding` backfill
+## Task 41: Engine — re-embedding and `pending_embedding` backfill
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/reembed.rs`
@@ -14728,7 +14875,7 @@ git commit -m "test(engine): the five correctness invariants as property tests"
 - Consumes: `Backend::list`, `Backend::apply`, `Embedder`.
 - Produces: `ReembedCursor { offset: usize }`, `ReembedReport { scanned, embedded, still_pending, next_cursor }`, `Engine::backfill_embeddings(&Scope, Option<ReembedCursor>)`, `Engine::reembed_scope(&Scope, Option<ReembedCursor>)`.
 
-**Why this task exists.** Task 32 admits an item with `pending_embedding: true` when the embedder is unavailable — a missing model file must never cost a user their memory. But without a backfill path those items stay invisible to vector search forever, which turns a transient outage into permanent silent recall degradation. This is the other half of that decision.
+**Why this task exists.** Task 33 admits an item with `pending_embedding: true` when the embedder is unavailable — a missing model file must never cost a user their memory. But without a backfill path those items stay invisible to vector search forever, which turns a transient outage into permanent silent recall degradation. This is the other half of that decision.
 
 `reembed_scope` is the migration the spec calls for when a tenant changes embedding model: it re-embeds every item in the scope, not just the pending ones, and audits the run as `Reembedded`. Both are explicit, resumable, cursor-driven jobs for the same reason maintenance is — nothing changes unobserved.
 
@@ -15106,7 +15253,7 @@ git commit -m "feat(engine): pending-embedding backfill and explicit re-embeddin
 Two `AuditEvent` variants defined in Task 8 are deliberately unused in Plan 1, because nothing in
 this plan triggers them from outside the process:
 
-- `Exported` / `Imported` — Task 38 provides the mechanism, but an export is only a governance
+- `Exported` / `Imported` — Task 39 provides the mechanism, but an export is only a governance
   event worth recording when a *person or API caller* initiates it. The audit record belongs at
   the CLI and HTTP boundary, with the actor attached.
 - `PolicyChanged` — there is one policy in Plan 1. The event becomes meaningful once policy
