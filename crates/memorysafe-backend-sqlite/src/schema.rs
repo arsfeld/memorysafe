@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The version marker's own table, created and read **before** anything else
 /// touches the file. Everything in `DDL` runs only once the version has been
@@ -125,13 +125,28 @@ CREATE INDEX IF NOT EXISTS idx_audit_scope_id
 -- Kept for the time-window filters, which the id index cannot serve.
 CREATE INDEX IF NOT EXISTS idx_audit_scope_at ON audit(subject, namespace, at, id DESC);
 
+-- The key is `(subject, namespace, key)`, NOT `key` alone.
+--
+-- Idempotency keys are chosen by the caller, so two subjects picking the same
+-- one ("nightly-import", a request id) is ordinary rather than exotic. Under a
+-- bare `key TEXT PRIMARY KEY` the second subject's write fails with
+-- `UNIQUE constraint failed: idempotency.key` — one subject's choice of key
+-- denying service to another, across the isolation boundary this backend
+-- otherwise enforces structurally. And a lookup that read the row back without
+-- constraining subject would be worse than the failure: it would replay one
+-- subject's stored outcome, `item_id` and `audit_id` included, to another.
+--
+-- Subject leads the key because `purge_subject` deletes a subject's rows as a
+-- range; every point lookup binds all three columns and does not care about
+-- the order.
 CREATE TABLE IF NOT EXISTS idempotency (
-  key            TEXT PRIMARY KEY,
+  key            TEXT NOT NULL,
   subject        TEXT NOT NULL,
   namespace      TEXT NOT NULL,
   payload_digest TEXT NOT NULL,
   outcome        TEXT NOT NULL,
-  at             INTEGER NOT NULL
+  at             INTEGER NOT NULL,
+  PRIMARY KEY (subject, namespace, key)
 );
 
 CREATE TABLE IF NOT EXISTS audit_aggregates (
@@ -228,7 +243,10 @@ pub fn initialise(conn: &Connection) -> rusqlite::Result<()> {
     // and v2 code opening a v1 file writes 2 over an unmigrated database. Both
     // destroy the only evidence of what the file actually is. Refusing to open
     // is the whole value of storing a version, and there is no migration path
-    // to offer instead while `SCHEMA_VERSION` is 1.
+    // to offer instead. Version 2 re-keyed `idempotency` on
+    // `(subject, namespace, key)`; a version-1 file has the old bare `key`
+    // primary key, which `CREATE TABLE IF NOT EXISTS` would silently leave in
+    // place, so the bump is what makes the two shapes distinguishable at all.
     conn.execute_batch(META_DDL)?;
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?1)",
@@ -580,12 +598,18 @@ mod tests {
     #[test]
     fn a_foreign_schema_version_is_refused_before_anything_durable_is_written() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v2.db");
+        let path = dir.path().join("foreign.db");
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
+        // Relative to `SCHEMA_VERSION`, never a literal: this test hardcoded
+        // `'2'` and silently stopped testing anything the moment
+        // `SCHEMA_VERSION` became 2 — `initialise` succeeded and the
+        // `unwrap_err` below panicked, which is the good outcome only because
+        // the assertion was `unwrap_err` rather than something permissive.
+        conn.execute_batch(&format!(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta(key,value) VALUES('schema_version','2');",
-        )
+             INSERT INTO meta(key,value) VALUES('schema_version','{}');",
+            SCHEMA_VERSION + 1
+        ))
         .unwrap();
         let journal_before: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -719,5 +743,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stale, 0, "the replaced body is still indexed");
+    }
+
+    /// Idempotency keys are chosen by the caller, so two subjects picking the
+    /// same one is ordinary. Under the bare `key TEXT PRIMARY KEY` this table
+    /// shipped with, the second subject's insert failed with
+    /// `UNIQUE constraint failed: idempotency.key` — one subject's choice of
+    /// key denying service to another, across the boundary this backend
+    /// otherwise enforces structurally.
+    ///
+    /// Nothing in the conformance suite can see this: both idempotency tests
+    /// use the single scope `("t","s","n")`, and no test anywhere pairs two
+    /// subjects with one key. The suite freezes at the portability task, so
+    /// this crate-local test is the guard until a conformance test is added.
+    #[test]
+    fn two_subjects_may_use_the_same_idempotency_key() {
+        let conn = db();
+        let insert = |subject: &str, digest: &str| {
+            conn.execute(
+                "INSERT INTO idempotency
+                     (key, subject, namespace, payload_digest, outcome, at)
+                 VALUES ('nightly-import', ?1, 'n', ?2, '{}', 0)",
+                [subject, digest],
+            )
+        };
+        insert("subject-a", "digest-a").expect("first subject");
+        insert("subject-b", "digest-b")
+            .expect("a second subject was refused the same idempotency key");
+
+        // And the two rows stay distinct rather than one overwriting the other.
+        let digest_of = |subject: &str| -> String {
+            conn.query_row(
+                "SELECT payload_digest FROM idempotency
+                  WHERE subject = ?1 AND namespace = 'n' AND key = 'nightly-import'",
+                [subject],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(digest_of("subject-a"), "digest-a");
+        assert_eq!(digest_of("subject-b"), "digest-b");
     }
 }
