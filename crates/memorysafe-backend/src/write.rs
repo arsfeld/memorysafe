@@ -88,6 +88,12 @@ pub struct AppliedWrite {
     pub replayed_outcome: Option<String>,
 }
 
+/// `audit_rows_removed + audit_rows_preserved` accounts for every audit row
+/// that existed for the subject *before* the purge ran — not for any row
+/// the purge itself may add. `AuditEvent::SubjectPurged` exists, so a
+/// conformant backend may write its own audit row recording the purge; that
+/// row did not exist to be removed or preserved and is not counted in
+/// either field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurgeReport {
     pub items_removed: u64,
