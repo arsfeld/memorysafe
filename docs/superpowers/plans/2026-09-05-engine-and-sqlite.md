@@ -7556,7 +7556,7 @@ git commit -m "feat(sqlite): item and audit persistence; isolation conformance p
 
 **Interfaces:**
 - Consumes: `QuantizedVector`, `items::row_to_item`.
-- Produces: `vectors::insert(&Connection, &ItemId, &Scope, &QuantizedVector)`, `vectors::delete`, `vectors::scope_embedder(&Connection, &Scope) -> Option<(String, u16)>`, `vectors::search(&Connection, &Scope, &QuantizedVector, k) -> Vec<(MemoryItem, f32)>`, and a real `Backend::neighbours`.
+- Produces: `vectors::insert(&Connection, &ItemId, &Scope, &QuantizedVector)`, `vectors::delete`, `vectors::scope_embedder(&Connection, &Scope) -> Option<(String, u16)>`, `vectors::AccessStats`, `vectors::search(&Connection, &Scope, &QuantizedVector, k) -> Vec<(MemoryItem, AccessStats, f32)>`, and a real `Backend::neighbours`.
 
 **Design:** no ANN index. Load the scope's vector rows, score them with `QuantizedVector::dot`, keep the top k with a bounded heap. Exact results, nothing to rebuild after every write. `scope_embedder` reports which model a scope's vectors use so a probe from a different model is rejected rather than silently compared.
 
@@ -7675,7 +7675,8 @@ use crate::tenant::SqlResultExt;
 use memorysafe_backend::BackendError;
 use memorysafe_core::{ItemId, MemoryItem, Scope};
 use memorysafe_embed::QuantizedVector;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Row, params};
+use time::OffsetDateTime;
 
 pub fn insert(
     conn: &Connection,
@@ -7732,6 +7733,43 @@ pub fn scope_embedder(
     }
 }
 
+/// The two access columns, carried beside the item rather than on it.
+///
+/// They must NOT go on `MemoryItem`: it is exported and digested, so adding a
+/// mutable counter to it would change an item's digest every time it is read.
+///
+/// **A row never recalled is `(None, 0)`, never `(Some(created_at), 0)`.**
+/// `ScoredCandidate::last_accessed_at`'s doc explains why the `Option` is the
+/// only thing separating the two states — `fx::item` pins `created_at` to
+/// `UNIX_EPOCH`, so a wrongly-defaulted `Some(created_at)` carries the same
+/// instant a real one would and no assertion on the timestamp can see it.
+pub struct AccessStats {
+    pub last_accessed_at: Option<OffsetDateTime>,
+    pub access_count: u64,
+}
+
+/// Read `AccessStats` from a row that selected `last_access` and
+/// `access_count` under those names. One implementation, because
+/// `vectors::search` and `keyword::search` are the two arms of one fusion and
+/// a difference between them would show up as retrieval-path-dependent access
+/// statistics — the hardest kind of discrepancy to notice.
+pub fn access_stats(row: &Row<'_>) -> rusqlite::Result<AccessStats> {
+    let last: Option<i64> = row.get("last_access")?;
+    Ok(AccessStats {
+        last_accessed_at: last
+            .map(OffsetDateTime::from_unix_timestamp)
+            .transpose()
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::new(e),
+                )
+            })?,
+        access_count: row.get::<_, i64>("access_count")? as u64,
+    })
+}
+
 /// Exact brute-force top-k. No ANN index: per-scope corpora are small, results
 /// are exact, and there is nothing to rebuild after every write.
 pub fn search(
@@ -7739,12 +7777,16 @@ pub fn search(
     scope: &Scope,
     probe: &QuantizedVector,
     k: usize,
-) -> Result<Vec<(MemoryItem, f32)>, BackendError> {
+) -> Result<Vec<(MemoryItem, AccessStats, f32)>, BackendError> {
     if k == 0 {
         return Ok(vec![]);
     }
     let sql = format!(
-        "SELECT i.rowid, {cols}, v.embedder AS v_embedder, v.dim AS v_dim,
+        // `last_access`/`access_count` are named explicitly: `ITEM_COLUMNS`
+        // contains neither, and `row_to_item` does not read them.
+        "SELECT i.rowid, {cols}, i.last_access AS last_access,
+                i.access_count AS access_count,
+                v.embedder AS v_embedder, v.dim AS v_dim,
                 v.scale AS v_scale, v.q AS v_q
          FROM items i JOIN vectors v ON v.item_id = i.id
          WHERE i.subject = ?1 AND i.namespace = ?2
@@ -7768,16 +7810,17 @@ pub fn search(
             ],
             move |r| {
                 let item = row_to_item(r, &tenant)?;
+                let access = access_stats(r)?;
                 let scale: f64 = r.get("v_scale")?;
                 let bytes: Vec<u8> = r.get("v_q")?;
-                Ok((item, scale as f32, bytes))
+                Ok((item, access, scale as f32, bytes))
             },
         )
         .sql()?;
 
-    let mut scored: Vec<(MemoryItem, f32)> = Vec::new();
+    let mut scored: Vec<(MemoryItem, AccessStats, f32)> = Vec::new();
     for row in rows {
-        let (item, scale, bytes) = row.sql()?;
+        let (item, access, scale, bytes) = row.sql()?;
         let q = QuantizedVector::from_bytes(
             probe.embedder.clone(),
             probe.dim,
@@ -7785,11 +7828,17 @@ pub fn search(
             &bytes,
         )
         .map_err(|e| BackendError::Storage { message: e.to_string(), retryable: false })?;
-        let score = probe.dot(&q).map_err(|e| BackendError::EmbedderMismatch {
-            got: e.to_string(),
-            expected: probe.embedder.to_string(),
-        })?;
-        scored.push((item, score));
+        // `Storage`, not `EmbedderMismatch`. `dot` fails on exactly one
+        // condition — differing embedder or dim — and `q` was just built with
+        // `probe`'s own embedder and dim, so this branch is unreachable by
+        // construction. Cross-model exclusion is done by the `WHERE` above and
+        // rejection by `neighbours`' `scope_embedder` guard. An
+        // `EmbedderMismatch` whose `got` held a `Display`ed error would be a
+        // lie in the one field a caller would read to diagnose the mismatch.
+        let score = probe
+            .dot(&q)
+            .map_err(|e| BackendError::Storage { message: e.to_string(), retryable: false })?;
+        scored.push((item, access, score));
     }
 
     // Tie-break by ascending `ItemId` before truncating at `k`: this
@@ -7798,7 +7847,7 @@ pub fn search(
     // an untied truncation here drops candidates nondeterministically
     // upstream of fusion — a downstream tie-break on the fused set cannot
     // recover a candidate this truncation already discarded.
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
+    scored.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.id.cmp(&b.0.id)));
     scored.truncate(k);
     Ok(scored)
 }
@@ -7884,7 +7933,9 @@ Add `pub mod vectors;` and wire vector insert/delete into `apply`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 3 unit tests plus 7 conformance tests ok.
+Expected: PASS — three new unit tests, and **10** conformance tests: the seven
+the previous task bound plus this task's three. Seven is the previous task's
+figure; propagate the change everywhere it is cited, per the Global Constraints.
 
 - [ ] **Step 5: Commit**
 
@@ -8023,6 +8074,7 @@ Expected: FAIL — `cannot find function escape_fts_query in this scope`.
 ```rust
 use crate::items::{ITEM_COLUMNS, row_to_item};
 use crate::tenant::SqlResultExt;
+use crate::vectors::{self, AccessStats};
 use memorysafe_core::{MemoryItem, Scope};
 use memorysafe_backend::BackendError;
 use rusqlite::{Connection, params};
@@ -8045,18 +8097,23 @@ pub fn escape_fts_query(raw: &str) -> Option<String> {
     Some(terms.join(" OR "))
 }
 
-/// Returns `(item, bm25_score)` where a higher score is a better match.
+/// Returns `(item, access, bm25_score)` where a higher score is a better
+/// match. The access columns ride alongside for the same reason they do in
+/// `vectors::search` — see `vectors::AccessStats`. Both arms of the fusion must
+/// carry them, or a keyword-only hit reaches `ScoredCandidate` with nothing to
+/// populate `last_accessed_at` from.
 pub fn search(
     conn: &Connection,
     scope: &Scope,
     raw_query: &str,
     limit: usize,
-) -> Result<Vec<(MemoryItem, f32)>, BackendError> {
+) -> Result<Vec<(MemoryItem, AccessStats, f32)>, BackendError> {
     let Some(expr) = escape_fts_query(raw_query) else {
         return Ok(vec![]);
     };
     let sql = format!(
-        "SELECT {cols}, bm25(items_fts) AS bm25
+        "SELECT {cols}, i.last_access AS last_access,
+                i.access_count AS access_count, bm25(items_fts) AS bm25
          FROM items_fts
          JOIN items i ON i.rowid = items_fts.rowid
          WHERE items_fts MATCH ?1 AND i.subject = ?2 AND i.namespace = ?3
@@ -8075,8 +8132,9 @@ pub fn search(
             params![expr, scope.subject.as_str(), scope.namespace.as_str(), limit as i64],
             move |r| {
                 let item = row_to_item(r, &tenant)?;
+                let access = vectors::access_stats(r)?;
                 let bm25: f64 = r.get("bm25")?;
-                Ok((item, bm25 as f32))
+                Ok((item, access, bm25 as f32))
             },
         )
         .sql()?;
@@ -8085,9 +8143,9 @@ pub fn search(
     // Flip and squash into (0, 1] so it can be fused with cosine.
     let mut out = Vec::new();
     for row in rows {
-        let (item, bm25) = row.sql()?;
+        let (item, access, bm25) = row.sql()?;
         let positive = (-bm25).max(0.0);
-        out.push((item, positive / (1.0 + positive)));
+        out.push((item, access, positive / (1.0 + positive)));
     }
     Ok(out)
 }
@@ -8147,7 +8205,11 @@ pub fn candidates(
     // Over-fetch from each source; fusion and the policy narrow afterwards.
     let fetch = query.limit.saturating_mul(4).max(query.limit);
 
-    let mut merged: HashMap<String, (MemoryItem, Option<f32>, Option<f32>)> = HashMap::new();
+    // `(item, access, vector_score, keyword_score)`. `access` is in the tuple
+    // rather than re-read later because neither arm's item row is still
+    // available by the time `ScoredCandidate` is built.
+    let mut merged: HashMap<String, (MemoryItem, AccessStats, Option<f32>, Option<f32>)> =
+        HashMap::new();
 
     if let Some(embedding) = &query.embedding
         && let Some((stored, dim)) = vectors::scope_embedder(conn, scope)?
@@ -8155,25 +8217,27 @@ pub fn candidates(
         && dim == embedding.dim
     {
         let probe = memorysafe_embed::QuantizedVector::from_embedding(embedding);
-        for (item, score) in vectors::search(conn, scope, &probe, fetch)? {
+        for (item, access, score) in vectors::search(conn, scope, &probe, fetch)? {
             merged
                 .entry(item.id.as_str().to_string())
-                .or_insert((item, None, None))
-                .1 = Some(score);
+                .or_insert((item, access, None, None))
+                .2 = Some(score);
         }
     }
 
     if let Some(text) = &query.text {
-        for (item, score) in keyword::search(conn, scope, text, fetch)? {
-            let e = merged.entry(item.id.as_str().to_string()).or_insert((item, None, None));
-            e.2 = Some(score);
+        for (item, access, score) in keyword::search(conn, scope, text, fetch)? {
+            let e = merged
+                .entry(item.id.as_str().to_string())
+                .or_insert((item, access, None, None));
+            e.3 = Some(score);
         }
     }
 
     let mut out: Vec<ScoredCandidate> = merged
         .into_values()
-        .filter(|(item, _, _)| passes(item, &query.filters))
-        .map(|(item, vector_score, keyword_score)| {
+        .filter(|(item, _, _, _)| passes(item, &query.filters))
+        .map(|(item, access, vector_score, keyword_score)| {
             let relevance = match (vector_score, keyword_score) {
                 (Some(v), Some(k)) => VECTOR_WEIGHT * v + (1.0 - VECTOR_WEIGHT) * k,
                 (Some(v), None) => v,
