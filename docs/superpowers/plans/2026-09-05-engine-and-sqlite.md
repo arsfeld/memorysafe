@@ -10826,7 +10826,12 @@ Add `pub mod maintain;`. `PolicyId` must derive `Clone`; confirm from Task 7.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy && cargo clippy -p memorysafe-policy --all-targets -- -D warnings`
-Expected: PASS — this task adds 7 tests; at least 48 in the crate. `BaselinePolicy` now implements all four trait methods.
+Expected: PASS — 135 tests in the crate (up from 103). The task's own
+seven are joined by the tests F-A and F-B are specified in prose rather
+than code: fragility rising as well as falling, consolidation's
+direction, threshold and pinned/claimed guards, and the one-decision-
+per-subject invariant across all four steps. `BaselinePolicy` now
+implements all four trait methods.
 
 - [ ] **Step 5: Commit**
 

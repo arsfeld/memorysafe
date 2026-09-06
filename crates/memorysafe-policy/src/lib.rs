@@ -9,6 +9,7 @@ pub mod compose;
 pub mod config;
 pub mod eviction;
 pub mod fragility;
+pub mod maintain;
 pub mod redundancy;
 pub mod sensitivity;
 pub mod similarity;
@@ -86,8 +87,8 @@ impl GovernancePolicy for BaselinePolicy {
     ) -> Result<WorkingSet, PolicyError> {
         Ok(compose::working_set(req, candidates, ctx, &self.config))
     }
-    fn maintain(&self, _ctx: &MaintainContext) -> Result<Vec<Decision>, PolicyError> {
-        unimplemented!("Task 29")
+    fn maintain(&self, ctx: &MaintainContext) -> Result<Vec<Decision>, PolicyError> {
+        Ok(maintain::decisions(ctx, &self.config, self.policy_id()))
     }
 }
 
@@ -95,7 +96,10 @@ impl GovernancePolicy for BaselinePolicy {
 mod tests {
     use super::*;
     use crate::testkit::{candidate, scope};
-    use memorysafe_core::{RecallBudget, RecallMode, ScopeStats, Score, SensitivityLevel};
+    use memorysafe_core::{
+        Action, Budget, CapacityState, RecallBudget, RecallMode, ScopeStats, Score,
+        SensitivityLevel,
+    };
     use time::{Duration, OffsetDateTime};
 
     #[test]
@@ -161,6 +165,66 @@ mod tests {
                 .items
                 .iter()
                 .any(|s| s.reason.code == memorysafe_core::ReasonCode::ReplayDue)
+        );
+    }
+    #[test]
+    fn maintain_delegates_to_the_maintain_module_with_the_policys_own_config() {
+        // The same hole `compose_delegates_...` above exists to close, in the
+        // one remaining trait method: nothing else in this package calls
+        // `BaselinePolicy::maintain`, so a stub returning `Ok(vec![])` would
+        // leave every other test in the workspace — and mutation testing's own
+        // baseline — passing.
+        //
+        // `cfg` is a non-default config (`merge_threshold: 0.5`) and the
+        // fixture's coverage is exactly 0.5, so a trait method that built its
+        // own `BaselineConfig::default()` instead of forwarding `self.config`
+        // would decline the merge and return an empty vector while the direct
+        // call returned one. That is also why the non-emptiness assertion
+        // below is load-bearing rather than decorative: `assert_eq!` alone is
+        // satisfied by two empty vectors.
+        let cfg = BaselineConfig {
+            merge_threshold: 0.5,
+            ..BaselineConfig::default()
+        };
+        let policy = BaselinePolicy::new(cfg.clone());
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::days(365);
+
+        // "alpha beta gamma delta" and "alpha beta epsilon zeta" share 2 of
+        // each side's 4 distinct tokens: coverage 0.5 in both directions.
+        let mut older = crate::testkit::maintenance_candidate("alpha beta gamma delta", 0.5, 0.5);
+        older.item.created_at = now - Duration::days(200);
+        let mut newer = crate::testkit::maintenance_candidate("alpha beta epsilon zeta", 0.5, 0.5);
+        newer.item.created_at = now - Duration::days(100);
+
+        let ctx = MaintainContext {
+            scope: scope(),
+            batch: vec![older, newer],
+            is_final_batch: true,
+            capacity: CapacityState {
+                budget: Budget::UNBOUNDED,
+                used_items: 2,
+                used_bytes: 0,
+            },
+            stats: ScopeStats {
+                item_count: 100,
+                mean_neighbour_similarity: 0.4,
+                ..Default::default()
+            },
+            now,
+        };
+
+        let via_trait = policy
+            .maintain(&ctx)
+            .expect("maintain must not error on well-formed input");
+        let direct = maintain::decisions(&ctx, &cfg, policy.policy_id());
+
+        assert_eq!(via_trait, direct);
+        assert!(
+            via_trait
+                .iter()
+                .any(|d| matches!(d.action, Action::Merge { .. })),
+            "the fixture is built to produce a merge under this config; \
+             an empty result means the config did not reach the module"
         );
     }
 }
