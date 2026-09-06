@@ -14,6 +14,14 @@ pub struct HardFilters {
     pub kinds: Vec<String>,
     /// Bound results by when the remembered thing happened.
     ///
+    /// **Both bounds are inclusive**: an item whose `occurred_at` falls exactly
+    /// on either edge matches. That is `>=` and `<=` in SQL, and it matches
+    /// every other range bound in this workspace — `Backend::audit`'s
+    /// `since`/`until`, `AuditAggregateFilter`'s day window, `Protection`'s
+    /// expiry boundary, and `RecallBudget`'s limits all say so explicitly.
+    /// These two were the only range bounds that did not, which made them the
+    /// odd pair out of a settled convention rather than an open question.
+    ///
     /// **An item whose `occurred_at` is `None` matches neither bound.** Set
     /// either field and every item with no occurrence time is excluded. That
     /// is the intended reading — a filter asking what happened after a date

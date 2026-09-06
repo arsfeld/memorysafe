@@ -247,6 +247,22 @@ mod tests {
     /// from either `vectors::search` or `keyword::search` is caught: whichever
     /// arm leaks floods the fused set the same way.
     #[test]
+    /// **What this test reaches, and what it cannot.** It discriminates each
+    /// SQL predicate by *count under limit pressure*: drop one and the
+    /// over-fetch fills with rows `passes` then rejects, so fewer than `limit`
+    /// come back while matching items existed — a completeness failure the
+    /// Rust re-check cannot repair.
+    ///
+    /// That mechanism catches an **absent** predicate and is structurally
+    /// incapable of catching an **off-by-one** one, because a boundary error
+    /// returns approximately the right count: one row different, still at or
+    /// above the limit under pressure. So "narrows every dimension" means
+    /// every predicate is *present*, not that any is *exact*.
+    ///
+    /// Exactness is a separate test per dimension, and only `sensitivity` has
+    /// one — `filter_sql_sensitivity_boundary_is_exact_on_both_arms`. Verified
+    /// by mutation: `occurred_at >=` to `>` and `<=` to `<` both survive the
+    /// whole suite. The other five need that shape.
     fn filter_sql_narrows_every_dimension_under_limit_pressure() {
         let c = conn();
         let scope = Scope::new("t", "s", "n").unwrap();
