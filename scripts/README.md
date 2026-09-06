@@ -59,6 +59,38 @@ That distinction is worth stating precisely, because the first version of this f
 category. **A "cannot" that is really a "have not" is the load-bearing kind of error**, and
 it was written by someone who had spent the day removing exactly that shape from tests.
 
+## The mutation baseline — measured, so a later run has something to differ from
+
+|  | `e7525a6` (pre-freeze) | `2d5701c` (freeze) |
+|---|---|---|
+| mutants | 187 | 211 |
+| caught | 123 | 147 |
+| missed | 21 | 16 |
+| timeouts | 0 | **2** |
+| unviable | 43 | 46 |
+| viable | 144 | 165 |
+| score on viable | 85.4% | 89.1% |
+| wall clock | 6 min | 9 min |
+
+**One verdict moved for a reason that has nothing to do with the code**, and it is the most
+useful thing in this table. `keyword.rs`'s squash mutant went MISSED → TIMEOUT. A timeout is
+**not** a kill — cargo-mutants reports it separately because it is unresolved.
+
+`cargo mutants` derives its per-mutant timeout from the baseline test run:
+
+    e7525a6   baseline test 1s   auto timeout 20s   headroom 20x
+    2d5701c   baseline test 4s   auto timeout 22s   headroom 5.5x
+
+The portability task collapsed 28 individually-bound conformance tests into one call to
+`run_conformance_suite`, whose `run!` **awaits each test inline** — so fifty tests that had
+been running in parallel within the binary now run serially. The conformance binary went
+2.5s to 4.1s *while gaining 22 tests*.
+
+**A measurement whose instrument is calibrated from the artifact under test drifts when the
+artifact's shape changes, not only its content.** Hence the pinned `timeout_multiplier` in
+`.cargo/mutants.toml`: on auto, verdicts stop being comparable across any commit that
+changes test structure.
+
 ## The denominator nobody had printed
 
 `cargo mutants` finds **187 mutants** in `memorysafe-backend-sqlite` — `lib.rs` 46,
