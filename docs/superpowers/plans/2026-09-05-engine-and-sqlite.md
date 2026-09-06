@@ -8331,7 +8331,10 @@ Replace the placeholder `retrieve_candidates` in `lib.rs`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 4 keyword unit tests plus 18 conformance tests ok.
+Expected: PASS — 4 keyword unit tests plus **21** conformance tests: the ten
+bound after the vectors task plus this task's eleven. Eighteen was seven plus
+eleven — computed from the items-and-audit task's figure with the vectors
+task's three never added. Propagate counts, per the Global Constraints.
 
 - [ ] **Step 5: Commit**
 
