@@ -481,7 +481,7 @@ pub trait Backend: Send + Sync {
 
     async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId) -> Result<PurgeReport>;
     async fn export(&self, scope: &ScopeSelector) -> Result<ExportStream>;
-    async fn import(&self, stream: ImportStream) -> Result<ImportReport>;
+    async fn import(&self, destination: &TenantId, stream: ImportStream) -> Result<ImportReport>;
 }
 ```
 

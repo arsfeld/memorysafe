@@ -1775,6 +1775,7 @@ mod tests {
         // decision whose match is in `reasons`, and `||` short-circuits, so the
         // evictions branch is never evaluated — deleting it passes all of them.
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![Eviction {
                 item: ItemId::new(),
@@ -1816,6 +1817,7 @@ mod tests {
         // reads it back with serde_json. Nothing else here exercises Merge,
         // ReplaceBody, a populated evictions vector, or PolicyId on the wire.
         let d = Decision {
+            subject: None,
             action: Action::Merge {
                 into: ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
                 strategy: MergeStrategy::ReplaceBody,
@@ -1845,7 +1847,7 @@ mod tests {
         // perfectly while orphaning every row already on disk. Pin the literal
         // bytes, which is the property stored data actually depends on.
         let expected = concat!(
-            r#"{"action":{"kind":"merge","into":"01ARZ3NDEKTSV4RRFFQ69G5FAV","#,
+            r#"{"subject":null,"action":{"kind":"merge","into":"01ARZ3NDEKTSV4RRFFQ69G5FAV","#,
             r#""strategy":"replace_body"},"#,
             r#""evictions":[{"item":"01BX5ZZKBKACTAV9WEVGEMMVRZ","#,
             r#""reason":{"code":"capacity_pressure","detail":"evicted to make room","#,
@@ -9542,13 +9544,14 @@ git commit -m "feat(policy): value scoring and pattern-based sensitivity detecti
 
 **Files:**
 - Create: `crates/memorysafe-policy/src/admit.rs`
+- Create: `crates/memorysafe-policy/src/eviction.rs`
 - Modify: `crates/memorysafe-policy/src/lib.rs`
 
 **Interfaces:**
 - Consumes: `Assessed`, `AdmitContext`, `BaselineConfig`, `Verdict`.
-- Produces: `admit::decide(&Assessed, &AdmitContext, &BaselineConfig, PolicyId) -> Decision`, and `GovernancePolicy::admit` on `BaselinePolicy`.
+- Produces: `admit::decide(&Assessed, &AdmitContext, &BaselineConfig, PolicyId) -> Decision`, `eviction::cost(&MaintenanceCandidate) -> f32`, and `GovernancePolicy::admit` on `BaselinePolicy`.
 
-**The rules, in order.** At or above `duplicate_threshold` the write is rejected. At or above `merge_threshold` it is merged into its closest neighbour. Otherwise the item is retained — and if capacity is tight, evictions are selected ascending by `value × (1 − fragility)` until there is room. A candidate that is both highly fragile and highly sensitive gets `Protected` plus a `SensitivityConflict` reason, so the conflict is visible in the audit trail rather than silently resolved. If nothing is evictable and there is no room, the write is rejected with `BudgetExhausted` — never by silently exceeding the budget.
+**The rules, in order.** At or above `duplicate_threshold` the write is rejected. At or above `merge_threshold` it is merged into its closest neighbour. Otherwise the item is retained — and if capacity is tight, evictions are selected ascending by `eviction::cost` (`value × fragility`) until there is room: expected loss is value times the unrecoverable share, and eviction takes the smallest first. A candidate that is both highly fragile and highly sensitive gets `Protected` plus a `SensitivityConflict` reason, so the conflict is visible in the audit trail rather than silently resolved. If nothing is evictable and there is no room, the write is rejected with `BudgetExhausted` — never by silently exceeding the budget.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9641,10 +9644,10 @@ mod tests {
         let cfg = BaselineConfig::default();
         let mut cheap = candidate("cheap to lose", 0.5);
         cheap.value = Score::clamped(0.1);
-        cheap.fragility = Score::clamped(0.1);
+        cheap.fragility = Score::clamped(0.1); // eviction::cost = 0.1 * 0.1 = 0.01
         let mut precious = candidate("expensive to lose", 0.5);
         precious.value = Score::clamped(0.9);
-        precious.fragility = Score::clamped(0.9);
+        precious.fragility = Score::clamped(0.9); // eviction::cost = 0.9 * 0.9 = 0.81
         let cheap_id = cheap.item.id.clone();
 
         let (c, a) = assessed(0.1, 0.8, 0.2, SensitivityLevel::Internal);
@@ -9713,9 +9716,10 @@ Expected: FAIL — `cannot find function decide in this scope`.
 
 ```rust
 use crate::config::{BaselineConfig, Verdict};
+use crate::eviction;
 use memorysafe_core::{
-    Action, AdmitContext, Assessed, Decision, Eviction, MergeStrategy, PolicyId, Protection,
-    Reason, ReasonCode, ScoredCandidate, SensitivityLevel, features,
+    Action, AdmitContext, Assessed, Decision, Eviction, MaintenanceCandidate, MergeStrategy,
+    PolicyId, Protection, Reason, ReasonCode, SensitivityLevel, features,
 };
 use time::Duration;
 
@@ -9723,11 +9727,6 @@ use time::Duration;
 const FRAGILE_THRESHOLD: f32 = 0.85;
 /// Length of that window.
 const PROTECTION_DAYS: i64 = 30;
-
-/// Cost of losing an item. Low value and low fragility means cheap to lose.
-fn eviction_cost(c: &ScoredCandidate) -> f32 {
-    c.value.get() * (1.0 - c.fragility.get()).max(0.0)
-}
 
 pub fn decide(
     assessed: &Assessed,
@@ -9752,6 +9751,7 @@ pub fn decide(
         Verdict::Mergeable => {
             if let Some((target, similarity)) = a.redundancy.best() {
                 return Decision {
+                    subject: None,
                     action: Action::Merge {
                         into: target.clone(),
                         strategy: MergeStrategy::AppendAndUnion,
@@ -9810,8 +9810,8 @@ pub fn decide(
     // Make room if needed.
     let mut evictions = Vec::new();
     if ctx.capacity.would_exceed(1, assessed.candidate.byte_size) {
-        let mut ranked: Vec<&ScoredCandidate> = ctx.eviction_candidates.iter().collect();
-        ranked.sort_by(|a, b| eviction_cost(a).total_cmp(&eviction_cost(b)));
+        let mut ranked: Vec<&MaintenanceCandidate> = ctx.eviction_candidates.iter().collect();
+        ranked.sort_by(|a, b| eviction::cost(a).total_cmp(&eviction::cost(b)));
 
         let mut freed_items = 0u64;
         let mut freed_bytes = 0u64;
@@ -9833,7 +9833,7 @@ pub fn decide(
                     features! {
                         "value" => c.value.get(),
                         "fragility" => c.fragility.get(),
-                        "eviction_cost" => eviction_cost(c),
+                        "eviction_cost" => eviction::cost(c),
                     },
                 ),
             });
@@ -9861,7 +9861,27 @@ pub fn decide(
         }
     }
 
-    Decision { action: Action::Retain { protection }, evictions, reasons, policy }
+    Decision { subject: None, action: Action::Retain { protection }, evictions, reasons, policy }
+}
+```
+
+`crates/memorysafe-policy/src/eviction.rs`:
+
+```rust
+//! The cost model shared by `admit` (capacity pressure during a write) and
+//! `maintain` (capacity reclaim during a maintenance pass). Both rank the
+//! same kind of candidate by the same rule, so the rule lives once, here,
+//! rather than as two copies that agree today and diverge at the next
+//! correction.
+
+use memorysafe_core::MaintenanceCandidate;
+
+/// Expected cost of losing this item: value times the unrecoverable share.
+/// Eviction takes the smallest cost first, so a highly fragile item — one
+/// with no near neighbours to reconstruct it from — must cost MORE to lose
+/// than a redundant one, never less.
+pub fn cost(c: &MaintenanceCandidate) -> f32 {
+    c.value.get() * c.fragility.get()
 }
 ```
 
@@ -9873,7 +9893,7 @@ Replace the `admit` stub in `lib.rs`:
     }
 ```
 
-Add `pub mod admit;`.
+Add `pub mod admit;` and `pub mod eviction;`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -9930,6 +9950,8 @@ mod tests {
             query: Some("cats".into()),
             tags_any: vec![],
             kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
             mode,
             budget: RecallBudget { max_tokens: Some(10_000), max_items: Some(max_items) },
             sensitivity_ceiling: SensitivityLevel::Restricted,
@@ -10087,6 +10109,14 @@ fn replay_due(c: &ScoredCandidate, ctx: &ComposeContext, cfg: &BaselineConfig) -
     // fallback is a decision taken here, visibly, which is why
     // `last_accessed_at` is `None` rather than a backend-invented
     // `Some(created_at)` — the policy can see it is guessing.
+    //
+    // This fallback is only honest because `(last_accessed_at: None,
+    // access_count: 0)` is ruled to mean the item has never been accessed,
+    // definitively — not "unknown". An item never recalled since creation is
+    // genuinely stale since creation. If that ruling is ever revisited so
+    // `(None, 0)` can also mean "unknown", this line starts fabricating a
+    // recall that may never have been absent at all, and must be revisited
+    // with it.
     let since_access = c.last_accessed_at.unwrap_or(c.item.created_at);
     let stale = ctx.now - since_access >= Duration::days(cfg.replay_stale_days as i64);
     c.fragility.get() >= 0.8 || (stale && c.fragility.get() >= 0.5)
@@ -10296,6 +10326,9 @@ mod tests {
         MaintainContext {
             scope: scope(),
             batch,
+            // Every test here hands `decisions` the whole namespace in one
+            // page — there is no further page to wait for.
+            is_final_batch: true,
             capacity: CapacityState {
                 budget: Budget { max_items: max, max_bytes: None },
                 used_items: used,
@@ -10391,9 +10424,10 @@ Expected: FAIL — `cannot find function decisions in this scope`.
 
 ```rust
 use crate::config::BaselineConfig;
+use crate::eviction;
 use memorysafe_core::{
-    Action, Decision, Eviction, MaintainContext, MemoryItem, PolicyId, Protection, Reason,
-    ReasonCode, features,
+    Action, Decision, Eviction, MaintainContext, MaintenanceCandidate, MemoryItem, PolicyId,
+    Protection, Reason, ReasonCode, features,
 };
 
 /// Ranking for capacity reclaim. Older and larger items go first; nothing
@@ -10418,6 +10452,7 @@ pub fn decisions(
         // a pin would silently override a retention limit.
         if item.must_forget(ctx.now) {
             out.push(Decision {
+                subject: Some(item.id.clone()),
                 action: Action::Reject,
                 evictions: vec![Eviction {
                     item: item.id.clone(),
@@ -10478,9 +10513,8 @@ pub fn decisions(
         .filter(|c| !expired.contains(&c.item.id) && c.item.protection.is_evictable(ctx.now))
         .collect();
     reclaimable.sort_by(|a, b| {
-        let cost = |c: &MaintenanceCandidate| c.value.get() * (1.0 - c.fragility.get()).max(0.0);
-        cost(a)
-            .total_cmp(&cost(b))
+        eviction::cost(a)
+            .total_cmp(&eviction::cost(b))
             .then_with(|| reclaim_rank(&a.item).cmp(&reclaim_rank(&b.item)))
     });
 
@@ -10490,6 +10524,7 @@ pub fn decisions(
             break;
         }
         out.push(Decision {
+            subject: Some(item.id.clone()),
             action: Action::Reject,
             evictions: vec![Eviction {
                 item: item.id.clone(),
@@ -10624,6 +10659,7 @@ mod tests {
     fn a_well_formed_decision_is_accepted() {
         let c = candidate(item("evictable"));
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![Eviction { item: c.item.id.clone(), reason: reason() }],
             reasons: vec![reason()],
@@ -10635,6 +10671,7 @@ mod tests {
     #[test]
     fn a_decision_evicting_an_item_outside_the_offered_set_is_refused() {
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![Eviction { item: ItemId::new(), reason: reason() }],
             reasons: vec![reason()],
@@ -10652,6 +10689,7 @@ mod tests {
         pinned.protection = Protection::Pinned;
         let c = candidate(pinned);
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![Eviction { item: c.item.id.clone(), reason: reason() }],
             reasons: vec![reason()],
@@ -10663,6 +10701,7 @@ mod tests {
     #[test]
     fn a_decision_with_no_reason_is_refused() {
         let d = Decision {
+            subject: None,
             action: Action::Retain { protection: Protection::Normal },
             evictions: vec![],
             reasons: vec![],
@@ -11427,7 +11466,7 @@ Create `crates/memorysafe-engine/src/gather.rs`:
 ```rust
 use crate::error::EngineError;
 use memorysafe_backend::Backend;
-use memorysafe_core::{AdmitContext, AssessContext, Embedding, Scope, ScoredCandidate};
+use memorysafe_core::{AdmitContext, AssessContext, Embedding, MaintenanceCandidate, Scope};
 use time::OffsetDateTime;
 
 /// One I/O pass producing everything `assess` may see.
@@ -11468,18 +11507,14 @@ pub async fn admit_context(
     let capacity = backend.capacity_state(scope).await?;
     let now = OffsetDateTime::now_utc();
 
-    let eviction_candidates: Vec<ScoredCandidate> = if capacity.budget.is_bounded() {
+    let eviction_candidates: Vec<MaintenanceCandidate> = if capacity.budget.is_bounded() {
         let page = memorysafe_backend::Page { offset: 0, limit };
         backend
             .list(scope, &page)
             .await?
             .into_iter()
             .filter(|i| i.protection.is_evictable(now))
-            .map(|item| ScoredCandidate {
-                estimated_tokens: ((item.body.len() as f32 / 4.0).ceil() as u32).max(1),
-                relevance: 0.0,
-                vector_score: None,
-                keyword_score: None,
+            .map(|item| MaintenanceCandidate {
                 value: memorysafe_core::Score::clamped(0.5),
                 fragility: memorysafe_core::Score::clamped(0.5),
                 item,
@@ -11677,6 +11712,8 @@ fn recall(query: &str, ceiling: SensitivityLevel, max_items: usize) -> RecallReq
         query: Some(query.into()),
         tags_any: vec![],
         kinds: vec![],
+        occurred_after: None,
+        occurred_before: None,
         mode: RecallMode::WorkingSet,
         budget: RecallBudget { max_tokens: Some(4000), max_items: Some(max_items) },
         sensitivity_ceiling: ceiling,
@@ -13551,6 +13588,8 @@ proptest! {
                     query: Some("memory concerning subject".into()),
                     tags_any: vec![],
                     kinds: vec![],
+                    occurred_after: None,
+                    occurred_before: None,
                     mode,
                     budget: RecallBudget { max_tokens: Some(8000), max_items: Some(50) },
                     sensitivity_ceiling: level,
@@ -13803,6 +13842,8 @@ async fn backfill_makes_a_pending_item_vector_searchable() {
             query: Some("the cat sat on the mat during the outage".into()),
             tags_any: vec![],
             kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
             mode: RecallMode::WorkingSet,
             budget: RecallBudget { max_tokens: Some(2000), max_items: Some(5) },
             sensitivity_ceiling: SensitivityLevel::Restricted,
