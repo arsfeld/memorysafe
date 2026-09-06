@@ -8387,24 +8387,17 @@ async fn scope_stats_reflect_the_corpus() {
     capacity::scope_stats_reflect_the_corpus(&SqliteFactory).await;
 }
 
-#[tokio::test]
-async fn admit_evict_and_audit_commit_together() {
-    atomicity::admit_evict_and_audit_commit_together(&SqliteFactory).await;
-}
-
+// `admit_evict_and_audit_commit_together`,
+// `an_invalid_transaction_is_rejected_and_writes_nothing` and
+// `every_mutation_writes_exactly_one_audit_record` are NOT added here: the
+// items-and-audit task already bound all three, having found them satisfiable
+// once `apply` wrote items, evictions and the audit row together. Re-adding
+// them is a duplicate `#[tokio::test]` name in one module and does not
+// compile. Only `a_failed_transaction_leaves_no_trace` was genuinely deferred
+// to this task, because it needs a merge and `MergeTargetMissing`.
 #[tokio::test]
 async fn a_failed_transaction_leaves_no_trace() {
     atomicity::a_failed_transaction_leaves_no_trace(&SqliteFactory).await;
-}
-
-#[tokio::test]
-async fn an_invalid_transaction_is_rejected_and_writes_nothing() {
-    atomicity::an_invalid_transaction_is_rejected_and_writes_nothing(&SqliteFactory).await;
-}
-
-#[tokio::test]
-async fn every_mutation_writes_exactly_one_audit_record() {
-    atomicity::every_mutation_writes_exactly_one_audit_record(&SqliteFactory).await;
 }
 
 #[tokio::test]
