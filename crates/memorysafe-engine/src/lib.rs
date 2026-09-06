@@ -5,6 +5,7 @@
 pub mod error;
 pub mod gather;
 pub mod outcome;
+pub mod read;
 pub mod validate;
 pub mod write;
 
