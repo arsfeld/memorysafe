@@ -646,23 +646,44 @@ mod tests {
     }
 
     #[test]
-    fn overlap_of_a_single_token_repeated_many_times_is_not_inflated_by_the_repeats() {
+    fn overlap_of_a_repeated_token_is_not_inflated_by_the_repeats() {
         // Rejects: tokenizing into a `Vec` (multiset) rather than a
-        // `HashSet` for either side — with a multiset, "the" would be
-        // counted three times in `a`, and a numerator/denominator mismatch
-        // (multiset count over distinct count, or vice versa) could push the
-        // ratio away from `1.0` in either direction.
-        // The correct value is `1.0` for a real reason, not a clamp on an
-        // otherwise-unbounded ratio (see `overlap`'s own doc comment for why
-        // that historical fix was replaced by this directional formula):
-        // `a`'s only DISTINCT content is the single token "the", which is
-        // fully present in `b` — the candidate is entirely CONTAINED IN the
-        // selected item, adding nothing new, which is exactly the case this
-        // penalty should score at its maximum.
-        // Vacuous if `a` had no repeated token to deduplicate — this fixture
-        // exists specifically to exercise `HashSet` deduplication, not any
-        // particular size relationship between `a` and `b`.
-        assert_eq!(overlap("the the the", "the cat"), 1.0);
+        // `HashSet` for either side — with `a`'s multiset `["the", "the",
+        // "cat"]` (occurrence-count numerator) over `ta.len() == 3`
+        // (multiset denominator), "the" is counted twice against `b`'s
+        // single "the", giving `2 / 3 ≈ 0.6666667`, not the `0.5` a
+        // distinct-token count gives (`shared = |{the, cat} ∩ {the, dog}| =
+        // 1`, `|A| = 2`).
+        //
+        // An earlier version of this fixture (`overlap("the the the", "the
+        // cat")`, expecting `1.0`) was NOT testing deduplication at all,
+        // in any version of the code, and this is what actually went wrong
+        // here — not that a once-discriminating fixture quietly stopped
+        // discriminating. That fixture was chosen for a DIFFERENT, real
+        // claim: it forced `shared = 3` against `min(3, 2) = 2`, i.e. `1.5`
+        // before the (then-current) `.min(1.0)` clamp, and it discriminated
+        // correctly for "the clamp exists". When the clamp was replaced by
+        // this directional `|A|` denominator — which makes a clamp
+        // unneeded, since `|A ∩ B| ≤ |A|` always — that fixture's original
+        // purpose became obsolete. Instead of deleting the test, it was
+        // RENAMED and its rejection claim swapped to "tokenizes into a
+        // `HashSet`, not a `Vec`" — a claim the fixture had never supported:
+        // `3 / 3` and `1 / 1` are both `1.0`, so it cannot tell a multiset
+        // from a set either before or after the rewrite. The fixture's
+        // credibility (it looked considered — a specific name over a
+        // specific number) carried across to a claim it was never built to
+        // support, and reading the result over did not catch it.
+        //
+        // The rule this is worth stating plainly: when a code change makes
+        // a test's purpose obsolete, DELETE the test — do not repurpose the
+        // fixture for a new claim. A fixture chosen to exercise property X
+        // is evidence about X only.
+        //
+        // Vacuous if `a` had at most one occurrence of any token that also
+        // appears in `b` — pinned by construction: "the" appears twice in
+        // `a` and matches `b`'s one occurrence, which is exactly the
+        // multiset/set divergence this fixture exists to force.
+        assert_eq!(overlap("the the cat", "the dog"), 0.5);
     }
 
     #[test]
@@ -745,6 +766,18 @@ mod tests {
         // comparisons cannot see a union — see `overlap`'s own doc comment),
         // not specific to this formula; the directional fix just changed
         // WHICH inputs happen to expose it.
+        //
+        // This test hand-rolls the `.max(...)` the real MMR fill loop
+        // computes over `selected`, rather than driving it through
+        // `working_set`, so it stays green through the deferred union fix
+        // named above changing what happens at the real call site (a new
+        // union-based helper replacing this `max` call, or `working_set`
+        // calling something else entirely) — it pins the PAIRWISE
+        // `overlap` values here, which the union fix leaves as building
+        // blocks, not the call site's current use of `max` over them. If
+        // the union fix lands, this test's own `max_sim` line stops
+        // describing what `working_set` actually does and should be
+        // revisited alongside it, even though it would keep passing.
         let candidate_body = "alpha beta";
         let selected_1 = "alpha";
         let selected_2 = "beta";
@@ -1015,9 +1048,10 @@ mod tests {
         // Brief-mandated, kept as written.
         //
         // What this test actually proves, corrected from the brief's own
-        // framing: `stale.fragility = Score::ONE` makes `fragility >= 0.8`
-        // true on its own, AND `created_at = UNIX_EPOCH` makes `stale` true
-        // on its own — both disjuncts of `replay_due`'s `||` are true here.
+        // framing: `stale.fragility = Score::ONE` makes
+        // `fragility >= cfg.replay_fragile_threshold` (default 0.8) true on
+        // its own, AND `created_at = UNIX_EPOCH` makes `stale` true on its
+        // own — both disjuncts of `replay_due`'s `||` are true here.
         // Breaking either one independently (a wrong threshold on the first,
         // a dead/broken staleness path on the second) leaves the other
         // disjunct to carry the result, so THIS test cannot fail either way
@@ -1108,7 +1142,10 @@ mod tests {
         let mut stale = candidate("old and moderately fragile", 0.5);
         stale.fragility = Score::clamped(0.6);
         stale.item.created_at = OffsetDateTime::UNIX_EPOCH;
-        assert!(stale.fragility.get() < 0.8 && stale.fragility.get() >= 0.5);
+        assert!(
+            stale.fragility.get() < cfg.replay_fragile_threshold
+                && stale.fragility.get() >= cfg.replay_stale_fragile_threshold
+        );
         assert!(
             replay_due(&stale, &c, &cfg),
             "0.6 fragility + stale must be replay-due"
@@ -1117,7 +1154,10 @@ mod tests {
         let mut fresh = candidate("new and moderately fragile", 0.5);
         fresh.fragility = Score::clamped(0.6);
         fresh.item.created_at = c.now;
-        assert!(fresh.fragility.get() < 0.8 && fresh.fragility.get() >= 0.5);
+        assert!(
+            fresh.fragility.get() < cfg.replay_fragile_threshold
+                && fresh.fragility.get() >= cfg.replay_stale_fragile_threshold
+        );
         assert!(
             !replay_due(&fresh, &c, &cfg),
             "0.6 fragility + fresh must not be replay-due"
