@@ -14,6 +14,7 @@ pub mod audit;
 pub mod items;
 pub mod schema;
 pub mod tenant;
+pub mod vectors;
 
 use async_trait::async_trait;
 use memorysafe_backend::{
@@ -27,6 +28,13 @@ use memorysafe_core::{
 use rusqlite::params;
 use std::path::PathBuf;
 use tenant::{SqlResultExt, TenantManager};
+
+/// Rough token count for budget packing: ~4 bytes per token, the usual
+/// English approximation. Deliberately cheap — the budget is a guide, not a
+/// contract with a specific tokenizer.
+pub(crate) fn estimate_tokens(body: &str) -> u32 {
+    ((body.len() as f32 / 4.0).ceil() as u32).max(1)
+}
 
 pub struct SqliteBackend {
     pub(crate) tenants: TenantManager,
@@ -53,13 +61,13 @@ impl SqliteBackend {
 
 /// **Partial, and deliberately so.** Task 20 implements `get`, `list`,
 /// `audit`, `record_recall` and a first `apply` covering insert, evictions and
-/// the audit row. Vectors and `neighbours` arrive in Task 21, keyword and
-/// hybrid retrieval in Task 22, merge and capacity and idempotency in
+/// the audit row. Task 21 adds vectors and a real `neighbours`. Keyword and
+/// hybrid retrieval arrive in Task 22, merge and capacity and idempotency in
 /// Task 23, and purge/export/import plus the aggregate *read* in Task 24.
 /// The methods those tasks own return `Ok` defaults here so the crate
 /// compiles and the isolation and atomicity conformance tests can run at
-/// all; each is marked, and none is bound by a conformance test in this
-/// crate's `tests/conformance.rs` yet.
+/// all; each is marked, and (`neighbours` now excepted) none is bound by a
+/// conformance test in this crate's `tests/conformance.rs` yet.
 #[async_trait]
 impl Backend for SqliteBackend {
     async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, BackendError> {
@@ -164,12 +172,16 @@ impl Backend for SqliteBackend {
                 let mut evicted = Vec::new();
                 for id in &txn.evictions {
                     items::delete(&tx, &txn.scope, id)?;
+                    vectors::delete(&tx, id)?;
                     evicted.push(id.clone());
                 }
 
                 let mut item_id = None;
                 if let Some(w) = &txn.upsert {
                     items::insert(&tx, &w.item)?;
+                    if let Some(v) = &w.vector {
+                        vectors::insert(&tx, &w.item.id, &txn.scope, v)?;
+                    }
                     item_id = Some(w.item.id.clone());
                 }
 
@@ -201,11 +213,48 @@ impl Backend for SqliteBackend {
     }
     async fn neighbours(
         &self,
-        _s: &Scope,
-        _e: &Embedding,
-        _k: usize,
+        scope: &Scope,
+        embedding: &Embedding,
+        k: usize,
     ) -> Result<Vec<ScoredCandidate>, BackendError> {
-        Ok(vec![])
+        let (scope, embedding) = (scope.clone(), embedding.clone());
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| {
+                // Refuse a probe from a model the scope was not indexed with.
+                if let Some((stored, dim)) = vectors::scope_embedder(c, &scope)?
+                    && (stored != embedding.embedder.to_string() || dim != embedding.dim)
+                {
+                    return Err(BackendError::EmbedderMismatch {
+                        got: format!("{}:{}", embedding.embedder, embedding.dim),
+                        expected: format!("{stored}:{dim}"),
+                    });
+                }
+                let probe = memorysafe_embed::QuantizedVector::from_embedding(&embedding);
+                let hits = vectors::search(c, &scope, &probe, k)?;
+                Ok(hits
+                    .into_iter()
+                    .map(|(item, access, score)| ScoredCandidate {
+                        estimated_tokens: estimate_tokens(&item.body),
+                        item,
+                        relevance: score,
+                        vector_score: Some(score),
+                        keyword_score: None,
+                        value: memorysafe_core::Score::ZERO,
+                        fragility: memorysafe_core::Score::ZERO,
+                        // `last_access`/`access_count` are the two columns the
+                        // schema has declared since Task 19 and nothing read
+                        // until now. Select them alongside `ITEM_COLUMNS` and
+                        // return them from `vectors::search` as their own
+                        // tuple element — they must NOT go on `MemoryItem`,
+                        // which is exported and digested. A row that has never
+                        // been recalled reads back `(None, 0)`, never
+                        // `(created_at, 0)`.
+                        last_accessed_at: access.last_accessed_at,
+                        access_count: access.access_count,
+                    })
+                    .collect())
+            })
+            .await
     }
     async fn capacity_state(&self, _s: &Scope) -> Result<CapacityState, BackendError> {
         Ok(CapacityState {
@@ -325,7 +374,7 @@ mod tests {
     ///
     /// No conformance test bound in this crate observes `audit_aggregates`:
     /// the read half is stubbed until the portability task, so
-    /// `aggregates::increment` can be deleted from `apply` and all seven
+    /// `aggregates::increment` can be deleted from `apply` and all ten
     /// conformance tests still pass — measured, not assumed. That is the
     /// `foreign_keys` shape: a real property with a present mechanism and no
     /// test that can fail.
@@ -580,6 +629,51 @@ mod tests {
             )),
             "a Recalled row is an audit row: it increments like every other, \
              on the UTC day it happened"
+        );
+    }
+
+    /// `neighbours` carries each hit's access statistics from storage, not a
+    /// constant `(None, 0)`. Nothing in `tests/conformance.rs` pins this yet:
+    /// `retrieval::recall_updates_access_statistics` — the conformance test
+    /// that owns this property — reads through `retrieve_candidates`, which
+    /// is still a stub, so it cannot bind until Task 22, and even then it
+    /// exercises the *other* retrieval path. Mutating the `access.*` mapping
+    /// in `neighbours` to hardcode `(None, 0)` was run against the ten bound
+    /// conformance tests and all ten stayed green — a mutant no test caught —
+    /// which is what this test exists to close.
+    #[tokio::test]
+    async fn neighbours_reports_the_items_stored_access_statistics() {
+        use memorysafe_embed::Embedder;
+
+        let b = backend();
+        let s = scope("s", "n");
+        let item = fx::item(&s, "the cat sat on the mat");
+        b.apply(fx::admit_txn_embedded(&s, item.clone()))
+            .await
+            .unwrap();
+
+        let at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(3_600);
+        let record = AuditRecord::new(
+            s.clone(),
+            AuditEvent::Recalled,
+            vec![ItemRef::from_item(&item)],
+            Actor::system(),
+            at,
+        );
+        b.record_recall(record).await.unwrap();
+
+        let probe = fx::embedder().embed("the cat sat on the mat").unwrap();
+        let hits = b.neighbours(&s, &probe, 1).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].access_count, 1,
+            "neighbours did not report the recalled item's access_count"
+        );
+        assert_eq!(
+            hits[0].last_accessed_at,
+            Some(at),
+            "neighbours did not report the recalled item's last_accessed_at"
         );
     }
 

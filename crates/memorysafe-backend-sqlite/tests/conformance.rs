@@ -7,10 +7,21 @@
 //! # What is bound here, and what is not
 //!
 //! Task 20 implements `get`, `list`, `audit`, `record_recall` and a first
-//! `apply` covering insert + eviction + audit. Every test below is one the
+//! `apply` covering insert + eviction + audit; Task 21 adds `vectors.rs` and
+//! a real `neighbours`. Every test below **except one** is one the
 //! null-backend census (`memorysafe_backend::conformance::null`) measured as
 //! **failing** against a backend that does nothing, so each is discriminating
 //! before this crate's implementation exists.
+//!
+//! The one exception is `retrieval::cross_model_vectors_are_rejected`: it is
+//! `NULL_TOLERANT` (`conformance::null`) because it accepts either an error
+//! or an empty result, so it also passes against a backend that does nothing.
+//! Its presence is covered by its sibling in the same list,
+//! `retrieval::neighbours_break_ties_before_truncating_at_k` — both are bound
+//! here, together, which is what makes the pairing sound: split across tasks,
+//! the absence test would sit green and meaningless in between. Going green
+//! is not evidence the cross-model rejection works on its own; the mutation
+//! testing in the task report is.
 //!
 //! The remaining four tests of the isolation and atomicity modules are bound
 //! by the task that supplies the method they observe, and are deliberately
@@ -29,6 +40,7 @@
 //! first unimplemented method would end the run. It arrives once every method
 //! is real.
 
+use memorysafe_backend::conformance::retrieval;
 use memorysafe_backend::conformance::{BackendFactory, atomicity, isolation};
 use memorysafe_backend_sqlite::SqliteBackend;
 
@@ -83,4 +95,19 @@ async fn an_invalid_transaction_is_rejected_and_writes_nothing() {
 #[tokio::test]
 async fn every_mutation_writes_exactly_one_audit_record() {
     atomicity::every_mutation_writes_exactly_one_audit_record(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn vector_search_ranks_by_similarity() {
+    retrieval::vector_search_ranks_by_similarity(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn cross_model_vectors_are_rejected() {
+    retrieval::cross_model_vectors_are_rejected(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn neighbours_break_ties_before_truncating_at_k() {
+    retrieval::neighbours_break_ties_before_truncating_at_k(&SqliteFactory).await;
 }
