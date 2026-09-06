@@ -434,6 +434,42 @@ mod tests {
         );
     }
 
+    /// The guard's placement, not just its effect. `a_merge_is_refused_whole…`
+    /// stays green if the refusal is moved *inside* `with_write`, because the
+    /// uncommitted transaction rolls back and "wrote nothing" is preserved by a
+    /// second, unrelated mechanism. What that test cannot see is the tenant
+    /// database being created, the write lock taken and a transaction opened
+    /// for a request that was always going to be refused.
+    ///
+    /// A tenant's file appears the moment `TenantManager` opens a connection
+    /// for it, so an untouched root is exactly the observable form of "refused
+    /// before a connection is taken".
+    #[tokio::test]
+    async fn a_refused_merge_never_opens_the_tenant_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let b = SqliteBackend::open(root.clone());
+        let s = scope("s", "n");
+
+        let mut txn = fx::evict_txn(&s, vec![fx::item(&s, "never written").id]);
+        txn.merge = Some(memorysafe_backend::write::MergeWrite {
+            target: fx::item(&s, "target").id,
+            body: "merged text".into(),
+            tags: vec![],
+            attrs: Default::default(),
+            vector: None,
+            byte_size: 11,
+        });
+        b.apply(txn).await.unwrap_err();
+
+        assert!(
+            !root.join(format!("{}.db", s.tenant.as_str())).exists(),
+            "the refusal opened a connection for the tenant: {:?}",
+            std::fs::read_dir(&root)
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+    }
+
     /// A policy-carrying decision keys its aggregate on the policy's **two
     /// parts**, taken from the record and not from the `audit` table's
     /// rendered `policy` column.
