@@ -10941,6 +10941,15 @@ pub fn working_set(
                     "selected by relevance traded against redundancy with the set so far",
                     features! {
                         "relevance" => c.relevance,
+                        // SUPERSEDED BY TASK 30 — transcribe with care. Task 30
+                        // replaces the pairwise `max` with coverage against the
+                        // union of the selected set and renames this key to
+                        // `fraction_covered_by_selected`, atomically, because the
+                        // old name is true of `max` and false of the union. This
+                        // block is left as it stands because it is the history of
+                        // what this task built and a reader needs to see what
+                        // changed — but it is a copy-paste hazard, and anything
+                        // written from it after Task 30 must use the new key.
                         "max_similarity_to_selected" => max_sim,
                         "mmr" => mmr,
                     },
