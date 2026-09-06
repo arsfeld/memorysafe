@@ -11127,9 +11127,16 @@ mod tests {
             1,
             "expiry dominates pinning: a pinned item past its TTL must still be forgotten"
         );
+        // Assert the REASON, not the action. `Action` has exactly three
+        // variants — `Retain`, `Merge`, `Reject` — and there is no `Forget`.
+        // The intent was always that a caller can tell a retention expiry from
+        // a capacity reclaim, and `ReasonCode` is where that distinction lives.
+        // Do not add an `Action::Forget` to make this read better: the enum is
+        // a stored wire format with audit-key implications and an applier in
+        // the engine's maintenance job, so the variant is a design decision.
         assert!(
-            matches!(out[0].action, Action::Forget { .. }),
-            "the decision must be Forget, not an eviction — the reason a caller sees              must say the retention limit expired, not that capacity was reclaimed"
+            out[0].has_reason(ReasonCode::TtlExpired),
+            "the reason must name the retention limit, not capacity pressure"
         );
     }
 
@@ -11271,6 +11278,10 @@ pub fn decisions(
     //                                                 `standing_check_budget_is_bounded`
     //   `CapacityState::pressure`   `capacity.rs:43`  reports it correctly
     //   `CapacityState::would_exceed` `capacity.rs:64` refuses the admission
+    //   `admit`'s make-room loop    `admit.rs:153-182` accumulates `freed_bytes`
+    //                                                 and EVICTS to fit — pinned by
+    //                                                 `a_byte_only_budget_frees_enough_
+    //                                                 room_after_one_eviction`
     //   `maintain::capacity_reclaim` HERE              ignores it
     //
     // So a namespace with `max_bytes: Some(_)` and `max_items: None` reports
@@ -11287,12 +11298,23 @@ pub fn decisions(
     // arrives with the `remember` pipeline. The waste is latent until then and
     // the stall is not.)
     //
+    // **So this is not a half-implemented feature. It is the two entry points
+    // of one policy disagreeing about whether byte budgets are enforced.**
+    // Admission-time pressure evicts to make room for a byte budget; scheduled
+    // maintenance never reclaims for one. Same namespace, same config, opposite
+    // behaviour depending on which path touches it — `eviction::cost`'s
+    // divergence a level up: not a formula copied twice, but one question
+    // answered twice differently.
+    //
+    // **The fix is to make reclaim match `admit`, not to reject the config.**
+    // An earlier version of this comment called a byte-only budget "a
+    // misconfiguration the engine should reject rather than a supported shape".
+    // That was false — `admit` supports it and has a test named for it, so
+    // rejecting it would break a working path.
+    //
     // Do not write a comment here saying byte budgets are deferred. **A reader
-    // who believes the deferral will not look for the liveness bug**, and a
+    // who believes the deferral will not look for the divergence**, and a
     // confident deferral note ends a look that silence would have invited.
-    // Owned by the engine's retention and capacity work; until it lands, a
-    // byte-only budget is a misconfiguration the engine should reject rather
-    // than a supported shape.
     let Some(max_items) = ctx.capacity.budget.max_items else {
         return out;
     };
