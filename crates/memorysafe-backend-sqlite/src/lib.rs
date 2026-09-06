@@ -219,8 +219,15 @@ impl Backend for SqliteBackend {
                     if size > 0 {
                         delta_items -= 1;
                         delta_bytes -= size as i64;
+                        // Inside the guard, with the counters. `AppliedWrite::evicted`
+                        // is the ids actually removed, not the ids the caller asked
+                        // to remove — and an id naming no row is not forbidden. It
+                        // was outside, so the counters and the report disagreed from
+                        // inside one loop; and because `AppliedWrite` is what an
+                        // idempotency row stores as its replayed outcome, a phantom
+                        // entry was replayed for as long as the key lived.
+                        evicted.push(id.clone());
                     }
-                    evicted.push(id.clone());
                 }
 
                 let mut item_id = None;
@@ -499,6 +506,40 @@ mod tests {
             .unwrap()
     }
 
+    /// `AppliedWrite::evicted` is the ids **actually removed**, not the ids the
+    /// caller asked to remove — see its doc on `WriteTransaction`. Nothing
+    /// forbids a transaction naming an eviction that matches no row, and the
+    /// push sat outside the `size > 0` guard, so the report claimed a phantom
+    /// while the capacity counters correctly ignored it: two answers out of one
+    /// loop.
+    ///
+    /// It matters beyond a wrong field because `AppliedWrite` is what an
+    /// idempotency row stores as its replayed outcome, so a phantom would be
+    /// replayed identically for as long as the key lived.
+    #[tokio::test]
+    async fn a_phantom_eviction_is_not_reported_as_evicted() {
+        let b = backend();
+        let s = scope("s", "n");
+        let real = fx::item(&s, "this one exists");
+        b.apply(fx::admit_txn(&s, real.clone(), None))
+            .await
+            .unwrap();
+
+        let ghost = fx::item(&s, "never inserted").id;
+        let applied = b
+            .apply(fx::evict_txn(&s, vec![real.id.clone(), ghost.clone()]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            applied.evicted,
+            vec![real.id.clone()],
+            "evicted must list what was removed; {ghost} matched no row"
+        );
+        // The premise: the real eviction did happen, so an empty vec cannot
+        // satisfy the assertion above for the wrong reason.
+        assert!(b.get(&s, &real.id).await.unwrap().is_none());
+    }
     /// **The aggregate write rule, on `apply`, and this test is the only thing
     /// that can see it.**
     ///

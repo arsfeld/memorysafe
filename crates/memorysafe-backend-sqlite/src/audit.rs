@@ -65,6 +65,21 @@ pub fn insert(conn: &Connection, record: &AuditRecord) -> Result<AuditId, Backen
     Ok(record.id.clone())
 }
 
+/// A stored value the writer could not have produced. Returning this rather
+/// than panicking matters more here than the wording suggests: a panic inside
+/// a `with_conn` closure poisons that tenant's connection mutex — see
+/// `TenantManager` — so one corrupt row takes the tenant down until the pool
+/// heals, where an error returns to the caller and leaves it working.
+fn unreadable(column: &str, detail: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::other(format!(
+            "audit.{column} holds {detail}, which no writer in this crate emits"
+        ))),
+    )
+}
+
 pub fn query(
     conn: &Connection,
     scope: &Scope,
@@ -131,15 +146,19 @@ pub fn query(
             let actor_json: String = r.get("actor")?;
             let at: i64 = r.get("at")?;
             Ok(AuditRecord {
-                id: AuditId::parse(&r.get::<_, String>("id")?).expect("stored audit ids"),
+                id: AuditId::parse(&r.get::<_, String>("id")?)
+                    .map_err(|e| unreadable("id", e.to_string()))?,
                 at: time::OffsetDateTime::from_unix_timestamp(at)
                     .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
-                scope: Scope::new(&tenant, &subject, &namespace).expect("stored scope"),
-                event: serde_json::from_str(&format!("\"{event_str}\"")).expect("stored event"),
+                scope: Scope::new(&tenant, &subject, &namespace)
+                    .map_err(|e| unreadable("scope", e.to_string()))?,
+                event: serde_json::from_str(&format!("\"{event_str}\""))
+                    .map_err(|e| unreadable("event", e.to_string()))?,
                 items: serde_json::from_str(&items_json).unwrap_or_default(),
                 assessment: assessment.and_then(|s| serde_json::from_str(&s).ok()),
                 decision: decision.and_then(|s| serde_json::from_str(&s).ok()),
-                actor: serde_json::from_str(&actor_json).expect("stored actor"),
+                actor: serde_json::from_str(&actor_json)
+                    .map_err(|e| unreadable("actor", e.to_string()))?,
             })
         })
         .sql()?;

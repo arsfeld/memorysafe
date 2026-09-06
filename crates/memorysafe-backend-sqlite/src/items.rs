@@ -114,8 +114,10 @@ pub fn row_to_item(row: &Row<'_>, tenant: &str) -> rusqlite::Result<MemoryItem> 
     let pending: i64 = row.get("pending_embedding")?;
 
     Ok(MemoryItem {
-        id: ItemId::parse(&row.get::<_, String>("id")?).expect("stored ids are valid ULIDs"),
-        scope: Scope::new(tenant, &subject, &namespace).expect("stored scopes are valid"),
+        id: ItemId::parse(&row.get::<_, String>("id")?)
+            .map_err(|e| unreadable_enum("id", &e.to_string()))?,
+        scope: Scope::new(tenant, &subject, &namespace)
+            .map_err(|e| unreadable_enum("scope", &e.to_string()))?,
         body: row.get("body")?,
         kind: row.get("kind")?,
         source: Source {
