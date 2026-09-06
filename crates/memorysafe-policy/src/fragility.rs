@@ -10,6 +10,21 @@ use memorysafe_core::{ScopeStats, Score, ScoredCandidate};
 /// absolute — 0.6 similarity is unusual in a tightly clustered corpus and
 /// unremarkable in a diffuse one. This is the "rare class" notion from the
 /// continual-learning lineage, expressed in embedding space.
+///
+/// A neighbourhood exactly as dense as `stats.mean_neighbour_similarity`
+/// scores exactly `0.5`; sparser-than-typical scores above `0.5` and
+/// denser-than-typical scores below it. Downstream policy code reads that
+/// midpoint directly (a fixed `0.5`/`0.8` threshold means "at least as sparse
+/// as typical" / "much sparser than typical"), so it is this function's
+/// contract, not an implementation detail.
+///
+/// **Precondition:** `stats.mean_neighbour_similarity` must already be a
+/// meaningful corpus-level baseline in the sense of `ScopeStats`'s own doc
+/// comment on that field — this function reads it as-is and cannot verify
+/// that on its own, since `stats` and `neighbours` are independent parameters
+/// with no enforced relationship between them. Supplying it unmet (in
+/// particular, the field's `0.0`/`Default` "no data" value while
+/// `item_count < 2`) is a caller error, not a case this function detects.
 pub fn score(neighbours: &[ScoredCandidate], stats: &ScopeStats) -> Score {
     if neighbours.is_empty() {
         return Score::ONE;
@@ -66,6 +81,48 @@ mod tests {
         let atypical = [candidate("a", 0.20), candidate("b", 0.15)];
         let typical = [candidate("a", 0.85), candidate("b", 0.80)];
         assert!(score(&atypical, &stats(0.5)) > score(&typical, &stats(0.5)));
+    }
+
+    #[test]
+    fn density_at_the_corpus_mean_scores_exactly_one_half() {
+        // 0.5 is the calibration anchor downstream policy code reads
+        // directly (compose's fixed 0.5/0.8 thresholds mean "at least as
+        // sparse as typical" / "much sparser than typical"): a neighbourhood
+        // exactly as dense as the corpus's own mean similarity must land
+        // exactly at the midpoint — for any baseline, not by coincidence at
+        // one particular value.
+        let baseline = 0.42;
+        // A single neighbour at exactly the baseline: local_density = b / 1
+        // = b with no averaging rounding, so this is exact by construction
+        // rather than exact by coincidence (three neighbours all at 0.5
+        // would also land exactly on 0.5, but only because 1.5 / 3 happens
+        // to divide evenly).
+        let at_baseline = [candidate("a", baseline)];
+        assert_eq!(score(&at_baseline, &stats(baseline)).get(), 0.5);
+    }
+
+    #[test]
+    fn a_neighbour_identical_to_the_item_scores_exactly_zero() {
+        // local_density == 1.0 is the other calibration anchor: an exact
+        // duplicate neighbour is never fragile, however diffuse or tight the
+        // rest of the corpus is.
+        let identical = [candidate("a", 1.0)];
+        assert_eq!(score(&identical, &stats(0.3)).get(), 0.0);
+    }
+
+    #[test]
+    fn sparser_than_typical_scores_above_half_denser_scores_below() {
+        // The gradient either side of the 0.5 anchor: strictly sparser than
+        // corpus-typical must land strictly above 0.5, and strictly denser
+        // strictly below. This is the function's contract independent of
+        // what any particular caller currently computes as `local_density`
+        // — it must hold for every caller, including ones that only ever
+        // produce values on one side of the anchor today.
+        let baseline = 0.5;
+        let sparser = [candidate("a", 0.2)];
+        let denser = [candidate("a", 0.8)];
+        assert!(score(&sparser, &stats(baseline)).get() > 0.5);
+        assert!(score(&denser, &stats(baseline)).get() < 0.5);
     }
 
     #[test]
