@@ -297,8 +297,23 @@ mod tests {
     #[test]
     fn under_pressure_the_cheapest_items_are_evicted_first() {
         let cfg = BaselineConfig::default();
-        let cheap = evictable("cheap to lose", 0.1, 0.1);
-        let precious = evictable("expensive to lose", 0.9, 0.9);
+        // Deliberate departure from the brief's verbatim fixture (a
+        // coordinator-approved fix, plan to be amended elsewhere): the
+        // brief's pair (0.1/0.1 vs 0.9/0.9) is lower on BOTH factors at
+        // once, so ranking by `value` alone or by `fragility` alone
+        // (ascending, either one) would evict the same item as the real
+        // `value * (1 - fragility)` product — the test could not tell the
+        // product apart from either factor by itself. Here the factors
+        // move in OPPOSITE directions: `cheap` has the HIGHER value AND the
+        // HIGHER fragility of the two, so both single-factor stand-ins
+        // would evict `precious` instead. Only the product gets this right.
+        //
+        //   cheap:    value 0.6, fragility 0.95  -> cost = 0.6 * 0.05 = 0.03
+        //   precious: value 0.5, fragility 0.10   -> cost = 0.5 * 0.90 = 0.45
+        //
+        // cost(cheap) = 0.03 < cost(precious) = 0.45, so `cheap` is evicted.
+        let cheap = evictable("cheap to lose", 0.6, 0.95);
+        let precious = evictable("expensive to lose", 0.5, 0.1);
         let cheap_id = cheap.item.id.clone();
 
         let (c, a) = assessed(0.1, 0.8, 0.2, SensitivityLevel::Internal);
@@ -318,7 +333,12 @@ mod tests {
             1,
             "exactly one eviction makes exactly enough room"
         );
-        assert_eq!(d.evictions[0].item, cheap_id, "evicted the expensive item");
+        assert_eq!(
+            d.evictions[0].item, cheap_id,
+            "must evict the lower-cost item despite its higher value AND \
+             higher fragility — value-only or fragility-only ranking would \
+             evict `precious` instead"
+        );
         assert_eq!(d.evictions[0].reason.code, ReasonCode::CapacityPressure);
     }
 
