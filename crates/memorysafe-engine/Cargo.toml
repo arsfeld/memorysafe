@@ -1,0 +1,28 @@
+[package]
+name = "memorysafe-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memorysafe-core.workspace = true
+memorysafe-embed.workspace = true
+memorysafe-backend.workspace = true
+memorysafe-policy.workspace = true
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+moka = { version = "0.12.16", features = ["future"] }
+async-trait = "0.1.92"
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+memorysafe-backend-sqlite.workspace = true
+tempfile = "3.27.0"
+proptest = "1.11.0"
+
+[lints]
+workspace = true
