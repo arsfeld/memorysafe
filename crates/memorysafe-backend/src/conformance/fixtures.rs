@@ -190,6 +190,28 @@ pub fn purge_record(scope: &Scope, id: AuditId, actor: Actor) -> AuditRecord {
     record
 }
 
+/// The five item ids the ordering tests pin, in ascending order: they share a
+/// prefix and differ only in the final character, so `...FA0 < ...FA1 < ... <
+/// ...FA4` by inspection.
+///
+/// A constant rather than a literal inlined at each use, for the reason
+/// `AUDIT_ORDER_ULIDS` is one: the premise (these ascend) is checked by
+/// `tests::the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending`,
+/// and a consumer that inlines its own copy of the strings is joined to that
+/// premise by string equality rather than by a symbol — so editing one and not
+/// the other silently detaches the check from the thing it checks.
+///
+/// `retrieval::list_tie_break_is_total_over_identical_timestamps` inserts all
+/// five out of order; `lifecycle::export_orders_the_stream_by_kind_then_by_id`
+/// uses the first three.
+pub const ITEM_ORDER_ULIDS: [&str; 5] = [
+    "01ARZ3NDEKTSV4RRFFQ69G5FA0",
+    "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+    "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+    "01ARZ3NDEKTSV4RRFFQ69G5FA3",
+    "01ARZ3NDEKTSV4RRFFQ69G5FA4",
+];
+
 /// The four audit ids `lifecycle::audit_filter_narrows_by_event_and_time`
 /// pins, in ascending order: three admits, then the eviction.
 ///
@@ -368,13 +390,7 @@ mod tests {
     #[test]
     fn the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending() {
         for family in [
-            [
-                "01ARZ3NDEKTSV4RRFFQ69G5FA0",
-                "01ARZ3NDEKTSV4RRFFQ69G5FA1",
-                "01ARZ3NDEKTSV4RRFFQ69G5FA2",
-                "01ARZ3NDEKTSV4RRFFQ69G5FA3",
-                "01ARZ3NDEKTSV4RRFFQ69G5FA4",
-            ],
+            ITEM_ORDER_ULIDS,
             [
                 "01BX5ZZKBKACTAV9WEVGEMMVR0",
                 "01BX5ZZKBKACTAV9WEVGEMMVR1",

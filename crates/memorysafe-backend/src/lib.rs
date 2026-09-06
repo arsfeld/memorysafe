@@ -37,6 +37,9 @@ pub enum BackendError {
     IdempotencyConflict,
     #[error("query is invalid: {0}")]
     InvalidQuery(String),
+    /// `WriteTransaction::is_valid` rejected the transaction — it both
+    /// inserts and merges, or its scope-bearing fields disagree. `Backend::apply`
+    /// returns this having written nothing.
     #[error("transaction is invalid: {0}")]
     InvalidTransaction(String),
     #[error("vector uses embedder {got}, scope uses {expected}")]
@@ -131,6 +134,18 @@ pub trait Backend: Send + Sync {
 
     /// Persists `txn.audit` under the id it already carries and returns that
     /// id as `AppliedWrite::audit_id` — see the echo rule on this trait.
+    ///
+    /// **`apply` must reject a transaction `WriteTransaction::is_valid`
+    /// rejects, with [`BackendError::InvalidTransaction`], having written
+    /// nothing.** Validation is not optional and not advisory: `is_valid`
+    /// exists because `scope`, the upserted item's own scope and
+    /// `audit.scope` are three independently-settable public fields that a
+    /// real backend reads for three different rows, so a transaction that
+    /// disagrees with itself files a row, its vector and its audit trail under
+    /// three different subjects. Rejecting *after* writing part of it is the
+    /// same defect with an error attached.
+    /// `conformance::atomicity::an_invalid_transaction_is_rejected_and_writes_nothing`
+    /// enforces both halves.
     async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError>;
 
     /// Writes the recall's audit row **and**, in the same transaction, updates
@@ -313,6 +328,32 @@ pub trait Backend: Send + Sync {
     /// cross-backend drift `list` and `audit` each had to have pinned down
     /// after the fact.
     ///
+    /// That order now has an executable referent — [`AggregateKey`]'s
+    /// hand-written `Ord`, which encodes exactly this sequence and
+    /// deliberately not the struct's field order — and a conformance test,
+    /// `conformance::lifecycle::audit_aggregates_page_in_the_documented_order`.
+    /// Two hazards it exists to catch, neither visible from this paragraph
+    /// alone: `None` before every `Some` is SQLite's default NULL ordering and
+    /// the **opposite** of Postgres's, which needs an explicit `NULLS FIRST`;
+    /// and `to_string()` is `name@version` as one string, so a numerically
+    /// compared version column puts `baseline@9` before `baseline@10` where
+    /// this order puts `baseline@10` first.
+    ///
+    /// **Two `Some`s compare by *byte* order** — `COLLATE "C"` / `ucs_basic`
+    /// in Postgres terms — not by the database's default collation. Saying
+    /// only "compare by `to_string()`" leaves the comparison to whatever the
+    /// storage engine does with text, and the two engines do different things:
+    /// SQLite's default TEXT collation is `BINARY`, while Postgres's `text`
+    /// uses the database collation, which is locale-aware by default. They
+    /// disagree wherever case or punctuation is involved, and `PolicyId` is
+    /// unvalidated free text — `PolicyId::new` restricts neither field — so
+    /// there is nothing keeping a policy name inside the range where the two
+    /// happen to agree. `B@1` sorts before `a@1` under byte order (`0x42` <
+    /// `0x61`) and after it under every locale collation; the conformance
+    /// sweep carries that exact pair. The id-keyed orderings elsewhere on this
+    /// trait need no such clause: `ItemId` and `AuditId` are fixed-length
+    /// `[0-9A-Z]` ULIDs, where byte order and locale order coincide.
+    ///
     /// **The cursor.** `filter.after`, when set, continues a previous page:
     /// the next page is restricted to keys strictly greater than it in the
     /// order above. `AggregateKey` is a value comparable without existing —
@@ -322,6 +363,10 @@ pub trait Backend: Send + Sync {
     /// `AuditRetention::aggregate`, whereas a row-id cursor would name
     /// nothing once its row was gone and would make the log look exhausted
     /// for a reason unrelated to the caller's query.
+    /// `conformance::lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row`
+    /// enforces that, with a cursor placed between two stored rows and named
+    /// by no row at all — a case no paging sweep can generate, since every
+    /// cursor a sweep produces came from a row the backend just returned.
     ///
     /// **Truncation is detectable from the page size, exactly as `audit`
     /// documents — there is no `truncated` flag.** An implementation must

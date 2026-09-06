@@ -140,10 +140,49 @@ pub fn day_bucket(at: OffsetDateTime) -> i64 {
     at.unix_timestamp().div_euclid(86_400)
 }
 
+/// The storage key for an event class: its serialised snake_case name.
+///
+/// `AggregateKey::event`'s doc says that name *is* the storage key, and
+/// `AggregateKey`'s ordering sorts by it, so both need it as a value. Taken
+/// from a `match` rather than from `serde_json` at comparison time for two
+/// reasons: an ordering that allocated two `String`s per comparison would be
+/// paid on every sort of every page, and the borrowed `&'static str` keeps
+/// `Ord` allocation-free. The risk that this table drifts from serde's is
+/// closed by `tests::the_event_sort_key_matches_what_serde_writes`, which
+/// checks every variant against the serialiser; and the `match` is exhaustive
+/// with no wildcard, so a new variant fails to compile here rather than
+/// silently acquiring another variant's sort position.
+pub fn event_sort_key(event: AuditEvent) -> &'static str {
+    match event {
+        AuditEvent::Admitted => "admitted",
+        AuditEvent::Rejected => "rejected",
+        AuditEvent::Merged => "merged",
+        AuditEvent::Forgotten => "forgotten",
+        AuditEvent::Recalled => "recalled",
+        AuditEvent::Exported => "exported",
+        AuditEvent::Imported => "imported",
+        AuditEvent::SubjectPurged => "subject_purged",
+        AuditEvent::Reembedded => "reembedded",
+        AuditEvent::PolicyChanged => "policy_changed",
+        AuditEvent::MaintenanceRun => "maintenance_run",
+    }
+}
+
 /// What an aggregate row is keyed by. There is no `subject` field and no
 /// `namespace` field, and the module doc says at length why not — the absence
 /// is the design, and a struct that cannot represent them is what keeps a
 /// later "just for this one query" from being a one-line change.
+///
+/// **`Ord` is hand-written, and must not be derived.** `Backend::audit_aggregates`
+/// documents the order as ascending by `day`, then `policy`, then the event's
+/// serialised name — while this struct *declares* `tenant, policy, event, day`,
+/// with `day` last. A derive would silently encode the declaration order and
+/// contradict the doc, and the doc is what `AuditAggregateFilter::after`'s
+/// cursor comparison and every backend's `ORDER BY` are written from. Before
+/// this impl existed there was no ordering on the type at all, so each backend
+/// re-derived one from prose — the condition under which two of them drift,
+/// which is exactly what the `Ordering` paragraph on that method says it
+/// exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateKey {
     pub tenant: TenantId,
@@ -171,6 +210,51 @@ pub struct AggregateKey {
     pub event: AuditEvent,
     /// Whole UTC days since the Unix epoch — see [`day_bucket`]. Not hours.
     pub day: i64,
+}
+
+impl Ord for AggregateKey {
+    /// `day`, then `policy`, then the event's serialised name — the order
+    /// `Backend::audit_aggregates` documents, in that order and not the field
+    /// declaration order.
+    ///
+    /// `policy` compares as `Option<String>` of `PolicyId::to_string()`, which
+    /// gives both halves of the documented rule at once: `Option`'s own
+    /// ordering puts `None` before every `Some`, and two `Some`s compare by
+    /// `name@version` as a single string. That last part is not cosmetic — a
+    /// backend comparing a name column and a numerically-typed version column
+    /// pairwise puts `baseline@9` before `baseline@10`, where the documented
+    /// string order puts `baseline@10` first.
+    ///
+    /// `String`'s `Ord` is **byte** order, which is the comparison
+    /// `Backend::audit_aggregates` documents (`COLLATE "C"`, not the
+    /// database's default collation). `PolicyId` is unvalidated free text, so
+    /// case and punctuation reach this comparison: `B@1` precedes `a@1` here
+    /// and would follow it under any locale-aware collation.
+    ///
+    /// `tenant` is compared **last**, after the three documented components.
+    /// It takes no part in the documented order because `audit_aggregates` is
+    /// already scoped to one tenant, so every row in any one query shares it —
+    /// but `Ord` must agree with `Eq`, and two keys differing only in tenant
+    /// are not equal, so it cannot simply be ignored. Placing it last means it
+    /// never perturbs the order any caller can observe.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.day
+            .cmp(&other.day)
+            .then_with(|| {
+                self.policy
+                    .as_ref()
+                    .map(PolicyId::to_string)
+                    .cmp(&other.policy.as_ref().map(PolicyId::to_string))
+            })
+            .then_with(|| event_sort_key(self.event).cmp(event_sort_key(other.event)))
+            .then_with(|| self.tenant.as_str().cmp(other.tenant.as_str()))
+    }
+}
+
+impl PartialOrd for AggregateKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// One aggregate row: how many events of this class the policy produced on
@@ -415,6 +499,186 @@ mod tests {
         );
         let back: AggregateKey = serde_json::from_str(&json).unwrap();
         assert_eq!(back.policy, None);
+    }
+
+    fn key(day: i64, policy: Option<PolicyId>, event: AuditEvent) -> AggregateKey {
+        AggregateKey {
+            tenant: TenantId::new("acme").unwrap(),
+            policy,
+            event,
+            day,
+        }
+    }
+
+    #[test]
+    fn the_event_sort_key_matches_what_serde_writes() {
+        // `event_sort_key` is a second copy of the snake_case names serde
+        // produces, kept for the borrow rather than the allocation. A second
+        // copy is only safe while something compares the two, so this is that
+        // something — and it is what makes the copy legitimate rather than a
+        // drift surface. Every variant, listed explicitly: a variant added to
+        // `AuditEvent` and forgotten here fails to compile in `event_sort_key`
+        // (no wildcard arm) and fails to appear in this list.
+        for event in [
+            AuditEvent::Admitted,
+            AuditEvent::Rejected,
+            AuditEvent::Merged,
+            AuditEvent::Forgotten,
+            AuditEvent::Recalled,
+            AuditEvent::Exported,
+            AuditEvent::Imported,
+            AuditEvent::SubjectPurged,
+            AuditEvent::Reembedded,
+            AuditEvent::PolicyChanged,
+            AuditEvent::MaintenanceRun,
+        ] {
+            let serialised = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                format!("\"{}\"", event_sort_key(event)),
+                serialised,
+                "the sort key and the storage key must be the same string"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_keys_order_by_day_then_policy_then_event_not_by_field_order() {
+        // The order `Backend::audit_aggregates` documents, asserted against
+        // the one thing that would otherwise encode it: a derive. `day` is the
+        // struct's **last** field and the sort's **first** component, so a
+        // derived `Ord` would order by `tenant, policy, event, day` and pass
+        // every comparison below that does not vary `day` — which is why the
+        // first assertion varies only `day`, against a policy and event that
+        // sort the other way.
+        let earlier_day = key(0, Some(PolicyId::new("zzz", "9")), AuditEvent::Rejected);
+        let later_day = key(1, None, AuditEvent::Admitted);
+        assert!(
+            earlier_day < later_day,
+            "day is the first component of the order even though it is the \
+             last field of the struct; a derived Ord gets this backwards"
+        );
+
+        // `None` before every `Some`, on the same day. This is the majority of
+        // the key space, not a corner: `SubjectPurged`, `Exported`, `Imported`,
+        // `Reembedded`, `MaintenanceRun` and `Recalled` never carry a policy.
+        let policy_less = key(5, None, AuditEvent::SubjectPurged);
+        let with_policy = key(5, Some(PolicyId::new("a", "1")), AuditEvent::Admitted);
+        assert!(
+            policy_less < with_policy,
+            "None must sort before every Some — the documented rule, and the \
+             opposite of Postgres's default NULL ordering for ASC"
+        );
+
+        // Two `Some`s compare by `to_string()`, which is `name@version` as one
+        // string. The pair below is the case that inverts under a version
+        // column compared numerically: "baseline@10" < "baseline@9" as text,
+        // 9 < 10 as numbers.
+        let v10 = key(
+            5,
+            Some(PolicyId::new("baseline", "10")),
+            AuditEvent::Admitted,
+        );
+        let v9 = key(
+            5,
+            Some(PolicyId::new("baseline", "9")),
+            AuditEvent::Admitted,
+        );
+        assert!(
+            v10 < v9,
+            "two Some policies compare as name@version strings, so \
+             baseline@10 precedes baseline@9 — a numerically compared version \
+             column reverses this and no other assertion in this crate would \
+             notice"
+        );
+
+        // And the comparison is over *bytes*, not a locale collation.
+        // `PolicyId::new` validates neither field, so an uppercase or
+        // punctuated policy name is reachable, and that is where SQLite's
+        // BINARY default and Postgres's locale-aware default diverge.
+        let upper_b = key(5, Some(PolicyId::new("B", "1")), AuditEvent::Admitted);
+        let lower_a = key(5, Some(PolicyId::new("a", "1")), AuditEvent::Admitted);
+        assert!(
+            upper_b < lower_a,
+            "policies compare by byte order: 'B' is 0x42 and 'a' is 0x61, so \
+             B@1 precedes a@1. Every locale-aware collation reverses this pair"
+        );
+
+        // Event breaks the remaining tie, by serialised name and not by
+        // declaration order: `Admitted` is declared first and `Rejected`
+        // second, while "forgotten" < "rejected" alphabetically. `Forgotten`
+        // is declared *fourth*, so a comparison by discriminant would put
+        // `Rejected` first.
+        let forgotten = key(5, None, AuditEvent::Forgotten);
+        let rejected = key(5, None, AuditEvent::Rejected);
+        assert!(
+            forgotten < rejected,
+            "events order by their serialised snake_case name, not by their \
+             declaration order in the enum"
+        );
+
+        // And the whole thing is a total order consistent with `Eq`: sorting a
+        // shuffled corpus reproduces exactly the sequence above.
+        let mut rows = vec![
+            rejected.clone(),
+            v9.clone(),
+            later_day.clone(),
+            policy_less.clone(),
+            v10.clone(),
+            earlier_day.clone(),
+            forgotten.clone(),
+            with_policy.clone(),
+        ];
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                // day 0, then day 1.
+                earlier_day,
+                later_day,
+                // day 5, policy-less first, and among those by event name:
+                // "forgotten" < "rejected" < "subject_purged".
+                forgotten,
+                rejected,
+                policy_less,
+                // then the policied rows, by `name@version` as one string:
+                // "a@1" < "baseline@10" < "baseline@9".
+                with_policy,
+                v10,
+                v9,
+            ],
+            "the full documented order: day, then policy (None first, then \
+             name@version), then the event's serialised name"
+        );
+    }
+
+    #[test]
+    fn ordering_by_tenant_is_last_so_it_never_perturbs_a_single_tenant_page() {
+        // `tenant` is in the key but not in the documented order. It cannot be
+        // dropped from `cmp` — `Ord` must agree with `Eq`, and two keys
+        // differing only in tenant are not equal — so it goes last, where it
+        // cannot reorder anything a caller of `audit_aggregates` can observe,
+        // since every row in one such query shares a tenant.
+        let a = AggregateKey {
+            tenant: TenantId::new("aaa").unwrap(),
+            policy: None,
+            event: AuditEvent::Admitted,
+            day: 9,
+        };
+        let z = AggregateKey {
+            tenant: TenantId::new("zzz").unwrap(),
+            policy: None,
+            event: AuditEvent::Admitted,
+            day: 1,
+        };
+        assert!(z < a, "day still outranks tenant");
+        let mut same_position = z.clone();
+        same_position.tenant = TenantId::new("aaa").unwrap();
+        assert!(
+            same_position < z,
+            "with every documented component equal, tenant breaks the tie so \
+             the order stays total and consistent with Eq"
+        );
+        assert_ne!(same_position, z);
     }
 
     #[test]

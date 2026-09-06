@@ -1339,15 +1339,27 @@ pub async fn purge_subject_persists_the_record_it_was_given<F: BackendFactory>(f
 /// `namespace` and ignores `subject` (or the reverse), since the corpus is
 /// arranged so either filter alone still excludes some records.
 ///
+/// **A fourth export repeats the narrowing with `include_audit: true`**, and
+/// that one carries a disclosure consequence rather than a correctness one.
+/// Narrowing enforced over `Item` records alone leaves a backend free to emit
+/// the whole tenant's audit table beside one subject's items — one subject's
+/// export carrying another subject's audit rows, in a product whose promise is
+/// that this cannot happen. Bodies are never in an audit row; ids, digests and
+/// feature numbers are.
+///
 /// **Vacuity:** the test proves nothing if the corpus lives in a single
 /// namespace or belongs to a single subject — there would be nothing for a
 /// narrowing selector to exclude, and "only the matching records came back"
 /// would be true of the whole tenant. The fixture therefore spans two
 /// namespaces *and* two subjects, and asserts before exporting that all four
 /// items are readable, so a backend that simply stored nothing cannot pass by
-/// exporting an empty stream. `include_audit` is not re-tested here: it is
-/// already covered by `import_is_idempotent`, which exports with
-/// `include_audit: false` and asserts the target's audit is empty afterwards.
+/// exporting an empty stream. The audit half has the mirror trap: absence
+/// alone is satisfied by a backend that emits no audit rows at all under
+/// `include_audit: true`, so the wanted row's presence is asserted too.
+///
+/// `include_audit: false` is not re-tested here — that direction is already
+/// covered by `import_is_idempotent`, which exports with the flag off and
+/// asserts the target's audit is empty after importing the stream.
 pub async fn export_narrows_to_the_selectors_subject_and_namespace<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let tenant = TenantId::new("t").unwrap();
@@ -1360,13 +1372,18 @@ pub async fn export_narrows_to_the_selectors_subject_and_namespace<F: BackendFac
     let theirs_b = Scope::new("t", "other", "ns-b").unwrap();
 
     let mut ids = Vec::new();
+    let mut audit_ids = Vec::new();
     for scope in [&mine_a, &mine_b, &theirs_a, &theirs_b] {
         let item = fx::item(scope, &format!("a memory in {}", scope.key()));
         ids.push(item.id.clone());
-        backend
+        let applied = backend
             .apply(fx::admit_txn(scope, item, None))
             .await
             .unwrap();
+        // One admit, one audit row, filed under that admit's own scope — so
+        // each of the four audit rows is narrowable on exactly the same two
+        // axes as its item.
+        audit_ids.push(applied.audit_id);
     }
     let (mine_a_id, mine_b_id, theirs_a_id, theirs_b_id) = (
         ids[0].clone(),
@@ -1463,9 +1480,58 @@ pub async fn export_narrows_to_the_selectors_subject_and_namespace<F: BackendFac
         .unwrap();
     assert_eq!(
         exported_ids(&both),
-        vec![mine_a_id],
+        vec![mine_a_id.clone()],
         "subject and namespace together must select their intersection, one item"
     );
+
+    // **The audit half, and it is the half with a disclosure consequence.**
+    // Every export above sets `include_audit: false`, and the one other test
+    // that sets it `true` (`export_orders_the_stream_by_kind_then_by_id`)
+    // narrows nothing — so without this fourth export nothing in the suite
+    // combines a narrowing selector with audit records, and a backend that
+    // narrows items while emitting the whole tenant's audit table passes.
+    // That is one subject's export carrying another subject's audit rows.
+    // Bodies are never in an audit row, but ids, content digests and feature
+    // numbers are, and "subject X's export contains only subject X's data" is
+    // the promise this product is sold on.
+    let with_audit = backend
+        .export(&ScopeSelector {
+            tenant: TenantId::new("t").unwrap(),
+            subject: Some(SubjectId::new("s").unwrap()),
+            namespace: Some(memorysafe_core::Namespace::new("ns-a").unwrap()),
+            include_audit: true,
+        })
+        .await
+        .unwrap();
+    let exported_audit: Vec<AuditId> = with_audit
+        .iter()
+        .filter_map(|r| match r {
+            ExportRecord::Audit { audit } => Some(audit.id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        exported_audit.contains(&audit_ids[0]),
+        "include_audit: true dropped the audit row of the very scope the          selector names — narrowing must exclude other scopes, not everything"
+    );
+    for (i, label) in [
+        (1usize, "the same subject's other namespace"),
+        (2, "another subject, same namespace"),
+        (3, "another subject, another namespace"),
+    ] {
+        assert!(
+            !exported_audit.contains(&audit_ids[i]),
+            "the export of one scope carried an audit row from {label}:              `ScopeSelector` narrowed the items and not the audit rows, which              is a cross-subject disclosure in the export path"
+        );
+    }
+    assert_eq!(
+        exported_audit.len(),
+        1,
+        "exactly one of the four audit rows belongs to (s, ns-a)"
+    );
+    // And the items are still narrowed when audit is switched on, so a
+    // backend cannot trade one for the other.
+    assert_eq!(exported_ids(&with_audit), vec![mine_a_id]);
 }
 
 /// `Backend::audit` returns exactly `min(filter.limit, rows still matching)`
@@ -1615,11 +1681,12 @@ pub async fn audit_returns_min_of_the_limit_and_the_rows_that_remain<F: BackendF
 /// `AuditFilter::after` pages **backwards down the id order**: the next page
 /// holds only ids strictly less than the cursor.
 ///
-/// `Backend::audit`'s doc comment has carried the note that "`filter.after`
-/// appears in no conformance test: the cursor is entirely untested, so this
-/// doc comment is the only thing pinning down both its direction and this
-/// rule." This is that test. It amends no contract — the rule was already
-/// written down; nothing enforced it.
+/// `Backend::audit`'s doc comment carried, until this test, the note that
+/// "`filter.after` appears in no conformance test: the cursor is entirely
+/// untested, so this doc comment is the only thing pinning down both its
+/// direction and this rule." This is that test, and that doc now names it. It
+/// amends no contract — the rule was already written down; nothing enforced
+/// it.
 ///
 /// **The implementations this rejects**, both of which keep the suite green
 /// today:
@@ -1765,9 +1832,10 @@ pub async fn audit_pages_by_the_after_cursor_without_repeating_a_row<F: BackendF
 /// `AuditFilter::since` and `until` are **inclusive**: a record timestamped
 /// exactly on either bound matches.
 ///
-/// `Backend::audit`'s doc comment has carried the note that "the conformance
-/// suite's window test deliberately places both bounds off every record's
-/// timestamp, so it cannot tell an inclusive backend from an exclusive one."
+/// `Backend::audit`'s doc comment carried, until this test, the note that
+/// "the conformance suite's window test deliberately places both bounds off
+/// every record's timestamp, so it cannot tell an inclusive backend from an
+/// exclusive one."
 /// That placement in `audit_filter_narrows_by_event_and_time` is deliberate
 /// and stays as it is — it tests the window *without* depending on the
 /// inclusivity choice, which is a property worth keeping. This is the separate
@@ -1850,11 +1918,11 @@ pub async fn audit_since_and_until_include_a_record_on_the_boundary<F: BackendFa
 /// `export` emits `Header` first, then `Item`s ascending by `ItemId`, then
 /// `Audit` rows ascending by `AuditId` — and the sections do not interleave.
 ///
-/// `Backend::export`'s doc comment has carried the note that
+/// `Backend::export`'s doc comment carried, until this test, the note that
 /// "`export_import_round_trips_exactly` never inspects the export stream
 /// itself — it compares `list` output after re-sorting both sides by
 /// `ItemId`, so no conformance test observes the stream's order at all." This
-/// is the test that observes it. The cost of leaving it unobserved is stated
+/// is the test that observes it, and that doc now names it. The cost of leaving it unobserved is stated
 /// on the trait: two backends exporting the same data in different orders
 /// produce byte-different artifacts, so a customer checksumming a migration
 /// cannot verify it.
@@ -1882,19 +1950,17 @@ pub async fn export_orders_the_stream_by_kind_then_by_id<F: BackendFactory>(fact
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
 
-    // Item ids from the family whose ascending order
-    // `fixtures::tests::the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending`
-    // checks today; audit ids from `fx::AUDIT_ORDER_ULIDS`, checked by its own
-    // sibling there. Neither sequence is generated, because generated ULIDs
-    // ascend with insertion and would hide exactly the defect under test.
-    let item_ids: Vec<ItemId> = [
-        "01ARZ3NDEKTSV4RRFFQ69G5FA0",
-        "01ARZ3NDEKTSV4RRFFQ69G5FA1",
-        "01ARZ3NDEKTSV4RRFFQ69G5FA2",
-    ]
-    .iter()
-    .map(|s| ItemId::parse(s).expect("literal must be a canonical ULID"))
-    .collect();
+    // Both sequences come from fixture constants rather than inlined
+    // literals, so the premise test and its consumer are joined by a symbol
+    // and not by string equality: `fx::ITEM_ORDER_ULIDS` and
+    // `fx::AUDIT_ORDER_ULIDS`, each checked ascending by its own test in
+    // `fixtures::tests` today. Neither sequence is generated, because
+    // generated ULIDs ascend with insertion and would hide the defect under
+    // test.
+    let item_ids: Vec<ItemId> = fx::ITEM_ORDER_ULIDS[..3]
+        .iter()
+        .map(|s| ItemId::parse(s).expect("literal must be a canonical ULID"))
+        .collect();
     let audit_ids: Vec<AuditId> = fx::AUDIT_ORDER_ULIDS[..3]
         .iter()
         .map(|s| AuditId::parse(s).expect("literal must be a canonical ULID"))
@@ -1970,7 +2036,10 @@ pub async fn export_orders_the_stream_by_kind_then_by_id<F: BackendFactory>(fact
          inserted in the order 2, 0, 1, so a backend emitting its natural row \
          order returns that instead"
     );
-    let mut audits_ascending = audits.clone();
+    // Against the pinned literals, ascending — not against a sorted copy of
+    // the returned list, which any three ids satisfy by construction and which
+    // would have made this half of the test unfalsifiable.
+    let mut audits_ascending = audit_ids.clone();
     audits_ascending.sort();
     assert_eq!(
         audits, audits_ascending,
@@ -1987,5 +2056,408 @@ pub async fn export_orders_the_stream_by_kind_then_by_id<F: BackendFactory>(fact
         "every Item must precede every Audit row: the two sections must not \
          interleave, or two backends emitting the same records in the same \
          per-section order still produce different bytes"
+    );
+}
+
+/// Eight aggregate rows spanning two days, both policy states, four `Some`
+/// policies and two event classes — the corpus both aggregate-cursor tests
+/// page over. Returns the tenant it wrote into.
+///
+/// Two of the four policies exist for the version hazard (`baseline@10` before
+/// `baseline@9` as text, the reverse as numbers) and two for the collation
+/// hazard (`B@1` before `a@1` as bytes, the reverse under any locale-aware
+/// collation).
+///
+/// Aggregates are produced by the write path, not by an API of their own: each
+/// `apply` writes one audit row and increments the aggregate keyed by that
+/// row's tenant, its decision's policy (`None` when the record carries no
+/// decision), its event class, and `day_bucket(record.at)`. So the corpus is
+/// built by choosing those four things per transaction.
+async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
+    use memorysafe_core::{Decision, PolicyId, Reason, ReasonCode};
+
+    let tenant = TenantId::new("t").unwrap();
+    let scope = Scope::new("t", "s", "n").unwrap();
+    let day0 = OffsetDateTime::UNIX_EPOCH;
+    let day1 = day0 + Duration::days(1);
+
+    let decision = |policy: PolicyId| {
+        Decision::retain(
+            policy,
+            Reason::new(ReasonCode::HighValue, "seeded", Default::default()),
+        )
+    };
+    let v10 = PolicyId::new("baseline", "10");
+    let v9 = PolicyId::new("baseline", "9");
+    // `PolicyId::new` validates neither field, so an uppercase name is a legal
+    // policy — and it is the pair on which SQLite's default TEXT collation
+    // (BINARY, i.e. bytes) and Postgres's (locale-aware) disagree with
+    // certainty rather than by locale.
+    let upper_b = PolicyId::new("B", "1");
+    let lower_a = PolicyId::new("a", "1");
+
+    // (day 0, None, Admitted)
+    let a = fx::item_at(&scope, "day zero, no policy", day0);
+    backend
+        .apply(fx::admit_txn(&scope, a.clone(), None))
+        .await
+        .unwrap();
+
+    // (day 0, Some(baseline@10), Admitted)
+    let b = fx::item_at(&scope, "day zero, policy ten", day0);
+    let mut txn = fx::admit_txn(&scope, b.clone(), None);
+    txn.audit = txn.audit.clone().with_decision(decision(v10.clone()));
+    backend.apply(txn).await.unwrap();
+
+    // (day 0, Some(baseline@9), Admitted)
+    let c = fx::item_at(&scope, "day zero, policy nine", day0);
+    let mut txn = fx::admit_txn(&scope, c, None);
+    txn.audit = txn.audit.clone().with_decision(decision(v9));
+    backend.apply(txn).await.unwrap();
+
+    // (day 0, Some(B@1), Admitted)
+    let e = fx::item_at(&scope, "day zero, uppercase policy", day0);
+    let mut txn = fx::admit_txn(&scope, e, None);
+    txn.audit = txn.audit.clone().with_decision(decision(upper_b));
+    backend.apply(txn).await.unwrap();
+
+    // (day 0, Some(a@1), Admitted)
+    let f = fx::item_at(&scope, "day zero, lowercase policy", day0);
+    let mut txn = fx::admit_txn(&scope, f, None);
+    txn.audit = txn.audit.clone().with_decision(decision(lower_a));
+    backend.apply(txn).await.unwrap();
+
+    // (day 1, None, Admitted)
+    let d = fx::item_at(&scope, "day one, no policy", day1);
+    backend.apply(fx::admit_txn(&scope, d, None)).await.unwrap();
+
+    // (day 1, None, Forgotten)
+    backend
+        .apply(fx::evict_txn_at(&scope, vec![a.id.clone()], day1))
+        .await
+        .unwrap();
+
+    // (day 1, Some(baseline@10), Forgotten)
+    let mut txn = fx::evict_txn_at(&scope, vec![b.id.clone()], day1);
+    txn.audit = txn.audit.clone().with_decision(decision(v10));
+    backend.apply(txn).await.unwrap();
+
+    tenant
+}
+
+/// Paging `audit_aggregates` by `AuditAggregateFilter::after` visits every row
+/// exactly once, in the documented order, across a corpus that includes
+/// policy-less rows.
+///
+/// **The implementations this rejects**, all three of which pass every other
+/// test in this suite:
+///
+/// - *A row-value comparison written from the struct's field order.*
+///   `Backend::audit_aggregates` documents the order as `day`, then `policy`,
+///   then the event's serialised name. `AggregateKey` **declares** `tenant,
+///   policy, event, day` — `day` is documented first and declared last — so
+///   the natural `(a, b, c, d) < (w, x, y, z)` written off the struct compares
+///   `day` last. Over a corpus spanning two days that misorders the sweep, and
+///   because the cursor comparison and the `ORDER BY` then disagree, rows
+///   repeat or vanish.
+/// - *Postgres's default NULL ordering.* "`None` sorts before every `Some`" is
+///   SQLite's default and the **opposite** of Postgres's, which sorts nulls
+///   larger than any non-null for `ASC`. A plain `ORDER BY policy` therefore
+///   conforms in SQLite and inverts in Postgres, and Postgres needs an explicit
+///   `NULLS FIRST`. Worse, a naive row-value comparison against a NULL
+///   component evaluates to NULL rather than false, so the row is dropped and
+///   the page comes back short — and a short page is defined to *mean* the log
+///   is exhausted, so the sweep terminates early and silently, on the majority
+///   of the key space.
+/// - *A numerically compared version column.* Two `Some`s compare by
+///   `PolicyId::to_string()`, i.e. `name@version` as one string, so
+///   `baseline@10` precedes `baseline@9`. A backend storing version as a
+///   number reverses exactly that pair.
+/// - *A locale collation on the policy column.* That comparison is over
+///   **bytes**. SQLite's default TEXT collation is `BINARY` and Postgres's is
+///   the database's, which is locale-aware by default, so `B@1` precedes
+///   `a@1` on one and follows it on the other. `PolicyId` validates neither
+///   of its fields, so an uppercase or punctuated policy name is reachable and
+///   nothing keeps the two collations in the range where they agree. Postgres
+///   conforms only with `COLLATE "C"` (`ucs_basic`).
+///
+/// **This test compares the backend against `AggregateKey`'s `Ord`**, not
+/// against a sequence written out here — a third copy of the order would be a
+/// third thing to drift. That makes `Ord` itself load-bearing, so it is pinned
+/// separately by `aggregates::tests::aggregate_keys_order_by_day_then_policy_
+/// then_event_not_by_field_order`, whose assertions are written from the
+/// method's doc comment rather than from the impl. The two endpoint assertions
+/// below are the exception: they are read straight from the prose and do not
+/// route through `Ord` at all.
+///
+/// **Vacuity.** The sweep proves nothing if the page size is not smaller than
+/// the corpus (no cursor is ever used), if the corpus spans one day (the
+/// field-order confusion is invisible), if it contains no policy-less row (the
+/// NULL hazard is invisible, and it is the majority of the key space), or if
+/// the two `Some` policies sort the same numerically and lexically (the
+/// version hazard is invisible), or if no policy name reaches outside the
+/// range where byte order and locale collation agree (the collation hazard is
+/// invisible). The fixture is eight rows over two days, swept two at a time,
+/// with three policy-less rows, the `baseline@9` / `baseline@10` pair that
+/// inverts under numeric comparison, and the `B@1` / `a@1` pair that inverts
+/// under any locale-aware collation.
+pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(factory: &F) {
+    use crate::{AggregateKey, AuditAggregate};
+
+    let backend = factory.create().await;
+    let tenant = seed_aggregate_corpus(&backend).await;
+
+    let page_size = 2;
+    let mut swept: Vec<AuditAggregate> = Vec::new();
+    let mut cursor: Option<AggregateKey> = None;
+    let mut terminated = false;
+    for _ in 0..10 {
+        let page = backend
+            .audit_aggregates(
+                &tenant,
+                &AuditAggregateFilter {
+                    after: cursor.clone(),
+                    limit: page_size,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            page.len() <= page_size,
+            "a page may never exceed the limit it was given"
+        );
+        let short = page.len() < page_size;
+        cursor = page.last().map(|a| a.key.clone());
+        swept.extend(page);
+        if short {
+            terminated = true;
+            break;
+        }
+    }
+    assert!(
+        terminated,
+        "paging never reached a short page: either the cursor is not being \
+         applied, or `min(limit, remaining)` is being padded"
+    );
+
+    assert_eq!(
+        swept.len(),
+        8,
+        "the corpus is eight distinct keys and every one must be visited \
+         exactly once; a smaller number means the sweep terminated early, a \
+         larger one means the cursor re-served rows it had already returned"
+    );
+    assert!(
+        page_size < swept.len(),
+        "the page size must be smaller than the corpus, or no cursor is ever \
+         used and this test degenerates into a single unpaginated read"
+    );
+
+    let keys: Vec<AggregateKey> = swept.iter().map(|a| a.key.clone()).collect();
+    let unique: BTreeSet<AggregateKey> = keys.iter().cloned().collect();
+    assert_eq!(
+        unique.len(),
+        keys.len(),
+        "the sweep returned a duplicate key"
+    );
+
+    let mut canonical = keys.clone();
+    canonical.sort();
+    assert_eq!(
+        keys, canonical,
+        "the pages must arrive in the documented order — ascending by day, \
+         then policy (None before every Some, two Somes by name@version), then \
+         the event's serialised name"
+    );
+
+    // Read straight from the prose rather than through `Ord`: the earliest day
+    // comes first, and within it the policy-less row precedes every policied
+    // one. If `Ord` were wrong these two would still be right.
+    assert_eq!(
+        keys.first().map(|k| (k.day, k.policy.clone())),
+        Some((0, None)),
+        "the first row must be the earliest day's policy-less one: day is the \
+         leading component and None sorts before every Some"
+    );
+    assert!(
+        keys.last()
+            .is_some_and(|k| k.day == 1 && k.policy.is_some()),
+        "the last row must be the later day's policied one"
+    );
+
+    // The premise the NULL hazard rests on: policy-less rows are actually in
+    // the corpus. Without them a backend that mishandles NULL passes.
+    assert_eq!(
+        keys.iter().filter(|k| k.policy.is_none()).count(),
+        3,
+        "three of the six rows carry no policy; if that ever reaches zero this \
+         test stops exercising the ordering hazard it exists for"
+    );
+    assert_eq!(
+        keys.iter()
+            .filter(|k| k.day == 0)
+            .filter(|k| k.policy.is_some())
+            .count(),
+        4,
+        "day zero must hold all four policied rows, or neither the \
+         name@version comparison nor the collation pair is exercised"
+    );
+
+    // The collation pair, asserted by position rather than through `Ord`:
+    // policies compare as bytes, so `B@1` (0x42) precedes `a@1` (0x61). Every
+    // locale-aware collation reverses this, so a Postgres backend that leaves
+    // the column at the database's default collation fails here and a SQLite
+    // backend passes on its BINARY default — which is the cross-backend split
+    // this pair exists to make visible.
+    let position = |name: &str| {
+        keys.iter()
+            .position(|k| k.policy.as_ref().is_some_and(|p| p.to_string() == name))
+    };
+    let (b_at, a_at) = (position("B@1"), position("a@1"));
+    assert!(
+        b_at.is_some() && a_at.is_some(),
+        "both halves of the collation pair must be in the swept corpus"
+    );
+    assert!(
+        b_at < a_at,
+        "policies order by byte order, not by the database's collation: B@1 \
+         precedes a@1. Postgres needs COLLATE \"C\" (ucs_basic) on that \
+         column; its default locale collation puts a@1 first"
+    );
+
+    // An unpaginated read must produce the same rows in the same order — a
+    // backend whose paged order differs from its unpaged order is paging over
+    // a different query than it answers.
+    let whole = backend
+        .audit_aggregates(
+            &tenant,
+            &AuditAggregateFilter {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        whole.iter().map(|a| a.key.clone()).collect::<Vec<_>>(),
+        keys,
+        "paging and a single unpaginated read must agree, on contents and on \
+         order"
+    );
+    assert_eq!(
+        whole.iter().map(|a| a.count).sum::<u64>(),
+        8,
+        "eight audit rows, eight distinct keys, one event counted in each"
+    );
+}
+
+/// `AuditAggregateFilter::after` names a **coordinate in the key space**, not
+/// a stored row: a cursor whose key was never written still resumes correctly.
+///
+/// **The implementation this rejects:** one that resolves `after` to a stored
+/// row — looking it up by equality, or storing a row id and seeking to it —
+/// and pages from that row's position. It is the row-id cursor
+/// `AuditAggregateFilter::after`'s own doc comment rejects, arriving by
+/// another route: the doc rejected it because "a row-id cursor would name
+/// nothing once its row was gone, and a caller paging through would see the
+/// log end early for a reason unrelated to their query." Handed a key it
+/// cannot find, such a backend returns an empty page (the log looks exhausted
+/// three rows early) or ignores the cursor and returns everything.
+///
+/// **This cannot be folded into the sweep test.** Every cursor a sweep
+/// produces came from a row the backend just returned, so a lookup-based
+/// implementation resolves all of them and passes. Only a key that was never
+/// stored distinguishes the two, and no paging fixture can generate one.
+///
+/// **Vacuity.** The test proves nothing if the cursor coincides with a stored
+/// key (it is then just another page of the sweep), if it sorts below every
+/// row (the whole corpus comes back, which a backend ignoring the cursor also
+/// returns), or if it sorts above every row (an empty page, which the broken
+/// backend also returns). So the cursor is placed strictly *between* stored
+/// rows with three on each side, and both sides are asserted: the three below
+/// absent, the three above present and in order. That the cursor names no
+/// stored row is asserted rather than assumed.
+pub async fn audit_aggregates_resume_from_a_cursor_that_names_no_stored_row<F: BackendFactory>(
+    factory: &F,
+) {
+    use crate::AggregateKey;
+    use memorysafe_core::PolicyId;
+
+    let backend = factory.create().await;
+    let tenant = seed_aggregate_corpus(&backend).await;
+
+    let all = backend
+        .audit_aggregates(
+            &tenant,
+            &AuditAggregateFilter {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        all.len(),
+        8,
+        "the corpus must exist before it can be resumed into"
+    );
+
+    // Day 0, policy `nonexistent@1.0.0`: no such row was ever written, and it
+    // sorts above every policy day zero holds ("B@1", "a@1", "baseline@10",
+    // "baseline@9" — all below "nonexistent@..." in byte order), so this
+    // coordinate sits after all five of day zero's rows and before all three
+    // of day one's.
+    let phantom = AggregateKey {
+        tenant: tenant.clone(),
+        policy: Some(PolicyId::new("nonexistent", "1.0.0")),
+        event: AuditEvent::Rejected,
+        day: 0,
+    };
+    assert!(
+        all.iter().all(|a| a.key != phantom),
+        "the cursor must name a key that was never stored, or this test is \
+         indistinguishable from an ordinary page of the sweep"
+    );
+
+    let resumed = backend
+        .audit_aggregates(
+            &tenant,
+            &AuditAggregateFilter {
+                after: Some(phantom.clone()),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !resumed.is_empty(),
+        "resuming from a key that names no stored row returned nothing: the \
+         cursor is being looked up as a row instead of compared as a value, so \
+         the log ends early for a reason unrelated to the caller's query"
+    );
+    assert!(
+        resumed.iter().all(|a| a.key.day == 1),
+        "every row strictly greater than a day-zero coordinate carrying a \
+         policy above all of day zero's is a day-one row; a day-zero row came \
+         back, so the cursor was ignored"
+    );
+    let expected: Vec<AggregateKey> = {
+        let mut k: Vec<AggregateKey> = all
+            .iter()
+            .map(|a| a.key.clone())
+            .filter(|k| *k > phantom)
+            .collect();
+        k.sort();
+        k
+    };
+    assert_eq!(expected.len(), 3, "three rows sort above the cursor");
+    assert_eq!(
+        resumed.iter().map(|a| a.key.clone()).collect::<Vec<_>>(),
+        expected,
+        "resuming must return exactly the rows strictly greater than the \
+         cursor, in the documented order"
     );
 }

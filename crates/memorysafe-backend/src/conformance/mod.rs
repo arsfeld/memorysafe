@@ -119,5 +119,7 @@ where
         lifecycle::import_rejects_a_later_record_whose_tenant_disagrees,
         lifecycle::import_rejects_a_foreign_audit_record_even_when_every_item_agrees,
         lifecycle::audit_aggregates_survive_a_cascading_purge,
+        lifecycle::audit_aggregates_page_in_the_documented_order,
+        lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row,
     );
 }
