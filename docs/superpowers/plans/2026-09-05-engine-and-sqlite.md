@@ -11141,7 +11141,14 @@ mod tests {
     }
 
     #[test]
-    fn an_over_budget_namespace_reclaims_cheapest_first() {
+    // Named for what this corpus pins, which is the COUNT and not the order:
+    // all five fixtures share `STORED_VALUE`, `STORED_FRAGILITY` and the
+    // default `created_at`, so cost and age are both ties and no ranking is
+    // distinguishable here. The ranking is covered next door by
+    // `reclaim_takes_the_cheapest_to_lose_first_not_merely_the_oldest`, which
+    // varies value and fragility on purpose — do not weaken that one, and do
+    // not re-add a ranking claim to this name.
+    fn an_over_budget_namespace_reclaims_down_to_its_budget() {
         let batch: Vec<MemoryItem> = (0..5).map(|i| item(&format!("memory {i}"))).collect();
         let ds = decisions(&ctx(batch, 5, Some(3)), &BaselineConfig::default(), pid());
         let evicted: usize = ds.iter().map(|d| d.evictions.len()).sum();
@@ -11252,6 +11259,19 @@ pub fn decisions(
     }
 
     // 3. Capacity reclaim, cheapest first, pinned untouchable.
+    // **Byte budgets are NOT deferred here — they are half-implemented, and the
+    // missing half is this one.** `CapacityState::pressure` consults
+    // `max_bytes`, and `CapacityState::would_exceed` refuses an admission that
+    // would break it. Only reclaim ignores it. So a namespace configured with
+    // `max_bytes: Some(_)` and `max_items: None` reports pressure correctly,
+    // rejects writes once over, and **never reclaims** — it is permanently
+    // stuck, not merely unbounded.
+    //
+    // Do not write a comment here saying byte budgets are deferred: two of the
+    // three code paths implement them, and a reader who believes the deferral
+    // will not look for the liveness bug. Owned by the engine's retention and
+    // capacity work; until it lands, a byte-only budget is a misconfiguration
+    // the engine should reject rather than a supported shape.
     let Some(max_items) = ctx.capacity.budget.max_items else {
         return out;
     };
