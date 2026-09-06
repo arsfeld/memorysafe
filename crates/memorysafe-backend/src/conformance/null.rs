@@ -26,13 +26,42 @@
 //!
 //! `run_conformance_suite`'s `run!` macro awaits each test inline, so the
 //! first panic ends the run and everything after it goes unmeasured. The
-//! census needs a verdict for all forty-nine. It therefore spawns each test
+//! census needs a verdict for all fifty. It therefore spawns each test
 //! as its own Tokio task and reads the `JoinHandle`: a panic arrives as
 //! `Err(JoinError)` instead of unwinding the census. The list below is a
 //! transcription of `run_conformance_suite`'s own list, in its order, and
 //! `the_census_measures_every_test_the_suite_runs` compares the two name by
 //! name against `mod.rs` itself, so a test added there cannot go unmeasured
 //! here.
+//!
+//! # Writing a test this census cannot help you with
+//!
+//! The census answers one question — *does this test pass against a backend
+//! that does nothing?* — and a test can be discriminating by that measure and
+//! still prove nothing about the property it names. Three ways, all of which
+//! have cost real time in this crate:
+//!
+//! 1. **The absence is satisfied by an empty result.**
+//!    `assert!(leaked.is_empty())` holds when the query returned nothing at
+//!    all. `assert_eq!(hits.len(), 1)` does not.
+//! 2. **The absence is satisfied by a write that silently failed.** If the
+//!    seeding never landed, "the foreign item did not come back" is true for
+//!    the wrong reason. Read the thing back from its own scope before
+//!    asserting it is absent from another.
+//! 3. **The two cases differ on more than one axis.** Two scopes differing in
+//!    subject *and* namespace pin neither predicate individually — neutralise
+//!    either half alone and the test still passes. One component per
+//!    neighbour, so each has a case that isolates it.
+//!
+//! These are one rule, not three: **an absence assertion is worth nothing
+//! until the presence it is an absence of is pinned.**
+//!
+//! [`isolation::retrieval_never_crosses_a_scope_boundary`](super::isolation::retrieval_never_crosses_a_scope_boundary)
+//! implements all three and says so in its own comments. It is the shape to
+//! copy for any scope or filter test.
+//!
+//! The census cannot see any of this: it substitutes the backend, and all
+//! three failures survive that substitution intact.
 
 use crate::{
     AppliedWrite, AuditAggregate, AuditAggregateFilter, Backend, BackendError, CandidateQuery,
