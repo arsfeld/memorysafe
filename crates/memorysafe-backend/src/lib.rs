@@ -182,16 +182,21 @@ pub trait Backend: Send + Sync {
     /// list is descending, "after" names a *position* in that returned
     /// order, not a point in time: the next page is restricted to
     /// `id < after` (strictly smaller), not `id > after` — the temporal
-    /// reading would instead re-request rows already returned. Neither
-    /// draft `Backend::audit` implementation wires up `after` yet, so this
-    /// doc comment is the only place the direction is pinned down.
+    /// reading would instead re-request rows already returned.
+    /// `conformance::lifecycle::audit_pages_by_the_after_cursor_without_repeating_a_row`
+    /// enforces this: it pages a four-row log at `limit: 2` and asserts
+    /// strict descent, disjoint pages, a complete walk, and termination on a
+    /// short page.
     ///
     /// `filter.since` and `filter.until` are both **inclusive** bounds: a
-    /// record timestamped exactly at either edge matches. The conformance
-    /// suite's window test deliberately places both bounds off every
-    /// record's timestamp, so it cannot tell an inclusive backend from an
-    /// exclusive one — this doc comment is the only place the choice is
-    /// pinned down.
+    /// record timestamped exactly at either edge matches.
+    /// `conformance::lifecycle::audit_since_and_until_include_a_record_on_the_boundary`
+    /// enforces this, by placing each bound exactly on the timestamp of the
+    /// record that must be the corresponding extreme of the result.
+    /// `audit_filter_narrows_by_event_and_time` still places its own bounds
+    /// off every record's timestamp, on purpose: it tests the window without
+    /// depending on the inclusivity choice, so the two tests fail for
+    /// different reasons.
     ///
     /// **Truncation is detectable from the page size, so there is no
     /// `truncated` flag.** An implementation must return exactly
@@ -207,9 +212,11 @@ pub trait Backend: Send + Sync {
     /// `AuditFilter`: `limit` defaults to 100, so a compliance query built
     /// from `AuditFilter::default()` stops at 100 rows. It still does — but
     /// the caller can now tell, because a full page means "ask again", not
-    /// "that was everything". Note that `filter.after` appears in no
-    /// conformance test: the cursor is entirely untested, so this doc comment
-    /// is the only thing pinning down both its direction and this rule.
+    /// "that was everything".
+    /// `conformance::lifecycle::audit_returns_min_of_the_limit_and_the_rows_that_remain`
+    /// pins both arguments of the `min` in one test — a filter matching fewer
+    /// rows than the limit returns all of them, and one matching more
+    /// truncates to exactly the limit.
     async fn audit(
         &self,
         scope: &Scope,
@@ -337,10 +344,17 @@ pub trait Backend: Send + Sync {
     /// backends exporting the same tenant with a different (or absent)
     /// order produce byte-different artifacts for identical data, so
     /// checksums do not match and a customer verifying a migration cannot.
-    /// `export_import_round_trips_exactly` never inspects the export stream
-    /// itself — it compares `list` output after re-sorting both sides by
-    /// `ItemId`, so no conformance test observes the stream's order at all —
-    /// this doc comment is the only thing pinning it down.
+    /// `export_import_round_trips_exactly` still does not observe the stream —
+    /// it compares `list` output after re-sorting both sides by `ItemId` —
+    /// but `conformance::lifecycle::export_orders_the_stream_by_kind_then_by_id`
+    /// now walks the records themselves, over a corpus whose insertion order
+    /// deliberately disagrees with its id order so that a backend emitting
+    /// rows in storage order fails.
+    ///
+    /// `sel`'s optional `subject` and `namespace` must narrow the result;
+    /// `conformance::lifecycle::export_narrows_to_the_selectors_subject_and_namespace`
+    /// enforces that, asserting both that the matching records are present and
+    /// that the others are absent.
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
 
     /// Imports `stream` into `destination`. The tenant is a parameter, not a

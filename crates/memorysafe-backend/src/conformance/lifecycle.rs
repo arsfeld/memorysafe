@@ -1611,3 +1611,381 @@ pub async fn audit_returns_min_of_the_limit_and_the_rows_that_remain<F: BackendF
          not an arbitrary two of the five that match"
     );
 }
+
+/// `AuditFilter::after` pages **backwards down the id order**: the next page
+/// holds only ids strictly less than the cursor.
+///
+/// `Backend::audit`'s doc comment has carried the note that "`filter.after`
+/// appears in no conformance test: the cursor is entirely untested, so this
+/// doc comment is the only thing pinning down both its direction and this
+/// rule." This is that test. It amends no contract — the rule was already
+/// written down; nothing enforced it.
+///
+/// **The implementations this rejects**, both of which keep the suite green
+/// today:
+///
+/// - *`id > after`.* "After" reads as "later" in English and as `>` in SQL, so
+///   a descending log paged with `id > after` is the single likeliest mistake
+///   here. It re-serves the rows the caller has already seen and never reaches
+///   the older ones: paging never terminates and the log looks infinite.
+/// - *A temporal cursor* — `at > cursor_row.at`, or `at < it` — which is what
+///   you get from reading `after` as a point in time rather than a position in
+///   the returned order. This corpus is arranged so the two disagree: the
+///   eviction carries the largest `AuditId` while its `at` sits between the
+///   second and third admit's, so an `at`-based page 2 returns a different set
+///   from an id-based one rather than the same set in another order.
+/// - *`id <= after`*, an off-by-one that returns the cursor row a second time.
+///   Caught by the strictness assertion rather than by the disjointness one,
+///   since a duplicated cursor row is one shared id, not a shared page.
+///
+/// **Vacuity:** every assertion below holds trivially if the log has no more
+/// rows than the limit — page 1 is then the whole log, page 2 is empty, and
+/// "disjoint" and "strictly less" are true of nothing. The fixture writes four
+/// rows and pages at `limit: 2`, so there are two full pages and a third,
+/// empty one that proves termination. It would also prove nothing if the ids
+/// ascended in the same order as `at`: an `at`-cursor backend would then
+/// produce identical pages. `fx::AUDIT_ORDER_ULIDS` pins the ids, and the
+/// eviction's `at` is placed *between* two admits so the two orders genuinely
+/// disagree — the same construction, and the same reason, as
+/// `audit_filter_narrows_by_event_and_time`.
+pub async fn audit_pages_by_the_after_cursor_without_repeating_a_row<F: BackendFactory>(
+    factory: &F,
+) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let ids: Vec<AuditId> = fx::AUDIT_ORDER_ULIDS
+        .iter()
+        .map(|u| AuditId::parse(u).expect("literal must be a canonical ULID"))
+        .collect();
+
+    // Three admits at 0s/10s/20s, then an eviction whose business timestamp is
+    // 15s — earlier than the third admit's — while its id is the largest of
+    // the four. Id order and `at` order therefore disagree.
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    for (i, at) in [t0, t0 + Duration::seconds(10), t0 + Duration::seconds(20)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut txn = fx::admit_txn(
+            &scope,
+            fx::item_at(&scope, &format!("memory {i}"), at),
+            None,
+        );
+        txn.audit.id = ids[i].clone();
+        backend.apply(txn).await.unwrap();
+    }
+    let items = backend.list(&scope, &Page::default()).await.unwrap();
+    let mut evict = fx::evict_txn_at(
+        &scope,
+        vec![items[0].id.clone()],
+        t0 + Duration::seconds(15),
+    );
+    evict.audit.id = ids[3].clone();
+    backend.apply(evict).await.unwrap();
+
+    let page = |after: Option<AuditId>| {
+        let scope = scope.clone();
+        let backend = &backend;
+        async move {
+            backend
+                .audit(
+                    &scope,
+                    &AuditFilter {
+                        after,
+                        limit: 2,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let first = page(None).await;
+    let first_ids: Vec<AuditId> = first.iter().map(|r| r.id.clone()).collect();
+    assert_eq!(
+        first_ids,
+        vec![ids[3].clone(), ids[2].clone()],
+        "the first page must be the two largest AuditIds, newest first"
+    );
+
+    let cursor = first_ids.last().expect("page 1 is not empty").clone();
+    let second = page(Some(cursor.clone())).await;
+    let second_ids: Vec<AuditId> = second.iter().map(|r| r.id.clone()).collect();
+
+    assert!(
+        second_ids.iter().all(|id| *id < cursor),
+        "every row after the cursor must have a strictly smaller AuditId: \
+         `id < after`, not `id > after` and not `id <= after`. Got {second_ids:?} \
+         against cursor {cursor}"
+    );
+    let first_set: BTreeSet<_> = first_ids.iter().cloned().collect();
+    let second_set: BTreeSet<_> = second_ids.iter().cloned().collect();
+    assert!(
+        first_set.is_disjoint(&second_set),
+        "the second page re-served a row from the first: paging by the cursor \
+         must not repeat"
+    );
+    assert_eq!(
+        second_ids,
+        vec![ids[1].clone(), ids[0].clone()],
+        "the second page must be the remaining two rows, still newest first"
+    );
+
+    // The two pages together are the whole log, in descending id order — so
+    // the cursor skipped nothing on the way down.
+    let mut walked = first_ids.clone();
+    walked.extend(second_ids.iter().cloned());
+    assert_eq!(
+        walked,
+        vec![
+            ids[3].clone(),
+            ids[2].clone(),
+            ids[1].clone(),
+            ids[0].clone()
+        ],
+        "paging by the cursor must visit every row exactly once, descending"
+    );
+
+    // And paging terminates: a page shorter than `limit` means exhausted.
+    let third = page(Some(ids[0].clone())).await;
+    assert!(
+        third.is_empty(),
+        "there is nothing below the smallest id, so the page after it must be \
+         empty — a non-empty page here means the cursor is not being applied"
+    );
+    assert!(
+        third.len() < 2,
+        "a page shorter than `limit` is the only signal a caller has that the \
+         log is exhausted"
+    );
+}
+
+/// `AuditFilter::since` and `until` are **inclusive**: a record timestamped
+/// exactly on either bound matches.
+///
+/// `Backend::audit`'s doc comment has carried the note that "the conformance
+/// suite's window test deliberately places both bounds off every record's
+/// timestamp, so it cannot tell an inclusive backend from an exclusive one."
+/// That placement in `audit_filter_narrows_by_event_and_time` is deliberate
+/// and stays as it is — it tests the window *without* depending on the
+/// inclusivity choice, which is a property worth keeping. This is the separate
+/// test that does depend on it.
+///
+/// **The implementation this rejects:** one whose SQL reads
+/// `at > since AND at < until`. Exclusive bounds are what you get from writing
+/// the comparison out by hand without deciding the edges, and the choice is
+/// invisible in every other test in this suite. Against this fixture such a
+/// backend returns one row where the contract requires three — the two
+/// boundary records are exactly the ones it drops.
+///
+/// **Vacuity:** the test proves nothing unless the boundary records are the
+/// *extremes* of the expected result. If `since` sat on an interior record's
+/// timestamp, an exclusive backend would still return the earlier ones and the
+/// set would differ by nothing observable at the edge. So `since` is placed
+/// exactly on the earliest expected record and `until` exactly on the latest.
+/// It would also prove nothing if no record lay outside the window, since
+/// "everything came back" is then true of a backend that ignores the bounds
+/// entirely: one record sits strictly below `since` and one strictly above
+/// `until`, and both are asserted absent.
+pub async fn audit_since_and_until_include_a_record_on_the_boundary<F: BackendFactory>(
+    factory: &F,
+) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // Five records ten seconds apart. The window is [10s, 30s]: the records at
+    // 10s and 30s are the boundaries and must be returned; 0s and 40s are
+    // outside and must not be.
+    let t0 = OffsetDateTime::UNIX_EPOCH;
+    let mut written: Vec<(OffsetDateTime, AuditId)> = Vec::new();
+    for step in 0..5u8 {
+        let at = t0 + Duration::seconds(i64::from(step) * 10);
+        let applied = backend
+            .apply(fx::admit_txn(
+                &scope,
+                fx::item_at(&scope, &format!("memory at {step}0s"), at),
+                None,
+            ))
+            .await
+            .unwrap();
+        written.push((at, applied.audit_id));
+    }
+
+    let since = written[1].0;
+    let until = written[3].0;
+    let returned = backend
+        .audit(
+            &scope,
+            &AuditFilter {
+                since: Some(since),
+                until: Some(until),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let got: BTreeSet<AuditId> = returned.iter().map(|r| r.id.clone()).collect();
+    let expected: BTreeSet<AuditId> = written[1..=3].iter().map(|(_, id)| id.clone()).collect();
+    assert_eq!(
+        got, expected,
+        "since and until are inclusive bounds: the records timestamped exactly \
+         at {since} and at {until} must both be returned, along with the one \
+         between them. An exclusive backend returns only the middle record"
+    );
+    assert_eq!(
+        returned.len(),
+        3,
+        "three of the five records fall inside the closed window"
+    );
+    assert!(
+        !got.contains(&written[0].1) && !got.contains(&written[4].1),
+        "a record outside the window leaked through, so the bounds are not \
+         being applied at all"
+    );
+}
+
+/// `export` emits `Header` first, then `Item`s ascending by `ItemId`, then
+/// `Audit` rows ascending by `AuditId` — and the sections do not interleave.
+///
+/// `Backend::export`'s doc comment has carried the note that
+/// "`export_import_round_trips_exactly` never inspects the export stream
+/// itself — it compares `list` output after re-sorting both sides by
+/// `ItemId`, so no conformance test observes the stream's order at all." This
+/// is the test that observes it. The cost of leaving it unobserved is stated
+/// on the trait: two backends exporting the same data in different orders
+/// produce byte-different artifacts, so a customer checksumming a migration
+/// cannot verify it.
+///
+/// **The implementation this rejects:** one that emits rows in whatever order
+/// its storage returns them — `SELECT ... FROM items` with no `ORDER BY`,
+/// which SQLite answers in rowid order, i.e. insertion order. Also one that
+/// walks items and audit rows together in a single pass (a union view, or a
+/// per-item "row then its audit trail" loop), which produces a correctly
+/// ordered stream by every check except the section boundary.
+///
+/// **Vacuity, and here it is the whole difficulty:** `ItemId` is a ULID minted
+/// at creation, so a corpus built with `fx::item` and inserted in the obvious
+/// order is *already* ascending by id. Against such a fixture a backend that
+/// sorts nothing at all passes, and the test certifies the defect it exists to
+/// catch. Both corpora below are therefore built from pinned literal ids with
+/// `fx::item_with_id` and inserted in a deliberately non-ascending order —
+/// `2, 0, 1` — for the items *and* for their audit rows, and the premise that
+/// insertion order differs from id order is asserted rather than assumed. The
+/// "non-decreasing" assertions would also be vacuous over zero or one record
+/// of a kind, so the fixture writes three of each and asserts both counts.
+pub async fn export_orders_the_stream_by_kind_then_by_id<F: BackendFactory>(factory: &F) {
+    use memorysafe_core::ItemId;
+
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // Item ids from the family whose ascending order
+    // `fixtures::tests::the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending`
+    // checks today; audit ids from `fx::AUDIT_ORDER_ULIDS`, checked by its own
+    // sibling there. Neither sequence is generated, because generated ULIDs
+    // ascend with insertion and would hide exactly the defect under test.
+    let item_ids: Vec<ItemId> = [
+        "01ARZ3NDEKTSV4RRFFQ69G5FA0",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+    ]
+    .iter()
+    .map(|s| ItemId::parse(s).expect("literal must be a canonical ULID"))
+    .collect();
+    let audit_ids: Vec<AuditId> = fx::AUDIT_ORDER_ULIDS[..3]
+        .iter()
+        .map(|s| AuditId::parse(s).expect("literal must be a canonical ULID"))
+        .collect();
+
+    // Insertion order 2, 0, 1 — non-ascending on both id sequences at once.
+    let insertion = [2usize, 0, 1];
+    for i in insertion {
+        let item = fx::item_with_id(&scope, item_ids[i].clone(), &format!("memory {i}"));
+        let mut txn = fx::admit_txn(&scope, item, None);
+        txn.audit.id = audit_ids[i].clone();
+        backend.apply(txn).await.unwrap();
+    }
+
+    // The premise, asserted rather than assumed: a backend that emits rows in
+    // insertion order must produce something other than ascending id order.
+    let inserted: Vec<ItemId> = insertion.iter().map(|i| item_ids[*i].clone()).collect();
+    let mut ascending = inserted.clone();
+    ascending.sort();
+    assert_ne!(
+        inserted, ascending,
+        "the corpus must be inserted out of id order, or a backend that sorts \
+         nothing passes this test"
+    );
+
+    let stream = backend
+        .export(&ScopeSelector {
+            tenant: TenantId::new("t").unwrap(),
+            subject: None,
+            namespace: None,
+            include_audit: true,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(stream.first(), Some(ExportRecord::Header { .. })),
+        "the stream must open with the Header: {stream:?}"
+    );
+
+    let mut items: Vec<ItemId> = Vec::new();
+    let mut audits: Vec<AuditId> = Vec::new();
+    let mut last_item_at: Option<usize> = None;
+    let mut first_audit_at: Option<usize> = None;
+    for (position, record) in stream.iter().enumerate() {
+        match record {
+            ExportRecord::Item { item, .. } => {
+                items.push(item.id.clone());
+                last_item_at = Some(position);
+            }
+            ExportRecord::Audit { audit } => {
+                audits.push(audit.id.clone());
+                first_audit_at = first_audit_at.or(Some(position));
+            }
+            ExportRecord::Header { .. } => {}
+        }
+    }
+
+    assert_eq!(
+        items.len(),
+        3,
+        "three items were written; with fewer than two an ordering assertion \
+         proves nothing"
+    );
+    assert_eq!(
+        audits.len(),
+        3,
+        "include_audit: true, and three audit rows were written"
+    );
+    assert_eq!(
+        items, ascending,
+        "Item records must be emitted ascending by ItemId. This corpus was \
+         inserted in the order 2, 0, 1, so a backend emitting its natural row \
+         order returns that instead"
+    );
+    let mut audits_ascending = audits.clone();
+    audits_ascending.sort();
+    assert_eq!(
+        audits, audits_ascending,
+        "Audit records must be emitted ascending by AuditId, and their \
+         insertion order was 2, 0, 1 as well"
+    );
+    // Unwrapped rather than compared as `Option`s: `None < Some(_)` holds, so
+    // an empty section would satisfy the comparison without satisfying the
+    // rule. The counts above already rule that out; this makes it structural.
+    let last_item_at = last_item_at.expect("three Item records were emitted");
+    let first_audit_at = first_audit_at.expect("three Audit records were emitted");
+    assert!(
+        last_item_at < first_audit_at,
+        "every Item must precede every Audit row: the two sections must not \
+         interleave, or two backends emitting the same records in the same \
+         per-section order still produce different bytes"
+    );
+}

@@ -193,6 +193,13 @@ pub fn purge_record(scope: &Scope, id: AuditId, actor: Actor) -> AuditRecord {
 /// The four audit ids `lifecycle::audit_filter_narrows_by_event_and_time`
 /// pins, in ascending order: three admits, then the eviction.
 ///
+/// `lifecycle::audit_pages_by_the_after_cursor_without_repeating_a_row` builds
+/// the same four-record corpus for the same reason — it needs id order and
+/// `at` order to disagree — and
+/// `lifecycle::export_orders_the_stream_by_kind_then_by_id` uses the first
+/// three as audit ids it can insert out of order. Both rely on the ascending
+/// order this array is checked for below.
+///
 /// **Why literals rather than `AuditRecord::new`'s generated ids.** `new` sets
 /// `id: AuditId::new()`, the plain ULID generator, while taking `at` as a
 /// parameter — so records minted inside one millisecond are ordered
