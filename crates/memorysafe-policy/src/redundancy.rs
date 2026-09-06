@@ -79,13 +79,13 @@ mod tests {
     #[test]
     fn classification_matches_the_documented_thresholds() {
         let cfg = BaselineConfig::default();
-        assert_eq!(cfg.classify(0.99), Verdict::ExactDuplicate);
+        assert_eq!(cfg.classify(0.99), Verdict::NearDuplicate);
         assert_eq!(cfg.classify(0.95), Verdict::Mergeable);
         assert_eq!(cfg.classify(0.50), Verdict::Novel);
         // Boundaries are inclusive at the threshold.
         assert_eq!(
             cfg.classify(cfg.duplicate_threshold),
-            Verdict::ExactDuplicate
+            Verdict::NearDuplicate
         );
         assert_eq!(cfg.classify(cfg.merge_threshold), Verdict::Mergeable);
     }

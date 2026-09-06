@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    ExactDuplicate,
+    NearDuplicate,
     Mergeable,
     Novel,
 }
@@ -11,7 +11,10 @@ pub enum Verdict {
 /// documented in the spec; tenants may override them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BaselineConfig {
-    /// At or above this, reject the write as an exact duplicate.
+    /// At or above this, the closest neighbour counts as a near-duplicate —
+    /// decided by cosine similarity, not content-digest identity, so two
+    /// items at this threshold can still have different digests — and the
+    /// write is rejected.
     pub duplicate_threshold: f32,
     /// At or above this (but below `duplicate_threshold`), merge.
     pub merge_threshold: f32,
@@ -48,7 +51,7 @@ impl Default for BaselineConfig {
 impl BaselineConfig {
     pub fn classify(&self, similarity: f32) -> Verdict {
         if similarity >= self.duplicate_threshold {
-            Verdict::ExactDuplicate
+            Verdict::NearDuplicate
         } else if similarity >= self.merge_threshold {
             Verdict::Mergeable
         } else {
