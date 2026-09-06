@@ -78,6 +78,7 @@ where
         isolation::subjects_are_isolated,
         isolation::namespaces_are_separated,
         isolation::audit_is_scoped,
+        isolation::retrieval_never_crosses_a_scope_boundary,
         atomicity::admit_evict_and_audit_commit_together,
         atomicity::a_failed_transaction_leaves_no_trace,
         atomicity::an_invalid_transaction_is_rejected_and_writes_nothing,

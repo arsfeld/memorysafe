@@ -4717,6 +4717,7 @@ pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) {
         isolation::subjects_are_isolated,
         isolation::namespaces_are_separated,
         isolation::audit_is_scoped,
+        isolation::retrieval_never_crosses_a_scope_boundary,
     );
 }
 ```
@@ -4906,6 +4907,7 @@ and extend the `run!` invocation in `run_conformance_suite`:
         isolation::subjects_are_isolated,
         isolation::namespaces_are_separated,
         isolation::audit_is_scoped,
+        isolation::retrieval_never_crosses_a_scope_boundary,
         atomicity::admit_evict_and_audit_commit_together,
         atomicity::a_failed_transaction_leaves_no_trace,
         atomicity::an_invalid_transaction_is_rejected_and_writes_nothing,
@@ -6237,9 +6239,9 @@ and extend `run!`:
         lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row,
 ```
 
-The suite now stands at **47 conformance tests** (4 isolation + 6 atomicity + 13 retrieval + 4 capacity + 20 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified. **The authoritative list is `run_conformance_suite`'s own `run!` in `crates/memorysafe-backend/src/conformance/mod.rs`** — every `pub async fn` across the conformance modules must appear in it, and that correspondence is checked by enumeration before each of these contract commits, not by reading this document.
+The suite now stands at **48 conformance tests** (5 isolation + 6 atomicity + 13 retrieval + 4 capacity + 20 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified. **The authoritative list is `run_conformance_suite`'s own `run!` in `crates/memorysafe-backend/src/conformance/mod.rs`** — every `pub async fn` across the conformance modules must appear in it, and that correspondence is checked by enumeration before each of these contract commits, not by reading this document.
 
-Twenty of those were added after Tasks 17 and 18 shipped, by the contract tasks that changed `Backend::import`'s and `Backend::purge_subject`'s signatures, put access statistics on the ranking structs, stated the echo rule, and closed the gaps the trait's own doc comments admitted nothing enforced — the last point at which adding conformance tests and changing trait signatures cost nothing, because no `impl Backend` existed yet. They are listed in the `run!` snippets above so those snippets match the file rather than the day it was written:
+Twenty-one of those were added after Tasks 17 and 18 shipped, by the contract tasks that changed `Backend::import`'s and `Backend::purge_subject`'s signatures, put access statistics on the ranking structs, stated the echo rule, and closed the gaps the trait's own doc comments admitted nothing enforced — the last point at which adding conformance tests and changing trait signatures cost nothing, because no `impl Backend` existed yet. They are listed in the `run!` snippets above so those snippets match the file rather than the day it was written:
 `retrieval::list_orders_oldest_first_by_created_at`,
 `retrieval::list_tie_break_is_total_over_identical_timestamps`,
 `retrieval::neighbours_break_ties_before_truncating_at_k`,
@@ -6258,20 +6260,27 @@ Twenty of those were added after Tasks 17 and 18 shipped, by the contract tasks 
 `lifecycle::audit_pages_by_the_after_cursor_without_repeating_a_row`,
 `lifecycle::audit_since_and_until_include_a_record_on_the_boundary`,
 `lifecycle::export_orders_the_stream_by_kind_then_by_id`,
-`lifecycle::audit_aggregates_page_in_the_documented_order`, and
-`lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row`.
+`lifecycle::audit_aggregates_page_in_the_documented_order`,
+`lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row`, and
+`isolation::retrieval_never_crosses_a_scope_boundary`.
 
-**The thirteen most recent are not reproduced above.** Their text lives in
+**The fourteen most recent are not reproduced above.** Their text lives in
 `crates/memorysafe-backend/src/conformance/lifecycle.rs` and
 `.../atomicity.rs`, which are authoritative; a sketch of a test that already
 exists in the tree can only drift from it, and this document has now lost that
-bet twice. Read them there. The last eight close contract claims the `Backend`
+bet twice. Read them there. Eight of them close contract claims the `Backend`
 trait itself recorded as unenforced — `WriteTransaction::is_valid` never
 reached through the trait, `ScopeSelector`'s optional fields (over audit rows
 as well as items), `audit`'s `min(limit, remaining)`, the `after` cursor,
 `since`/`until` inclusivity, the export stream's order, and the aggregate
 key's documented ordering and its own cursor — and each of those doc comments
-now names the test that covers it.
+now names the test that covers it. The most recent closes a gap no doc
+comment had recorded at all: `isolation::retrieval_never_crosses_a_scope_boundary`.
+`retrieve_candidates` and `neighbours` are the two methods a recall reaches,
+and until it was written no test in the suite called either across a scope
+boundary — every retrieval test built one scope, and the isolation module
+exercised only `get`, `list` and `audit`. A backend whose retrieval predicate
+was absent or mis-bound returned another subject's memories and passed.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -7676,6 +7685,14 @@ async fn pending_embedding_items_are_excluded_when_asked() {
 async fn recall_updates_access_statistics() {
     retrieval::recall_updates_access_statistics(&SqliteFactory).await;
 }
+
+// Wired here rather than with the other isolation tests in the items-and-audit
+// task: it calls `retrieve_candidates` and `neighbours`, so it cannot pass
+// until both retrieval arms exist.
+#[tokio::test]
+async fn retrieval_never_crosses_a_scope_boundary() {
+    isolation::retrieval_never_crosses_a_scope_boundary(&SqliteFactory).await;
+}
 ```
 
 Append to `crates/memorysafe-backend-sqlite/src/keyword.rs`:
@@ -7971,7 +7988,7 @@ Replace the placeholder `retrieve_candidates` in `lib.rs`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 4 keyword unit tests plus 17 conformance tests ok.
+Expected: PASS — 4 keyword unit tests plus 18 conformance tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -8369,7 +8386,7 @@ Add `pub mod capacity;` and `use rusqlite::params;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 47 conformance tests minus the 20 lifecycle ones, i.e. 27 conformance tests plus 12 unit tests, all ok.
+Expected: PASS — 48 conformance tests minus the 20 lifecycle ones, i.e. 28 conformance tests plus 12 unit tests, all ok.
 
 - [ ] **Step 5: Commit**
 
@@ -8748,7 +8765,7 @@ Replace the last three placeholders in `lib.rs`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite && cargo clippy -p memorysafe-backend-sqlite --all-targets -- -D warnings`
-Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 47 conformance test names and passes.
+Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 48 conformance test names and passes.
 
 - [ ] **Step 5: Commit**
 
@@ -14190,7 +14207,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 47 backend conformance tests, and the unit and integration suites of all six crates.
+Expected: PASS — the whole workspace green: 5 invariants, 48 backend conformance tests, and the unit and integration suites of all six crates.
 
 - [ ] **Step 5: Commit**
 
@@ -14580,7 +14597,7 @@ git commit -m "feat(engine): pending-embedding backfill and explicit re-embeddin
 - `cargo test --workspace --all-features` is green.
 - `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 - The CI purity job confirms `memorysafe-core` and `memorysafe-policy` pull in no I/O crates.
-- `SqliteBackend` passes all 47 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
+- `SqliteBackend` passes all 48 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
 - The five invariants pass at 64 proptest cases in release mode.
 - An engine can be constructed and driven end to end from a Rust test with no server, no network, and no model files.
 - No item is left permanently unsearchable: `pending_embedding` has a backfill path, and changing embedder is an explicit audited migration.
