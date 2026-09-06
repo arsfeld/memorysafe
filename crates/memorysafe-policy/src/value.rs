@@ -302,9 +302,10 @@ mod tests {
         // `k*0.5 + (1-k)*0.5 = 0.5` on the first pass too, so a 0.5 fixture
         // cannot distinguish that bug from the correct implementation (this
         // is the second time this crate's own fixtures have coincided at the
-        // fixed point of a symmetric operation — see the eviction-order
-        // fixture's note on picking values that do NOT let two formulas
-        // agree). At 0.625 the same bug instead gives
+        // fixed point of a symmetric operation — see `eviction.rs`'s
+        // `cost_is_the_product_of_value_and_fragility`, whose fixture used
+        // to sit at fragility `0.5`, the fixed point of `x -> 1-x`, for the
+        // same reason). At 0.625 the same bug instead gives
         // `0.25*0.5 + 0.75*0.625 = 0.59375` on the first pass — already
         // visibly different from the correct 0.625, so the fixture-sanity
         // assertion below catches it immediately. Had that first number

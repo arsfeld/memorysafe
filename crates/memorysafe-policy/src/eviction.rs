@@ -35,7 +35,15 @@ mod tests {
 
     #[test]
     fn cost_is_the_product_of_value_and_fragility() {
-        assert_eq!(cost(&fixture(0.6, 0.5)), 0.3);
+        // NOT fragility 0.5: 0.5 is the fixed point of `x -> 1-x`, so
+        // `0.6*0.5` and `0.6*(1-0.5)` both equal `0.3` — a `0.5` fixture
+        // cannot tell `value * fragility` from a `value * (1 - fragility)`
+        // regression. 0.25 is not fixed by that map (`1-0.25 = 0.75`), so
+        // the two formulas disagree (`0.75*0.25 = 0.1875` vs
+        // `0.75*0.75 = 0.5625`), and both factors stay dyadic so the
+        // equality holds exactly by construction. Do not round this back to
+        // 0.5.
+        assert_eq!(cost(&fixture(0.75, 0.25)), 0.1875);
     }
 
     #[test]
