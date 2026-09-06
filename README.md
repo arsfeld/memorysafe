@@ -106,7 +106,7 @@ The table below is accurate as of commit
 | `memorysafe-core` — ids, scope, items, assessments, decisions, audit types, and the `GovernancePolicy` trait | **landed**, no I/O dependencies (enforced in CI) |
 | `memorysafe-embed` — `Embedder` trait, int8 quantization, deterministic test embedder, optional Model2Vec | **landed**, reaches no network stack (enforced in CI) |
 | `memorysafe-backend` — the `Backend` trait, query/write types, and the 50-test conformance suite | **landed**, suite frozen |
-| `memorysafe-backend-sqlite` — the SQLite backend, one database file per tenant | **partial** — per-tenant files, schema, pooled connections, items, audit, aggregates. Vector and keyword retrieval, merge, capacity accounting, idempotency, purge, and export/import are not implemented yet |
+| `memorysafe-backend-sqlite` — the SQLite backend, one database file per tenant | **partial** — per-tenant files, schema, pooled connections, items, audit, and aggregate *writes*. Vector and keyword retrieval, merge, capacity accounting, idempotency, purge, export/import, and the aggregate *read* are not implemented yet |
 | `memorysafe-policy` — the baseline policy | not started |
 | `memorysafe-engine` — orchestration, the component that ties the above together | not started |
 | MCP server, HTTP API, CLI | not started |
