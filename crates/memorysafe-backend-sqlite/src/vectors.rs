@@ -258,57 +258,163 @@ mod tests {
         );
     }
 
-    /// `search` and `scope_embedder` must not cross a subject boundary within
-    /// one tenant. The tenant is the file — that isolation is structural —
-    /// but subject/namespace is a query predicate here and nothing structural
-    /// enforces it.
+    /// `search` and `scope_embedder` must not cross a subject *or* a
+    /// namespace boundary within one tenant. The tenant is the file — that
+    /// isolation is structural — but subject and namespace are query
+    /// predicates here and nothing structural enforces either.
     ///
     /// `isolation::retrieval_never_crosses_a_scope_boundary` owns this
     /// property through the trait, but it reads through *both*
     /// `retrieve_candidates` and `neighbours`, so it cannot bind until
     /// `retrieve_candidates` exists (Task 22) — a deferral recorded in
     /// `tests/conformance.rs`'s module doc. Until then, this crate-local test
-    /// is the only thing that can fail if either predicate is dropped:
-    /// neutralising `search`'s `WHERE i.subject = ?1 AND i.namespace = ?2`
-    /// (or `scope_embedder`'s `WHERE subject=?1 AND namespace=?2`) left the
-    /// whole workspace green before this test existed.
+    /// is the only thing that can fail if either predicate is dropped. It is
+    /// modelled directly on that test — three properties it already gets
+    /// right, restated here because a fix round having asked for "two
+    /// subjects (or two namespaces)" is what let a namespace-only regression
+    /// through the first time:
     ///
-    /// Both scopes share the same embedder and dimension on purpose: if the
-    /// subject/namespace predicate were the only thing keeping them apart,
-    /// dropping it would let `elsewhere`'s probe match `home`'s row exactly
-    /// (the probe text is identical to the stored body), and `scope_embedder`
-    /// would report `home`'s model identity for a scope that holds no
-    /// vectors of its own.
+    /// **One dimension varied at a time.** An earlier version of this test
+    /// varied only the subject (`home` vs. an `elsewhere` differing solely in
+    /// subject), which certifies the subject predicate and says nothing about
+    /// the namespace one — `WHERE i.subject = ?1 AND i.namespace = ?2` with
+    /// the second half neutralised passed that version outright. Here `home`
+    /// has two neighbours, `subject_neighbour` and `namespace_neighbour`,
+    /// each differing from `home` in **exactly one** component, so a
+    /// predicate that drops either half is caught by the neighbour that
+    /// varies it.
+    ///
+    /// **A positive control, so a complete no-op cannot hide behind an
+    /// all-empty assertion.** Every "the foreign item did not come back"
+    /// check below is satisfied by a backend that returns nothing at all —
+    /// including one whose `insert` silently wrote nothing. So `home`'s own
+    /// item and model identity are asserted *present* first, and the two
+    /// neighbour corpora are read back from their own scopes to prove their
+    /// writes actually landed, before any absence is trusted.
+    ///
+    /// **`scope_embedder` needs its own, empty-of-content neighbours, and
+    /// cannot reuse `subject_neighbour`/`namespace_neighbour` for this.**
+    /// `search` returns a `Vec`, so "did the foreign item come back" is a
+    /// membership question with no ambiguity. `scope_embedder` returns one
+    /// `Option<(embedder, dim)>` picked by `LIMIT 1` with no `ORDER BY`, and
+    /// every scope in this test shares one embedder and one dimension on
+    /// purpose (round 1's finding: this test isolates the subject/namespace
+    /// predicate from cross-model exclusion, which is a separate mechanism).
+    /// That means a leaking query and a correctly-scoped one return the
+    /// *identical value* whenever the leaked-from scope has any vector at
+    /// all — asserting `scope_embedder(&c, &home)` equals the shared tuple
+    /// cannot distinguish "read home's own row" from "read someone else's,
+    /// which happens to look the same". The only way to observe a leak
+    /// through an `Option` is presence vs. absence, which requires a probing
+    /// scope with **no vectors of its own**: `subject_diag` shares `home`'s
+    /// namespace but an unused subject (so a dropped subject predicate lets
+    /// `home`'s row satisfy it), and `namespace_diag` shares `home`'s subject
+    /// but an unused namespace (so a dropped namespace predicate lets
+    /// `home`'s row satisfy it). Relying on `LIMIT 1`'s physical row order
+    /// instead — giving each scope a distinct embedder and asserting which
+    /// one comes back — was considered and rejected: SQLite does not
+    /// document an order for an unindexed `LIMIT 1` with no `ORDER BY`, so a
+    /// test built on it would be asserting on undefined behaviour.
     #[test]
     fn search_and_scope_embedder_are_scoped_by_subject_and_namespace() {
         let c = conn();
-        let home = memorysafe_core::Scope::new("t", "s", "n").unwrap();
-        let elsewhere = memorysafe_core::Scope::new("t", "other-s", "n").unwrap();
         let e = DeterministicEmbedder::new(256);
 
-        let item = memorysafe_backend::conformance::fx::item(&home, "alpha memory");
-        crate::items::insert(&c, &item).unwrap();
-        let q =
-            memorysafe_embed::QuantizedVector::from_embedding(&e.embed("alpha memory").unwrap());
-        insert(&c, &item.id, &home, &q).unwrap();
+        let home = memorysafe_core::Scope::new("t", "s", "n").unwrap();
+        // Content neighbours for `search`: each differs from `home` in
+        // exactly one component and holds its own vector, so a predicate
+        // that omits either half is caught by the neighbour that varies it.
+        let subject_neighbour = memorysafe_core::Scope::new("t", "other-s", "n").unwrap();
+        let namespace_neighbour = memorysafe_core::Scope::new("t", "s", "other-n").unwrap();
+        // Empty diagnostics for `scope_embedder`: no vectors of their own, so
+        // a leak surfaces as `Some` where the absence of any own row demands
+        // `None` — see the doc above for why a value-level check cannot see
+        // this leak when every real scope shares one embedder and dim.
+        let subject_diag = memorysafe_core::Scope::new("t", "diag-s", "n").unwrap();
+        let namespace_diag = memorysafe_core::Scope::new("t", "s", "diag-n").unwrap();
 
-        // A probe from a different subject, same tenant, must not see
-        // `home`'s vector — even though the probe matches it exactly.
+        // The home item is only a partial match for the probe and the
+        // neighbours' bodies are exact matches, so a leak (if present) would
+        // rank ahead of the home item rather than merely being one of
+        // several ties — the same inversion
+        // `retrieval_never_crosses_a_scope_boundary` uses, and for the same
+        // reason: it removes any dependence on how ties or truncation are
+        // broken.
+        let probe_text = "the cat sat on the mat";
+        let home_body = "the cat sat on a rug";
+
+        let plant = |scope: &memorysafe_core::Scope, body: &str| {
+            let item = memorysafe_backend::conformance::fx::item(scope, body);
+            crate::items::insert(&c, &item).unwrap();
+            let q = memorysafe_embed::QuantizedVector::from_embedding(&e.embed(body).unwrap());
+            insert(&c, &item.id, scope, &q).unwrap();
+        };
+        plant(&home, home_body);
+        plant(&subject_neighbour, probe_text);
+        plant(&namespace_neighbour, probe_text);
+
         let probe =
-            memorysafe_embed::QuantizedVector::from_embedding(&e.embed("alpha memory").unwrap());
-        let hits = search(&c, &elsewhere, &probe, 5).unwrap();
-        assert!(
-            hits.is_empty(),
-            "search leaked a vector across a subject boundary: {:?}",
-            hits.iter().map(|h| h.0.body.clone()).collect::<Vec<_>>()
-        );
+            memorysafe_embed::QuantizedVector::from_embedding(&e.embed(probe_text).unwrap());
 
-        // A scope with no vectors of its own must not report another
-        // subject's stored model identity.
+        // `search`: the positive control first — home's own item must come
+        // back, or "the neighbours didn't leak" is true of a backend that
+        // returns nothing for anyone.
+        let home_hits = search(&c, &home, &probe, 10).unwrap();
         assert_eq!(
-            scope_embedder(&c, &elsewhere).unwrap(),
+            home_hits.len(),
+            1,
+            "home holds exactly one item; a different count means either a \
+             leak or a search that returned nothing at all"
+        );
+        assert_eq!(home_hits[0].0.body, home_body);
+        for (scope, dimension) in [
+            (&subject_neighbour, "subject"),
+            (&namespace_neighbour, "namespace"),
+        ] {
+            assert!(
+                !home_hits.iter().any(|h| h.0.scope == *scope),
+                "search leaked across the {dimension} boundary into home: {:?}",
+                home_hits
+                    .iter()
+                    .map(|h| h.0.body.clone())
+                    .collect::<Vec<_>>()
+            );
+            // And the foreign corpus is independently readable from its own
+            // scope, so the leak assertion above did not pass because the
+            // write into it silently failed.
+            let theirs = search(&c, scope, &probe, 10).unwrap();
+            assert_eq!(
+                theirs.len(),
+                1,
+                "the other-{dimension} corpus must exist, or 'nothing leaked \
+                 from it' is true of a scope that never stored anything"
+            );
+            assert_eq!(theirs[0].0.body, probe_text);
+        }
+
+        // `scope_embedder`: the positive control first — home reports its
+        // own stored model.
+        assert_eq!(
+            scope_embedder(&c, &home).unwrap(),
+            Some(("deterministic-256".to_string(), 256)),
+            "scope_embedder did not report home's own stored model"
+        );
+        // Then the two empty diagnostics, one per dimension, must each still
+        // report None despite home holding a row that a broken predicate on
+        // either half would let them see.
+        assert_eq!(
+            scope_embedder(&c, &subject_diag).unwrap(),
             None,
-            "scope_embedder leaked another subject's embedder identity"
+            "scope_embedder leaked across the subject boundary: a scope with \
+             no vectors of its own, sharing home's namespace, reported a \
+             model identity"
+        );
+        assert_eq!(
+            scope_embedder(&c, &namespace_diag).unwrap(),
+            None,
+            "scope_embedder leaked across the namespace boundary: a scope \
+             with no vectors of its own, sharing home's subject, reported a \
+             model identity"
         );
     }
 
