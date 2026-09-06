@@ -81,6 +81,26 @@ impl WriteTransaction {
 pub struct AppliedWrite {
     pub item_id: Option<ItemId>,
     pub audit_id: memorysafe_core::AuditId,
+    /// The ids that were **actually removed**, not the ids the caller asked to
+    /// remove.
+    ///
+    /// The two differ whenever `WriteTransaction::evictions` names an id that
+    /// matches no row in the scope — which nothing forbids. A backend must
+    /// report the former; the caller already has the latter, and a field that
+    /// echoes the request back carries no information.
+    ///
+    /// **Stated because it was not, and the omission had consequences.** With
+    /// the field undefined, the SQLite backend pushed every requested id while
+    /// updating its capacity counters only for rows that really went — so the
+    /// counters and the report disagreed, from inside the same loop, and both
+    /// were defensible against a contract that said nothing. `AppliedWrite` is
+    /// also what an idempotency row stores as its replayed outcome, so a
+    /// phantom entry is not a transient wrong answer: it is recorded and
+    /// replayed identically for as long as the key lives.
+    ///
+    /// `atomicity::admit_evict_and_audit_commit_together` asserts this field,
+    /// but only for an eviction that hit an existing row, so it cannot see the
+    /// difference. A test for the phantom case is queued.
     pub evicted: Vec<ItemId>,
     /// True when an idempotency key matched and the stored outcome was
     /// returned instead of applying anything.
