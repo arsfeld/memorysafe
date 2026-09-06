@@ -340,19 +340,36 @@ pub trait Backend: Send + Sync {
     /// this order puts `baseline@10` first.
     ///
     /// **Two `Some`s compare by *byte* order** — `COLLATE "C"` / `ucs_basic`
-    /// in Postgres terms — not by the database's default collation. Saying
-    /// only "compare by `to_string()`" leaves the comparison to whatever the
-    /// storage engine does with text, and the two engines do different things:
-    /// SQLite's default TEXT collation is `BINARY`, while Postgres's `text`
-    /// uses the database collation, which is locale-aware by default. They
-    /// disagree wherever case or punctuation is involved, and `PolicyId` is
-    /// unvalidated free text — `PolicyId::new` restricts neither field — so
-    /// there is nothing keeping a policy name inside the range where the two
-    /// happen to agree. `B@1` sorts before `a@1` under byte order (`0x42` <
-    /// `0x61`) and after it under every locale collation; the conformance
-    /// sweep carries that exact pair. The id-keyed orderings elsewhere on this
-    /// trait need no such clause: `ItemId` and `AuditId` are fixed-length
-    /// `[0-9A-Z]` ULIDs, where byte order and locale order coincide.
+    /// in Postgres terms, SQLite's `BINARY` default — and this is **forced,
+    /// not preferred**. [`AggregateKey`]'s `Ord` compares `PolicyId` through
+    /// Rust's `String: Ord`, which is lexicographic over UTF-8 bytes, and
+    /// `conformance::lifecycle::audit_aggregates_page_in_the_documented_order`
+    /// measures a backend against that `Ord`. A backend whose SQL sorts under
+    /// any other collation therefore disagrees with the type the suite
+    /// compares it to. It is not a stylistic call and must not be relaxed to
+    /// match a customer's expected sort order.
+    ///
+    /// Saying only "compare by `to_string()`" leaves the comparison to
+    /// whatever the storage engine does with text, and the two engines do
+    /// different things: Postgres's `text` uses the database collation, which
+    /// is locale-aware by default. `B@1` sorts before `a@1` under byte order
+    /// (`0x42` < `0x61`) and after it under every locale collation; the
+    /// conformance sweep carries that exact pair.
+    ///
+    /// **Why `PolicyId` is the only key on this trait needing the clause**, and
+    /// it is not because the others are validated. `ItemId` and `AuditId` are
+    /// fixed-length `[0-9A-Z]` ULIDs — no case variation, no punctuation — so
+    /// they are genuinely collation-stable. `TenantId` is not: `validate_component`
+    /// permits `-`, `_` and `.`, and glibc collations reweight punctuation
+    /// rather than comparing it positionally, so `a-b` before `ab` in byte
+    /// order becomes `ab` before `a-b` under `en_US.UTF-8`. `TenantId` is safe
+    /// here **by unreachability, not by validation**: `audit_aggregates` takes
+    /// the tenant as a parameter, so every row in a result set shares it and
+    /// the trailing tiebreaker never discriminates between two of them. A SQL
+    /// implementation of the four-column comparison still wants `COLLATE "C"`
+    /// on *both* text columns; pinning only `policy` looks complete and is
+    /// not, and no test can catch the difference because the comparison it
+    /// would have to exercise never fires.
     ///
     /// **The cursor.** `filter.after`, when set, continues a previous page:
     /// the next page is restricted to keys strictly greater than it in the

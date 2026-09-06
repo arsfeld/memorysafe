@@ -2090,9 +2090,12 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
     let v10 = PolicyId::new("baseline", "10");
     let v9 = PolicyId::new("baseline", "9");
     // `PolicyId::new` validates neither field, so an uppercase name is a legal
-    // policy — and it is the pair on which SQLite's default TEXT collation
+    // policy — and this is the pair on which SQLite's default TEXT collation
     // (BINARY, i.e. bytes) and Postgres's (locale-aware) disagree with
-    // certainty rather than by locale.
+    // certainty rather than by locale. Validation would not have helped:
+    // `validate_component` permits `-`, `_` and `.`, and glibc collations
+    // reweight punctuation, so a validated component is not collation-stable
+    // either.
     let upper_b = PolicyId::new("B", "1");
     let lower_a = PolicyId::new("a", "1");
 
@@ -2174,12 +2177,15 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
 ///   `baseline@10` precedes `baseline@9`. A backend storing version as a
 ///   number reverses exactly that pair.
 /// - *A locale collation on the policy column.* That comparison is over
-///   **bytes**. SQLite's default TEXT collation is `BINARY` and Postgres's is
-///   the database's, which is locale-aware by default, so `B@1` precedes
-///   `a@1` on one and follows it on the other. `PolicyId` validates neither
-///   of its fields, so an uppercase or punctuated policy name is reachable and
-///   nothing keeps the two collations in the range where they agree. Postgres
-///   conforms only with `COLLATE "C"` (`ucs_basic`).
+///   **bytes**, and byte order is forced rather than preferred: this test
+///   measures a backend against `AggregateKey`'s `Ord`, which compares through
+///   Rust's `String: Ord`. SQLite's default TEXT collation is `BINARY` and
+///   Postgres's is the database's, which is locale-aware by default, so `B@1`
+///   precedes `a@1` on one and follows it on the other. Postgres conforms only
+///   with `COLLATE "C"` (`ucs_basic`) — and on both text columns of the key
+///   comparison, not only `policy`, even though the `tenant` one is
+///   unreachable here because `audit_aggregates` takes the tenant as a
+///   parameter.
 ///
 /// **This test compares the backend against `AggregateKey`'s `Ord`**, not
 /// against a sequence written out here — a third copy of the order would be a

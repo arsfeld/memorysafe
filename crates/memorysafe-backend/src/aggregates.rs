@@ -225,11 +225,21 @@ impl Ord for AggregateKey {
     /// pairwise puts `baseline@9` before `baseline@10`, where the documented
     /// string order puts `baseline@10` first.
     ///
-    /// `String`'s `Ord` is **byte** order, which is the comparison
-    /// `Backend::audit_aggregates` documents (`COLLATE "C"`, not the
-    /// database's default collation). `PolicyId` is unvalidated free text, so
-    /// case and punctuation reach this comparison: `B@1` precedes `a@1` here
-    /// and would follow it under any locale-aware collation.
+    /// `String`'s `Ord` is **byte** order, and that is what forces
+    /// `Backend::audit_aggregates` to mandate `COLLATE "C"` rather than the
+    /// database's default collation: the conformance sweep compares a backend
+    /// against this function, so a backend sorting under any other collation
+    /// disagrees with the type it is being measured by. `PolicyId::new`
+    /// validates neither field, so case and punctuation both reach this
+    /// comparison — `B@1` precedes `a@1` here and would follow it under any
+    /// locale-aware collation.
+    ///
+    /// The trailing `tenant` comparison has the same exposure and no test can
+    /// reach it: `TenantId` permits `-`, `_` and `.`, which glibc collations
+    /// reweight rather than compare positionally, but `audit_aggregates` takes
+    /// the tenant as a parameter so every row in one result set shares it. A
+    /// SQL implementation still wants `COLLATE "C"` on both text columns —
+    /// pinning only `policy` looks complete and is not.
     ///
     /// `tenant` is compared **last**, after the three documented components.
     /// It takes no part in the documented order because `audit_aggregates` is
