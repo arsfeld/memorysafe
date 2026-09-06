@@ -21,6 +21,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: memorysafe-core and memorysafe-policy must have no I/O dependencies
         run: |
-          cargo tree -p memorysafe-core --edges normal --prefix none \
-            | grep -Ei '^(tokio|rusqlite|sqlx|reqwest|hyper) ' && exit 1
-          echo "core is I/O free"
+          for c in memorysafe-core memorysafe-policy; do
+            cargo tree -p "$c" --edges normal --prefix none \
+              | grep -Ei '^(tokio|rusqlite|sqlx|reqwest|hyper|hf-hub|ureq) ' && exit 1
+            echo "$c is I/O free"
+          done
+      # The structural half of "No LLM and no network call in the write path".
+      # `model2vec-rs` is taken with default-features = false and features
+      # ["onig", "local-only"]; without local-only, `from_pretrained` on a
+      # missing path falls back to a HuggingFace Hub request. The behavioural
+      # guard for that is `a_missing_model_path_is_unavailable_not_a_panic`,
+      # which lives behind the `model2vec` feature and therefore does not run
+      # unless --all-features links — so this dependency check is the only
+      # thing that notices if the feature list is edited. Do not delete it as
+      # redundant with the test; the test is the one that is conditional.
+      - name: memorysafe-embed must reach no network stack, with every feature on
+        run: |
+          cargo tree -p memorysafe-embed --all-features --edges normal --prefix none \
+            | grep -Ei '^(reqwest|hyper|hf-hub|ureq|native-tls|rustls) ' && exit 1
+          echo "embed reaches no network stack under --all-features"
