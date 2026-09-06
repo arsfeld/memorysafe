@@ -6,8 +6,9 @@
 //! rejected rather than silently compared — see `lib.rs`'s `neighbours`.
 
 use crate::items::{ITEM_COLUMNS, row_to_item};
+use crate::retrieve::filter_sql;
 use crate::tenant::SqlResultExt;
-use memorysafe_backend::BackendError;
+use memorysafe_backend::{BackendError, HardFilters};
 use memorysafe_core::{ItemId, MemoryItem, Scope};
 use memorysafe_embed::QuantizedVector;
 use rusqlite::{Connection, Row, params};
@@ -112,15 +113,29 @@ pub fn access_stats(row: &Row<'_>) -> rusqlite::Result<AccessStats> {
 
 /// Exact brute-force top-k. No ANN index: per-scope corpora are small, results
 /// are exact, and there is nothing to rebuild after every write.
+///
+/// `filters` is applied in the `WHERE` clause via `filter_sql`, before this
+/// function's own Rust-side truncation to `k`: a filter enforced only after
+/// that truncation can let excluded rows crowd real matches out of the top-`k`
+/// set entirely rather than merely leaking one through — see `filter_sql`'s
+/// doc and `retrieve.rs`'s module doc.
 pub fn search(
     conn: &Connection,
     scope: &Scope,
     probe: &QuantizedVector,
+    filters: &HardFilters,
     k: usize,
 ) -> Result<Vec<(MemoryItem, AccessStats, f32)>, BackendError> {
     if k == 0 {
         return Ok(vec![]);
     }
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(scope.subject.as_str().to_string()),
+        Box::new(scope.namespace.as_str().to_string()),
+        Box::new(probe.embedder.to_string()),
+        Box::new(probe.dim as i64),
+    ];
+    let filter_clause = filter_sql(filters, &mut args);
     let sql = format!(
         // `last_access`/`access_count` are named explicitly: `ITEM_COLUMNS`
         // contains neither, and `row_to_item` does not read them.
@@ -130,7 +145,7 @@ pub fn search(
                 v.scale AS v_scale, v.q AS v_q
          FROM items i JOIN vectors v ON v.item_id = i.id
          WHERE i.subject = ?1 AND i.namespace = ?2
-           AND v.embedder = ?3 AND v.dim = ?4",
+           AND v.embedder = ?3 AND v.dim = ?4{filter_clause}",
         cols = ITEM_COLUMNS
             .split(", ")
             .map(|c| format!("i.{c} AS {c}"))
@@ -140,22 +155,15 @@ pub fn search(
 
     let tenant = scope.tenant.as_str().to_string();
     let mut stmt = conn.prepare(&sql).sql()?;
+    let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let rows = stmt
-        .query_map(
-            params![
-                scope.subject.as_str(),
-                scope.namespace.as_str(),
-                probe.embedder.to_string(),
-                probe.dim as i64,
-            ],
-            move |r| {
-                let item = row_to_item(r, &tenant)?;
-                let access = access_stats(r)?;
-                let scale: f64 = r.get("v_scale")?;
-                let bytes: Vec<u8> = r.get("v_q")?;
-                Ok((item, access, scale as f32, bytes))
-            },
-        )
+        .query_map(refs.as_slice(), move |r| {
+            let item = row_to_item(r, &tenant)?;
+            let access = access_stats(r)?;
+            let scale: f64 = r.get("v_scale")?;
+            let bytes: Vec<u8> = r.get("v_q")?;
+            Ok((item, access, scale as f32, bytes))
+        })
         .sql()?;
 
     let mut scored: Vec<(MemoryItem, AccessStats, f32)> = Vec::new();
@@ -204,6 +212,20 @@ mod tests {
         c
     }
 
+    /// A `HardFilters` that excludes nothing, for tests whose subject is
+    /// unrelated to filtering. `HardFilters::default()` fails closed
+    /// (`sensitivity_ceiling: Internal`), which happens to admit every fixture
+    /// item here since `fx::item` defaults to `Internal` too — but that
+    /// coincidence is exactly the kind of thing a later fixture change could
+    /// silently break, so these tests are explicit about wanting "nothing
+    /// filtered" rather than relying on two defaults agreeing.
+    fn unrestricted() -> HardFilters {
+        HardFilters {
+            sensitivity_ceiling: memorysafe_core::SensitivityLevel::Restricted,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn top_k_is_bounded_and_sorted_descending() {
         let c = conn();
@@ -228,7 +250,7 @@ mod tests {
 
         let probe =
             memorysafe_embed::QuantizedVector::from_embedding(&e.embed("alpha one").unwrap());
-        let hits = search(&c, &scope, &probe, 2).unwrap();
+        let hits = search(&c, &scope, &probe, &unrestricted(), 2).unwrap();
 
         assert_eq!(hits.len(), 2, "k was not honoured");
         // `.2` is the score. `search` returns `(MemoryItem, AccessStats, f32)`
@@ -406,7 +428,7 @@ mod tests {
         // `search`: the positive control first — home's own item must come
         // back, or "the neighbours didn't leak" is true of a backend that
         // returns nothing for anyone.
-        let home_hits = search(&c, &home, &probe, 10).unwrap();
+        let home_hits = search(&c, &home, &probe, &unrestricted(), 10).unwrap();
         assert_eq!(
             home_hits.len(),
             1,
@@ -429,7 +451,7 @@ mod tests {
             // And the foreign corpus is independently readable from its own
             // scope, so the leak assertion above did not pass because the
             // write into it silently failed.
-            let theirs = search(&c, scope, &probe, 10).unwrap();
+            let theirs = search(&c, scope, &probe, &unrestricted(), 10).unwrap();
             assert_eq!(
                 theirs.len(),
                 1,

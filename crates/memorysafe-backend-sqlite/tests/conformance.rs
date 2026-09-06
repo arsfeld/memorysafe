@@ -8,33 +8,39 @@
 //!
 //! Task 20 implements `get`, `list`, `audit`, `record_recall` and a first
 //! `apply` covering insert + eviction + audit; Task 21 adds `vectors.rs` and
-//! a real `neighbours`. Every test below **except one** is one the
+//! a real `neighbours`; Task 22 adds `keyword.rs`, `retrieve.rs` and a real
+//! `retrieve_candidates`. Every test below **except two** is one the
 //! null-backend census (`memorysafe_backend::conformance::null`) measured as
 //! **failing** against a backend that does nothing, so each is discriminating
 //! before this crate's implementation exists.
 //!
-//! The one exception is `retrieval::cross_model_vectors_are_rejected`: it is
-//! `NULL_TOLERANT` (`conformance::null`) because it accepts either an error
-//! or an empty result, so it also passes against a backend that does nothing.
-//! Its presence is covered by its sibling in the same list,
-//! `retrieval::neighbours_break_ties_before_truncating_at_k` — both are bound
-//! here, together, which is what makes the pairing sound: split across tasks,
-//! the absence test would sit green and meaningless in between. Going green
-//! is not evidence the cross-model rejection works on its own; the mutation
-//! testing in the task report is.
+//! The two exceptions are both `NULL_TOLERANT` (`conformance::null`) —
+//! absence-shaped tests that pass against a backend that does nothing because
+//! they assert something is *not* there, which an empty result satisfies for
+//! free. Each is paired with a sibling that covers the presence case, bound in
+//! the same task, which is what makes the pairing sound: split across tasks,
+//! the absence test would sit green and meaningless in between. Going green is
+//! not evidence the property holds on its own; the mutation testing in the
+//! relevant task report is.
 //!
-//! The remaining four tests of the isolation and atomicity modules are bound
-//! by the task that supplies the method they observe, and are deliberately
-//! absent rather than bound-and-failing:
+//! - `retrieval::cross_model_vectors_are_rejected` (Task 21), paired with
+//!   `retrieval::neighbours_break_ties_before_truncating_at_k`.
+//! - `retrieval::keyword_search_escapes_user_input` (Task 22), paired with
+//!   `retrieval::keyword_search_finds_exact_terms`.
 //!
-//! - `isolation::retrieval_never_crosses_a_scope_boundary` — reads through
-//!   *both* `retrieve_candidates` and `neighbours`. Task 21 supplies only
-//!   `neighbours`, so this binds at Task 22, with `retrieve_candidates`.
+//! The remaining three tests of the atomicity module are bound by the task
+//! that supplies the method they observe, and are deliberately absent rather
+//! than bound-and-failing:
+//!
 //! - `atomicity::a_failed_transaction_leaves_no_trace` — requires a merge and
 //!   `BackendError::MergeTargetMissing`. Task 23.
 //! - `atomicity::idempotent_writes_replay_the_original_outcome` and
 //!   `atomicity::idempotency_conflict_on_different_payload` — require the
 //!   `idempotency` table's read-write path. Task 23.
+//!
+//! `isolation::retrieval_never_crosses_a_scope_boundary` bound at Task 22: it
+//! reads through *both* `retrieve_candidates` and `neighbours`, and Task 21
+//! supplied only `neighbours`.
 //!
 //! `run_conformance_suite` is not called: it awaits each test inline, so the
 //! first unimplemented method would end the run. It arrives once every method
@@ -110,4 +116,62 @@ async fn cross_model_vectors_are_rejected() {
 #[tokio::test]
 async fn neighbours_break_ties_before_truncating_at_k() {
     retrieval::neighbours_break_ties_before_truncating_at_k(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn sensitivity_ceiling_is_enforced_in_the_query() {
+    retrieval::sensitivity_ceiling_is_enforced_in_the_query(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn tag_and_kind_filters_narrow_results() {
+    retrieval::tag_and_kind_filters_narrow_results(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn keyword_search_finds_exact_terms() {
+    retrieval::keyword_search_finds_exact_terms(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn keyword_search_escapes_user_input() {
+    retrieval::keyword_search_escapes_user_input(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn hybrid_returns_both_signal_sources() {
+    retrieval::hybrid_returns_both_signal_sources(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn list_pages_are_disjoint_and_complete() {
+    retrieval::list_pages_are_disjoint_and_complete(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn list_orders_oldest_first_by_created_at() {
+    retrieval::list_orders_oldest_first_by_created_at(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn list_tie_break_is_total_over_identical_timestamps() {
+    retrieval::list_tie_break_is_total_over_identical_timestamps(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn pending_embedding_items_are_excluded_when_asked() {
+    retrieval::pending_embedding_items_are_excluded_when_asked(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn recall_updates_access_statistics() {
+    retrieval::recall_updates_access_statistics(&SqliteFactory).await;
+}
+
+// Wired here rather than with the other isolation tests in the items-and-audit
+// task: it calls `retrieve_candidates` and `neighbours`, so it cannot pass
+// until both retrieval arms exist.
+#[tokio::test]
+async fn retrieval_never_crosses_a_scope_boundary() {
+    isolation::retrieval_never_crosses_a_scope_boundary(&SqliteFactory).await;
 }

@@ -12,6 +12,8 @@
 pub mod aggregates;
 pub mod audit;
 pub mod items;
+pub mod keyword;
+pub mod retrieve;
 pub mod schema;
 pub mod tenant;
 pub mod vectors;
@@ -19,11 +21,12 @@ pub mod vectors;
 use async_trait::async_trait;
 use memorysafe_backend::{
     AppliedWrite, AuditAggregate, AuditAggregateFilter, Backend, BackendError, CandidateQuery,
-    ExportStream, ImportReport, ImportStream, Page, PurgeReport, ScopeSelector, WriteTransaction,
+    ExportStream, HardFilters, ImportReport, ImportStream, Page, PurgeReport, ScopeSelector,
+    WriteTransaction,
 };
 use memorysafe_core::{
     AuditFilter, AuditId, AuditRecord, Budget, CapacityState, Embedding, ItemId, MemoryItem,
-    PurgeCascade, Scope, ScopeStats, ScoredCandidate, SubjectId, TenantId,
+    PurgeCascade, Scope, ScopeStats, ScoredCandidate, SensitivityLevel, SubjectId, TenantId,
 };
 use rusqlite::params;
 use std::path::PathBuf;
@@ -61,13 +64,14 @@ impl SqliteBackend {
 
 /// **Partial, and deliberately so.** Task 20 implements `get`, `list`,
 /// `audit`, `record_recall` and a first `apply` covering insert, evictions and
-/// the audit row. Task 21 adds vectors and a real `neighbours`. Keyword and
-/// hybrid retrieval arrive in Task 22, merge and capacity and idempotency in
-/// Task 23, and purge/export/import plus the aggregate *read* in Task 24.
-/// The methods those tasks own return `Ok` defaults here so the crate
-/// compiles and the isolation and atomicity conformance tests can run at
-/// all; each is marked, and (`neighbours` now excepted) none is bound by a
-/// conformance test in this crate's `tests/conformance.rs` yet.
+/// the audit row. Task 21 adds vectors and a real `neighbours`. Task 22 adds
+/// keyword search and a real `retrieve_candidates`. Merge and capacity and
+/// idempotency arrive in Task 23, and purge/export/import plus the aggregate
+/// *read* in Task 24. The methods those remaining tasks own return `Ok`
+/// defaults here so the crate compiles and the isolation and atomicity
+/// conformance tests can run at all; each is marked, and none but the ones
+/// already real is bound by a conformance test in this crate's
+/// `tests/conformance.rs` yet.
 #[async_trait]
 impl Backend for SqliteBackend {
     async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, BackendError> {
@@ -203,13 +207,17 @@ impl Backend for SqliteBackend {
             .await
     }
 
-    // Implemented in Tasks 21-24.
     async fn retrieve_candidates(
         &self,
-        _s: &Scope,
-        _q: &CandidateQuery,
+        scope: &Scope,
+        query: &CandidateQuery,
     ) -> Result<Vec<ScoredCandidate>, BackendError> {
-        Ok(vec![])
+        let (scope, query) = (scope.clone(), query.clone());
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| {
+                retrieve::candidates(c, &scope, &query)
+            })
+            .await
     }
     async fn neighbours(
         &self,
@@ -230,7 +238,20 @@ impl Backend for SqliteBackend {
                     });
                 }
                 let probe = memorysafe_embed::QuantizedVector::from_embedding(&embedding);
-                let hits = vectors::search(c, &scope, &probe, k)?;
+                // `neighbours` carries no `HardFilters` of its own — it is not
+                // given a `CandidateQuery` — so this is a policy-free scan of
+                // the scope, exactly as it was before `vectors::search` grew a
+                // `filters` parameter. `sensitivity_ceiling` is the only
+                // `HardFilters` field that is restrictive by default
+                // (`Internal`, fail-closed for `retrieve_candidates`'s
+                // caller), so it is the one field overridden to the most
+                // permissive level; every other field's default already
+                // excludes nothing.
+                let filters = HardFilters {
+                    sensitivity_ceiling: SensitivityLevel::Restricted,
+                    ..HardFilters::default()
+                };
+                let hits = vectors::search(c, &scope, &probe, &filters, k)?;
                 Ok(hits
                     .into_iter()
                     .map(|(item, access, score)| ScoredCandidate {
