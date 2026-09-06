@@ -4546,8 +4546,7 @@ git commit -m "feat(backend): conformance harness, fixtures, and isolation tests
 
 ```rust
 use super::{BackendFactory, fx};
-use crate::BackendError;
-use crate::Page;
+use crate::{Backend, BackendError, Page};
 use memorysafe_core::{AuditFilter, ItemId, Scope};
 
 /// The item insert, the evictions, and the audit row must land together.
@@ -4744,7 +4743,7 @@ git commit -m "feat(backend): conformance tests for atomicity and idempotency"
 ```rust
 use super::{BackendFactory, fx};
 use crate::query::{CandidateQuery, HardFilters};
-use crate::Page;
+use crate::{Backend, Page};
 use memorysafe_core::{Scope, SensitivityLevel};
 use memorysafe_embed::Embedder;
 
@@ -4999,7 +4998,7 @@ pub async fn cross_model_vectors_are_rejected<F: BackendFactory>(factory: &F) {
 
 ```rust
 use super::{BackendFactory, fx};
-use crate::Page;
+use crate::{Backend, Page};
 use memorysafe_core::{Budget, Scope};
 
 pub async fn capacity_accounting_tracks_items_and_bytes<F: BackendFactory>(factory: &F) {
@@ -5161,7 +5160,7 @@ git commit -m "feat(backend): conformance tests for retrieval, filters, and capa
 ```rust
 use super::{BackendFactory, fx};
 use crate::portability::ScopeSelector;
-use crate::Page;
+use crate::{Backend, Page};
 use memorysafe_core::{AuditEvent, AuditFilter, Scope, SubjectId, TenantId};
 
 pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: &F) {
