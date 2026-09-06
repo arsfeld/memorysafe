@@ -96,6 +96,13 @@
 //!      **exact count**, and `passes` restores exactly that count. The backstop
 //!      repairs the asserted outcome.
 //!
+//! 5. **The expected value is computed by the code under test.**
+//!    `assert_eq!(candidate.estimated_tokens, estimate_tokens(&item.body))`
+//!    moves both sides together under any change to the formula: a divisor of
+//!    `3.0` in place of `4.0` passed it. Write the literal, and say in a
+//!    comment what it was derived from — the arithmetic belongs in the comment
+//!    so a reader can check it, not in the assertion where it cancels.
+//!
 //!    So: **a second enforcement layer is dangerous precisely when it can
 //!    restore the specific thing the test asserts.** Where the test admits a
 //!    range of acceptable outcomes, redundancy is visible and harmless; where

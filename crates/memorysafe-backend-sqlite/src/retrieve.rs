@@ -414,8 +414,13 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(
             hits[0].estimated_tokens,
-            estimate_tokens(&item.body),
-            "estimated_tokens did not match the item's own body"
+            // A literal, NOT `estimate_tokens(&item.body)`: calling the
+            // function under test on both sides of the assertion is
+            // tautological — any change to the formula moves both sides
+            // together, and a divisor of 3.0 instead of 4.0 passed this test.
+            // 499 bytes (`"word "` x100, trimmed) at 4 bytes per token.
+            125,
+            "estimated_tokens did not match ceil(499/4) for the item's body"
         );
         assert!(
             hits[0].estimated_tokens > 50,
