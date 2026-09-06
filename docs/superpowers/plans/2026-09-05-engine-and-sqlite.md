@@ -1759,10 +1759,10 @@ mod tests {
     fn reject_constructor_carries_its_reason() {
         let d = Decision::reject(
             PolicyId::new("baseline", "0.1.0"),
-            Reason::new(ReasonCode::ExactDuplicate, "cosine 0.99", features! { "sim" => 0.99 }),
+            Reason::new(ReasonCode::NearDuplicate, "cosine 0.99", features! { "sim" => 0.99 }),
         );
         assert!(matches!(d.action, Action::Reject));
-        assert!(d.has_reason(ReasonCode::ExactDuplicate));
+        assert!(d.has_reason(ReasonCode::NearDuplicate));
         assert_eq!(d.reasons[0].evidence.get("sim"), Some(&0.99));
     }
 
@@ -1911,7 +1911,7 @@ pub enum ReasonCode {
     NovelContent,
     HighValue,
     HighRedundancy,
-    ExactDuplicate,
+    NearDuplicate,
     CapacityPressure,
     ProtectedFragile,
     SensitivityCap,
@@ -8147,11 +8147,11 @@ mod tests {
     #[test]
     fn classification_matches_the_documented_thresholds() {
         let cfg = BaselineConfig::default();
-        assert_eq!(cfg.classify(0.99), Verdict::ExactDuplicate);
+        assert_eq!(cfg.classify(0.99), Verdict::NearDuplicate);
         assert_eq!(cfg.classify(0.95), Verdict::Mergeable);
         assert_eq!(cfg.classify(0.50), Verdict::Novel);
         // Boundaries are inclusive at the threshold.
-        assert_eq!(cfg.classify(cfg.duplicate_threshold), Verdict::ExactDuplicate);
+        assert_eq!(cfg.classify(cfg.duplicate_threshold), Verdict::NearDuplicate);
         assert_eq!(cfg.classify(cfg.merge_threshold), Verdict::Mergeable);
     }
 }
@@ -8244,7 +8244,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    ExactDuplicate,
+    NearDuplicate,
     Mergeable,
     Novel,
 }
@@ -8290,7 +8290,7 @@ impl Default for BaselineConfig {
 impl BaselineConfig {
     pub fn classify(&self, similarity: f32) -> Verdict {
         if similarity >= self.duplicate_threshold {
-            Verdict::ExactDuplicate
+            Verdict::NearDuplicate
         } else if similarity >= self.merge_threshold {
             Verdict::Mergeable
         } else {
@@ -8305,6 +8305,7 @@ impl BaselineConfig {
 ```rust
 use crate::config::BaselineConfig;
 use memorysafe_core::{RedundancyAssessment, Score, ScoredCandidate};
+use std::cmp::Reverse;
 
 pub use crate::config::Verdict;
 
@@ -8322,7 +8323,7 @@ pub fn assess(
         // relevance marginally above 1.0 from f32 rounding must not error.
         .map(|n| (n.item.id.clone(), Score::clamped(n.relevance)))
         .collect();
-    near.sort_by(|a, b| b.1.cmp(&a.1));
+    near.sort_by_key(|x| Reverse(x.1));
 
     let best = neighbours.iter().map(|n| n.relevance).fold(0.0f32, f32::max);
     RedundancyAssessment { score: Score::clamped(best), near_duplicates: near }
@@ -8930,7 +8931,7 @@ mod tests {
         let (c, a) = assessed(0.99, 0.8, 0.2, SensitivityLevel::Internal);
         let d = decide(&Assessed { candidate: &c, assessment: &a }, &ctx(0, None, vec![]), &cfg, pid());
         assert!(matches!(d.action, Action::Reject));
-        assert!(d.has_reason(ReasonCode::ExactDuplicate));
+        assert!(d.has_reason(ReasonCode::NearDuplicate));
     }
 
     #[test]
@@ -9059,11 +9060,11 @@ pub fn decide(
     let best = a.redundancy.score.get();
 
     match cfg.classify(best) {
-        Verdict::ExactDuplicate => {
+        Verdict::NearDuplicate => {
             return Decision::reject(
                 policy,
                 Reason::new(
-                    ReasonCode::ExactDuplicate,
+                    ReasonCode::NearDuplicate,
                     "an existing memory is effectively identical",
                     features! { "similarity" => best, "threshold" => cfg.duplicate_threshold },
                 ),
@@ -10312,7 +10313,7 @@ async fn an_identical_rewrite_is_rejected_as_a_duplicate() {
 
     // A rejection is a successful call: the product working, not an error.
     assert!(matches!(second.action, Action::Reject));
-    assert!(second.reasons.iter().any(|r| r.code == ReasonCode::ExactDuplicate));
+    assert!(second.reasons.iter().any(|r| r.code == ReasonCode::NearDuplicate));
 }
 
 #[tokio::test]
