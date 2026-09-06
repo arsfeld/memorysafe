@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 45-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
+**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 47-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
 
 **Architecture:** A second Cargo workspace, in its own closed repository, with the open-source repository vendored as a git submodule at `vendor/memorysafe` and consumed through path dependencies. One crate, `memorysafe-backend-postgres`, implements the `Backend` trait frozen at the end of Plan 1 Task 24. Every operation runs inside a transaction that first sets a transaction-local `memorysafe.tenant_id` GUC and `search_path`; the pool's connections run as a non-superuser role, so the RLS policy — not the query text — is what makes cross-tenant reads return nothing. Vector search generates candidates through a pgvector HNSW index and then reranks them exactly in Rust with `QuantizedVector::dot`, the same function the SQLite backend scores with, so both backends order identically.
 
@@ -60,7 +60,7 @@ pub trait Backend: Send + Sync {
     async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId,
         cascade: PurgeCascade, audit: AuditRecord)
         -> Result<PurgeReport, BackendError>;
-    async fn audit_aggregates(&self, tenant: &TenantId)
+    async fn audit_aggregates(&self, tenant: &TenantId, filter: &AuditAggregateFilter)
         -> Result<Vec<AuditAggregate>, BackendError>;
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
     async fn import(&self, destination: &TenantId, stream: ImportStream)
@@ -97,7 +97,7 @@ pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) where F::B: '
 
 Fixtures live in `memorysafe_backend::conformance::fx`: `embedder()` (a `DeterministicEmbedder` at **dim 256**, embedder id `deterministic-256`), `item`, `item_with`, `item_at`, `item_with_id`, `vector_for`, `admit_txn`, `admit_txn_embedded`, `evict_txn`, `evict_txn_at`.
 
-### The 45 conformance tests
+### The 47 conformance tests
 
 The authoritative list is `run_conformance_suite`'s own `run!` in
 `crates/memorysafe-backend/src/conformance/mod.rs`; this table is transcribed
@@ -110,7 +110,7 @@ against that list. Recount, do not adjust by a difference.
 | `atomicity` (6) | `admit_evict_and_audit_commit_together`, `a_failed_transaction_leaves_no_trace`, `an_invalid_transaction_is_rejected_and_writes_nothing`, `every_mutation_writes_exactly_one_audit_record`, `idempotent_writes_replay_the_original_outcome`, `idempotency_conflict_on_different_payload` |
 | `retrieval` (13) | `sensitivity_ceiling_is_enforced_in_the_query`, `tag_and_kind_filters_narrow_results`, `vector_search_ranks_by_similarity`, `keyword_search_finds_exact_terms`, `keyword_search_escapes_user_input`, `hybrid_returns_both_signal_sources`, `list_pages_are_disjoint_and_complete`, `list_orders_oldest_first_by_created_at`, `list_tie_break_is_total_over_identical_timestamps`, `pending_embedding_items_are_excluded_when_asked`, `cross_model_vectors_are_rejected`, `neighbours_break_ties_before_truncating_at_k`, `recall_updates_access_statistics` |
 | `capacity` (4) | `capacity_accounting_tracks_items_and_bytes`, `eviction_releases_capacity`, `concurrent_admits_do_not_double_count`, `scope_stats_reflect_the_corpus` |
-| `lifecycle` (18) | `audit_filter_narrows_by_event_and_time`, `audit_returns_min_of_the_limit_and_the_rows_that_remain`, `audit_pages_by_the_after_cursor_without_repeating_a_row`, `audit_since_and_until_include_a_record_on_the_boundary`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `purge_subject_preserves_audit_when_asked`, `purge_subject_persists_the_record_it_was_given`, `apply_persists_the_audit_id_it_was_given`, `record_recall_persists_the_audit_id_it_was_given`, `import_preserves_every_audit_id`, `export_narrows_to_the_selectors_subject_and_namespace`, `export_orders_the_stream_by_kind_then_by_id`, `export_import_round_trips_exactly`, `import_is_idempotent`, `import_rejects_a_later_record_whose_tenant_disagrees`, `import_rejects_a_foreign_audit_record_even_when_every_item_agrees`, `audit_aggregates_survive_a_cascading_purge` |
+| `lifecycle` (20) | `audit_filter_narrows_by_event_and_time`, `audit_returns_min_of_the_limit_and_the_rows_that_remain`, `audit_pages_by_the_after_cursor_without_repeating_a_row`, `audit_since_and_until_include_a_record_on_the_boundary`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `purge_subject_preserves_audit_when_asked`, `purge_subject_persists_the_record_it_was_given`, `apply_persists_the_audit_id_it_was_given`, `record_recall_persists_the_audit_id_it_was_given`, `import_preserves_every_audit_id`, `export_narrows_to_the_selectors_subject_and_namespace`, `export_orders_the_stream_by_kind_then_by_id`, `export_import_round_trips_exactly`, `import_is_idempotent`, `import_rejects_a_later_record_whose_tenant_disagrees`, `import_rejects_a_foreign_audit_record_even_when_every_item_agrees`, `audit_aggregates_survive_a_cascading_purge`, `audit_aggregates_page_in_the_documented_order`, `audit_aggregates_resume_from_a_cursor_that_names_no_stored_row` |
 
 **`pagination_is_stable` no longer exists.** It was renamed to
 `list_pages_are_disjoint_and_complete` — what it actually proves. It sorts and
@@ -435,7 +435,7 @@ The pool connects with whatever credentials `PgConfig::url` carries — typicall
 | 10 | Hard filters and keyword search | Hostile input cannot become an operator |
 | 11 | Hybrid retrieval | Retrieval conformance passes |
 | 12 | Capacity locking, merge, idempotency | Atomicity and capacity conformance pass |
-| 13 | Purge and portable export/import | The full 45-test suite passes |
+| 13 | Purge and portable export/import | The full 47-test suite passes |
 | 14 | `SchemaPerTenant` layout | The full suite passes under both layouts |
 | 15 | Cross-backend parity | SQLite and Postgres rank identically |
 | 16 | Schema-version guard and operator docs | Refuses a database from a newer version |
@@ -2387,8 +2387,10 @@ pub async fn query(
            AND ($5::bigint IS NULL OR at >= $5)
            AND ($6::bigint IS NULL OR at <= $6)
            AND ($7::text IS NULL OR id < $7)
+           AND ($8::text IS NULL OR items @> jsonb_build_array(
+                   jsonb_build_object('id', $8::text)))
          ORDER BY id DESC
-         LIMIT $8",
+         LIMIT $9",
     )
     .bind(scope.tenant.as_str())
     .bind(scope.subject.as_str())
@@ -2397,23 +2399,28 @@ pub async fn query(
     .bind(filter.since.map(|t| t.unix_timestamp()))
     .bind(filter.until.map(|t| t.unix_timestamp()))
     .bind(filter.after.as_ref().map(|a| a.as_str()))
+    .bind(filter.item.as_ref().map(|i| i.as_str()))
     .bind(filter.limit as i64)
     .fetch_all(conn)
     .await
     .pg()?;
 
     let mut out: Vec<AuditRecord> = rows.iter().map(row_to_record).collect::<Result<_, _>>()?;
-    // `AuditFilter::item` has no column of its own; the ids live inside the
-    // `items` JSONB. Filtering in Rust keeps the scope indexes useful — but
-    // note it happens *after* `LIMIT`, so a page can come back shorter than
-    // `min(filter.limit, rows still matching)` when `filter.item` is set,
-    // which `Backend::audit` forbids. No conformance test sets `filter.item`,
-    // so nothing catches it; resolving it is Plan 2's, and the choice is
-    // between a JSONB containment predicate in the WHERE clause and an
-    // expression index on the ids.
-    if let Some(wanted) = &filter.item {
-        out.retain(|r| r.items.iter().any(|i| &i.id == wanted));
-    }
+    // `AuditFilter::item` is filtered in the `WHERE` clause above, not here.
+    // Filtering in Rust after `LIMIT` would let a page come back shorter than
+    // `min(filter.limit, rows still matching)`, which `Backend::audit`
+    // forbids and which a caller reads as "the log is exhausted". No
+    // conformance test sets `filter.item`, so nothing would have caught it.
+    //
+    // Over-fetching and looping until the page fills was rejected: it turns a
+    // correctness property into a retry heuristic that still returns a short
+    // page under adversarial data, and it re-creates the class this repository
+    // already paid to fix at `b6bb15f`.
+    //
+    // The predicate pushes down because `AuditFilter::item` is `Option<ItemId>`
+    // against `AuditRecord::items: Vec<ItemRef>` — a **membership** test, which
+    // Postgres expresses natively. The shape made it feel unpushable; it never
+    // was.
     Ok(out)
 }
 ```
@@ -2558,7 +2565,7 @@ impl Backend for PostgresBackend {
         Ok(ImportReport::default())
     }
 
-    async fn audit_aggregates(&self, _tenant: &TenantId)
+    async fn audit_aggregates(&self, _tenant: &TenantId, _filter: &AuditAggregateFilter)
         -> Result<Vec<AuditAggregate>, BackendError> {
         Ok(vec![])
     }
@@ -4226,7 +4233,7 @@ Add `pub mod capacity;` and `use sqlx::Row;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-postgres`
-Expected: PASS — 22 conformance tests (everything but the five lifecycle ones) plus the unit tests, all ok.
+Expected: PASS — 27 conformance tests (everything but the 20 lifecycle ones) plus the unit tests, all ok.
 
 - [ ] **Step 5: Commit**
 
@@ -4249,7 +4256,7 @@ git commit -m "feat(pg): row-locked capacity accounting, merge, and idempotent w
 - Consumes: everything in the crate.
 - Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and the single `run_conformance_suite` entry point.
 
-**Milestone: the complete 45-test suite passes under `SharedPartitioned`.**
+**Milestone: the complete 47-test suite passes under `SharedPartitioned`.**
 
 **Why vectors are deleted explicitly when the cascade would do it.** `PurgeReport` counts what was removed, and a cascade reports nothing. Deleting vectors first makes the count exact and leaves the item delete with nothing to cascade to.
 
@@ -4642,7 +4649,7 @@ git commit -m "feat(pg): subject purge and portable export/import; full conforma
 - Consumes: `ddl::statements` (already branches on layout), `ensure_ready` (already lazy).
 - Produces: an advisory lock around `ensure_schema`, and a second full conformance run.
 
-**Milestone: the full 45-test suite passes under both layouts.**
+**Milestone: the full 47-test suite passes under both layouts.**
 
 **Most of this layout already exists** — `ddl::statements` omits the partitioning clause and the partition tables, and `ensure_ready` creates a tenant's schema on first use. Two things are missing, and both are the kind of bug that only appears under load.
 
@@ -5328,7 +5335,7 @@ git commit -m "feat(pg): refuse an incompatible schema or vector width at connec
 
 - `cargo test --workspace --all-features` is green, both with Docker (container harness) and against `MEMORYSAFE_TEST_DATABASE_URL` (external server). CI runs both.
 - `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --all -- --check` are clean.
-- `PostgresBackend` passes all **27** conformance tests **unmodified**, under `SharedPartitioned` and under `SchemaPerTenant`.
+- `PostgresBackend` passes all **47** conformance tests **unmodified**, under `SharedPartitioned` and under `SchemaPerTenant`.
 - The isolation tests prove the guarantee is structural: a query with no `tenant_id` predicate returns one tenant's rows, a connection with no tenant context reads nothing and writes nothing, a cross-tenant write is refused by `WITH CHECK`, and partitions cannot be read directly.
 - Vector relevance is bit-identical to the SQLite backend's, and hard filters select the same rows on both.
 - An export produced by the SQLite backend imports into Postgres and reproduces the corpus, vectors included.

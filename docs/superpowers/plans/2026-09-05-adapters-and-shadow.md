@@ -153,7 +153,7 @@ impl Engine {
     pub async fn review(&self, scope: &Scope, page: &Page) -> Result<Vec<MemoryItem>, EngineError>;
     pub async fn protect(&self, scope: &Scope, id: &ItemId, p: Protection) -> Result<WriteOutcome, EngineError>;
     pub async fn maintain(&self, scope: &Scope, cursor: Option<MaintainCursor>) -> Result<MaintainReport, EngineError>;
-    pub async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId) -> Result<PurgeOutcome, EngineError>;
+    pub async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId) -> Result<PurgeOutcome, EngineError>;  // Task 2 adds `actor: &Actor`
     pub async fn audit(&self, scope: &Scope, filter: &AuditFilter) -> Result<Vec<AuditRecord>, EngineError>;
     pub async fn set_budget(&self, scope: &Scope, budget: Budget) -> Result<(), EngineError>;
     pub async fn capacity_state(&self, scope: &Scope) -> Result<CapacityState, EngineError>;
@@ -301,6 +301,10 @@ impl Engine {
     pub async fn export_ndjson_as(&self, sel: &ScopeSelector, actor: &Actor) -> Result<String, EngineError>;
     pub async fn import_ndjson_as(&self, ndjson: &str, tenant: &TenantId, actor: &Actor)
         -> Result<ImportReport, EngineError>;
+    // Was `(tenant, subject)` in Plan 1; Task 2 adds the actor, so the
+    // `SubjectPurged` record names who ordered the erasure.
+    pub async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId, actor: &Actor)
+        -> Result<PurgeOutcome, EngineError>;
 }
 
 // memorysafe-mcp
@@ -928,7 +932,22 @@ git commit -m "feat(auth): tenant-scoped API keys and a reserved admin scope"
   `AuditEvent::{PolicyChanged, Exported, Imported}`, `Backend::apply`.
 - Produces: `TenantSettings`, `Engine::policy_for`, `Engine::retention_for`,
   `Engine::tenant_settings`, `Engine::set_tenant_policy_config`, `Engine::set_tenant_retention`,
-  `Engine::export_ndjson_as`, `Engine::import_ndjson_as`.
+  `Engine::export_ndjson_as`, `Engine::import_ndjson_as`, and an `Actor` parameter on
+  `Engine::purge_subject`.
+
+**`Engine::purge_subject` gains an `Actor` here, and this is the task that closes
+that gap.** Plan 1 Task 33 builds the `SubjectPurged` record in the engine — the
+backend inserts what it is handed and mints nothing — but writes
+`Actor { kind: ActorKind::Human, id: None }`, an anonymous human carrying no more
+identity than `Actor::system()`. Plan 1 recorded the deferral pointing here, so the
+signature becomes `purge_subject(&self, tenant: &TenantId, subject: &SubjectId,
+actor: &Actor)` and the record is built from that argument. It is the same move as
+the four methods above, for the same reason: the actor exists at the boundary and
+the record is written in the engine. Every call site is in this plan — the HTTP
+route (`ops::purge_subject`), the CLI command, and this task's own `settings.rs`
+test — and each already has an `Actor` in scope, from `AuthContext::actor()` at the
+adapters. An erasure is the single operation whose audit row most needs to name who
+ordered it.
 
 **Why the engine and not the adapters.** Plan 1's "Known deferrals to Plan 3" put the
 `Exported` / `Imported` / `PolicyChanged` audit records at "the CLI and HTTP boundary, with the
@@ -945,7 +964,9 @@ single-tenant test but cannot serve the admin surface.
 `default_retention`. Renaming makes the compiler enumerate every call site — `write.rs`
 (`run_assess`, `run_admit`), `read.rs` (compose), `maintain.rs`, `mutate.rs` (`purge_subject`) —
 instead of leaving one behind that silently keeps using the global policy for a tenant that
-overrode it.
+overrode it. `mutate.rs`'s `purge_subject` is touched twice in this task: once for
+`retention_for`, and once for the `Actor` parameter above, which the compiler
+enumerates the same way.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1061,8 +1082,8 @@ async fn retention_is_per_tenant_and_purge_honours_the_tenant_it_is_purging() {
     e.remember(RememberRequest::new(scope("globex"), "an ordinary note")).await.unwrap();
 
     let user = SubjectId::new("user-42").unwrap();
-    let kept = e.purge_subject(&acme(), &user).await.unwrap();
-    let dropped = e.purge_subject(&globex(), &user).await.unwrap();
+    let kept = e.purge_subject(&acme(), &user, &operator()).await.unwrap();
+    let dropped = e.purge_subject(&globex(), &user, &operator()).await.unwrap();
 
     assert_eq!(kept.items_removed, 1);
     assert!(kept.audit_rows_preserved >= 1, "hipaa_retain must keep the decision record");
@@ -2197,8 +2218,17 @@ impl From<&OmittedItem> for OmittedView {
 pub struct RecallResult {
     pub items: Vec<RecalledMemory>,
     pub tokens_used: u32,
-    /// Considered and cut, with the reason. Capped by the engine.
+    /// A **sample** of what was considered and cut, with the reason, capped at
+    /// `memorysafe_core::OMITTED_CAP`. Its length is not the number of
+    /// omissions — read `omitted_total` for that.
     pub omitted: Vec<OmittedView>,
+    /// How many items were omitted before the sample above was truncated.
+    /// Carried through from `WorkingSet::omitted_total`, and carried
+    /// deliberately: the caller this number exists for is the one tuning the
+    /// recall budget, and dropping it at this boundary would leave an MCP
+    /// client unable to tell fifty omissions from five thousand — which is the
+    /// silent truncation the field was added to remove.
+    pub omitted_total: usize,
     pub audit_id: String,
 }
 
@@ -2215,6 +2245,7 @@ impl RecallResult {
             items: ws.items.iter().map(RecalledMemory::from).collect(),
             tokens_used: ws.tokens_used,
             omitted: ws.omitted.iter().map(OmittedView::from).collect(),
+            omitted_total: ws.omitted_total,
             audit_id: audit_id.to_string(),
         })
     }
@@ -5340,7 +5371,12 @@ pub async fn purge_subject(
         return Err(ApiError::Forbidden(format!("'{ADMIN_COMPONENT}' is reserved")));
     }
     let subject = SubjectId::new(&subject)?;
-    Ok(Json(state.engine.purge_subject(auth.tenant(), &subject).await?))
+    Ok(Json(
+        state
+            .engine
+            .purge_subject(auth.tenant(), &subject, &auth.actor())
+            .await?,
+    ))
 }
 ```
 
@@ -6820,8 +6856,8 @@ use crate::render;
 use anyhow::{Result, bail};
 use clap::Args;
 use memorysafe_core::{
-    ADMIN_COMPONENT, AuditEvent, AuditFilter, AuditId, AuditRecord, ItemId, Protection, Scope,
-    SubjectId, TenantId,
+    ADMIN_COMPONENT, Actor, ActorKind, AuditEvent, AuditFilter, AuditId, AuditRecord, ItemId,
+    Protection, Scope, SubjectId, TenantId,
 };
 use memorysafe_engine::{Engine, ForgetSelector, MaintainCursor};
 use serde::Serialize;
@@ -7028,7 +7064,16 @@ pub async fn purge_subject(
         );
     }
     let subject = SubjectId::new(&args.subject)?;
-    let outcome = engine.purge_subject(tenant, &subject).await?;
+    let outcome = engine
+        .purge_subject(
+            tenant,
+            &subject,
+            // No id to supply — the CLI authenticates the process, not a
+            // person — but the kind is real and is more than the anonymous
+            // `Human` Plan 1 wrote. See `Engine::purge_subject`.
+            &Actor { kind: ActorKind::Cli, id: None },
+        )
+        .await?;
     render::emit(json, &outcome, || {
         println!(
             "removed {} item(s); audit rows removed {} preserved {}",
