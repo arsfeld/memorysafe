@@ -587,6 +587,15 @@ git -c protocol.file.allow=always submodule update --init --recursive
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# `vendor/memorysafe` is its own workspace. Without this exclude, the outer
+# workspace pulls vendor's member crates in and resolves their
+# `.workspace = true` inheritance against THIS manifest — `memorysafe-core`
+# declares `ulid.workspace = true`, this workspace never declares `ulid`, and
+# resolution fails for the whole workspace, including the one test Task 1
+# exists to run. Hit on the first `cargo` invocation after the submodule was
+# added; invisible until then, because a manifest written for a vendored
+# workspace that has never been vendored has nothing to fail against.
+exclude = ["vendor"]
 
 [workspace.package]
 edition = "2024"
@@ -596,6 +605,11 @@ license = "LicenseRef-MemorySafe-Commercial"
 [workspace.dependencies]
 # Path dependencies into the vendored OSS repository. The submodule SHA is the
 # pin; there is no version to bump.
+# `memorysafe-backend-sqlite` is deliberately absent here and from
+# `[dev-dependencies]`. Cargo resolves path dependencies eagerly, so naming a
+# directory the submodule does not yet contain fails the whole workspace. It
+# returns when Plan 1 ships that crate, and its only consumer here is the
+# cross-backend export/import task — nothing before that references it.
 memorysafe-core    = { path = "vendor/memorysafe/crates/memorysafe-core" }
 memorysafe-backend = { path = "vendor/memorysafe/crates/memorysafe-backend" }
 memorysafe-embed   = { path = "vendor/memorysafe/crates/memorysafe-embed" }
@@ -4397,7 +4411,7 @@ git commit -m "feat(pg): row-locked capacity accounting, merge, and idempotent w
 - Consumes: everything in the crate.
 - Produces: `aggregates::increment`, `aggregates::query`, `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, `audit_aggregates`, and the single `run_conformance_suite` entry point.
 
-**Milestone: the complete 50-test suite passes under `SharedPartitioned`** — which requires the aggregate write and read this task adds, not only the purge and portability work. Three lifecycle tests depend on them and the stub they replace returns `Ok(vec![])`; the milestone was stated before the aggregates existed anywhere in this document and could not have been met.
+**Milestone: every conformance test the pinned submodule contains passes under `SharedPartitioned`** — which requires the aggregate write and read this task adds, not only the purge and portability work. Three lifecycle tests depend on them and the stub they replace returns `Ok(vec![])`; the milestone was stated before the aggregates existed anywhere in this document and could not have been met.
 
 **Why vectors are deleted explicitly when the cascade would do it.** `PurgeReport` counts what was removed, and a cascade reports nothing. Deleting vectors first makes the count exact and leaves the item delete with nothing to cascade to.
 
@@ -4796,7 +4810,11 @@ git commit -m "feat(pg): subject purge and portable export/import; full conforma
 - Consumes: `ddl::statements` (already branches on layout), `ensure_ready` (already lazy).
 - Produces: an advisory lock around `ensure_schema`, and a second full conformance run.
 
-**Milestone: the full 50-test suite passes under both layouts.**
+**Milestone: every conformance test the pinned submodule contains passes under both
+layouts.** Stated against the pin rather than against a number: the submodule SHA is
+authoritative and the count is descriptive. A milestone naming a count is a derived
+value with no reference — it was written at 33, has been 39, 45, 47, 49 and is 50 as of
+`5776fce`, and each of those was correct when written.
 
 **Most of this layout already exists** — `ddl::statements` omits the partitioning clause and the partition tables, and `ensure_ready` creates a tenant's schema on first use. Two things are missing, and both are the kind of bug that only appears under load.
 
