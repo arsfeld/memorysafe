@@ -3,15 +3,32 @@ use memorysafe_backend::Backend;
 use memorysafe_core::{AdmitContext, AssessContext, Embedding, MaintenanceCandidate, Scope};
 use time::OffsetDateTime;
 
-/// One I/O pass producing everything `assess` may see.
+/// Gathers everything `assess` may see. Not one I/O pass: this makes up to
+/// two backend round trips (`neighbours`, when there is an embedding to
+/// probe with, and `scope_stats`, always) before `assess` ever runs.
 pub async fn assess_context(
     backend: &dyn Backend,
     scope: &Scope,
     embedding: Option<&Embedding>,
     k: usize,
 ) -> Result<AssessContext, EngineError> {
+    // `?`, matching `scope_stats` on the next line — not `unwrap_or_default()`.
+    // A transient failure here must not silently degrade into "this scope has
+    // no neighbours": that reading feeds three consequences downstream, none
+    // of them visible in the outcome. `assess` sees no near-duplicates, so an
+    // identical rewrite is admitted as novel instead of rejected;
+    // `mean_neighbour_similarity` becomes `0.0`; and `fragility::score`
+    // short-circuits to `Score::ONE` on an empty neighbour list, so the very
+    // duplicate that should have been rejected is instead stored `Protected`
+    // for a full protection window. Nothing in `WriteOutcome`, the stored
+    // item, or the audit row would distinguish "this scope genuinely has no
+    // neighbours" from "the neighbour query failed" — a governance *input*
+    // failing closed is the safer default here, the same asymmetry the
+    // embedding path resolves the other way for a governance *output*
+    // (`pending_embedding` degrades gracefully because losing one embedding
+    // costs one item's recall quality, not a duplicate-detection guarantee).
     let neighbours = match embedding {
-        Some(e) => backend.neighbours(scope, e, k).await.unwrap_or_default(),
+        Some(e) => backend.neighbours(scope, e, k).await?,
         None => vec![],
     };
     let mut stats = backend.scope_stats(scope).await?;
@@ -48,26 +65,51 @@ pub async fn admit_context(
             .await?
             .into_iter()
             .filter(|i| i.protection.is_evictable(now))
+            // OPEN: every field below except `item` is fabricated, not
+            // measured, and this is the whole comment, not just the
+            // access-statistics half of it.
+            //
+            // `value` and `fragility` are both a hardcoded `Score::clamped(0.5)`
+            // for every candidate — computing the real ones needs a neighbour
+            // query per candidate, a design decision this task cannot make
+            // (see `BaselinePolicy::assess`, which the policy crate spends a
+            // whole module on for exactly one candidate at a time). Two
+            // consequences follow, and both are silent: `eviction::cost` is
+            // `value * fragility`, so every candidate here ties at `0.25`,
+            // and `admit`'s stable sort then leaves the order exactly as
+            // `Backend::list` returned it — ascending `created_at` — so
+            // "evict the lowest value-weighted retention cost" degrades to
+            // "evict the oldest" without anything saying so. Worse, `admit`
+            // writes `"value" => 0.5, "fragility" => 0.5, "eviction_cost" =>
+            // 0.25` into the eviction `Reason`'s evidence, and that reason is
+            // what lands in the audit row — three fabricated constants
+            // presented as measurements in a compliance record.
+            //
+            // `last_accessed_at`/`access_count` are the second, narrower gap:
+            // `Backend::list` returns bare `MemoryItem`s, and the access
+            // statistics deliberately do not live on that type, so this path
+            // has no source for them. `(None, 0)` is NOT "unknown" here — the
+            // ruling recorded at compose's staleness fallback (see
+            // `replay_due` in Task 28) makes `(None, 0)` mean the item has
+            // never been accessed, definitively, everywhere this pair
+            // appears. Passing it for an item whose access history is merely
+            // unavailable therefore states something false, not merely
+            // something imprecise: a frequently-recalled item offered for
+            // eviction reads to the policy as indistinguishable from one
+            // nobody has ever touched. Before `admit` is allowed to weigh
+            // staleness, the listing path needs to carry the real statistics
+            // — a `list` that returns them beside each item, or a dedicated
+            // read.
+            //
+            // Flagged by the contract task that added these fields; not
+            // solved there. Recorded separately for the final whole-branch
+            // review as a design gap, not something this task is asked to
+            // close — the job here is that this comment stop hiding half of
+            // what it names.
             .map(|item| MaintenanceCandidate {
                 value: memorysafe_core::Score::clamped(0.5),
                 fragility: memorysafe_core::Score::clamped(0.5),
                 item,
-                // OPEN: `Backend::list` returns bare `MemoryItem`s, and the
-                // access statistics deliberately do not live on that type, so
-                // this path has no source for them. `(None, 0)` is NOT
-                // "unknown" here — the ruling recorded at compose's staleness
-                // fallback (see `replay_due` in Task 28) makes `(None, 0)`
-                // mean the item has never been accessed, definitively,
-                // everywhere this pair appears. Passing it for an item whose
-                // access history is merely unavailable therefore states
-                // something false, not merely something imprecise: a
-                // frequently-recalled item offered for eviction reads to the
-                // policy as indistinguishable from one nobody has ever
-                // touched. Before `admit` is allowed to weigh staleness, the
-                // listing path needs to carry the real statistics — a `list`
-                // that returns them beside each item, or a dedicated read.
-                // Flagged by the contract task that added these fields; not
-                // solved there.
                 last_accessed_at: None,
                 access_count: 0,
             })
@@ -107,6 +149,8 @@ mod tests {
     /// double rather than a copy.
     struct FakeBackend {
         neighbours: Vec<ScoredCandidate>,
+        /// When set, `neighbours()` returns this error instead of `Ok`.
+        neighbours_error: bool,
         scope_stats: ScopeStats,
         capacity: CapacityState,
         list: Mutex<Vec<MemoryItem>>,
@@ -116,6 +160,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 neighbours: vec![],
+                neighbours_error: false,
                 scope_stats: ScopeStats::default(),
                 capacity: CapacityState {
                     budget: Budget::UNBOUNDED,
@@ -143,6 +188,12 @@ mod tests {
             _embedding: &Embedding,
             _k: usize,
         ) -> Result<Vec<ScoredCandidate>, BackendError> {
+            if self.neighbours_error {
+                return Err(BackendError::Storage {
+                    message: "vector store unavailable".into(),
+                    retryable: true,
+                });
+            }
             Ok(self.neighbours.clone())
         }
 
@@ -280,6 +331,26 @@ mod tests {
             ctx.stats.mean_neighbour_similarity, 0.5,
             "expected the mean of 0.2 and 0.8, not their sum"
         );
+    }
+
+    #[tokio::test]
+    async fn a_neighbour_lookup_failure_propagates_rather_than_degrading_to_no_neighbours() {
+        // `unwrap_or_default()` here would silently read a transient backend
+        // failure as "this scope has no neighbours" — indistinguishable from
+        // the genuine case, and one that cascades into admitting a duplicate
+        // as novel and protecting it for a full window (see the doc comment
+        // on the call site). `?`, matching `scope_stats`, must surface it.
+        let backend = FakeBackend {
+            neighbours_error: true,
+            ..Default::default()
+        };
+        let err = assess_context(&backend, &scope(), Some(&embedding()), 16)
+            .await
+            .expect_err("a neighbour lookup failure must not be swallowed");
+        assert!(matches!(
+            err,
+            EngineError::Backend(BackendError::Storage { .. })
+        ));
     }
 
     #[tokio::test]

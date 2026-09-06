@@ -1,9 +1,31 @@
 use memorysafe_backend_sqlite::SqliteBackend;
-use memorysafe_core::{Action, Budget, ReasonCode, Scope, SensitivityLevel};
+use memorysafe_core::{Action, Budget, Protection, ReasonCode, Scope, SensitivityLevel};
 use memorysafe_embed::DeterministicEmbedder;
 use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
 use memorysafe_policy::BaselinePolicy;
 use std::sync::Arc;
+
+/// Every timestamp in this workspace is durably Unix-seconds (the global
+/// constraint: "stored as Unix seconds (i64) in SQLite"); an
+/// `Action::Retain { protection: Protection::Protected { until } }` computed
+/// moments ago in-process still carries sub-second precision that never
+/// survives a round trip through the audit trail. Comparing an
+/// in-process-fresh `Action` against one reconstructed from storage is
+/// therefore only meaningful at the precision both can actually agree on —
+/// this truncates `until` to whole seconds so that comparison is honest
+/// rather than flaky.
+fn at_second_precision(action: Action) -> Action {
+    match action {
+        Action::Retain {
+            protection: Protection::Protected { until },
+        } => Action::Retain {
+            protection: Protection::Protected {
+                until: time::OffsetDateTime::from_unix_timestamp(until.unix_timestamp()).unwrap(),
+            },
+        },
+        other => other,
+    }
+}
 
 fn engine() -> Engine {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -66,6 +88,19 @@ async fn an_identical_rewrite_is_rejected_as_a_duplicate() {
             .reasons
             .iter()
             .any(|r| r.code == ReasonCode::NearDuplicate)
+    );
+    assert!(
+        second.item_id.is_none(),
+        "a rejected write must not store an item"
+    );
+    // The flagship governance guarantee this test exists to pin: a
+    // policy-rejected write stores nothing. Both writes share one body, so a
+    // second stored row here means the rejection was reported but not
+    // enforced.
+    assert_eq!(
+        e.review(&scope(), &Default::default()).await.unwrap().len(),
+        1,
+        "a rejected write must not be stored"
     );
 }
 
@@ -152,10 +187,81 @@ async fn a_retried_write_returns_the_original_outcome() {
     let first = e.remember(r.clone()).await.unwrap();
     let second = e.remember(r).await.unwrap();
 
+    // The name's whole promise: a retry returns what actually happened the
+    // first time, not a fresh (and here self-contradictory) re-evaluation of
+    // an already-stored item as a new near-duplicate of itself. Compared
+    // field by field, `action` at second precision (see `at_second_precision`
+    // above) — everything else must match exactly.
     assert_eq!(first.item_id, second.item_id);
+    assert_eq!(first.audit_id, second.audit_id);
+    assert_eq!(first.evicted, second.evicted);
+    assert_eq!(first.reasons, second.reasons);
+    assert_eq!(first.merged_into, second.merged_into);
+    assert!(
+        !matches!(second.action, Action::Reject),
+        "the retried write must not be reported as rejected when an item was stored"
+    );
+    assert_eq!(
+        at_second_precision(first.action),
+        at_second_precision(second.action),
+        "a retried write must return the ORIGINAL outcome, not the second run's own decision"
+    );
     assert_eq!(
         e.review(&scope(), &Default::default()).await.unwrap().len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn a_retried_rejected_write_replays_the_original_rejection() {
+    // The other half of the replay fix: `txn.idempotency_key` is set
+    // unconditionally in `remember`, so a genuinely rejected write is
+    // idempotent too, and its replay must report the same rejection, not a
+    // fresh re-evaluation. Seeded so the write under test is rejected on its
+    // very first attempt.
+    let e = engine();
+    let body = "the deploy key rotates every ninety days";
+    e.remember(req(body)).await.unwrap();
+
+    let mut r = req(body);
+    r.idempotency_key = Some("reject-retry-key".into());
+
+    let first = e.remember(r.clone()).await.unwrap();
+    let second = e.remember(r).await.unwrap();
+
+    assert!(matches!(first.action, Action::Reject));
+    assert_eq!(first.item_id, second.item_id);
+    assert_eq!(first.audit_id, second.audit_id);
+    assert_eq!(first.evicted, second.evicted);
+    // Codes and details only, not full `Reason` equality: reconstructing
+    // `second` round-trips the original `Decision` through the audit
+    // trail's SQLite storage, and that round trip has a pre-existing,
+    // separate 1-ULP precision loss on `Reason.evidence`'s `f64` values —
+    // confirmed present even for a single, non-replayed write with no
+    // replay logic involved at all (verified with a throwaway debug test:
+    // `WriteOutcome.reasons` from the live call reads `0.9800000190734863`
+    // for `NearDuplicate`'s `threshold` feature, the SAME row read back via
+    // `Engine::audit` immediately after reads `...864`). Out of scope for
+    // this fix — flagged in the task report for the final review — and
+    // orthogonal to what this test exists to pin.
+    assert_eq!(
+        first
+            .reasons
+            .iter()
+            .map(|r| (&r.code, &r.detail))
+            .collect::<Vec<_>>(),
+        second
+            .reasons
+            .iter()
+            .map(|r| (&r.code, &r.detail))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(first.merged_into, second.merged_into);
+    assert_eq!(first.action, second.action);
+    assert_eq!(
+        e.review(&scope(), &Default::default()).await.unwrap().len(),
+        1,
+        "only the seed item is stored"
     );
 }
 

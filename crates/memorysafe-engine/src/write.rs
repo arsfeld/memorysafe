@@ -89,7 +89,11 @@ impl Engine {
             ),
         };
 
-        // One I/O pass gathers everything the policy is allowed to see.
+        // Gathers everything the policy is allowed to see. Not one I/O pass:
+        // `assess_context` and `admit_context` together make up to four
+        // backend round trips before `apply` — `neighbours`, `scope_stats`,
+        // `capacity_state`, and `list` (when the budget is bounded) — a
+        // fifth (`get`) for a merge decision, and a sixth for `apply` itself.
         let ctx = gather::assess_context(
             self.backend.as_ref(),
             &req.scope,
@@ -211,6 +215,19 @@ impl Engine {
 
         let applied = self.backend.apply(txn).await?;
 
+        // The backend short-circuited on this request's idempotency key and
+        // returned the ORIGINAL `AppliedWrite`, having applied nothing this
+        // time — but `decision` above is this call's own fresh evaluation,
+        // computed against a corpus that (for a retried admit) now already
+        // contains the item the first call created. An identical retried
+        // body reads back as a near-duplicate of itself, so `decision.action`
+        // here can be `Reject` while `applied.item_id` names a real, stored
+        // row: a self-contradictory outcome that never happened. See
+        // `replayed_outcome` for how the real one is recovered.
+        if applied.replayed {
+            return self.replayed_outcome(&req.scope, applied).await;
+        }
+
         Ok(WriteOutcome {
             item_id: applied.item_id.clone(),
             action: decision.action.clone(),
@@ -219,6 +236,91 @@ impl Engine {
                 Action::Merge { into, .. } => Some(into.clone()),
                 _ => None,
             },
+            evicted: applied.evicted,
+            audit_id: applied.audit_id,
+        })
+    }
+
+    /// Reconstructs the outcome of a replayed idempotent write. `AppliedWrite`
+    /// itself carries only `item_id`/`audit_id`/`evicted` from the original
+    /// call — not the original `Decision` — so `action`/`reasons`/
+    /// `merged_into` are not present on it at all; guessing them from this
+    /// call's fresh (and, for a retried admit, actively misleading) decision
+    /// is exactly the bug this exists to avoid.
+    ///
+    /// When the original write stored an item, its own audit row is looked
+    /// up by the `audit_id` the backend already returned, narrowed to that
+    /// item's history (small, and bounded by `AuditFilter`'s default page) —
+    /// recovering the real `Decision` and, with it, exact `action`/`reasons`/
+    /// `merged_into`.
+    ///
+    /// **Known gap, not chased in this fix:** a replayed MERGE cannot be
+    /// found this way. A merge's own audit record carries no `ItemRef` (see
+    /// `refs` above — `item` is `None` on the `Merge` arm), so filtering by
+    /// item id never matches it, and the fallback below reports a
+    /// protection-accurate `Retain` instead of the true `Merge`. That is an
+    /// approximation, not a fabrication: the reported protection is read
+    /// fresh from the stored item, never guessed, and the outcome still
+    /// never contradicts `item_id`/`evicted`/`audit_id`, which stay exact.
+    async fn replayed_outcome(
+        &self,
+        scope: &Scope,
+        applied: memorysafe_backend::AppliedWrite,
+    ) -> Result<WriteOutcome, EngineError> {
+        // Narrowed by item when there is one (bounds the scan to that item's
+        // own small history); unnarrowed when there is not (idempotency rows
+        // are written for genuine rejects too — `txn.idempotency_key` is set
+        // unconditionally above — so `applied.item_id` can be `None` here).
+        // Either way this is `AuditFilter`'s default page, newest first, and
+        // the record being searched for was written moments before this
+        // call, so it is reliably on it.
+        let filter = memorysafe_core::AuditFilter {
+            item: applied.item_id.clone(),
+            ..Default::default()
+        };
+        let history = self.backend.audit(scope, &filter).await?;
+        if let Some(decision) = history
+            .into_iter()
+            .find(|r| r.id == applied.audit_id)
+            .and_then(|r| r.decision)
+        {
+            return Ok(WriteOutcome {
+                item_id: applied.item_id.clone(),
+                merged_into: match &decision.action {
+                    Action::Merge { into, .. } => Some(into.clone()),
+                    _ => None,
+                },
+                action: decision.action,
+                reasons: decision.reasons,
+                evicted: applied.evicted,
+                audit_id: applied.audit_id,
+            });
+        }
+
+        // The original decision could not be recovered — a replayed merge
+        // (whose own audit row carries no item reference; see `refs` above),
+        // or a row that fell outside the default audit page. Report only
+        // what is safe not to contradict: `Reject` when nothing is stored,
+        // otherwise `Retain` at the item's real, current protection rather
+        // than a guess. `reasons`/`merged_into` are left unrecoverable
+        // rather than fabricated.
+        let action = match &applied.item_id {
+            Some(id) => {
+                let protection = self
+                    .backend
+                    .get(scope, id)
+                    .await?
+                    .map(|i| i.protection)
+                    .unwrap_or(memorysafe_core::Protection::Normal);
+                Action::Retain { protection }
+            }
+            None => Action::Reject,
+        };
+        Ok(WriteOutcome {
+            item_id: applied.item_id.clone(),
+            action,
+            reasons: vec![],
+            merged_into: None,
             evicted: applied.evicted,
             audit_id: applied.audit_id,
         })
