@@ -254,7 +254,14 @@ impl PostgresBackend {
     pub async fn connect(config: PgConfig) -> Result<Self, BackendError>;
     pub fn config(&self) -> &PgConfig;
     /// Escape hatch for the isolation tests: the runtime (app-role) pool.
-    pub fn app_pool(&self) -> &PgPool;
+    ///
+    /// **Named for what it is because it cannot be hidden.** `tests/isolation.rs`
+    /// is an integration test, so this must be `pub`; `pub(crate)` and
+    /// `#[cfg(test)]` are both unavailable. The name is therefore the only thing
+    /// that makes a production use of it visibly wrong at the call site — and a
+    /// production use is exactly what would break the invariant stated on
+    /// `impl Backend for PostgresBackend`.
+    pub fn pool_for_isolation_tests(&self) -> &PgPool;
 }
 
 pub(crate) fn estimate_tokens(body: &str) -> u32;
@@ -1480,7 +1487,7 @@ git commit -m "test(pg): container harness with a DATABASE_URL override and per-
 
 **Interfaces:**
 - Consumes: `PgConfig`, `PgLayout`, `SqlxResultExt`.
-- Produces: `ddl::SCHEMA_VERSION`, `ddl::statements(config, schema) -> Vec<String>`, `ddl::checked_ident`, `bootstrap::ensure_role`, `bootstrap::ensure_schema`, `PostgresBackend::connect`, `PostgresBackend::app_pool`.
+- Produces: `ddl::SCHEMA_VERSION`, `ddl::statements(config, schema) -> Vec<String>`, `ddl::checked_ident`, `bootstrap::ensure_role`, `bootstrap::ensure_schema`, `PostgresBackend::connect`, `PostgresBackend::pool_for_isolation_tests`.
 
 **The whole bootstrap runs in one transaction.** DDL is transactional in PostgreSQL, so a bootstrap that fails halfway leaves nothing behind — there is no half-initialised schema to reason about.
 
@@ -1510,7 +1517,7 @@ async fn bootstrap_creates_the_schema_and_is_idempotent() {
     let version: String = sqlx::query(&format!(
         "SELECT value FROM {schema}.meta WHERE key = 'schema_version'"
     ))
-    .fetch_one(backend.app_pool())
+    .fetch_one(backend.pool_for_isolation_tests())
     .await
     .unwrap()
     .get("value");
@@ -1531,7 +1538,7 @@ async fn every_tenant_table_has_row_level_security_forced() {
         )
         .bind(&schema)
         .bind(table)
-        .fetch_one(backend.app_pool())
+        .fetch_one(backend.pool_for_isolation_tests())
         .await
         .unwrap();
 
@@ -1551,7 +1558,7 @@ async fn the_application_role_cannot_bypass_row_level_security() {
 
     let row = sqlx::query("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1")
         .bind(&role)
-        .fetch_one(backend.app_pool())
+        .fetch_one(backend.pool_for_isolation_tests())
         .await
         .unwrap();
     assert!(!row.get::<bool, _>("rolsuper"), "the app role is a superuser");
@@ -1559,7 +1566,7 @@ async fn the_application_role_cannot_bypass_row_level_security() {
 
     // And the pool actually assumed it.
     let current: String = sqlx::query("SELECT current_user AS u")
-        .fetch_one(backend.app_pool())
+        .fetch_one(backend.pool_for_isolation_tests())
         .await
         .unwrap()
         .get("u");
@@ -1582,7 +1589,7 @@ async fn the_shared_layout_partitions_every_tenant_table() {
         )
         .bind(&schema)
         .bind(table)
-        .fetch_one(backend.app_pool())
+        .fetch_one(backend.pool_for_isolation_tests())
         .await
         .unwrap()
         .get("c");
@@ -1961,7 +1968,7 @@ impl PostgresBackend {
 
     /// The runtime pool, exposed so the isolation tests can pose as the
     /// application without going through the `Backend` methods.
-    pub fn app_pool(&self) -> &PgPool {
+    pub fn pool_for_isolation_tests(&self) -> &PgPool {
         &self.app
     }
 }
@@ -2040,7 +2047,7 @@ async fn the_tenant_guc_is_transaction_local() {
     //    three distinct backends. A loop that assumes reuse inspects
     //    connections that never ran the transaction and passes whatever the
     //    GUC does — so pin the connection instead of looping and hoping.
-    let mut held = backend.app_pool().acquire().await.unwrap();
+    let mut held = backend.pool_for_isolation_tests().acquire().await.unwrap();
     for _ in 0..8 {
         let leaked: Option<String> =
             sqlx::query("SELECT nullif(current_setting('memorysafe.tenant_id', true), '') AS t")
@@ -2080,7 +2087,7 @@ async fn the_search_path_does_not_survive_the_transaction() {
     let tenant = TenantId::new("acme").unwrap();
     let schema = schema_for_tenant(backend.config(), &tenant);
 
-    let mut held = backend.app_pool().acquire().await.unwrap();
+    let mut held = backend.pool_for_isolation_tests().acquire().await.unwrap();
 
     // The premise: without it, "the schema is absent afterwards" is also true
     // of a connection that never had it.
@@ -2179,7 +2186,27 @@ use sqlx::{Postgres, Transaction};
 ///   `items`. **Writes are not.** `WITH CHECK (tenant_id = <A>)` accepts a row
 ///   labelled A, so A's row lands in B's schema: correctly labelled, wrongly
 ///   placed, and invisible to RLS by construction, because RLS answers "may
-///   this row exist here" and not "is this the right table". Pinned by
+///   this row exist here" and not "is this the right table". `idempotency` is
+///   one of the five policied tables, so the blast radius includes the
+///   idempotency record: it lands in the wrong schema, the retry looks for it
+///   under the right `search_path` and does not find it, and the operation
+///   runs twice — an exactly-once guarantee becoming a duplicate, which is
+///   what a client notices.
+///
+///   **Reachability, stated because the severity depends on it and it is not
+///   settled.** `tenant_txn` sets `search_path` at the start of every
+///   transaction, so a leaked value is overwritten before any operation reads
+///   it: the leak is live only in the window *between* transactions, and
+///   reaching it needs a query that runs outside `tenant_txn`. Every
+///   implemented `Backend` method opens one (see the invariant on the impl
+///   block), so today there is no such path — which makes this hazard
+///   contingent on an unenforced convention rather than on the code as
+///   written. The same premise clears the conformance freeze, so it should not
+///   be assumed twice in two directions: flipping `is_local` on this setting
+///   against a live server is what settles both, and it is the Postgres
+///   crate's instrument, not this document's.
+///
+///   Locality itself is pinned by
 ///   `the_search_path_does_not_survive_the_transaction`.
 /// * `memorysafe.tenant_id` is what the RLS policies compare against. With no
 ///   tenant claimed the policies see NULL — via `nullif(..., '')`, because an
@@ -2756,6 +2783,32 @@ use memorysafe_core::{
 use session::tenant_txn;
 
 #[async_trait]
+/// **Every method here opens with `tenant_txn` and runs all of its SQL inside
+/// that transaction. There are no exceptions, and the invariant is held by
+/// convention rather than by structure.**
+///
+/// Stated because two separate rulings rest on it and neither states it:
+///
+/// * The conformance suite is frozen without a `search_path`-locality test, on
+///   the grounds that a leaked `search_path` is overwritten by the next
+///   `tenant_txn` before any suite-visible read — so the leak window contains
+///   no `Backend` operation and the class is unobservable through the trait.
+/// * A misplaced write under a leaked `search_path` — a row correctly labelled
+///   for its tenant but landing in another tenant's schema, which RLS cannot
+///   see because it answers "may this row exist here" and never "is this the
+///   right table" — likewise requires a query running *outside* `tenant_txn`.
+///
+/// Both hold only while this invariant does. It holds today: of the fourteen
+/// methods, five are implemented and all five open with `tenant_txn`; the
+/// other nine are stubs. **Each of those nine is an opportunity to break it**,
+/// and nothing in the type system objects — `pool_for_isolation_tests` is
+/// `pub` because `tests/isolation.rs` is an integration test and cannot see a
+/// narrower visibility.
+///
+/// So a new method that touches the database without opening a `tenant_txn` is
+/// not a style deviation: it falsifies a freeze ruling and upgrades a
+/// write-placement hazard, in a different repository from the one where either
+/// was decided.
 impl Backend for PostgresBackend {
     async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, BackendError> {
         let mut tx = tenant_txn(self, &scope.tenant).await?;
@@ -2924,7 +2977,7 @@ git commit -m "feat(pg): item and audit persistence; isolation conformance passe
 - Create: `crates/memorysafe-backend-postgres/tests/isolation.rs`
 
 **Interfaces:**
-- Consumes: `PostgresBackend::begin_for_test`, `PostgresBackend::app_pool`, the conformance fixtures.
+- Consumes: `PostgresBackend::begin_for_test`, `PostgresBackend::pool_for_isolation_tests`, the conformance fixtures.
 - Produces: nothing. This task adds no source code — it adds the evidence for the product claim.
 
 **Why this is a task of its own.** The conformance suite proves the *backend's methods* isolate tenants, which any correct set of `WHERE` clauses would also do. The commercial claim is stronger than that: isolation is a property of the database, so a query that loses its predicate returns nothing rather than everything. Only a test that deliberately writes the wrong query can show that, and such a test cannot live in the OSS conformance suite because SQLite achieves isolation a different way — one file per tenant.
@@ -3001,7 +3054,7 @@ async fn a_connection_with_no_tenant_context_reads_nothing() {
     let (backend, schema) = two_tenants().await;
 
     let n: i64 = sqlx::query(&format!("SELECT count(*) AS c FROM {schema}.items"))
-        .fetch_one(backend.app_pool())
+        .fetch_one(backend.pool_for_isolation_tests())
         .await
         .unwrap()
         .get("c");
@@ -3021,7 +3074,7 @@ async fn a_connection_with_no_tenant_context_cannot_write() {
          VALUES ('tenant-a','01GHOSTGHOSTGHOSTGHOSTGHOST','s','n','x','fact','agent',1,
                  ARRAY[]::text[], '', '{{}}'::jsonb, 1, 'normal', 1)"
     ))
-    .execute(backend.app_pool())
+    .execute(backend.pool_for_isolation_tests())
     .await
     .expect_err("a write with no tenant context was accepted");
 
@@ -5022,7 +5075,7 @@ async fn per_tenant() -> PostgresBackend {
 async fn schema_exists(backend: &PostgresBackend, schema: &str) -> bool {
     sqlx::query("SELECT 1 FROM pg_namespace WHERE nspname = $1")
         .bind(schema)
-        .fetch_optional(backend.app_pool())
+        .fetch_optional(backend.pool_for_isolation_tests())
         .await
         .unwrap()
         .is_some()
@@ -5073,7 +5126,7 @@ async fn the_per_tenant_layout_creates_no_partitions() {
          WHERE ns.nspname = $1 AND c.relispartition",
     )
     .bind(&schema)
-    .fetch_one(backend.app_pool())
+    .fetch_one(backend.pool_for_isolation_tests())
     .await
     .unwrap()
     .get("c");
@@ -5090,7 +5143,7 @@ async fn row_level_security_is_still_enforced_per_tenant() {
     let schema = schema_for_tenant(backend.config(), &TenantId::new("acme").unwrap());
 
     let n: i64 = sqlx::query(&format!("SELECT count(*) AS c FROM {schema}.items"))
-        .fetch_one(backend.app_pool())
+        .fetch_one(backend.pool_for_isolation_tests())
         .await
         .unwrap()
         .get("c");
@@ -5474,7 +5527,7 @@ async fn a_database_from_a_newer_build_is_refused() {
     sqlx::query(&format!(
         "UPDATE {schema}.meta SET value = '99' WHERE key = 'schema_version'"
     ))
-    .execute(backend.app_pool())
+    .execute(backend.pool_for_isolation_tests())
     .await
     .unwrap();
     drop(backend);
