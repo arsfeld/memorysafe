@@ -1,0 +1,130 @@
+use crate::AuthError;
+use base64::Engine as _;
+use memorysafe_core::TenantId;
+use serde::{Deserialize, Serialize};
+
+/// Presented form: `msk_<26-char ULID id>_<base64url secret>`.
+pub const KEY_PREFIX: &str = "msk";
+const SECRET_BYTES: usize = 32;
+
+/// What is written to configuration. Holds a hash, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyRecord {
+    pub id: String,
+    pub tenant: TenantId,
+    /// BLAKE3 of the whole presented key, hex encoded.
+    pub hash: String,
+    pub label: String,
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+/// The only moment the secret exists. Returned once, then unrecoverable.
+#[derive(Debug, Clone)]
+pub struct GeneratedKey {
+    pub secret: String,
+    pub record: ApiKeyRecord,
+}
+
+pub fn generate(tenant: TenantId, label: &str) -> Result<GeneratedKey, AuthError> {
+    let id = ulid::Ulid::generate().to_string();
+    let mut bytes = [0u8; SECRET_BYTES];
+    getrandom::fill(&mut bytes).map_err(|_| AuthError::Rng)?;
+    let secret_part = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let secret = format!("{KEY_PREFIX}_{id}_{secret_part}");
+
+    Ok(GeneratedKey {
+        record: ApiKeyRecord {
+            id,
+            tenant,
+            hash: hash_presented(&secret),
+            label: label.to_owned(),
+            disabled: false,
+        },
+        secret,
+    })
+}
+
+pub(crate) fn hash_presented(presented: &str) -> String {
+    blake3::hash(presented.as_bytes()).to_hex().to_string()
+}
+
+/// Splits a presented key into its id, without validating the secret. The id is
+/// public by construction — it is how the store finds one record instead of
+/// hashing against all of them.
+pub(crate) fn parse_presented(presented: &str) -> Result<&str, AuthError> {
+    let rest = presented
+        .strip_prefix(KEY_PREFIX)
+        .ok_or(AuthError::Malformed)?;
+    let rest = rest.strip_prefix('_').ok_or(AuthError::Malformed)?;
+    let (id, secret) = rest.split_once('_').ok_or(AuthError::Malformed)?;
+    if id.len() != 26 || secret.len() < 40 {
+        return Err(AuthError::Malformed);
+    }
+    Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memorysafe_core::TenantId;
+
+    #[test]
+    fn a_generated_key_carries_its_id_in_the_clear_and_its_secret_only_once() {
+        let tenant = TenantId::new("acme").unwrap();
+        let g = generate(tenant.clone(), "ci runner").expect("generate");
+
+        let (prefix, rest) = g.secret.split_once('_').expect("prefixed");
+        assert_eq!(prefix, KEY_PREFIX);
+        let (id, secret) = rest.split_once('_').expect("id then secret");
+        assert_eq!(
+            id, g.record.id,
+            "the id must be readable without the secret"
+        );
+        assert_eq!(id.len(), 26, "a ULID id");
+        assert!(secret.len() >= 40, "at least 240 bits of base64url");
+
+        assert_eq!(g.record.tenant, tenant);
+        assert_eq!(g.record.label, "ci runner");
+        assert!(!g.record.disabled);
+    }
+
+    #[test]
+    fn the_record_never_contains_the_secret() {
+        // The record is what gets written to msafe.toml. If the secret survives
+        // serialization, every operator's config file is a credential store in
+        // plaintext.
+        let g = generate(TenantId::new("acme").unwrap(), "ci").unwrap();
+        let json = serde_json::to_string(&g.record).unwrap();
+        let secret_tail = g.secret.rsplit('_').next().unwrap();
+        assert!(
+            !json.contains(secret_tail),
+            "the record serialised the secret"
+        );
+    }
+
+    #[test]
+    fn two_generated_keys_never_collide() {
+        let a = generate(TenantId::new("acme").unwrap(), "a").unwrap();
+        let b = generate(TenantId::new("acme").unwrap(), "b").unwrap();
+        assert_ne!(a.record.id, b.record.id);
+        assert_ne!(a.record.hash, b.record.hash);
+        assert_ne!(a.secret, b.secret);
+    }
+
+    #[test]
+    fn a_malformed_presented_key_is_rejected_before_any_lookup() {
+        for bad in [
+            "",
+            "nope",
+            "msk_short",
+            "xxx_01ARZ3NDEKTSV4RRFFQ69G5FAV_abc",
+            "msk__abc",
+        ] {
+            assert!(
+                matches!(parse_presented(bad), Err(AuthError::Malformed)),
+                "{bad} was accepted"
+            );
+        }
+    }
+}

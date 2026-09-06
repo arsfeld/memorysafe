@@ -39,6 +39,11 @@ fn validate_component(field: &'static str, raw: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Reserved subject and namespace for tenant-level records. Legal as a
+/// component, so reserving it is a rule the adapters enforce, not something
+/// validation gives for free.
+pub const ADMIN_COMPONENT: &str = "_admin";
+
 // **Signature change here is not local.** `scope_component!` generates
 // `new(&str) -> Result<Self, CoreError>` and `as_str(&self) -> &str` for
 // `TenantId`, `SubjectId` and `Namespace`. Those signatures are inside a macro
@@ -203,6 +208,24 @@ impl Scope {
             self.tenant, self.subject, self.namespace
         )
     }
+
+    /// The scope tenant-level audit records are written under. Nothing a caller
+    /// can name, because every adapter refuses `ADMIN_COMPONENT` in a
+    /// caller-supplied subject or namespace.
+    pub fn admin(tenant: &TenantId) -> Scope {
+        Scope {
+            tenant: tenant.clone(),
+            subject: SubjectId::new(ADMIN_COMPONENT).expect("ADMIN_COMPONENT is a valid component"),
+            namespace: Namespace::new(ADMIN_COMPONENT)
+                .expect("ADMIN_COMPONENT is a valid component"),
+        }
+    }
+
+    /// Both halves, not either: a scope reserved in one position only is an
+    /// ordinary scope that happens to share a name.
+    pub fn is_admin(&self) -> bool {
+        self.subject.as_str() == ADMIN_COMPONENT && self.namespace.as_str() == ADMIN_COMPONENT
+    }
 }
 
 #[cfg(test)]
@@ -292,5 +315,30 @@ mod tests {
         assert!(ItemId::parse("not-a-ulid").is_err());
         assert!(ItemId::parse("").is_err());
         assert!(AuditId::parse(AuditId::new().as_str()).is_ok());
+    }
+
+    #[test]
+    fn the_admin_scope_is_recognisable_and_is_not_a_normal_scope() {
+        let tenant = TenantId::new("acme").unwrap();
+        let admin = Scope::admin(&tenant);
+
+        assert_eq!(admin.tenant, tenant);
+        assert_eq!(admin.subject.as_str(), ADMIN_COMPONENT);
+        assert_eq!(admin.namespace.as_str(), ADMIN_COMPONENT);
+        assert!(admin.is_admin());
+
+        let ordinary = Scope::new("acme", "user-42", "agent").unwrap();
+        assert!(!ordinary.is_admin());
+    }
+
+    #[test]
+    fn a_scope_is_only_admin_when_both_halves_are_reserved() {
+        // Half-reserved scopes are ordinary. `is_admin` gates whether audit rows
+        // are treated as tenant-level, so a scope that is reserved in only one
+        // position must not be mistaken for one the engine wrote.
+        let half = Scope::new("acme", ADMIN_COMPONENT, "agent").unwrap();
+        assert!(!half.is_admin());
+        let other_half = Scope::new("acme", "user-42", ADMIN_COMPONENT).unwrap();
+        assert!(!other_half.is_admin());
     }
 }
