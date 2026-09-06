@@ -29,12 +29,22 @@ impl AuditEvent {
     /// name". Without it those are four independent encodings of the same
     /// thing, free to drift.
     ///
-    /// **`AuditEvent` deliberately has no `Ord`.** Deriving one would give
+    /// **`AuditEvent` deliberately has no `Ord`, and the absence is
+    /// load-bearing — do not add one for convenience.** Deriving it would give
     /// *declaration* order, which is nothing like this order: `rejected` is
     /// declared second and sorts tenth, `exported` is declared sixth and sorts
     /// second. Anything ordering audit events must compare `as_str()`, and the
-    /// absence of a derive is what stops `a.event.cmp(&b.event)` from
-    /// compiling into the wrong answer.
+    /// missing derive is what makes `a.event.cmp(&b.event)` a compile error
+    /// rather than a silently wrong answer. That is a rung above a comment,
+    /// which relies on being read, and above a test, which catches the mistake
+    /// only after it is written: it removes the option. The obvious unblock
+    /// when that error appears — adding `Ord` to the derive list — is the bug.
+    ///
+    /// No tiebreaker is needed alongside `as_str`, unlike
+    /// `memorysafe_backend::AggregateKey`, whose ordering has to append
+    /// `tenant` to stay consistent with `Eq`: `as_str` is injective over
+    /// variants, so ordering by it returns `Equal` only for the same variant
+    /// and already agrees with the derived `Eq`.
     ///
     /// The same trap has a storage form: a backend that stores the event as an
     /// integer ordinal and orders by that column gets declaration order.
