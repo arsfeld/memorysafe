@@ -88,12 +88,32 @@ pub struct AppliedWrite {
     pub replayed_outcome: Option<String>,
 }
 
-/// `audit_rows_removed + audit_rows_preserved` accounts for every audit row
-/// that existed for the subject *before* the purge ran — not for any row
-/// the purge itself may add. `AuditEvent::SubjectPurged` exists, so a
-/// conformant backend may write its own audit row recording the purge; that
-/// row did not exist to be removed or preserved and is not counted in
-/// either field.
+/// What `Backend::purge_subject` removed.
+///
+/// **The audit accounting is an equation, not a convention:**
+///
+/// ```text
+/// audit_rows_removed + audit_rows_preserved
+///     == the number of audit rows for that subject immediately before the call
+/// ```
+///
+/// It is written as an equation because that is what
+/// `lifecycle::purge_subject_removes_everything_for_that_subject` already
+/// asserts — `assert_eq!(removed + preserved, 6)` against a corpus of six
+/// admits — so prose and test cannot drift into two different rules. Under
+/// `PurgeCascade::Cascade` the whole count lands in `audit_rows_removed`;
+/// under `PurgeCascade::Preserve` the whole count lands in
+/// `audit_rows_preserved` and `audit_rows_removed` is 0. No row is in both,
+/// and none is in neither.
+///
+/// **The purge's own `SubjectPurged` record is excluded from both terms.**
+/// `purge_subject` always inserts the record it is handed, but that row did
+/// not exist before the call, so it is neither removed nor preserved: the
+/// report describes what the purge did to *existing* data. A backend that
+/// counted its own row would report `preserved == existing + 1` and break the
+/// equation — which is why the `Preserve` conformance test asserts the
+/// `SubjectPurged` row is readable *and* that `audit_rows_preserved` does not
+/// count it. Without that second clause the equation is decorative.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurgeReport {
     pub items_removed: u64,

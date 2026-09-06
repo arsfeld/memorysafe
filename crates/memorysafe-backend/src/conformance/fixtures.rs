@@ -1,6 +1,6 @@
 use crate::write::{ItemWrite, WriteTransaction};
 use memorysafe_core::{
-    Actor, AuditEvent, AuditRecord, ItemId, ItemRef, MemoryItem, Protection, Scope,
+    Actor, AuditEvent, AuditId, AuditRecord, ItemId, ItemRef, MemoryItem, Protection, Scope,
     SensitivityLevel, Source, SourceKind,
 };
 use memorysafe_embed::{DeterministicEmbedder, Embedder, QuantizedVector};
@@ -166,6 +166,53 @@ pub fn evict_txn_at(scope: &Scope, evictions: Vec<ItemId>, at: OffsetDateTime) -
     txn.evictions = evictions;
     txn
 }
+
+/// The `SubjectPurged` record `Backend::purge_subject` is handed. The engine
+/// builds this record; the backend deletes first, then inserts it verbatim
+/// under the id it carries — see the echo rule on `Backend`.
+///
+/// **`id` and `actor` are parameters, not defaults, on purpose.**
+/// `lifecycle::purge_subject_persists_the_record_it_was_given` asserts both:
+/// against a generated `AuditId::new()` an echoed id and a backend-minted one
+/// are indistinguishable, and against `Actor::system()` — which a backend
+/// inventing its own record would also plausibly use — so is the actor. `at`
+/// is pinned to `UNIX_EPOCH` for the reason `item` pins `created_at`;
+/// `AuditRecord::at` is public where a test needs otherwise.
+pub fn purge_record(scope: &Scope, id: AuditId, actor: Actor) -> AuditRecord {
+    let mut record = AuditRecord::new(
+        scope.clone(),
+        AuditEvent::SubjectPurged,
+        vec![],
+        actor,
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    record.id = id;
+    record
+}
+
+/// The four audit ids `lifecycle::audit_filter_narrows_by_event_and_time`
+/// pins, in ascending order: three admits, then the eviction.
+///
+/// **Why literals rather than `AuditRecord::new`'s generated ids.** `new` sets
+/// `id: AuditId::new()`, the plain ULID generator, while taking `at` as a
+/// parameter — so records minted inside one millisecond are ordered
+/// *randomly* relative to each other. That test asserts an exact two-element
+/// id sequence over records minted microseconds apart, which made its verdict
+/// depend on backend speed: it failed roughly half the time against a fast
+/// in-memory backend and passed against one with a real fsync between writes.
+/// This is `item_with_id`'s argument, on the audit side.
+///
+/// All four are pinned, not only the two the sequence names. A generated
+/// `AuditId` carries today's millisecond timestamp and every literal here
+/// carries a 2016 one, so pinning two and generating two would put the
+/// generated pair above both literals and reverse the very ordering under
+/// test.
+pub const AUDIT_ORDER_ULIDS: [&str; 4] = [
+    "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+    "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+    "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+    "01ARZ3NDEKTSV4RRFFQ69G5FB3",
+];
 
 #[cfg(test)]
 mod tests {
@@ -373,6 +420,80 @@ mod tests {
             byte_size: 11,
         });
         assert!(txn.is_valid());
+    }
+
+    // `purge_record` is what every purge conformance test hands
+    // `Backend::purge_subject`, and two of its arguments are load-bearing
+    // exactly because the defaults would look identical to a wrong backend's
+    // behaviour: a fixture that dropped the `record.id = id` line would hand
+    // the suite a generated id, against which an echoed id and a minted one
+    // are the same observation; one that ignored `actor` and wrote
+    // `Actor::system()` would match what a backend inventing its own
+    // `SubjectPurged` row would most plausibly write. Neither mutation is
+    // visible through `is_valid()` — which does not exist for a bare
+    // `AuditRecord` at all — so assert the fields, with values that differ
+    // from both defaults.
+    //
+    // Vacuous if the assertion ever compares against `AuditId::new()` or
+    // `Actor::system()` instead of the distinct literals below: the fixture
+    // would then be free to ignore both arguments.
+    #[test]
+    fn purge_record_uses_the_given_id_and_actor_not_defaults() {
+        let s = scope();
+        let id = AuditId::parse("01ARZ3NDEKTSV4RRFFQ69G5FC7").unwrap();
+        let actor = Actor {
+            kind: memorysafe_core::ActorKind::Human,
+            id: Some("dpo-7".into()),
+        };
+        let rec = purge_record(&s, id.clone(), actor.clone());
+        assert_eq!(rec.id, id, "purge_record minted its own id");
+        assert_eq!(
+            rec.actor, actor,
+            "purge_record ignored the actor it was given"
+        );
+        assert_ne!(
+            rec.actor,
+            Actor::system(),
+            "the fixture's actor must differ from the default a backend \
+             inventing its own record would use"
+        );
+        assert_eq!(rec.event, AuditEvent::SubjectPurged);
+        assert_eq!(rec.scope, s);
+        assert!(
+            rec.items.is_empty(),
+            "a purge record names no surviving item"
+        );
+    }
+
+    // The premise `audit_filter_narrows_by_event_and_time` rests on, and the
+    // audit-side twin of
+    // `the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending`:
+    // these four literals are canonical ULIDs whose lexicographic order is the
+    // ascending order that test writes them in. `AuditId` derives `Ord` over
+    // the string, so this is exactly the comparison the assertion there makes
+    // — and it is checkable today, unlike the conformance test itself, which
+    // does not execute until a backend exists.
+    #[test]
+    fn the_literal_audit_ulids_the_ordering_test_uses_parse_and_sort_ascending() {
+        let ids: Vec<AuditId> = AUDIT_ORDER_ULIDS
+            .iter()
+            .map(|s| AuditId::parse(s).expect("literal must be a canonical ULID"))
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, ids,
+            "AUDIT_ORDER_ULIDS is written in the order the ordering test \
+             assigns it — three admits, then the eviction last and largest; \
+             if it does not sort that way, that test asserts the wrong sequence"
+        );
+        // And the eviction's id must be strictly the largest, since the whole
+        // point is that it is newest by id while being earlier by `at`.
+        assert!(
+            ids[3] > ids[2],
+            "the eviction's id must exceed the third admit's, or `at`-ordering \
+             and id-ordering do not disagree and the test cannot tell them apart"
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub use assessment::{
     Assessment, AssessorId, RedundancyAssessment, SensitivityAssessment, SensitivityCategory,
     SensitivityLevel,
 };
-pub use audit::{Actor, ActorKind, AuditEvent, AuditFilter, AuditRecord, ItemRef};
+pub use audit::{Actor, ActorKind, AuditEvent, AuditFilter, AuditRecord, ItemRef, PurgeCascade};
 pub use capacity::{Budget, CapacityState, ScopeStats};
 pub use decision::{Action, Decision, Eviction, MergeStrategy, PolicyId, Reason, ReasonCode};
 pub use embedding::{EmbedderId, Embedding};

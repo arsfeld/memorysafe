@@ -211,7 +211,7 @@ pub struct AuditAggregate {
 /// version — "how did behaviour change across policy 1.4" — which the
 /// original unfiltered, unpaginated `audit_aggregates(&self, tenant)` could
 /// not express at all.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditAggregateFilter {
     /// Inclusive lower bound, in the same whole-UTC-day units as
     /// `AggregateKey::day` and [`day_bucket`] — not a timestamp. `None` means
