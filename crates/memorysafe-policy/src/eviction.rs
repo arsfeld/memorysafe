@@ -24,15 +24,13 @@ pub fn cost(candidate: &MaintenanceCandidate) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::item;
-    use memorysafe_core::Score;
 
+    /// Delegates to `testkit::maintenance_candidate` (body fixed at `"x"`,
+    /// irrelevant to a cost that only reads `value`/`fragility`) so a future
+    /// field addition to `MaintenanceCandidate` costs one edit there, not one
+    /// per call site.
     fn fixture(value: f32, fragility: f32) -> MaintenanceCandidate {
-        MaintenanceCandidate {
-            item: item("x"),
-            value: Score::clamped(value),
-            fragility: Score::clamped(fragility),
-        }
+        crate::testkit::maintenance_candidate("x", value, fragility)
     }
 
     #[test]

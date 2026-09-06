@@ -166,7 +166,7 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{candidate, candidate_from, item, scope};
+    use crate::testkit::{candidate, candidate_from, scope};
     use memorysafe_core::{
         Assessment, AssessorId, Budget, Candidate, CapacityState, ReasonCode, ScopeStats, Score,
         ScoredCandidate, SensitivityAssessment,
@@ -224,13 +224,11 @@ mod tests {
     /// A `MaintenanceCandidate` fixture for the eviction path. NOT
     /// `testkit::candidate` — that returns a `ScoredCandidate`, and
     /// `AdmitContext::eviction_candidates` is `Vec<MaintenanceCandidate>`
-    /// (see the discrepancy note in the task report).
+    /// (see the discrepancy note in the task report). Delegates to
+    /// `testkit::maintenance_candidate` so a future field addition to
+    /// `MaintenanceCandidate` costs one edit there, not one per call site.
     fn evictable(body: &str, value: f32, fragility: f32) -> MaintenanceCandidate {
-        MaintenanceCandidate {
-            item: item(body),
-            value: Score::clamped(value),
-            fragility: Score::clamped(fragility),
-        }
+        crate::testkit::maintenance_candidate(body, value, fragility)
     }
 
     #[test]

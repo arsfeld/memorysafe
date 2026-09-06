@@ -1,8 +1,8 @@
 //! Fixture builders shared by this crate's unit tests.
 
 use memorysafe_core::{
-    Candidate, ItemId, MemoryItem, Protection, Scope, Score, ScoredCandidate, SensitivityLevel,
-    Source, SourceKind,
+    Candidate, ItemId, MaintenanceCandidate, MemoryItem, Protection, Scope, Score, ScoredCandidate,
+    SensitivityLevel, Source, SourceKind,
 };
 use time::OffsetDateTime;
 
@@ -40,6 +40,28 @@ pub fn candidate(body: &str, relevance: f32) -> ScoredCandidate {
         value: Score::clamped(0.5),
         fragility: Score::clamped(0.5),
         estimated_tokens: 10,
+        // Nothing in this crate reads either field yet — recency is realised
+        // as decay during maintenance (Task 29), not by anything `admit`,
+        // `value`, `fragility`, `eviction`, or `redundancy` compute today.
+        // `None`/`0` (never-accessed) is the right default for every current
+        // caller, not a placeholder standing in for a value some test needs.
+        last_accessed_at: None,
+        access_count: 0,
+    }
+}
+
+/// A `MaintenanceCandidate` fixture, for `eviction` and `admit`'s capacity
+/// path, which rank `Vec<MaintenanceCandidate>` rather than `ScoredCandidate`
+/// (see the discrepancy note in the task report). Shares `candidate`'s
+/// never-accessed default above, for the same reason: nothing here reads
+/// `last_accessed_at` or `access_count` yet.
+pub fn maintenance_candidate(body: &str, value: f32, fragility: f32) -> MaintenanceCandidate {
+    MaintenanceCandidate {
+        item: item(body),
+        value: Score::clamped(value),
+        fragility: Score::clamped(fragility),
+        last_accessed_at: None,
+        access_count: 0,
     }
 }
 
