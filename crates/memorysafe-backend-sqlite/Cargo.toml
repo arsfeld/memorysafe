@@ -1,0 +1,26 @@
+[package]
+name = "memorysafe-backend-sqlite"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+memorysafe-core.workspace = true
+memorysafe-embed.workspace = true
+memorysafe-backend.workspace = true
+rusqlite = { version = "0.40.2", features = ["bundled", "time"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+async-trait = "0.1.92"
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+base64.workspace = true
+lru = "0.16"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true
