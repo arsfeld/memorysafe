@@ -10696,9 +10696,10 @@ use memorysafe_core::{
     Protection, Reason, ReasonCode, features,
 };
 
-/// Ranking for capacity reclaim. Older and larger items go first; nothing
-/// smarter is warranted without access statistics, which the backend collects
-/// asynchronously and the policy sees only through `value` on candidates.
+/// Tie-breaker for capacity reclaim, applied UNDER `eviction::cost` — not the
+/// primary ranking. `cost` decides which items are cheapest to lose; this only
+/// separates two candidates `cost` scores equally, and it separates them by age
+/// alone: older first, on `created_at`. It does not consider size.
 fn reclaim_rank(item: &MemoryItem) -> i64 {
     item.created_at.unix_timestamp()
 }
