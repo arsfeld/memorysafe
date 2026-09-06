@@ -59,8 +59,12 @@ pub trait Backend: Send + Sync {
     ) -> Result<Vec<ScoredCandidate>, BackendError>;
 
     /// Ordered descending by `relevance`, ties broken by ascending `ItemId`
-    /// — the same rule and reason as `retrieve_candidates`. Here the
-    /// consequence is narrower but still real: the policy's `best()`
+    /// — the same rule as `retrieve_candidates`, for the same reason:
+    /// `neighbours` truncates too, at `k`, so tied similarity at the k-th
+    /// position means two backends that each conform to "descending by
+    /// relevance" alone can return different *neighbour sets* — not the
+    /// same set in a different order. The tie-break must be applied before
+    /// truncating at `k`, not after. Concretely, the policy's `best()`
     /// neighbour — the merge target — becomes nondeterministic on tied
     /// similarity if two backends break ties differently.
     async fn neighbours(
