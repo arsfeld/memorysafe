@@ -386,7 +386,14 @@ CREATE TABLE audit_aggregates (
   count          BIGINT NOT NULL,
   value_histogram     JSONB NOT NULL,
   fragility_histogram JSONB NOT NULL,
-  histogram_version   INTEGER NOT NULL
+  histogram_version   INTEGER NOT NULL,
+  -- The two policy columns are NULL together or set together. Without this a
+  -- row like ('x', NULL, 'admitted', 1) is representable, falls inside the
+  -- policied partial index — whose predicate tests only `policy_name` — and
+  -- `aggregates::query`'s `(Some(n), Some(v)) => Some(..), _ => None` would
+  -- silently relabel it as policy-less: a wrong aggregate that looks
+  -- well-formed. The invariant was a comment; this makes it a constraint.
+  CHECK ((policy_name IS NULL) = (policy_version IS NULL))
 ) PARTITION BY HASH (tenant_id);
 -- No subject column and no namespace column: that absence is what lets these
 -- rows legitimately outlive `purge_subject`, and it is the single most
@@ -2430,7 +2437,7 @@ pub async fn query(
     let events: Option<Vec<String>> = if filter.events.is_empty() {
         None
     } else {
-        Some(filter.events.iter().map(|e| event_str(*e)).collect())
+        Some(filter.events.iter().map(|e| event_str(*e).to_string()).collect())
     };
 
     // Ordered by id, descending (newest first) — see `AuditFilter::after`'s
@@ -4351,9 +4358,9 @@ git commit -m "feat(pg): row-locked capacity accounting, merge, and idempotent w
 
 **Interfaces:**
 - Consumes: everything in the crate.
-- Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and the single `run_conformance_suite` entry point.
+- Produces: `aggregates::increment`, `aggregates::query`, `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, `audit_aggregates`, and the single `run_conformance_suite` entry point.
 
-**Milestone: the complete 49-test suite passes under `SharedPartitioned`.**
+**Milestone: the complete 49-test suite passes under `SharedPartitioned`** — which requires the aggregate write and read this task adds, not only the purge and portability work. Three lifecycle tests depend on them and the stub they replace returns `Ok(vec![])`; the milestone was stated before the aggregates existed anywhere in this document and could not have been met.
 
 **Why vectors are deleted explicitly when the cascade would do it.** `PurgeReport` counts what was removed, and a cascade reports nothing. Deleting vectors first makes the count exact and leaves the item delete with nothing to cascade to.
 
@@ -4670,7 +4677,13 @@ pub async fn import(
 }
 ```
 
-Replace the last three placeholders in `lib.rs`:
+`crates/memorysafe-backend-postgres/src/aggregates.rs` — both halves, write and read. Plan 1's items-and-audit task carries the SQLite sketch for `increment` and its portability task carries `query`; the shapes transfer, the dialect does not. Three things this document must get right that the SQLite one states in the same places:
+
+- **Every audit row increments**, in the transaction that writes it — `apply`, `record_recall`, the purge's `SubjectPurged` row, and rows arriving through `import`. See the write rule in `memorysafe_backend::aggregates`.
+- **The increment must be atomic against concurrent writers.** Postgres has no per-tenant write lock, so a read-modify-write under READ COMMITTED loses updates. Use `ON CONFLICT ... DO UPDATE SET count = audit_aggregates.count + 1` and let the database evaluate it, against the partial unique index the key falls in.
+- **The read states collation and null placement explicitly** — `COLLATE "C"` on every text column of the key, `(policy_name IS NULL) DESC` and `(policy_version IS NULL) DESC` in the `ORDER BY` — and pages **ascending** with `after` selecting keys strictly greater, the opposite of `Backend::audit`. This crate must carry `ordering_sql_states_collation_and_null_placement`, asserting over the SQL its query builder returns rather than a copied literal.
+
+Replace the last four placeholders in `lib.rs`:
 
 ```rust
     async fn purge_subject(

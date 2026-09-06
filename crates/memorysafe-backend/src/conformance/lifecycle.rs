@@ -2098,9 +2098,14 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
     let v10 = PolicyId::new("baseline", "10");
     let v9 = PolicyId::new("baseline", "9");
     // `PolicyId::new` validates neither field, so an uppercase name is a legal
-    // policy — and this is the pair on which SQLite's default TEXT collation
-    // (BINARY, i.e. bytes) and Postgres's (locale-aware) disagree with
-    // certainty rather than by locale. Validation would not have helped:
+    // policy — and this is the pair that separates byte order from any
+    // locale-aware collation with certainty rather than by locale: `B` is 0x42
+    // and `a` is 0x61, while every locale orders them the other way.
+    //
+    // (*Which engine defaults to which is recollection, unverified here — no
+    // database was available. The assertion below does not depend on it: it
+    // asserts byte order, which the trait mandates explicitly, so it is right
+    // whatever the defaults turn out to be.*) Validation would not have helped:
     // `validate_component` permits `-`, `_` and `.`, and glibc collations
     // reweight punctuation, so a validated component is not collation-stable
     // either.
@@ -2142,15 +2147,25 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
     txn.audit = txn.audit.clone().with_decision(decision(lower_a));
     backend.apply(txn).await.unwrap();
 
-    // (day 0, Some(a@b / c), Admitted) and (day 0, Some(a / b@c), Admitted):
-    // two keys that render the same string.
+    // The render-collision pair: two keys whose policies render identically.
+    // **Their events differ deliberately**, and the two orders disagree because
+    // of it. Correct order compares the policy *parts*, so `("a", "b@c")`
+    // precedes `("a@b", "c")` — `"a"` is a prefix of `"a@b"` — regardless of
+    // event. A backend that stores the parts but orders by the rendered
+    // `policy_name || '@' || policy_version` sees the two tie on day and on
+    // policy, falls through to the event, and puts `admitted` before
+    // `forgotten` — the opposite. With both rows carrying the same event that
+    // backend ties on all three components and emits them in an arbitrary
+    // order, so it would be caught only about half the time; this makes it
+    // every time. (The other wrong implementation — a single rendered key
+    // column — merges them into one row and is caught by the corpus size.)
     let g = fx::item_at(&scope, "day zero, name carries the separator", day0);
+    let g_id = g.id.clone();
     let mut txn = fx::admit_txn(&scope, g, None);
     txn.audit = txn.audit.clone().with_decision(decision(split_early));
     backend.apply(txn).await.unwrap();
 
-    let h = fx::item_at(&scope, "day zero, version carries the separator", day0);
-    let mut txn = fx::admit_txn(&scope, h, None);
+    let mut txn = fx::evict_txn_at(&scope, vec![g_id], day0);
     txn.audit = txn.audit.clone().with_decision(decision(split_late));
     backend.apply(txn).await.unwrap();
 
@@ -2196,10 +2211,9 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
 ///   the page comes back short — and a short page is defined to *mean* the log
 ///   is exhausted, so the sweep terminates early and silently, on the majority
 ///   of the key space.
-/// - *A numerically compared version column.* Two `Some`s compare by
-///   `PolicyId::to_string()`, i.e. `name@version` as one string, so
-///   `baseline@10` precedes `baseline@9`. A backend storing version as a
-///   number reverses exactly that pair.
+/// - *A numerically compared version column.* Two `Some`s compare by name and
+///   then by version, each as text, so `baseline@10` precedes `baseline@9`. A
+///   backend storing version as a number reverses exactly that pair.
 /// - *A policy key built from the rendered `name@version`.* `Display` is not
 ///   injective — `PolicyId` constrains neither field — so `("a@b", "c")` and
 ///   `("a", "b@c")` both render `"a@b@c"`. A backend keying its aggregate
@@ -2239,7 +2253,10 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
 /// rows over two days, swept two at a time, with three policy-less rows, the
 /// `baseline@9` / `baseline@10` pair that inverts under numeric comparison,
 /// the `B@1` / `a@1` pair that inverts under any locale-aware collation, and
-/// the `("a@b", "c")` / `("a", "b@c")` pair that renders identically.
+/// the `("a@b", "c")` / `("a", "b@c")` pair that renders identically — the last
+/// of which carries two different events, so that a backend ordering by the
+/// render breaks the resulting tie on the event and lands the wrong way round
+/// deterministically rather than by coin flip.
 pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(factory: &F) {
     use crate::{AggregateKey, AuditAggregate};
 
@@ -2308,8 +2325,8 @@ pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(fa
     assert_eq!(
         keys, canonical,
         "the pages must arrive in the documented order — ascending by day, \
-         then policy (None before every Some, two Somes by name@version), then \
-         the event's serialised name"
+         then policy (None before every Some, two Somes by name and then \
+         version), then the event's serialised name"
     );
 
     // Read straight from the prose rather than through `Ord`: the earliest day
@@ -2369,8 +2386,10 @@ pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(fa
     assert!(
         late < early,
         "policy compares by name then version, so ('a', 'b@c') precedes \
-         ('a@b', 'c') — 'a' is a prefix of 'a@b'. Ordering by the rendered \
-         `name@version` returns Equal for this pair and pins nothing"
+         ('a@b', 'c') — 'a' is a prefix of 'a@b'. A backend ordering by the \
+         rendered `name@version` ties these two, falls through to the event, \
+         and returns them the other way round: their events differ precisely so \
+         that fallback is wrong every time rather than arbitrary"
     );
 
     // The collation pair, asserted by position rather than through `Ord`:

@@ -307,7 +307,14 @@ CREATE TABLE audit_aggregates (
   count          INTEGER NOT NULL,
   value_histogram     TEXT NOT NULL,          -- JSON [u64; 10]
   fragility_histogram TEXT NOT NULL,          -- JSON [u64; 10]
-  histogram_version   INTEGER NOT NULL
+  histogram_version   INTEGER NOT NULL,
+  -- The two policy columns are NULL together or set together. Without this a
+  -- row like ('x', NULL, 'admitted', 1) is representable, falls inside the
+  -- policied partial index — whose predicate tests only `policy_name` — and
+  -- `aggregates::query`'s `(Some(n), Some(v)) => Some(..), _ => None` would
+  -- silently relabel it as policy-less: a wrong aggregate that looks
+  -- well-formed. The invariant was a comment; this makes it a constraint.
+  CHECK ((policy_name IS NULL) = (policy_version IS NULL))
 );
 -- Uniqueness in two partial indexes rather than one PRIMARY KEY over the
 -- nullable tuple. A unique index treats NULLs as distinct from each other, so
@@ -6360,7 +6367,7 @@ git commit -m "feat(backend): conformance tests for audit, purge, and portabilit
 
 **The policy is two columns, not one rendered string, and this is a correctness constraint rather than a layout preference.** `PolicyId`'s `Display` is `{name}@{version}` and neither field is constrained, so `("a@b", "c")` and `("a", "b@c")` both render `"a@b@c"`. A single rendered key column would merge two distinct policies' counts into one row — a lost count, unrecoverable, in the artifact designed to outlive the detail rows. `lifecycle::audit_aggregates_page_in_the_documented_order` carries that exact pair and fails on a merged row. Note that the `audit` detail table's own `policy` column *is* the rendered form: that is a display and filter convenience, nothing keys on it, and nothing in Plan 1 reads it — do not derive the aggregate key from it.
 
-**The ordering index states its collation explicitly on every text column.** `Backend::audit_aggregates` mandates that every ordering over a text column states its collation and every ordering over a nullable column states null placement, neither relying on a dialect default. `COLLATE BINARY` is SQLite's spelling of byte order; Postgres's is `COLLATE "C"`. `policy_name` is nullable and must sort NULL first, which is SQLite's default — state it anyway, with `ORDER BY (policy_name IS NULL) DESC, ...` in the query rather than relying on the default, since the point of the mandate is that a reader can see the choice was made. Task 22's `ordering_sql_states_collation_and_null_placement` is where that is asserted. The two columns `items.last_access` and `items.access_count` are also read for the first time from Task 21 onward; they have been declared since this task and unread until now.
+**The ordering index states its collation explicitly on every text column.** `Backend::audit_aggregates` mandates that every ordering over a text column states its collation and every ordering over a nullable column states null placement, neither relying on a dialect default. `COLLATE BINARY` is SQLite's spelling of byte order; Postgres's is `COLLATE "C"`. `policy_name` and `policy_version` are nullable and must sort NULL first. State it in the query — `ORDER BY (policy_name IS NULL) DESC, ...` — rather than relying on any default; the point of the mandate is that a reader can see the choice was made, and it holds whatever the default turns out to be. (*Recollection, unverified in this environment: SQLite treats NULL as smallest and would agree by default. That is why the mandate is semantic — if the recollection is wrong, the explicit clause is still right.*) `ordering_sql_states_collation_and_null_placement` is where that is asserted, and it lives in the purge-and-portability task, where the query builder it must read is written — not with the retrieval tasks. The two columns `items.last_access` and `items.access_count` are also read for the first time from Task 21 onward; they have been declared since this task and unread until now.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6651,7 +6658,14 @@ CREATE TABLE IF NOT EXISTS audit_aggregates (
   count          INTEGER NOT NULL,
   value_histogram     TEXT NOT NULL,          -- JSON [u64; 10]
   fragility_histogram TEXT NOT NULL,          -- JSON [u64; 10]
-  histogram_version   INTEGER NOT NULL
+  histogram_version   INTEGER NOT NULL,
+  -- The two policy columns are NULL together or set together. Without this a
+  -- row like ('x', NULL, 'admitted', 1) is representable, falls inside the
+  -- policied partial index — whose predicate tests only `policy_name` — and
+  -- `aggregates::query`'s `(Some(n), Some(v)) => Some(..), _ => None` would
+  -- silently relabel it as policy-less: a wrong aggregate that looks
+  -- well-formed. The invariant was a comment; this makes it a constraint.
+  CHECK ((policy_name IS NULL) = (policy_version IS NULL))
 );
 -- Uniqueness in two partial indexes rather than one PRIMARY KEY over the
 -- nullable tuple. A unique index treats NULLs as distinct from each other, so
@@ -6864,7 +6878,20 @@ git commit -m "feat(sqlite): per-tenant database files, schema, and pooled conne
 
 ## Task 20: SQLite — items and audit
 
-**Also increments the aggregates**, through `aggregates::increment` below — a real function, not a described one; the increment was prose for several rounds against a table that did not exist, so the first `apply` would have failed at runtime rather than at the aggregate tests. Every audit row this task writes updates the matching `audit_aggregates` row in the same transaction — same key, count + 1, and the assessment's `value`/`fragility` bucketed with `memorysafe_backend::aggregates::score_bucket`. Same transaction, not a follow-up write: an aggregate that can diverge from the detail rows it summarises is worse than no aggregate. `record_recall` additionally bumps `items.last_access` and `items.access_count` for every item its `AuditRecord::items` references, in that same transaction — see `Backend::record_recall`.
+**The aggregate write rule, stated once and binding on every path: every audit row a backend writes increments exactly one `audit_aggregates` row, in the same transaction that writes the audit row.** No exceptions, and the exceptions are what needed deciding — the plan previously said "every audit row" in prose while calling `aggregates::increment` from one of four write paths.
+
+*Why every row and not only the policy-driven ones.* Both rules are defensible in the abstract; this one is settled by a design decision already made. `AggregateKey::policy` is `Option<PolicyId>` precisely because "most audit events have no decision behind them at all — `SubjectPurged`, `Exported`, `Imported`, `Reembedded`, `MaintenanceRun` and `Recalled` are never the result of a policy call", and its doc adds that "rows that do carry a policy still group by it — 'grouped by policy version' is unaffected by policy-less rows existing alongside them". That sentence only means anything if policy-less rows exist. Aggregating only policy-driven events would make `None` unreachable in stored data and reduce the `Option` to decoration.
+
+*The four paths, each decided:*
+
+- **`apply`** — `Admitted`, `Merged`, `Forgotten`. Increments. This task's `apply` and the final-form one in the capacity/merge/idempotency task; the second replaces the first wholesale, so the call has to appear in both.
+- **`record_recall`** — `Recalled`. Increments. Its sketch below previously inserted the audit row and returned, doing neither this nor the access-statistics update this same paragraph claimed for it.
+- **`purge_subject`'s `SubjectPurged` row** — increments. The purge deletes the subject's *detail* rows and must never touch aggregates, so the erasure's own record is exactly the kind of history the aggregate table exists to keep: after a cascading purge it is the only remaining evidence, at tenant granularity, that an erasure happened that day.
+- **`import`'s audit rows** — increment. An `ExportStream` carries `Header`, `Item` and `Audit` records and **no aggregate records**, so a migrated tenant that did not increment would arrive holding detail rows and no summary — and lose the history entirely at its first cascading purge. Double counting on a re-import is not the risk it looks like: audit rows are preserved under their own `AuditId`, which is the table's primary key, so a second import of the same rows aborts on the conflict and `import` is all-or-nothing.
+
+Same transaction, not a follow-up write: an aggregate that can diverge from the detail rows it summarises is worse than no aggregate.
+
+The increment itself is `aggregates::increment` below — a real function, not a described one. It was prose for several rounds against a table that did not exist, so the first `apply` would have failed at runtime rather than at the aggregate tests. Same key, count + 1, and the assessment's `value`/`fragility` bucketed with `memorysafe_backend::aggregates::score_bucket`.
 
 **Files:**
 - Create: `crates/memorysafe-backend-sqlite/src/items.rs`
@@ -7292,10 +7319,22 @@ pub fn increment(conn: &Connection, record: &AuditRecord) -> Result<(), BackendE
              (policy_name, policy_version, event, day, count,
               value_histogram, fragility_histogram, histogram_version)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-         ON CONFLICT DO UPDATE SET
+         ON CONFLICT (policy_name, policy_version, event, day) WHERE policy_name IS NOT NULL
+         DO UPDATE SET
              count = excluded.count,
              value_histogram = excluded.value_histogram,
-             fragility_histogram = excluded.fragility_histogram",
+             fragility_histogram = excluded.fragility_histogram,
+             -- Refreshed, not left at whatever the row was created with.
+             -- `histogram_version` is not part of the key, so a row created
+             -- under older `SCORE_HISTOGRAM_EDGES` would otherwise keep
+             -- advertising them while accumulating counts bucketed by this
+             -- build's — the silent splicing the version exists to make
+             -- detectable. A row whose stored version differs from the
+             -- incoming one is a migration signal; writing the current version
+             -- makes the row honest about the edges its most recent counts
+             -- used, and the retention task is where a genuine bump gets its
+             -- migration.
+             histogram_version = excluded.histogram_version",
         params![
             name,
             version,
@@ -7313,6 +7352,19 @@ pub fn increment(conn: &Connection, record: &AuditRecord) -> Result<(), BackendE
 ```
 
 `rusqlite::OptionalExtension` is needed for `.optional()`.
+
+**The conflict target is named, and named with the partial index's predicate.**
+An `ON CONFLICT` with no target resolves against any unique constraint, and
+whether it resolves against a *partial* unique index is a question this plan
+should not discover at execution time. Naming the index's columns and its
+`WHERE` clause is the form that unambiguously selects one. The policy-less
+half needs the other target — `ON CONFLICT (event, day) WHERE policy_name IS
+NULL` — so the write is two statements chosen on `policy_name.is_some()`, or
+one `UPDATE ... WHERE policy_name IS ?1 AND ...` followed by an `INSERT` when
+`changes() == 0`. Either is correct under this backend's per-tenant write lock;
+pick one and say which. **(This paragraph's claim about partial-index conflict
+resolution is reasoned, not run — there is no `sqlite3` in the environment this
+was written in.)**
 
 Add a first `Backend` impl in `crates/memorysafe-backend-sqlite/src/lib.rs`. `apply` at this stage handles insert, evictions, and audit inside one transaction; vectors, merge, capacity, and idempotency arrive in Tasks 21–23. Every other method returns `Ok` defaults so the crate compiles and the isolation tests can run:
 
@@ -7362,7 +7414,37 @@ impl Backend for SqliteBackend {
 
     async fn record_recall(&self, record: AuditRecord) -> Result<AuditId, BackendError> {
         let tenant = record.scope.tenant.clone();
-        self.tenants.with_write(&tenant, move |c| audit::insert(c, &record)).await
+        self.tenants
+            .with_write(&tenant, move |conn| {
+                let tx = conn.transaction().map_err(|e| tenant::storage_error(e, false))?;
+                let id = audit::insert(&tx, &record)?;
+                // A `Recalled` row is an audit row: it increments, like every
+                // other. See the write-path rule below.
+                aggregates::increment(&tx, &record)?;
+                // And the access statistics ride this same write rather than a
+                // second one — `Backend::record_recall` says why: the record
+                // already carries exactly the ids that were recalled, and two
+                // writes would let a backend audit a recall without counting
+                // it. `record.at`, never a clock read, so a replay produces
+                // comparable rows.
+                for item in &record.items {
+                    tx.execute(
+                        "UPDATE items
+                            SET access_count = access_count + 1, last_access = ?1
+                          WHERE id = ?2 AND subject = ?3 AND namespace = ?4",
+                        params![
+                            record.at.unix_timestamp(),
+                            item.id().as_str(),
+                            record.scope.subject.as_str(),
+                            record.scope.namespace.as_str(),
+                        ],
+                    )
+                    .sql()?;
+                }
+                tx.commit().map_err(|e| tenant::storage_error(e, false))?;
+                Ok(id)
+            })
+            .await
     }
 
     async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError> {
@@ -8517,6 +8599,11 @@ Rewrite `apply` in `lib.rs` to its final form:
 
                 capacity::adjust(&tx, &txn.scope, delta_items, delta_bytes)?;
                 let audit_id = audit::insert(&tx, &txn.audit)?;
+                // Carried forward from Task 20's partial `apply`. This block
+                // replaces that one wholesale, so an increment omitted here is
+                // an aggregate table that is never written at all — which is
+                // how it was lost once already.
+                aggregates::increment(&tx, &txn.audit)?;
 
                 let applied = AppliedWrite {
                     item_id,
@@ -8697,6 +8784,12 @@ pub fn subject(
     // otherwise delete this very row, and the purge would eat its own record.
     // `audit::insert` writes `audit.id` verbatim: the echo rule on `Backend`.
     crate::audit::insert(&tx, audit)?;
+    // And it increments, like every audit row — see the write rule in the
+    // items-and-audit task. After a cascading purge this row's aggregate is
+    // the only remaining evidence, at tenant granularity, that an erasure
+    // happened that day; the detail row it summarises may itself be swept by
+    // a later retention pass.
+    crate::aggregates::increment(&tx, audit)?;
 
     tx.commit().map_err(|e| crate::tenant::storage_error(e, false))?;
 
@@ -8897,6 +8990,13 @@ pub fn import(
                     )));
                 }
                 crate::audit::insert(&tx, &audit)?;
+                // Imported audit rows increment too: an `ExportStream` carries
+                // no aggregate records, so a migrated tenant would otherwise
+                // hold detail with no summary and lose the history at its first
+                // cascading purge. A re-import cannot double-count — audit rows
+                // keep their own `AuditId`, which is the table's primary key,
+                // so the second import conflicts and `import` is all-or-nothing.
+                crate::aggregates::increment(&tx, &audit)?;
                 report.audit_imported += 1;
             }
         }
@@ -8990,6 +9090,7 @@ pub fn query(
              ORDER BY day ASC,
                       (policy_name IS NULL) DESC,
                       policy_name    COLLATE BINARY ASC,
+                      (policy_version IS NULL) DESC,
                       policy_version COLLATE BINARY ASC,
                       event          COLLATE BINARY ASC
              LIMIT ?9",

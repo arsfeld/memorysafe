@@ -6,9 +6,43 @@
 //! plan mentioned the concept.
 //!
 //! **What is in this module and what is not.** The contract: the key, the
-//! histogram edges, and the read method on `Backend`. The storage table is
-//! Task 19, the increments are Tasks 20 and 23, and retention enforcement is
-//! Task 36. None of those belong here.
+//! histogram edges, the write rule below, and the read method on `Backend`.
+//! The storage table, the increments themselves and retention enforcement are
+//! the SQLite and engine tasks' — the schema task creates the table, every
+//! task that writes an audit row increments, and the retention task expires
+//! rows on `AuditRetention::aggregate`. None of those belong here.
+//!
+//! # The write rule, and its atomicity requirement
+//!
+//! **Every audit row a backend writes increments exactly one aggregate row, in
+//! the same transaction that writes the audit row.** Every path: admissions,
+//! merges, evictions, recalls, the `SubjectPurged` record a purge inserts, and
+//! audit rows arriving through `import`. `AggregateKey::policy` is an `Option`
+//! precisely because most event classes carry no policy, so a rule that
+//! aggregated only policy-driven events would make `None` unreachable in
+//! stored data.
+//!
+//! **And the increment must be atomic against concurrent writers — "same
+//! transaction" is not sufficient and this is the part that is easy to miss.**
+//! An implementation that reads the row, adds one, and writes it back is
+//! correct only if concurrent increments of the same key cannot interleave.
+//! Under a per-tenant write lock they cannot; under a database default like
+//! READ COMMITTED they can, and the second write silently overwrites the
+//! first's count. Use an atomic upsert (`count = count + 1` evaluated by the
+//! database), or a row lock, or serialise the writers — but choose, and say
+//! which in the backend.
+//!
+//! **Why this is stated here rather than left to the same care capacity
+//! accounting gets.** Capacity has a conformance test for exactly this
+//! (`capacity::concurrent_admits_do_not_double_count`) and aggregates do not,
+//! and the asymmetry is deliberate rather than an omission: capacity drift is
+//! **reconcilable** — `used_items` and `used_bytes` can be recomputed from the
+//! `items` table at any time. An aggregate undercount is not. These rows are
+//! designed to outlive the detail rows they summarise, so after a cascading
+//! purge or a retention sweep there is nothing left to recount from. **The loss
+//! is permanent, in the one artifact built to be permanent**, which is why the
+//! requirement is a contract sentence binding backends nobody has written yet
+//! rather than a test that would bind only the ones that remembered.
 //!
 //! # The key: tenant + policy version + event class + day bucket
 //!
@@ -556,10 +590,10 @@ mod tests {
              opposite of Postgres's default NULL ordering for ASC"
         );
 
-        // Two `Some`s compare by `to_string()`, which is `name@version` as one
-        // string. The pair below is the case that inverts under a version
-        // column compared numerically: "baseline@10" < "baseline@9" as text,
-        // 9 < 10 as numbers.
+        // Two `Some`s compare by name and then by version, each as text. The
+        // pair below is the case that inverts under a version column compared
+        // numerically: names tie, then "10" < "9" as text while 9 < 10 as
+        // numbers.
         let v10 = key(
             5,
             Some(PolicyId::new("baseline", "10")),
@@ -572,10 +606,10 @@ mod tests {
         );
         assert!(
             v10 < v9,
-            "two Some policies compare as name@version strings, so \
-             baseline@10 precedes baseline@9 — a numerically compared version \
-             column reverses this and no other assertion in this crate would \
-             notice"
+            "two Some policies compare by name and then by version, each as \
+             text, so baseline@10 precedes baseline@9 — a numerically compared \
+             version column reverses this and no other assertion in this crate \
+             would notice"
         );
 
         // Two `PolicyId`s that render the same string still compare as
@@ -653,8 +687,8 @@ mod tests {
                 forgotten,
                 rejected,
                 policy_less,
-                // then the policied rows, by `name@version` as one string:
-                // "a@1" < "baseline@10" < "baseline@9".
+                // then the policied rows, by name and then version:
+                // "a" < "baseline", and within it "10" < "9" as text.
                 with_policy,
                 v10,
                 v9,
