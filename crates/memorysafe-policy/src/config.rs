@@ -73,31 +73,71 @@ pub struct BaselineConfig {
     /// MMR tradeoff: 1.0 is pure relevance, 0.0 is pure diversity.
     ///
     /// **Deliberately unchanged when the MMR fill moved from a pairwise `max`
-    /// to union coverage**, which is not the same as unexamined. Union
-    /// coverage is `>=` the pairwise max always, so the penalty term rose on
-    /// every candidate — but a penalty that rises by the SAME amount on every
-    /// candidate cannot change a ranking. What can is the penalty's
-    /// DISPERSION across candidates, and that is what `1.0 - mmr_lambda`
-    /// converts into power to overturn a relevance difference.
+    /// to union coverage**, which is not the same as unexamined.
     ///
-    /// Measured, on synthetic corpora spanning three shapes, the ratio
-    /// `sd(union) / sd(pairwise max)` across candidates runs from about
-    /// `1.03x` (terse facts, large vocabulary, few function words) to about
-    /// `1.90x` (prose, 45% function words), and is NOT monotone in the number
-    /// of items already selected — in a narrow-vocabulary scope it peaks near
-    /// `1.56x` and falls back toward `1.14x` as coverage saturates. Holding
-    /// the diversity term's ranking power fixed would therefore need
-    /// `mmr_lambda` anywhere in `0.70..=0.84`, varying by corpus AND by
-    /// position within a single recall. No constant does that, so there is no
-    /// well-defined target to recalibrate toward.
+    /// **The strongest reason is measurement-independent**, so take it first:
+    /// the pairwise `max` was a biased-LOW estimator of "how much of this
+    /// candidate is already covered", and union coverage is the unbiased one.
+    /// Damping a correction with the tradeoff knob is the wrong response to
+    /// fixing a biased estimator — it re-suppresses exactly the thing the fix
+    /// recovered. Nothing below can overturn that; the measurements only bound
+    /// how much room there was to argue the other way.
     ///
-    /// Two further reasons not to move it. The extra dispersion is mostly the
-    /// signal the pairwise `max` was discarding, and damping a correction
-    /// with the tradeoff knob is the wrong response to fixing a biased
-    /// estimator. And what remains tracks FUNCTION-WORD density rather than
-    /// content redundancy (the `1.03x` and `1.90x` above differ in stopword
-    /// fraction, not in how alike the items actually are), so the lever for it
-    /// is a stopword-aware tokenizer in `similarity`, not a tuned constant
+    /// **What actually changed, stated precisely.** Union coverage is `>=` the
+    /// pairwise max always, so the penalty rose. It did NOT rise by the same
+    /// amount on every candidate: `union - max` is zero where a candidate's
+    /// covered tokens sit inside a single selected item and large where they
+    /// are split across several, which is the whole point of the change.
+    /// Measured, `sd(union - max)` across candidates reaches `0.08` in prose
+    /// and narrow-topic scopes but stays under `0.03` in terse ones, and the
+    /// share of candidates with `union == max` collapses from 100% at one
+    /// selected item to 0.8% (prose) and 0.0% (narrow topic) by five — while
+    /// STAYING above 92% for terse, distinctive bodies. So the increment is
+    /// per-candidate and shape-dependent, which is why the question cannot be
+    /// settled by looking at the penalty's level.
+    ///
+    /// **The statistic that settles it is the argmax, not the spread.** An
+    /// earlier revision of this note derived a "hold ranking power fixed"
+    /// range of `0.70..=0.84` from `(1 - lambda_new) * sd(union) =
+    /// (1 - lambda_old) * sd(max)`. That is a heuristic, not a fact: `sd` is
+    /// whole-set spread, MMR takes an argmax, and extra spread landing
+    /// mid-pack moves `sd` without moving any pick. Measured directly — the
+    /// rate at which the union form's pick differs from the pairwise-max
+    /// form's pick at the shipped `0.70`, swept over lambda — the heuristic
+    /// does not survive:
+    ///
+    /// ```text
+    ///                       lambda:  0.70   0.75   0.80   0.84   0.90   0.95
+    ///   prose-like,   5 selected:   17.2%  13.7%  11.5%  10.4%  10.9%  12.7%
+    ///   narrow topic, 5 selected:   19.3%  16.3%  14.1%  13.2%  13.3%  14.5%
+    ///   terse facts,  5 selected:    0.7%   2.2%   3.4%   4.5%   6.3%   7.9%
+    ///   prose-like,   1 selected:    0.0%   3.4%   6.4%   8.7%  11.9%  14.3%
+    /// ```
+    ///
+    /// Three things fall out, and each independently blocks a move:
+    ///
+    /// 1. **No lambda drives the divergence to zero.** It bottoms out near
+    ///    10-13%, because most of the change is a different candidate WINNING,
+    ///    not a scale factor lambda can undo. The `0.70..=0.84` range promised
+    ///    a recovery that is not available at any price.
+    /// 2. **The shapes disagree on the DIRECTION.** Terse, distinctive bodies
+    ///    are already optimal at `0.70` and get monotonically worse above it;
+    ///    prose and narrow-topic scopes have a shallow minimum near
+    ///    `0.84..=0.90`. One constant cannot serve both, and `0.70` is the only
+    ///    value that is never the worst choice.
+    /// 3. **At one selected item the two forms are IDENTICAL** (a union over a
+    ///    single set is that set), so the divergence at `0.70` is 0.0% in
+    ///    EVERY shape, and every lambda above it introduces divergence where
+    ///    there was none — at `0.95`, 14.3% of picks in prose, 17.5% in a
+    ///    narrow-topic scope, 2.3% in a terse one. The MMR fill faces an empty
+    ///    or one-item selected set on its first picks in every recall, so a
+    ///    lambda raised to help later rounds actively corrupts the earliest
+    ///    and most consequential ones.
+    ///
+    /// Finally, much of the effect is a MEASUREMENT ARTIFACT rather than
+    /// content redundancy: the shapes above differ chiefly in function-word
+    /// density (45% vs 15%), and `similarity`'s tokenizer removes no
+    /// stopwords. The lever for that is the tokenizer, not a tuned constant
     /// here that would hide the artifact instead of leaving it visible.
     ///
     /// Stated plainly, since a documented default invites being read as a
@@ -105,6 +145,14 @@ pub struct BaselineConfig {
     /// not a value this project measured against a corpus. It was not
     /// well-founded before this change either, and this change does not make
     /// it worse-founded. The first real corpus should re-derive it.
+    ///
+    /// Every number above comes from `examples/mmr_calibration.rs`
+    /// (`cargo run --release --example mmr_calibration -p memorysafe-policy`),
+    /// retained in the checkout so they can be re-derived rather than trusted.
+    /// They are SYNTHETIC — a generated vocabulary with a function-word head,
+    /// because this project has no corpus yet — so they bound the shape of
+    /// each effect and its sensitivity to function-word density, and are not
+    /// calibration data.
     pub mmr_lambda: f32,
     /// `compose::working_set`'s MMR fill: an item more than this fraction of
     /// whose own content is already covered by the union of what is already
@@ -135,10 +183,13 @@ pub struct BaselineConfig {
     ///
     /// The measured cost, flagged rather than tuned away: in a
     /// narrow-vocabulary scope the tag fires on essentially every MMR pick
-    /// past about five selected items (synthetic corpus: `9.5% -> 100%` at ten
-    /// selected), at which point it separates nothing. That is the same
-    /// function-word artifact `mmr_lambda`'s note names, and it has the same
-    /// fix — a stopword-aware tokenizer, not a threshold move.
+    /// past about five selected items — `0.3% -> 94.1%` at five selected and
+    /// `0.7% -> 100.0%` at ten — at which point it separates nothing. In a
+    /// terse, distinctive scope it stays at `0.0% -> 0.0%` throughout, so this
+    /// is not a uniform inflation but the same function-word artifact
+    /// `mmr_lambda`'s note names, and it has the same fix: a stopword-aware
+    /// tokenizer, not a threshold move. Numbers from
+    /// `examples/mmr_calibration.rs`, with the caveats recorded there.
     pub diversity_cut_similarity: f32,
     /// Half-life in days for value decay during maintenance.
     pub value_half_life_days: f32,
