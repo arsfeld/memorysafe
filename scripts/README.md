@@ -18,10 +18,18 @@ was written down long before the ad-hoc greps that contradicted it, and
 
 Prints the count and the denominator: `stubs (body is a bare Ok(..)): N of M methods`.
 
-## `mutate <file> <anchor> <replacement> [label]`
+## `mutate <repo-relative-file> <anchor> <replacement> [label]`
 
-Applies one textual mutation, runs the workspace suite, restores via `trap` on every exit
-path. **Refuses to report a verdict** unless the anchor matched exactly once and the tree
+Applies one textual mutation, runs the workspace suite, reports a verdict.
+
+**The working tree is never touched.** The mutation happens in a scratch copy extracted from
+a git ref (`MUTATE_REF`, default `HEAD`), so this is safe to run while someone else is
+editing, and the verdict is pinned to a commit — reproducible by anyone with that SHA rather
+than a photograph of one desk at one moment. The first version mutated in place and restored
+via `trap`, which is correct only while nobody else is working; that is not a condition a
+script can check, so it stopped being a condition.
+
+**Refuses to report a verdict** unless the anchor matched exactly once and the tree
 compiled.
 
 Three ways a mutation run lies, all producing the same clean output as a genuinely
@@ -50,3 +58,15 @@ That distinction is worth stating precisely, because the first version of this f
 `mutate` *"cannot"* be a gate and used it to justify keeping the script in a weaker
 category. **A "cannot" that is really a "have not" is the load-bearing kind of error**, and
 it was written by someone who had spent the day removing exactly that shape from tests.
+
+## The denominator nobody had printed
+
+`cargo mutants` finds **187 mutants** in `memorysafe-backend-sqlite` — `lib.rs` 46,
+`retrieve.rs` 40, `items.rs` 37, `tenant.rs` 14, `vectors.rs` 13, `keyword.rs` 13,
+`aggregates.rs` 12, `capacity.rs` 6, `audit.rs` 4, `schema.rs` 2 — at roughly six seconds
+each, so about twenty minutes for the set.
+
+**Every mutation result in this project's history was hand-selected by whoever chose what to
+break.** They found real defects, and they are a sample from a population whose size nobody
+had measured. `mutate` tests a hypothesis; `cargo mutants` supplies the denominator. Use the
+second before believing a clean sweep from the first.
