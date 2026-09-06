@@ -24,7 +24,8 @@ Every task's requirements implicitly include this section.
 - **Audit rows never contain item bodies** — only ids, content digests (BLAKE3 hex), and feature numbers.
 - **Tenant isolation is structural:** one SQLite file per tenant. No query may span tenants.
 - **TDD.** Every task writes a failing test first, watches it fail, then implements. Commit at the end of every task.
-- **A task that changes a test count must propagate it.** Every task's Step 4 states an expected count (`Expected: PASS — N tests ok`), and those counts are cumulative *per crate*: adding, removing or splitting a test in one task changes the expected count of **every later task that runs the same crate**, not just its own. Walk forward to the last task touching that crate and update each one. This is not hypothetical — Task 28 gained a test and Task 29's count stayed at the old total for a full round, which turns the one signal a task executor has that its step went right into noise it learns to ignore.
+- **When you change a test count, propagate it — whoever you are and whatever you are doing.** Every task's Step 4 states an expected count (`Expected: PASS — N tests ok`), and those counts are cumulative *per crate*: adding, removing or splitting a test in one task changes the expected count of **every later task that runs the same crate**, not just its own. Walk forward to the last task touching that crate and update each one. This is not hypothetical — Task 28 gained a test and Task 29's count stayed at the old total for a full round, which turns the one signal a task executor has that its step went right into noise it learns to ignore. The rule is deliberately addressed to the **action**, not to a role: the four extra tests in Task 25 were written by a policy author, routed by a coordinator and applied by a third party, and the count went uncorrected because the obligation had been worded as binding on *implementers* and none of the three was one. A rule whose trigger names a person or a document has a gap wherever the action happens outside it.
+- **When you assert a fact about this codebase, cite the symbol, and say whether you verified it or are relaying it.** Cite `Backend::purge_subject` or `fixtures::fx::admit_txn`, never a line number: this document's line numbers have drifted six times during execution and every citation made against them is now wrong, while a symbol survives any edit that does not delete it. The verified/relayed marking matters because an unmarked relayed claim reads exactly like a checked one, and the reader cannot tell which they are acting on. This binds the **act of claiming** — it reaches task reports, review findings, ledger entries and messages equally, not only the documents where a reader is obviously waiting.
 - **Lints:** `#![deny(warnings)]` in CI via `RUSTFLAGS="-Dwarnings"`, plus `cargo clippy --all-targets --all-features -- -D warnings`.
 - **`Score` is a newtype over `f32` clamped to `[0.0, 1.0]`.** Never a bare `f32`.
 - **Timestamps are `time::OffsetDateTime`,** stored as Unix seconds (`i64`) in SQLite.
@@ -9242,6 +9243,16 @@ pure" becomes enforceable:
 Run: `cargo test -p memorysafe-policy`
 Expected: PASS — 9 tests ok.
 
+> **This count is known stale: it is low by 8, and so is every policy count after it.**
+> The blocks above list 13 `#[test]` functions, and the comment closing `fragility.rs`'s
+> test module commissions 4 more by name (the mutation-killer set, which it states have
+> not been written anywhere yet). Executing this task as written therefore yields **17**,
+> not 9. The later `cargo test -p memorysafe-policy` counts inherit the same deficit:
+> Task 26's 18, Task 27's 25, Task 28's 33 and Task 29's 40 should read **26, 33, 41 and
+> 48**. The numbers are left uncorrected here because only this task's executor can
+> confirm 17 by running the crate; whoever confirms it must correct all five in one
+> change — see Global Constraints, "When you change a test count, propagate it".
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -9615,6 +9626,9 @@ impl GovernancePolicy for BaselinePolicy {
 
 Run: `cargo test -p memorysafe-policy`
 Expected: PASS — 18 tests ok.
+
+> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
+> corrected together, not one at a time.
 
 - [ ] **Step 5: Commit**
 
@@ -10001,6 +10015,9 @@ Add `pub mod admit;` and `pub mod eviction;`.
 
 Run: `cargo test -p memorysafe-policy`
 Expected: PASS — 25 tests ok.
+
+> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
+> corrected together, not one at a time.
 
 - [ ] **Step 5: Commit**
 
@@ -10432,6 +10449,9 @@ Add `pub mod compose;`.
 Run: `cargo test -p memorysafe-policy`
 Expected: PASS — 33 tests ok.
 
+> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
+> corrected together, not one at a time.
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -10709,6 +10729,9 @@ Add `pub mod maintain;`. `PolicyId` must derive `Clone`; confirm from Task 7.
 
 Run: `cargo test -p memorysafe-policy && cargo clippy -p memorysafe-policy --all-targets -- -D warnings`
 Expected: PASS — 40 tests ok. `BaselinePolicy` now implements all four trait methods.
+
+> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
+> corrected together, not one at a time.
 
 - [ ] **Step 5: Commit**
 
