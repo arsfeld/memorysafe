@@ -1,0 +1,420 @@
+//! The `audit_aggregates` write half. The read half arrives with `purge`,
+//! `export` and `import` in the portability task; both are listed there so
+//! neither is forgotten again.
+//!
+//! # The write rule
+//!
+//! **Every audit row a backend writes increments exactly one aggregate row, in
+//! the same transaction that writes the audit row.** The rule is stated once,
+//! on `memorysafe_backend::aggregates`, and it binds every path — not only the
+//! policy-driven ones. `AggregateKey::policy` is an `Option` precisely because
+//! most event classes carry no decision at all, and aggregating only
+//! policy-driven events would make `None` unreachable in stored data.
+//!
+//! # How concurrent increments are made atomic, and by what
+//!
+//! `memorysafe_backend::aggregates` requires each backend to choose between an
+//! atomic upsert, a row lock and serialised writers, **and to say which**. This
+//! backend **serialises the writers**: every mutating path goes through
+//! `TenantManager::with_write`, whose per-tenant async mutex is the permanent
+//! cross-handle serializer — permanent because two live connections to one
+//! tenant file are a normal steady state produced by ordinary LRU eviction, not
+//! only by a race. The read-modify-write below is correct under that lock and
+//! under nothing weaker.
+
+use crate::tenant::SqlResultExt;
+use memorysafe_backend::BackendError;
+use memorysafe_backend::aggregates::{
+    SCORE_HISTOGRAM_BUCKETS, SCORE_HISTOGRAM_VERSION, day_bucket, score_bucket,
+};
+use memorysafe_core::AuditRecord;
+use rusqlite::{Connection, OptionalExtension, params};
+
+fn unreadable(field: &str, e: impl std::fmt::Display) -> BackendError {
+    BackendError::Storage {
+        message: format!("aggregate {field} histogram is not readable: {e}"),
+        retryable: false,
+    }
+}
+
+/// Counts one audit row into its aggregate, creating the row on first sight.
+///
+/// The key comes from the record itself: the decision's policy **as two
+/// fields**, the event's `as_str()`, and `day_bucket(record.at)`. Not from the
+/// `audit` table's rendered `policy` column — that column is a display
+/// convenience and `PolicyId`'s `Display` is not injective, so keying on it
+/// merges distinct policies into one row.
+///
+/// `sum(histogram) <= count`, never `==`: only rows carrying an `Assessment`
+/// land in a bucket, while `count` counts every row matching the key. See
+/// `AuditAggregate`.
+///
+/// # Why an `UPDATE`, then an `INSERT` when it changed nothing
+///
+/// Not a targetless `ON CONFLICT`, and not one target either. The table's
+/// uniqueness lives in **two partial unique indexes** — one predicated on
+/// `policy_name IS NOT NULL` and one on `policy_name IS NULL` — because a
+/// single index over the nullable tuple would treat NULLs as distinct and let
+/// two policy-less rows for the same event and day both insert. An `ON
+/// CONFLICT` naming one of those targets covers only half the key space, and
+/// the policy-less half is the majority of it. Naming both would mean two
+/// statements selected on `policy_name.is_some()`, whose policied branch no
+/// test in this crate's write paths reaches.
+///
+/// `UPDATE` first and `INSERT` when `changes() == 0` has neither problem: one
+/// pair of statements covering both halves, with both branches reached by the
+/// same policy-less corpus — first increment inserts, second updates. It is
+/// correct because writers are serialised; see the module doc.
+pub fn increment(conn: &Connection, record: &AuditRecord) -> Result<(), BackendError> {
+    let (name, version) = match record.decision.as_ref().map(|d| &d.policy) {
+        Some(p) => (Some(p.name.as_str()), Some(p.version.as_str())),
+        None => (None, None),
+    };
+    let event = record.event.as_str();
+    let day = day_bucket(record.at);
+
+    // `IS`, not `=`: the policy columns are NULL for the majority of event
+    // classes, and `= NULL` is never true. This is the same NULL-distinctness
+    // that forced two partial unique indexes in the schema.
+    let existing: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT count, value_histogram, fragility_histogram FROM audit_aggregates
+             WHERE policy_name IS ?1 AND policy_version IS ?2 AND event = ?3 AND day = ?4",
+            params![name, version, event, day],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .sql()?;
+
+    let mut value: Vec<u64> = vec![0; SCORE_HISTOGRAM_BUCKETS];
+    let mut fragility: Vec<u64> = vec![0; SCORE_HISTOGRAM_BUCKETS];
+    let mut count = 0i64;
+    if let Some((c, v, f)) = existing {
+        count = c;
+        value = serde_json::from_str(&v).map_err(|e| unreadable("value", e))?;
+        fragility = serde_json::from_str(&f).map_err(|e| unreadable("fragility", e))?;
+        // A stored histogram of the wrong width would index out of bounds
+        // below, and a panic inside a `with_write` closure poisons the
+        // tenant's connection. A corrupt row is a storage error, not a panic.
+        if value.len() != SCORE_HISTOGRAM_BUCKETS || fragility.len() != SCORE_HISTOGRAM_BUCKETS {
+            return Err(BackendError::Storage {
+                message: format!(
+                    "aggregate row holds histograms of width {} and {}, not \
+                     {SCORE_HISTOGRAM_BUCKETS}",
+                    value.len(),
+                    fragility.len()
+                ),
+                retryable: false,
+            });
+        }
+    }
+    count += 1;
+    if let Some(a) = &record.assessment {
+        value[score_bucket(a.value)] += 1;
+        fragility[score_bucket(a.fragility)] += 1;
+    }
+
+    let value_json = serde_json::to_string(&value).expect("a Vec<u64> serialises");
+    let fragility_json = serde_json::to_string(&fragility).expect("a Vec<u64> serialises");
+
+    let updated = conn
+        .execute(
+            "UPDATE audit_aggregates
+                SET count = ?5,
+                    value_histogram = ?6,
+                    fragility_histogram = ?7,
+                    -- Refreshed, not left at whatever the row was created
+                    -- with. `histogram_version` is not part of the key, so a
+                    -- row created under older `SCORE_HISTOGRAM_EDGES` would
+                    -- otherwise keep advertising them while accumulating
+                    -- counts bucketed by this build's — the silent splicing
+                    -- the version exists to make detectable. Writing the
+                    -- current version makes the row honest about the edges its
+                    -- most recent counts used; the retention task is where a
+                    -- genuine bump gets its migration.
+                    histogram_version = ?8
+              WHERE policy_name IS ?1 AND policy_version IS ?2
+                AND event = ?3 AND day = ?4",
+            params![
+                name,
+                version,
+                event,
+                day,
+                count,
+                value_json,
+                fragility_json,
+                SCORE_HISTOGRAM_VERSION as i64,
+            ],
+        )
+        .sql()?;
+
+    if updated == 0 {
+        conn.execute(
+            "INSERT INTO audit_aggregates
+                 (policy_name, policy_version, event, day, count,
+                  value_histogram, fragility_histogram, histogram_version)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                name,
+                version,
+                event,
+                day,
+                count,
+                value_json,
+                fragility_json,
+                SCORE_HISTOGRAM_VERSION as i64,
+            ],
+        )
+        .sql()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema;
+    use memorysafe_backend::aggregates::SCORE_HISTOGRAM_EDGES;
+    use memorysafe_core::{
+        Actor, Assessment, AssessorId, AuditEvent, AuditRecord, Decision, PolicyId, Reason,
+        ReasonCode, RedundancyAssessment, Scope, Score, SensitivityAssessment, SensitivityLevel,
+    };
+    use time::OffsetDateTime;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::initialise(&conn).unwrap();
+        conn
+    }
+
+    fn record(event: AuditEvent, at: i64) -> AuditRecord {
+        AuditRecord::new(
+            Scope::new("t", "s", "n").unwrap(),
+            event,
+            vec![],
+            Actor::system(),
+            OffsetDateTime::from_unix_timestamp(at).unwrap(),
+        )
+    }
+
+    fn assessment(value: f32, fragility: f32) -> Assessment {
+        Assessment {
+            value: Score::clamped(value),
+            fragility: Score::clamped(fragility),
+            sensitivity: SensitivityAssessment {
+                level: SensitivityLevel::Internal,
+                categories: vec![],
+                confidence: Score::ONE,
+            },
+            redundancy: RedundancyAssessment {
+                score: Score::ZERO,
+                near_duplicates: vec![],
+            },
+            features: Default::default(),
+            assessor: AssessorId::new("test", "1"),
+        }
+    }
+
+    fn decision(name: &str, version: &str) -> Decision {
+        Decision::reject(
+            PolicyId::new(name, version),
+            Reason::new(ReasonCode::LowValue, "", Default::default()),
+        )
+    }
+
+    /// `(policy_name, policy_version, event, day)` — the whole key, as stored.
+    type Key = (Option<String>, Option<String>, String, i64);
+    /// `(count, sum(value_histogram), sum(fragility_histogram),
+    /// histogram_version)`. The histograms are summed rather than compared
+    /// bucket by bucket because most assertions here are about *which key* a
+    /// row landed under; the bucket placement has its own test.
+    type Totals = (i64, u64, u64, i64);
+
+    /// One row per key, in the order `Backend::audit_aggregates` documents.
+    fn rows(conn: &Connection) -> Vec<(Key, Totals)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT policy_name, policy_version, event, day, count,
+                        value_histogram, fragility_histogram, histogram_version
+                 FROM audit_aggregates
+                 ORDER BY day, policy_name COLLATE BINARY ASC NULLS FIRST,
+                          policy_version COLLATE BINARY ASC NULLS FIRST,
+                          event COLLATE BINARY ASC",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            let value: Vec<u64> = serde_json::from_str(&r.get::<_, String>(5)?).unwrap();
+            let fragility: Vec<u64> = serde_json::from_str(&r.get::<_, String>(6)?).unwrap();
+            assert_eq!(value.len(), SCORE_HISTOGRAM_BUCKETS);
+            assert_eq!(fragility.len(), SCORE_HISTOGRAM_BUCKETS);
+            Ok((
+                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
+                (
+                    r.get(4)?,
+                    value.iter().sum::<u64>(),
+                    fragility.iter().sum::<u64>(),
+                    r.get(7)?,
+                ),
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// Both branches, on the majority half of the key space. The first
+    /// increment takes the `INSERT` path (the `UPDATE` matched nothing); the
+    /// second takes the `UPDATE` path. A backend that only ever inserted would
+    /// fail on the second call with a UNIQUE violation from
+    /// `idx_aggregates_key_policy_less`, and one that only ever updated would
+    /// silently store nothing.
+    #[test]
+    fn a_policy_less_key_inserts_once_and_updates_thereafter() {
+        let conn = db();
+        let rec = record(AuditEvent::Admitted, 0);
+        increment(&conn, &rec).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![((None, None, "admitted".into(), 0), (1, 0, 0, 1))]
+        );
+
+        increment(&conn, &record(AuditEvent::Admitted, 86_399)).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![((None, None, "admitted".into(), 0), (2, 0, 0, 1))],
+            "a second row for the same key was created instead of incrementing"
+        );
+    }
+
+    /// The key discriminates on all four components. Each row below differs
+    /// from the first in exactly one of them, so a key that dropped any one
+    /// component would collapse two rows into one.
+    #[test]
+    fn each_key_component_separates_rows() {
+        let conn = db();
+        let base = record(AuditEvent::Admitted, 0);
+        increment(&conn, &base).unwrap();
+
+        // Different day.
+        increment(&conn, &record(AuditEvent::Admitted, 86_400)).unwrap();
+        // Different event.
+        increment(&conn, &record(AuditEvent::Forgotten, 0)).unwrap();
+        // Different policy name, and different version under the same name.
+        let mut policied = record(AuditEvent::Admitted, 0);
+        policied.decision = Some(decision("baseline", "1"));
+        increment(&conn, &policied).unwrap();
+        let mut other_version = record(AuditEvent::Admitted, 0);
+        other_version.decision = Some(decision("baseline", "2"));
+        increment(&conn, &other_version).unwrap();
+
+        assert_eq!(rows(&conn).len(), 5, "a key component was dropped");
+        assert!(
+            rows(&conn).iter().all(|(_, (count, ..))| *count == 1),
+            "two distinct keys were merged into one row"
+        );
+    }
+
+    /// Two policies that render identically under `PolicyId`'s `Display` stay
+    /// two rows. This is the case a single rendered `policy` column merges —
+    /// `("a@b", "c")` and `("a", "b@c")` both render `"a@b@c"` — and it is why
+    /// the key is two columns.
+    #[test]
+    fn two_policies_that_render_alike_are_two_aggregate_rows() {
+        let conn = db();
+        let mut left = record(AuditEvent::Admitted, 0);
+        left.decision = Some(decision("a@b", "c"));
+        let mut right = record(AuditEvent::Admitted, 0);
+        right.decision = Some(decision("a", "b@c"));
+        assert_eq!(
+            left.decision.as_ref().unwrap().policy.to_string(),
+            right.decision.as_ref().unwrap().policy.to_string(),
+            "the premise: these two render identically"
+        );
+
+        increment(&conn, &left).unwrap();
+        increment(&conn, &right).unwrap();
+        assert_eq!(
+            rows(&conn).len(),
+            2,
+            "two policies that render alike were merged into one aggregate row"
+        );
+    }
+
+    /// `sum(histogram) <= count`, never `==`: only rows carrying an
+    /// `Assessment` land in a bucket, while `count` counts every row matching
+    /// the key. The mixed corpus below is what makes the inequality strict.
+    #[test]
+    fn only_assessed_rows_land_in_a_bucket_so_the_sum_stays_below_the_count() {
+        let conn = db();
+        let mut assessed = record(AuditEvent::Admitted, 0);
+        assessed.assessment = Some(assessment(0.05, 0.95));
+        increment(&conn, &assessed).unwrap();
+        increment(&conn, &record(AuditEvent::Admitted, 0)).unwrap();
+
+        let got = rows(&conn);
+        assert_eq!(got.len(), 1);
+        let (count, value_sum, fragility_sum, version) = got[0].1;
+        assert_eq!(count, 2);
+        assert_eq!(value_sum, 1, "the unassessed row was bucketed");
+        assert_eq!(fragility_sum, 1);
+        assert!(value_sum < count as u64);
+        assert_eq!(version, SCORE_HISTOGRAM_VERSION as i64);
+    }
+
+    /// Scores land in the bucket `score_bucket` names, and the two histograms
+    /// are kept apart. A single shared histogram, or one written into the
+    /// other's column, would be invisible against equal scores — so the two
+    /// scores here are deliberately at opposite ends.
+    #[test]
+    fn value_and_fragility_are_bucketed_separately_and_by_score_bucket() {
+        let conn = db();
+        let mut rec = record(AuditEvent::Admitted, 0);
+        rec.assessment = Some(assessment(0.05, 0.95));
+        increment(&conn, &rec).unwrap();
+
+        let (value, fragility): (Vec<u64>, Vec<u64>) = conn
+            .query_row(
+                "SELECT value_histogram, fragility_histogram FROM audit_aggregates",
+                [],
+                |r| {
+                    Ok((
+                        serde_json::from_str(&r.get::<_, String>(0)?).unwrap(),
+                        serde_json::from_str(&r.get::<_, String>(1)?).unwrap(),
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(value[0], 1, "0.05 belongs to the first bucket");
+        assert_eq!(value.iter().sum::<u64>(), 1);
+        assert_eq!(
+            fragility[SCORE_HISTOGRAM_BUCKETS - 1],
+            1,
+            "0.95 belongs to the last bucket; edges are {SCORE_HISTOGRAM_EDGES:?}"
+        );
+        assert_eq!(fragility.iter().sum::<u64>(), 1);
+    }
+
+    /// A histogram of the wrong width is a storage error, not a panic. A panic
+    /// here would happen inside a `with_write` closure and poison the tenant's
+    /// connection — a corrupt row taking the tenant out until the pool heals.
+    #[test]
+    fn a_histogram_of_the_wrong_width_is_an_error_rather_than_a_panic() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO audit_aggregates
+               (policy_name, policy_version, event, day, count,
+                value_histogram, fragility_histogram, histogram_version)
+             VALUES (NULL, NULL, 'admitted', 0, 1, '[0,0,0]', '[0,0,0]', 1)",
+            [],
+        )
+        .unwrap();
+
+        let mut rec = record(AuditEvent::Admitted, 0);
+        rec.assessment = Some(assessment(0.5, 0.5));
+        let err = increment(&conn, &rec).unwrap_err();
+        assert!(
+            matches!(err, BackendError::Storage { .. }),
+            "expected a storage error, got {err:?}"
+        );
+    }
+}
