@@ -17,7 +17,7 @@ pub enum FailureStance {
 pub enum Invalid {
     #[error("decision evicts {item}, which was not offered as an eviction candidate")]
     EvictionOutsideScope { item: ItemId },
-    #[error("decision evicts {item}, which is pinned")]
+    #[error("decision evicts {item}, which is pinned or under an unexpired protection window")]
     EvictsPinned { item: ItemId },
     #[error("decision carries no reason")]
     NoReason,
@@ -65,12 +65,37 @@ pub fn decision(d: &Decision, ctx: &AdmitContext) -> Result<(), Invalid> {
 }
 
 /// The leak-prevention check. A policy may narrow the candidate set it was
-/// given; it may never introduce an item the backend's hard filters excluded.
+/// given; it may never introduce an item — nor a substituted item wearing an
+/// offered id — that the backend's hard filters excluded.
+///
+/// Compares the WHOLE `MemoryItem`, not just its id. An id-only check would
+/// let a policy return an offered id with an arbitrary body, scope,
+/// sensitivity, tags or attrs attached — a third-party policy that caches
+/// items across calls and mixes up which body belongs to which id produces
+/// exactly this shape, and an id match alone cannot tell it from a genuine
+/// candidate. `BaselinePolicy::compose` clones the offered candidate's item
+/// unmodified into `SelectedItem`, so strict equality never rejects
+/// legitimate policy output.
+///
+/// `ws.omitted` is checked too: `OmittedItem` carries only an id (never a
+/// body, so there is nothing to substitute), but that id must still have
+/// been offered — `memorysafe_core::recall`'s own doc comment states
+/// `omitted` is serialised into the MCP and HTTP responses, so an
+/// out-of-scope id smuggled in there reaches a caller exactly as an
+/// unvalidated `ws.items` entry would.
 pub fn working_set(ws: &WorkingSet, offered: &[ScoredCandidate]) -> Result<(), Invalid> {
     for selected in &ws.items {
-        if !offered.iter().any(|c| c.item.id == selected.item.id) {
+        if !offered.iter().any(|c| c.item == selected.item) {
             return Err(Invalid::UnofferedItem {
                 item: selected.item.id.clone(),
+            });
+        }
+    }
+
+    for omitted in &ws.omitted {
+        if !offered.iter().any(|c| c.item.id == omitted.id) {
+            return Err(Invalid::UnofferedItem {
+                item: omitted.id.clone(),
             });
         }
     }
@@ -121,8 +146,9 @@ mod tests {
     use super::*;
     use memorysafe_core::{
         Action, Budget, CapacityState, Eviction, ItemId, MaintenanceCandidate, MemoryItem,
-        PolicyId, Protection, Reason, ReasonCode, Scope, ScopeStats, Score, ScoredCandidate,
-        SelectedItem, SensitivityLevel, Source, SourceKind, WorkingSet, features,
+        MergeStrategy, OmittedItem, PolicyId, Protection, Reason, ReasonCode, Scope, ScopeStats,
+        Score, ScoredCandidate, SelectedItem, SensitivityLevel, Source, SourceKind, WorkingSet,
+        features,
     };
     use time::OffsetDateTime;
 
@@ -218,22 +244,24 @@ mod tests {
 
     #[test]
     fn a_decision_evicting_an_item_outside_the_offered_set_is_refused() {
+        let outside_id = ItemId::new();
         let d = Decision {
             subject: None,
             action: Action::Retain {
                 protection: Protection::Normal,
             },
             evictions: vec![Eviction {
-                item: ItemId::new(),
+                item: outside_id.clone(),
                 reason: reason(),
             }],
             reasons: vec![reason()],
             policy: PolicyId::new("rogue", "0.1.0"),
         };
-        assert!(matches!(
+        assert_eq!(
             decision(&d, &ctx(vec![])),
-            Err(Invalid::EvictionOutsideScope { .. })
-        ));
+            Err(Invalid::EvictionOutsideScope { item: outside_id }),
+            "the payload must name the item actually evicted, not just the variant"
+        );
     }
 
     #[test]
@@ -253,10 +281,75 @@ mod tests {
             reasons: vec![reason()],
             policy: PolicyId::new("rogue", "0.1.0"),
         };
-        assert!(matches!(
-            decision(&d, &ctx(vec![c])),
-            Err(Invalid::EvictsPinned { .. })
-        ));
+        assert_eq!(
+            decision(&d, &ctx(vec![c.clone()])),
+            Err(Invalid::EvictsPinned { item: c.item.id }),
+            "the payload must name the item actually pinned, not just the variant"
+        );
+    }
+
+    #[test]
+    fn a_decision_evicting_an_item_under_an_unexpired_protection_window_is_refused() {
+        // `Protection::is_evictable` refuses both `Pinned` AND an unexpired
+        // `Protected { until }` window, and both share the `EvictsPinned`
+        // variant. This pins the second case, which no other test reaches,
+        // and — by using a `now` that differs from every other test's fixed
+        // `OffsetDateTime::UNIX_EPOCH` — makes `ctx.now` actually load-bearing:
+        // a mutant that ignored `ctx.now` and checked evictability against a
+        // hardcoded instant would need to coincidentally agree with this
+        // window boundary to survive.
+        let now = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let until = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        let mut protected = item("under an active protection window");
+        protected.protection = Protection::Protected { until };
+        let c = maintenance_candidate(protected);
+        let d = Decision {
+            subject: None,
+            action: Action::Retain {
+                protection: Protection::Normal,
+            },
+            evictions: vec![Eviction {
+                item: c.item.id.clone(),
+                reason: reason(),
+            }],
+            reasons: vec![reason()],
+            policy: PolicyId::new("rogue", "0.1.0"),
+        };
+        let mut context = ctx(vec![c.clone()]);
+        context.now = now;
+        assert_eq!(
+            decision(&d, &context),
+            Err(Invalid::EvictsPinned { item: c.item.id })
+        );
+    }
+
+    #[test]
+    fn a_decision_evicting_an_item_whose_protection_window_has_expired_is_accepted() {
+        // The positive counterpart: once `now` passes `until`, the same
+        // `Protected` item is evictable. Together with the test above, this
+        // pair only agrees with the implementation if `ctx.now` — not some
+        // other, unrelated instant — is what `is_evictable` is actually
+        // checked against.
+        let now = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        let until = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        let mut protected = item("protection window has lapsed");
+        protected.protection = Protection::Protected { until };
+        let c = maintenance_candidate(protected);
+        let d = Decision {
+            subject: None,
+            action: Action::Retain {
+                protection: Protection::Normal,
+            },
+            evictions: vec![Eviction {
+                item: c.item.id.clone(),
+                reason: reason(),
+            }],
+            reasons: vec![reason()],
+            policy: PolicyId::new("baseline", "0.1.0"),
+        };
+        let mut context = ctx(vec![c.clone()]);
+        context.now = now;
+        assert!(decision(&d, &context).is_ok());
     }
 
     #[test]
@@ -270,7 +363,74 @@ mod tests {
             reasons: vec![],
             policy: PolicyId::new("rogue", "0.1.0"),
         };
-        assert!(matches!(decision(&d, &ctx(vec![])), Err(Invalid::NoReason)));
+        assert_eq!(decision(&d, &ctx(vec![])), Err(Invalid::NoReason));
+    }
+
+    #[test]
+    fn a_reject_decision_justified_only_by_eviction_reasons_needs_no_top_level_reason() {
+        // The asymmetric case the top guard's `&&` exists for: `reasons` is
+        // empty but `evictions` is not, and each eviction already carries its
+        // own reason. A `||` in place of that `&&` would refuse this
+        // legitimate decision outright.
+        let c = maintenance_candidate(item("evictable"));
+        let d = Decision {
+            subject: None,
+            action: Action::Reject,
+            evictions: vec![Eviction {
+                item: c.item.id.clone(),
+                reason: reason(),
+            }],
+            reasons: vec![],
+            policy: PolicyId::new("baseline", "0.1.0"),
+        };
+        assert!(decision(&d, &ctx(vec![c])).is_ok());
+    }
+
+    #[test]
+    fn a_retain_decision_with_evictions_but_no_top_level_reason_is_refused() {
+        // Same asymmetric shape as the test above (evictions non-empty,
+        // top-level reasons empty), but `Action::Retain` — which the eviction
+        // list alone cannot justify, unlike `Reject`. This is what the
+        // *second* guard (`Action::Retain{..} | Action::Merge{..}` plus
+        // `d.reasons.is_empty()`) exists to catch; deleting that guard
+        // wholesale would flip this decision from refused to accepted.
+        let c = maintenance_candidate(item("evictable"));
+        let d = Decision {
+            subject: None,
+            action: Action::Retain {
+                protection: Protection::Normal,
+            },
+            evictions: vec![Eviction {
+                item: c.item.id.clone(),
+                reason: reason(),
+            }],
+            reasons: vec![],
+            policy: PolicyId::new("rogue", "0.1.0"),
+        };
+        assert_eq!(decision(&d, &ctx(vec![c])), Err(Invalid::NoReason));
+    }
+
+    #[test]
+    fn a_merge_decision_with_evictions_but_no_top_level_reason_is_refused() {
+        // The `Action::Merge{..}` arm of the same second guard, which the
+        // Retain-only test above cannot exercise — a mutant narrowing the
+        // pattern to `Action::Retain{..}` alone would still pass every other
+        // test here.
+        let c = maintenance_candidate(item("evictable"));
+        let d = Decision {
+            subject: None,
+            action: Action::Merge {
+                into: ItemId::new(),
+                strategy: MergeStrategy::AppendAndUnion,
+            },
+            evictions: vec![Eviction {
+                item: c.item.id.clone(),
+                reason: reason(),
+            }],
+            reasons: vec![],
+            policy: PolicyId::new("rogue", "0.1.0"),
+        };
+        assert_eq!(decision(&d, &ctx(vec![c])), Err(Invalid::NoReason));
     }
 
     #[test]
@@ -278,6 +438,7 @@ mod tests {
         // The leak-prevention check: a policy may only narrow, never widen.
         let offered = candidate(item("offered"));
         let smuggled = item("never offered to the policy");
+        let smuggled_id = smuggled.id.clone();
         let ws = WorkingSet {
             items: vec![SelectedItem {
                 item: smuggled,
@@ -289,10 +450,64 @@ mod tests {
             omitted_total: 0,
             audit_id: None,
         };
-        assert!(matches!(
+        assert_eq!(
             working_set(&ws, std::slice::from_ref(&offered)),
-            Err(Invalid::UnofferedItem { .. })
-        ));
+            Err(Invalid::UnofferedItem { item: smuggled_id }),
+            "the payload must name the smuggled item, not just the variant"
+        );
+    }
+
+    #[test]
+    fn a_working_set_substituting_a_different_body_under_an_offered_id_is_refused() {
+        // The stronger property the brief actually asks for: "may contain
+        // only candidates that were supplied to it". An id-only check would
+        // accept this — the id genuinely was offered — but the body attached
+        // to it here was not. A policy that caches items across calls and
+        // mixes up which body belongs to which id produces exactly this
+        // shape, and only whole-item equality catches it.
+        let offered = candidate(item("the real body"));
+        let mut substituted = offered.item.clone();
+        substituted.body = "a different body entirely".into();
+        let offered_id = offered.item.id.clone();
+        let ws = WorkingSet {
+            items: vec![SelectedItem {
+                item: substituted,
+                relevance: 0.9,
+                reason: reason(),
+            }],
+            tokens_used: 5,
+            omitted: vec![],
+            omitted_total: 0,
+            audit_id: None,
+        };
+        assert_eq!(
+            working_set(&ws, std::slice::from_ref(&offered)),
+            Err(Invalid::UnofferedItem { item: offered_id })
+        );
+    }
+
+    #[test]
+    fn a_working_sets_omitted_list_containing_an_unoffered_item_is_refused() {
+        // `OmittedItem` carries only an id — nothing to substitute — but that
+        // id must still have been offered. `omitted` is serialised straight
+        // into the MCP/HTTP response, so an unchecked id here leaks exactly
+        // as an unchecked `items` entry would.
+        let offered = candidate(item("offered"));
+        let smuggled_id = ItemId::new();
+        let ws = WorkingSet {
+            items: vec![],
+            tokens_used: 0,
+            omitted: vec![OmittedItem {
+                id: smuggled_id.clone(),
+                reason: reason(),
+            }],
+            omitted_total: 1,
+            audit_id: None,
+        };
+        assert_eq!(
+            working_set(&ws, std::slice::from_ref(&offered)),
+            Err(Invalid::UnofferedItem { item: smuggled_id })
+        );
     }
 
     #[test]
@@ -314,10 +529,47 @@ mod tests {
     }
 
     #[test]
+    fn a_working_set_with_a_wrong_token_total_is_refused() {
+        // The accounting check is untested by the two tests above: the
+        // unoffered-item test never reaches it (it returns earlier), and the
+        // accepted test's `tokens_used` is deliberately exact. Force a real
+        // mismatch and pin the whole `TokenAccountingWrong` payload, not just
+        // the variant — a field-swap bug in that payload is otherwise
+        // invisible.
+        let a = candidate(item("a")); // estimated_tokens: 5
+        let ws = WorkingSet {
+            items: vec![SelectedItem {
+                item: a.item.clone(),
+                relevance: 0.9,
+                reason: reason(),
+            }],
+            tokens_used: 999,
+            omitted: vec![],
+            omitted_total: 0,
+            audit_id: None,
+        };
+        assert_eq!(
+            working_set(&ws, std::slice::from_ref(&a)),
+            Err(Invalid::TokenAccountingWrong {
+                reported: 999,
+                actual: 5,
+            })
+        );
+    }
+
+    #[test]
     fn a_panicking_policy_is_caught_rather_than_taking_down_the_process() {
         let result: Result<u32, PolicyFailure> =
             call_policy(|| panic!("the closed scorer exploded"));
-        assert!(matches!(result, Err(PolicyFailure::Panicked(_))));
+        match result {
+            Err(PolicyFailure::Panicked(message)) => {
+                // The message is the only diagnostic an operator gets when a
+                // closed-source policy explodes; a `matches!(.., Panicked(_))`
+                // alone cannot tell a preserved message from `"unknown panic"`.
+                assert_eq!(message, "the closed scorer exploded");
+            }
+            other => panic!("expected PolicyFailure::Panicked, got {other:?}"),
+        }
     }
 
     #[test]
@@ -325,5 +577,16 @@ mod tests {
         let result: Result<u32, PolicyFailure> =
             call_policy(|| Err(memorysafe_core::PolicyError::MissingEmbedding));
         assert!(matches!(result, Err(PolicyFailure::Errored(_))));
+    }
+
+    #[test]
+    fn a_successful_policy_call_returns_its_value() {
+        // Every real policy call takes this path, and nothing here exercised
+        // it before: both existing `call_policy` tests close over a failing
+        // closure (one panics, one returns `Err`). `Ok(Ok(v)) => Ok(v)` could
+        // be replaced with an unconditional `Err` and both of those stayed
+        // green.
+        let result: Result<u32, PolicyFailure> = call_policy(|| Ok(7));
+        assert_eq!(result.unwrap(), 7);
     }
 }
