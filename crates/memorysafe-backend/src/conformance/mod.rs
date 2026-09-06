@@ -22,6 +22,20 @@ pub trait BackendFactory: Send + Sync {
 
 /// Runs every conformance test in order. Panics on the first failure with the
 /// test's own assertion message.
+///
+/// What this suite proves, and what it does not: every test here observes
+/// state through the `Backend` trait after `apply` returns — item present or
+/// absent, evictions gone, audit rows counted. That catches a backend that
+/// skips a write, fabricates a success, or leaves a failed transaction's
+/// side effects behind. It does not prove atomicity in the transactional
+/// sense: there is no fault injection and no concurrent observer, so a
+/// backend that performs the item write, the evictions, and the audit row
+/// as three separate, non-atomic commits — and simply does not crash
+/// between them — passes it too.
+/// `atomicity::admit_evict_and_audit_commit_together` is the test whose
+/// name promises more than it can check; read it as "the end state after a
+/// successful apply is internally consistent," not as proof the three
+/// writes committed as one transaction.
 pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) {
     macro_rules! run {
         ($($test:path),* $(,)?) => {

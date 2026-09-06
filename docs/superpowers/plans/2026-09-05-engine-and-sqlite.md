@@ -4497,6 +4497,22 @@ pub trait BackendFactory: Send + Sync {
 
 /// Runs every conformance test in order. Panics on the first failure with the
 /// test's own assertion message.
+///
+/// What this suite proves, and what it does not: every test here observes
+/// state through the `Backend` trait after `apply` returns — item present or
+/// absent, evictions gone, audit rows counted. That catches a backend that
+/// skips a write, fabricates a success, or leaves a failed transaction's
+/// side effects behind. It does not prove atomicity in the transactional
+/// sense: there is no fault injection and no concurrent observer, so a
+/// backend that performs the item write, the evictions, and the audit row
+/// as three separate, non-atomic commits — and simply does not crash
+/// between them — passes it too.
+/// `atomicity::admit_evict_and_audit_commit_together` is the test whose
+/// name promises more than it can check; read it as "the end state after a
+/// successful apply is internally consistent," not as proof the three
+/// writes committed as one transaction. (Note: this doc comment was added
+/// in Task 16's review pass, once `atomicity` existed to name — it applies
+/// from Task 15 onward regardless.)
 pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) {
     macro_rules! run {
         ($($test:path),* $(,)?) => {
@@ -4721,6 +4737,29 @@ Expected: PASS — compiles clean.
 ```bash
 git add crates/memorysafe-backend/src/conformance/
 git commit -m "feat(backend): conformance tests for atomicity and idempotency"
+```
+
+**Authorised addition (beyond this brief):** three `is_valid()` unit tests in
+`conformance/fixtures.rs`, exercising the transaction shapes this task
+introduces — a transaction carrying evictions, a merge-only transaction, and
+one carrying an idempotency key and payload digest. The last of the three
+has no bite today:
+
+```rust
+#[test]
+fn a_transaction_with_an_idempotency_key_and_payload_digest_is_valid() {
+    let s = scope();
+    let i = item(&s, "written once");
+    let mut txn = admit_txn(&s, i.clone(), None);
+    txn.idempotency_key = Some("key-1".into());
+    txn.payload_digest = Some(i.digest());
+    // `is_valid()` never inspects `idempotency_key` or `payload_digest`,
+    // so this test passes identically whether or not those fields are
+    // set — no mutation on either field is demonstrable here. It is kept
+    // as a guard against a future `is_valid()` that does inspect them,
+    // not as evidence of coverage today.
+    assert!(txn.is_valid());
+}
 ```
 
 ---

@@ -190,6 +190,11 @@ mod tests {
         let mut txn = admit_txn(&s, i.clone(), None);
         txn.idempotency_key = Some("key-1".into());
         txn.payload_digest = Some(i.digest());
+        // `is_valid()` never inspects `idempotency_key` or `payload_digest`,
+        // so this test passes identically whether or not those fields are
+        // set — no mutation on either field is demonstrable here. It is kept
+        // as a guard against a future `is_valid()` that does inspect them,
+        // not as evidence of coverage today.
         assert!(txn.is_valid());
     }
 }
