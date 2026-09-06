@@ -59,9 +59,9 @@
 use crate::config::BaselineConfig;
 use crate::{eviction, fragility, similarity};
 use memorysafe_core::{
-    Action, Decision, Eviction, ItemId, MaintainContext, MaintenanceCandidate, MemoryItem,
-    MergeStrategy, PolicyId, Protection, Reason, ReasonCode, ScopeStats, Score, ScoredCandidate,
-    features,
+    Action, CapacityState, Decision, Eviction, ItemId, MaintainContext, MaintenanceCandidate,
+    MemoryItem, MergeStrategy, PolicyId, Protection, Reason, ReasonCode, ScopeStats, Score,
+    ScoredCandidate, features,
 };
 use std::collections::BTreeSet;
 use time::Duration;
@@ -115,7 +115,41 @@ fn ttl_expiries(ctx: &MaintainContext, policy: &PolicyId) -> Vec<Decision> {
         .collect()
 }
 
-/// Capacity reclaim, cheapest first, pinned untouchable.
+/// Capacity reclaim, cheapest first, pinned untouchable, both budget
+/// dimensions honoured.
+///
+/// **`max_items` and `max_bytes` are both read here, matching every other
+/// consumer of `CapacityState`/`Budget` in the workspace.**
+/// `Budget::is_bounded`, `CapacityState::pressure` and
+/// `CapacityState::would_exceed` (`crates/memorysafe-core/src/capacity.rs`)
+/// already treat a byte-only budget as a real, supported shape — pressure
+/// reports it, admission refuses it once over, and `admit`'s make-room loop
+/// (`crates/memorysafe-policy/src/admit.rs`) evicts to satisfy it before
+/// admitting. This function used to be the one holdout, deciding "am I over
+/// budget?" from `max_items` alone: a namespace bounded only by `max_bytes`
+/// reported pressure, refused writes once full, and never reclaimed —
+/// permanently stuck while looking actively managed from the outside. That
+/// was the bug; the fix is to ask the same question `admit` already asks and
+/// reuse its answers rather than re-deriving them:
+///
+/// * `CapacityState::would_exceed(0, 0)` — "is this state, with no further
+///   admission, already over budget on any bounded dimension" — is exactly
+///   `would_exceed`'s existing OR-of-both-dimensions check, called with a
+///   zero increment instead of a pending write. (Its doc comment names this
+///   as a second legitimate caller shape alongside admission's
+///   `would_exceed(1, item.byte_size())`.)
+/// * `MemoryItem::byte_size()`, accumulated into `freed_bytes` exactly as
+///   `admit`'s make-room loop accumulates it — never a second, parallel byte
+///   computation over the same field.
+///
+/// This run's own expiries have already made room on BOTH dimensions —
+/// counting from `used_items`/`used_bytes` alone would reclaim a live item to
+/// free space that was about to be free anyway — so `expired`'s members are
+/// subtracted from both before anything else is asked. The loop below then
+/// evicts cheapest-first (unchanged: bytes and items together decide *how
+/// many*, `eviction::cost`/`reclaim_rank` alone decide *which*) until the
+/// projected state, with candidates removed one at a time, no longer exceeds
+/// on any dimension.
 ///
 /// Computed BEFORE decay and consolidation even though its decisions are
 /// emitted after theirs: both of those read the surviving neighbourhood, and a
@@ -126,55 +160,28 @@ fn capacity_reclaim(
     expired: &BTreeSet<ItemId>,
     policy: &PolicyId,
 ) -> Vec<Decision> {
-    // **Byte budgets are NOT deferred here — they are half-implemented, and
-    // this is the missing half.** Three of the four places that read
-    // `max_bytes` honour it; only this one does not:
-    //
-    //   * `Budget::is_bounded` returns true for a byte-only budget
-    //     (`max_items.is_some() || max_bytes.is_some()`), which core pins
-    //     deliberately in `standing_check_budget_is_bounded`.
-    //   * `CapacityState::pressure` maxes over both dimensions, so the
-    //     pressure signal on a byte-only budget is live and correct.
-    //   * `CapacityState::would_exceed` refuses an admission that would break
-    //     it — and `admit`'s make-room loop evicts until it stops refusing, so
-    //     ADMISSION already frees bytes.
-    //   * The early return below ignores `max_bytes` entirely.
-    //
-    // So a namespace with `max_bytes: Some(_)` and `max_items: None` reports
-    // pressure correctly, refuses writes once over, and never reclaims —
-    // permanently stuck, not merely unbounded. It also puts the two entry
-    // points into disagreement about one question: `admit` frees bytes to make
-    // room and `maintain` does not, which is the divergence `eviction::cost`
-    // exists to prevent, reappearing one level up.
-    //
-    // **The engine cost is worse than a no-op.** Task 32 gathers eviction
-    // candidates only when `capacity.budget.is_bounded()` — which a byte-only
-    // budget satisfies — so it will run the backend `list`, build the
-    // candidate vector, hand it over, and this early return will discard it
-    // without a decision or an audit row: work performed and silently thrown
-    // away, while from outside the namespace looks actively managed (pressure
-    // live, writes refused, candidates gathered on every write). Tense matters
-    // here: `is_bounded`'s behaviour is real and asserted today, but that
-    // consumer is not written yet, so the waste is latent rather than current.
-    // The reader being warned is the one who arrives after Task 32 lands.
-    //
-    // Do not write a comment here saying byte budgets are deferred: three of
-    // the four readers implement them, and a reader who believes the deferral
-    // will not go looking for the liveness bug. Owned by the engine's
-    // retention and capacity work; until that lands, a byte-only budget is a
-    // misconfiguration the engine should reject rather than a supported shape.
-    let Some(max_items) = ctx.capacity.budget.max_items else {
-        return Vec::new();
-    };
-    // This run's own expiries have already made room; counting from
-    // `used_items` alone would reclaim live items to free space that was
-    // about to be free anyway.
-    let after_expiry = ctx.capacity.used_items.saturating_sub(expired.len() as u64);
-    if after_expiry <= max_items {
+    if !ctx.capacity.budget.is_bounded() {
         return Vec::new();
     }
 
-    let mut over = after_expiry - max_items;
+    // This run's own expiries have already made room; counting from
+    // `used_items`/`used_bytes` alone would reclaim live items to free space
+    // that was about to be free anyway.
+    let expired_bytes: u64 = ctx
+        .batch
+        .iter()
+        .filter(|c| expired.contains(&c.item.id))
+        .map(|c| c.item.byte_size())
+        .sum();
+    let after_expiry = CapacityState {
+        budget: ctx.capacity.budget,
+        used_items: ctx.capacity.used_items.saturating_sub(expired.len() as u64),
+        used_bytes: ctx.capacity.used_bytes.saturating_sub(expired_bytes),
+    };
+    if !after_expiry.would_exceed(0, 0) {
+        return Vec::new();
+    }
+
     // Rank by what it costs to lose the item, matching `admit`'s eviction
     // order — `eviction::cost` is the one answer to "what is cheapest to lose
     // right now", and both entry points must give it. Age breaks ties only.
@@ -189,12 +196,46 @@ fn capacity_reclaim(
             .then_with(|| reclaim_rank(&a.item).cmp(&reclaim_rank(&b.item)))
     });
 
+    let mut freed_bytes = 0u64;
     let mut out = Vec::new();
-    for candidate in reclaimable {
-        if over == 0 {
+    for (freed_items, candidate) in reclaimable.into_iter().enumerate() {
+        let freed_items = freed_items as u64;
+        let still_over = {
+            let mut projected = after_expiry;
+            projected.used_items = projected.used_items.saturating_sub(freed_items);
+            projected.used_bytes = projected.used_bytes.saturating_sub(freed_bytes);
+            projected.would_exceed(0, 0)
+        };
+        if !still_over {
             break;
         }
         let item = &candidate.item;
+
+        // Each BOUNDED dimension's used/max pair is reported; an unbounded
+        // one is omitted rather than filled with a fabricated `0` or
+        // `u64::MAX`. Under a byte-only budget `max_items` is genuinely
+        // `None`, so "used_items"/"max_items" are absent from the evidence —
+        // not zeroed, not maxed-out — and an items-only budget omits the byte
+        // pair the same way. A mixed budget carries both pairs regardless of
+        // which single dimension pushed this particular candidate over,
+        // because the evidence describes the run's capacity state, not a
+        // claim about which number forced this one eviction — and the whole
+        // point of this fix is that byte pressure must stop being invisible
+        // to whoever reads this audit row.
+        let mut evidence = features! {
+            "value" => candidate.value.get(),
+            "fragility" => candidate.fragility.get(),
+            "eviction_cost" => eviction::cost(candidate),
+        };
+        if let Some(max_items) = ctx.capacity.budget.max_items {
+            evidence.insert("used_items".to_string(), ctx.capacity.used_items as f64);
+            evidence.insert("max_items".to_string(), max_items as f64);
+        }
+        if let Some(max_bytes) = ctx.capacity.budget.max_bytes {
+            evidence.insert("used_bytes".to_string(), ctx.capacity.used_bytes as f64);
+            evidence.insert("max_bytes".to_string(), max_bytes as f64);
+        }
+
         out.push(Decision {
             subject: Some(item.id.clone()),
             action: Action::Reject,
@@ -203,19 +244,13 @@ fn capacity_reclaim(
                 reason: Reason::new(
                     ReasonCode::CapacityPressure,
                     "namespace is over budget; reclaimed the cheapest evictable item",
-                    features! {
-                        "used_items" => ctx.capacity.used_items as f64,
-                        "max_items" => max_items as f64,
-                        "value" => candidate.value.get(),
-                        "fragility" => candidate.fragility.get(),
-                        "eviction_cost" => eviction::cost(candidate),
-                    },
+                    evidence,
                 ),
             }],
             reasons: vec![],
             policy: policy.clone(),
         });
-        over -= 1;
+        freed_bytes += item.byte_size();
     }
     out
 }
@@ -580,6 +615,20 @@ mod tests {
         ctx_with_stats(batch, used, max, ScopeStats::default())
     }
 
+    /// Full control over `CapacityState`, for the byte-budget reclaim tests
+    /// below — `ctx`/`ctx_with_stats` only ever vary `max_items`, with
+    /// `max_bytes` fixed at `None` and `used_bytes` at `0`.
+    fn ctx_with_capacity(batch: Vec<MemoryItem>, capacity: CapacityState) -> MaintainContext {
+        MaintainContext {
+            scope: scope(),
+            batch: batch.into_iter().map(candidate_for).collect(),
+            is_final_batch: true,
+            capacity,
+            stats: ScopeStats::default(),
+            now: now(),
+        }
+    }
+
     fn ctx_with_stats(
         batch: Vec<MemoryItem>,
         used: u64,
@@ -926,6 +975,244 @@ mod tests {
             !ds.iter()
                 .any(|d| d.has_reason(ReasonCode::CapacityPressure)),
             "the expiry already brought the namespace within budget"
+        );
+    }
+
+    // ------------------------------------------- byte-budget reclaim (T31) --
+
+    #[test]
+    fn a_byte_only_budget_over_its_limit_reclaims() {
+        // Byte-only: `max_items: None`. `item("aaaa")` charges
+        // `body.len() (4) + kind.len() ("fact", 4) + attrs_len ("{}", 2) +
+        // subject.len() ("s", 1) + namespace.len() ("n", 1) + FIXED_OVERHEAD
+        // (64) = 76` bytes (`MemoryItem::byte_size`'s documented accounting)
+        // — two such items put `used_bytes` at 152 against a 100-byte budget.
+        //
+        // Falsify: this is exactly the case the current early return
+        // (`let Some(max_items) = ... else { return Vec::new() }`) discards
+        // before ever looking at `max_bytes` — it must fail before the fix.
+        let a = item("aaaa");
+        let b = item("bbbb");
+        assert_eq!(
+            a.byte_size(),
+            76,
+            "byte accounting drifted from the derivation above"
+        );
+
+        let cap = CapacityState {
+            budget: Budget {
+                max_items: None,
+                max_bytes: Some(100),
+            },
+            used_items: 2,
+            used_bytes: 152,
+        };
+        let ds = decisions(
+            &ctx_with_capacity(vec![a, b], cap),
+            &BaselineConfig::default(),
+            pid(),
+        );
+        assert!(
+            !ds.is_empty(),
+            "a byte-only budget over its limit produced no reclaim"
+        );
+        assert!(
+            ds.iter()
+                .any(|d| d.has_reason(ReasonCode::CapacityPressure))
+        );
+        // Exactly ONE eviction: 152 bytes over a 100-byte budget needs only
+        // the 76-byte item removed (152 - 76 = 76 <= 100) to stop. Rejects a
+        // loop whose running `freed_bytes` fails to track what has already
+        // been freed (e.g. never accumulates) — that version keeps seeing
+        // the ORIGINAL 152 as still over budget and reclaims the second item
+        // too, deleting something the first eviction had already made room
+        // for.
+        let evicted: usize = ds.iter().map(|d| d.evictions.len()).sum();
+        assert_eq!(
+            evicted, 1,
+            "one 76-byte eviction is enough to clear a 100-byte budget: {ds:?}"
+        );
+
+        // Evidence check for the design decision in resolution 3: under a
+        // byte-only budget `max_items` is genuinely absent, so the evidence
+        // must carry the byte pair and must NOT fabricate an item pair —
+        // neither a `0` nor a `u64::MAX` standing in for the missing bound.
+        let d = ds
+            .iter()
+            .find(|d| d.has_reason(ReasonCode::CapacityPressure))
+            .expect("a CapacityPressure decision");
+        // A reclaim's `CapacityPressure` reason lives on its (sole) eviction,
+        // not in `Decision.reasons` — that field is `vec![]` for a reclaim,
+        // same as for a TTL expiry (see `an_expired_item_is_forgotten_with_a_ttl_reason`).
+        let r = &d.evictions[0].reason;
+        assert_eq!(evidence(r, "used_bytes"), 152.0);
+        assert_eq!(evidence(r, "max_bytes"), 100.0);
+        assert!(
+            !r.evidence.contains_key("used_items"),
+            "an absent max_items bound must not appear in the evidence: {:?}",
+            r.evidence
+        );
+        assert!(
+            !r.evidence.contains_key("max_items"),
+            "an absent max_items bound must not appear in the evidence: {:?}",
+            r.evidence
+        );
+    }
+
+    #[test]
+    fn a_mixed_budget_reclaims_when_only_bytes_are_over() {
+        // `max_items: Some(5)` is satisfied by `used_items: 2`; `max_bytes:
+        // Some(100)` is exceeded by `used_bytes: 152` (two 76-byte items, as
+        // derived above). Rejects an implementation that keeps the old
+        // `max_items`-only early return and adds a byte check only INSIDE
+        // the branch that already concluded items are over — that shape
+        // never reaches this fixture's items-satisfied/bytes-over state.
+        let a = item("aaaa");
+        let b = item("bbbb");
+        let cap = CapacityState {
+            budget: Budget {
+                max_items: Some(5),
+                max_bytes: Some(100),
+            },
+            used_items: 2,
+            used_bytes: 152,
+        };
+        let ds = decisions(
+            &ctx_with_capacity(vec![a, b], cap),
+            &BaselineConfig::default(),
+            pid(),
+        );
+        assert!(
+            !ds.is_empty(),
+            "byte overage under a mixed, items-satisfied budget produced no reclaim"
+        );
+        assert!(
+            ds.iter()
+                .any(|d| d.has_reason(ReasonCode::CapacityPressure))
+        );
+        let evicted: usize = ds.iter().map(|d| d.evictions.len()).sum();
+        assert_eq!(
+            evicted, 1,
+            "one 76-byte eviction is enough to clear a 100-byte budget: {ds:?}"
+        );
+
+        // A mixed budget carries BOTH pairs, regardless of which dimension
+        // is the one actually over — see the design-decision comment on
+        // `capacity_reclaim`.
+        let d = ds
+            .iter()
+            .find(|d| d.has_reason(ReasonCode::CapacityPressure))
+            .expect("a CapacityPressure decision");
+        let r = &d.evictions[0].reason;
+        assert_eq!(evidence(r, "used_items"), 2.0);
+        assert_eq!(evidence(r, "max_items"), 5.0);
+        assert_eq!(evidence(r, "used_bytes"), 152.0);
+        assert_eq!(evidence(r, "max_bytes"), 100.0);
+    }
+
+    #[test]
+    fn a_mixed_budget_reclaims_when_only_items_are_over() {
+        // The existing behaviour (`an_over_budget_namespace_reclaims_down_to_its_budget`),
+        // pinned under a budget that ALSO configures `max_bytes`, so adding
+        // the byte dimension cannot regress the item-only case. `max_bytes:
+        // Some(10_000)` is nowhere near `used_bytes: 500`, so only the item
+        // dimension is over.
+        let batch: Vec<MemoryItem> = (0..5).map(|i| item(&format!("memory {i}"))).collect();
+        let cap = CapacityState {
+            budget: Budget {
+                max_items: Some(3),
+                max_bytes: Some(10_000),
+            },
+            used_items: 5,
+            used_bytes: 500,
+        };
+        let ds = decisions(
+            &ctx_with_capacity(batch, cap),
+            &BaselineConfig::default(),
+            pid(),
+        );
+        let evicted: usize = ds.iter().map(|d| d.evictions.len()).sum();
+        assert_eq!(
+            evicted, 2,
+            "5 items against a budget of 3 means 2 evictions"
+        );
+    }
+
+    #[test]
+    fn expiry_counts_against_the_byte_budget_before_reclaim_does() {
+        // The byte analogue of `expiry_counts_against_the_budget_before_reclaim_does`.
+        // Byte-only: `max_items: None`. Three 76-byte items (see the
+        // derivation on `a_byte_only_budget_over_its_limit_reclaims`) put
+        // `used_bytes` at 228 against `max_bytes: Some(200)` — over by 28 if
+        // counted from `used_bytes` alone. But one of the three is expiring
+        // this run, and removing its 76 bytes brings the namespace to 152,
+        // comfortably under. Rejects an implementation that adds a bytes
+        // check without also subtracting the expired set's bytes: that
+        // version still sees `228 > 200` and reclaims a live item to free
+        // space the TTL step already freed.
+        let mut expiring = item("aaaa");
+        expiring.created_at = now() - Duration::days(10);
+        expiring.ttl = Some(Duration::days(1));
+        let keep_a = item("bbbb");
+        let keep_b = item("cccc");
+        assert_eq!(
+            expiring.byte_size() + keep_a.byte_size() + keep_b.byte_size(),
+            228,
+            "byte accounting drifted from the derivation above"
+        );
+
+        let cap = CapacityState {
+            budget: Budget {
+                max_items: None,
+                max_bytes: Some(200),
+            },
+            used_items: 3,
+            used_bytes: 228,
+        };
+        let ds = decisions(
+            &ctx_with_capacity(vec![expiring, keep_a, keep_b], cap),
+            &BaselineConfig::default(),
+            pid(),
+        );
+        assert!(
+            !ds.iter()
+                .any(|d| d.has_reason(ReasonCode::CapacityPressure)),
+            "the expiry already brought the namespace within the byte budget: {ds:?}"
+        );
+    }
+
+    #[test]
+    fn a_byte_only_budget_needing_two_evictions_reclaims_exactly_two() {
+        // Every other byte-reclaim fixture in this file needs only ONE
+        // eviction to clear its budget, so none of them can tell a correct
+        // running `freed_bytes` accumulator apart from a corrupted one that
+        // over- or under-counts by a constant factor — evicting the single
+        // cheapest item satisfies both alike. This fixture needs exactly TWO:
+        // three 76-byte items (`used_bytes: 228`) against `max_bytes:
+        // Some(150)`. Evicting one 76-byte item leaves 152, still over 150;
+        // evicting a second leaves 76, clear. Confirmed by mutation: doubling
+        // the accumulator (`freed_bytes += 2 * item.byte_size()`) makes the
+        // second iteration see `228 - 152 = 76 <= 150` after only ONE real
+        // eviction and stop early — this fixture is what catches that, where
+        // every other reclaim test in this file passes it unnoticed.
+        let batch: Vec<MemoryItem> = vec![item("aaaa"), item("bbbb"), item("cccc")];
+        let cap = CapacityState {
+            budget: Budget {
+                max_items: None,
+                max_bytes: Some(150),
+            },
+            used_items: 3,
+            used_bytes: 228,
+        };
+        let ds = decisions(
+            &ctx_with_capacity(batch, cap),
+            &BaselineConfig::default(),
+            pid(),
+        );
+        let evicted: usize = ds.iter().map(|d| d.evictions.len()).sum();
+        assert_eq!(
+            evicted, 2,
+            "228 bytes against a 150-byte budget needs two 76-byte evictions: {ds:?}"
         );
     }
 
