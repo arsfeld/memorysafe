@@ -612,6 +612,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "memorysafe-policy"
+version = "0.1.0"
+dependencies = [
+ "memorysafe-core",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

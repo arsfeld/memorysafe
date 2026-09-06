@@ -21,6 +21,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: memorysafe-core and memorysafe-policy must have no I/O dependencies
         run: |
-          cargo tree -p memorysafe-core --edges normal --prefix none \
-            | grep -Ei '^(tokio|rusqlite|sqlx|reqwest|hyper) ' && exit 1
-          echo "core is I/O free"
+          for crate in memorysafe-core memorysafe-policy; do
+            cargo tree -p "$crate" --edges normal --prefix none \
+              | grep -Ei '^(tokio|rusqlite|sqlx|reqwest|hyper) ' && exit 1
+            echo "$crate is I/O free"
+          done
