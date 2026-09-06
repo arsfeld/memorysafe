@@ -339,23 +339,28 @@ pub async fn hybrid_returns_both_signal_sources<F: BackendFactory>(factory: &F) 
     assert!(exact.relevance > 0.0);
 }
 
-/// Two pages must not overlap or drop rows.
+/// Three pages must not overlap and must not drop rows: page *disjointness*
+/// and completeness, and nothing else.
 ///
-/// `fx::item` pins every `created_at` to `OffsetDateTime::UNIX_EPOCH` so most
-/// conformance runs are deterministic — see its doc comment. That is exactly
-/// wrong for this test: with all 25 rows tied on `created_at`, a `list()`
-/// that orders by timestamp alone (the natural choice) sorts them in no
-/// stable order at all, and `LIMIT`/`OFFSET` over an unstable sort can
-/// return the same row on two pages while dropping another entirely. That
-/// would fail here looking like a backend bug when it is really a fixture
-/// bug — the corpus, not the backend, created the tie. `fx::item_at` gives
-/// each item its own increasing timestamp so this corpus contains no ties.
-/// `Backend::list`'s doc comment (`memorysafe-backend/src/lib.rs`) still
-/// requires implementations to break ties with a unique key, because a real
-/// corpus (a bulk import, say) can absolutely produce them — this fixture
-/// change makes the present test deterministic, it does not remove that
-/// requirement.
-pub async fn pagination_is_stable<F: BackendFactory>(factory: &F) {
+/// Named for what it proves. It was called `pagination_is_stable`, and the
+/// name was part of why a gap survived for so long: "stable" reads as
+/// tie-break stability — the property this test does *not* check — so an
+/// auditor reading test names ticked that box and moved on. The collected ids
+/// are sorted and deduped before the assertions, which is exactly right for
+/// disjointness and destroys any evidence of order, direction included.
+///
+/// **The implementation this exists to reject: one whose `OFFSET` arithmetic
+/// is off by one**, so a row appears on two pages or on none. That is a real
+/// bug, and it survives a perfect total order — which is why this test keeps
+/// its own corpus rather than being merged into the ordering tests.
+///
+/// The corpus uses `fx::item_at`, so every `created_at` is distinct and
+/// nothing ties. That is deliberate: with no ties, no tie-break is involved,
+/// so an overlap or a dropped row here can only be a paging bug and never a
+/// tie-break bug. The tied case is covered on its own by
+/// `list_tie_break_is_total_over_identical_timestamps`, and direction by
+/// `list_orders_oldest_first_by_created_at`.
+pub async fn list_pages_are_disjoint_and_complete<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
 
@@ -414,6 +419,164 @@ pub async fn pagination_is_stable<F: BackendFactory>(factory: &F) {
     assert_eq!(total, 25, "pages dropped rows");
 }
 
+/// `list` orders **ascending** by `created_at`: page one is the *oldest* ten,
+/// not the newest.
+///
+/// **The implementation this exists to reject: a backend that pages
+/// descending.** Such a backend passes the entire rest of the suite. Look at
+/// what the other `list` callers actually assert:
+/// `list_pages_are_disjoint_and_complete` sorts and dedups the collected ids
+/// before asserting, so direction is not merely unchecked — the evidence is
+/// destroyed; `purge_subject_*` and `pending_embedding_*` only count rows;
+/// `export_import_round_trips_exactly` re-sorts both sides by `ItemId` before
+/// comparing. Every one of them is insensitive to direction by accident.
+/// `Backend::list`'s own doc comment names "SQLite paging ascending while
+/// Postgres paged descending" as the drift this suite exists to prevent, and
+/// until this test nothing in the suite prevented it.
+///
+/// **Why this cannot be merged with the tie-break test.** It needs distinct
+/// timestamps, because on a fully tied corpus an ascending and a descending
+/// backend produce *identical* output: the primary key contributes nothing and
+/// the tie-break alone orders the rows. Run this corpus through the tied one
+/// and the discrimination disappears entirely. The two tests read as
+/// duplication and are not: see
+/// `list_tie_break_is_total_over_identical_timestamps` for the other half of
+/// the argument.
+///
+/// All three pages are asserted, not just the first. A backend that pages
+/// descending but sorts each page ascending internally would produce a correct
+/// first page of the *wrong ten rows*, which only a whole-corpus assertion
+/// catches.
+pub async fn list_orders_oldest_first_by_created_at<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // Twelve items, one second apart, inserted oldest-first. Insertion order
+    // is irrelevant to the assertion — `created_at` is what orders them — but
+    // the bodies are numbered by age so a failure message reads directly as
+    // "this backend handed back the newest rows first".
+    for i in 0..12i64 {
+        let created_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(i);
+        let item = fx::item_at(&scope, &format!("memory {i:02}"), created_at);
+        backend
+            .apply(fx::admit_txn(&scope, item, None))
+            .await
+            .unwrap();
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    for offset in [0usize, 4, 8] {
+        let page = backend
+            .list(&scope, &Page { offset, limit: 4 })
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 4, "page at offset {offset} was not full");
+        seen.extend(page.into_iter().map(|i| i.body));
+    }
+
+    let expected: Vec<String> = (0..12i64).map(|i| format!("memory {i:02}")).collect();
+    assert_eq!(
+        seen, expected,
+        "list must order ascending by created_at — page one is the oldest four. \
+         A backend paging descending returns memory 11 first and passes every \
+         other list test in this suite."
+    );
+}
+
+/// The tie-break is **total**: over a corpus where every `created_at` is
+/// identical, `list` still returns a single, reproducible order — ascending by
+/// `ItemId`.
+///
+/// **The implementation this exists to reject: a backend whose tie-break is
+/// not total** — one that orders by `created_at` alone and lets the storage
+/// engine's natural row order decide the rest. `Backend::list`'s doc names
+/// this exact case: a bulk import leaves many rows with an identical
+/// `created_at`, and `LIMIT`/`OFFSET` over an unstable sort can return the
+/// same row on two pages while dropping another.
+///
+/// **The corpus is built from `fx::item`, whose `created_at` is pinned to
+/// `UNIX_EPOCH`, so every row ties and the tie-break is the *only* thing
+/// ordering the pages.** That is the whole design of the test, not an
+/// oversight inherited from the fixture.
+///
+/// **The ids are literals, and that is load-bearing.** `ItemId::new()` is
+/// `ulid::Ulid::generate()`, and `ulid_id!`'s doc says lexicographic order
+/// equals creation order only "up to the timestamp's millisecond resolution" —
+/// so ids minted in a tight loop are randomly ordered relative to each other.
+/// Built from `fx::item()`, this test would pass or fail by coin flip, and on
+/// the runs where the loop straddled a millisecond boundary it would pass
+/// *deterministically for the wrong reason*: ids ascending in insertion order
+/// let a backend with no tie-break at all through. Do not simplify this back
+/// to `fx::item()`.
+///
+/// **Why this cannot be merged with the direction test.** On this corpus an
+/// ascending and a descending backend produce identical output — the primary
+/// key contributes nothing — so the tied corpus cannot catch a descending
+/// backend; that is `list_orders_oldest_first_by_created_at`'s job. Conversely
+/// a distinct-timestamp corpus never ties, so totality is unobservable there.
+/// Neither subsumes the other. Against a compliant `(created_at ASC, id ASC)`
+/// backend the four wrong combinations split like this: `(ASC, DESC)` caught
+/// here only, `(DESC, ASC)` caught by the direction test only, `(DESC, DESC)`
+/// caught by both, and no-tie-break-at-all caught here only. This test carries
+/// three of the four, which is why it asserts the exact sequence rather than
+/// the weaker "the pages did not overlap".
+pub async fn list_tie_break_is_total_over_identical_timestamps<F: BackendFactory>(factory: &F) {
+    use memorysafe_core::ItemId;
+
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // Five ULIDs sharing a prefix and differing only in the final character,
+    // so their ascending order is `...FA0 < ...FA1 < ... < ...FA4` by
+    // inspection. `fixtures::tests::the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending`
+    // checks that premise in a test that actually runs today.
+    let ascending: Vec<ItemId> = [
+        "01ARZ3NDEKTSV4RRFFQ69G5FA0",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA3",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA4",
+    ]
+    .iter()
+    .map(|s| ItemId::parse(s).unwrap())
+    .collect();
+
+    // Inserted in a deliberately non-ascending order. A backend that applies
+    // no tie-break returns its natural row order, which for most storage
+    // engines is insertion order — so this ordering is what makes such a
+    // backend fail here deterministically rather than by luck.
+    for i in [3usize, 0, 4, 1, 2] {
+        let item = fx::item_with_id(&scope, ascending[i].clone(), &format!("tied memory {i}"));
+        backend
+            .apply(fx::admit_txn(&scope, item, None))
+            .await
+            .unwrap();
+    }
+
+    let mut seen: Vec<ItemId> = Vec::new();
+    for (offset, expected_len) in [(0usize, 2usize), (2, 2), (4, 1)] {
+        let page = backend
+            .list(&scope, &Page { offset, limit: 2 })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.len(),
+            expected_len,
+            "page at offset {offset} had the wrong size"
+        );
+        seen.extend(page.into_iter().map(|i| i.id));
+    }
+
+    assert_eq!(
+        seen, ascending,
+        "with every created_at tied, the pages must come back in ascending ItemId \
+         order. A backend that orders by created_at alone returns its natural row \
+         order here — insertion order, which this corpus deliberately made \
+         non-ascending — and a backend whose tie-break is descending returns the \
+         exact reverse."
+    );
+}
+
 /// `exclude_pending_embedding` must narrow the candidate set, not empty it.
 ///
 /// The assertion also pins the exact surviving count, not just "nothing
@@ -461,6 +624,102 @@ pub async fn pending_embedding_items_are_excluded_when_asked<F: BackendFactory>(
     assert!(hits.iter().all(|h| !h.item.pending_embedding));
 }
 
+/// `neighbours` applies the tie-break **before** truncating at `k`, not after.
+///
+/// **The implementation this exists to reject: one that takes the top `k` rows
+/// in whatever order its index produced and only then sorts them.** With a tie
+/// straddling position `k`, that backend and a compliant one return *different
+/// neighbour sets* — not the same set in a different order — and
+/// `Backend::neighbours`' doc says that is precisely what the tie-break exists
+/// to prevent: the policy's `best()` neighbour is the merge target, so a
+/// different set is a different merge decision and a different audit record.
+///
+/// **Nothing else in the suite constructs this case.**
+/// `vector_search_ranks_by_similarity` calls `neighbours` with `k` equal to its
+/// corpus size, so nothing is ever truncated, and its three bodies are all
+/// distinct, so relevance never ties. Both conditions have to hold at once for
+/// the boundary to be observable, and only here do they.
+///
+/// The corpus: one item whose body is the probe text verbatim (it ranks first
+/// under any scorer), and **four items sharing one identical body**, which the
+/// deterministic embedder maps to one identical vector — an exact tie, not an
+/// approximate one. With `k = 3` against a corpus of 5, two of those four must
+/// come back and two must be cut, so the tie straddles the boundary. Ascending
+/// `ItemId` decides which two.
+///
+/// **The assertion is set membership, not order.** An order assertion would
+/// pass while the membership was wrong — a backend that truncated first and
+/// then sorted returns a correctly *ordered* list of the wrong rows, which is
+/// the whole reason the doc specifies tie-break before truncation. The ids are
+/// literals for the reason `fx::item_with_id` documents: generated ULIDs are
+/// ordered only to millisecond resolution, so "which two survive" would
+/// otherwise be a coin flip, and the insertion order below is deliberately not
+/// ascending so a truncate-first backend fails deterministically.
+pub async fn neighbours_break_ties_before_truncating_at_k<F: BackendFactory>(factory: &F) {
+    use memorysafe_core::ItemId;
+    use std::collections::BTreeSet;
+
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let probe_body = "the cat sat on the mat";
+    // One identical body for all four tied items: the deterministic embedder
+    // is a pure function of the text, so these four score exactly equally
+    // against any probe. A tie that merely happens to be close would not
+    // exercise the tie-break at all.
+    let tied_body = "quarterly revenue exceeded projections";
+
+    let exact = ItemId::parse("01BX5ZZKBKACTAV9WEVGEMMVR9").unwrap();
+    let tied: Vec<ItemId> = [
+        "01BX5ZZKBKACTAV9WEVGEMMVR0",
+        "01BX5ZZKBKACTAV9WEVGEMMVR1",
+        "01BX5ZZKBKACTAV9WEVGEMMVR2",
+        "01BX5ZZKBKACTAV9WEVGEMMVR3",
+    ]
+    .iter()
+    .map(|s| ItemId::parse(s).unwrap())
+    .collect();
+
+    backend
+        .apply(fx::admit_txn_embedded(
+            &scope,
+            fx::item_with_id(&scope, exact.clone(), probe_body),
+        ))
+        .await
+        .unwrap();
+    // Insertion order 2, 3, 0, 1: the two ids that must survive the tie-break
+    // are the two inserted *last*, so a backend that truncates in natural row
+    // order keeps the wrong pair every time rather than sometimes.
+    for i in [2usize, 3, 0, 1] {
+        backend
+            .apply(fx::admit_txn_embedded(
+                &scope,
+                fx::item_with_id(&scope, tied[i].clone(), tied_body),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let probe = fx::embedder().embed(probe_body).unwrap();
+    let hits = backend.neighbours(&scope, &probe, 3).await.unwrap();
+
+    assert_eq!(
+        hits.len(),
+        3,
+        "k is 3 over a corpus of 5; neighbours must return exactly k"
+    );
+    let got: BTreeSet<ItemId> = hits.into_iter().map(|h| h.item.id).collect();
+    let expected: BTreeSet<ItemId> = [exact, tied[0].clone(), tied[1].clone()]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        got, expected,
+        "with a four-way tie straddling k, the two lowest ItemIds must survive. \
+         A backend that truncates at k before applying the tie-break returns a \
+         different set — here, the two tied items it happened to reach first."
+    );
+}
+
 /// Vectors from a different embedder must be refused, not silently compared.
 pub async fn cross_model_vectors_are_rejected<F: BackendFactory>(factory: &F) {
     use memorysafe_embed::DeterministicEmbedder;
@@ -489,4 +748,115 @@ pub async fn cross_model_vectors_are_rejected<F: BackendFactory>(factory: &F) {
         ),
         Err(e) => panic!("unexpected error {e:?}"),
     }
+}
+
+/// A recall bumps the access statistics of the items it names, and a later
+/// retrieve reflects them.
+///
+/// **The implementations this exists to reject.** Three, and the corpus is
+/// built so each fails a different assertion:
+///
+/// 1. A backend that never writes the statistics at all — the two columns both
+///    backend schemas already declare, which nothing reads or writes today.
+///    It fails on the recalled item's `access_count`.
+/// 2. A backend that seeds `last_accessed_at` from `created_at` rather than
+///    leaving it unset. `fx::item` pins `created_at` to `UNIX_EPOCH`, so
+///    "never accessed" and "accessed at creation" would be *literally the same
+///    value* in every fixture in this suite — which is why the assertion below
+///    is `is_none()`, not a comparison against some expected timestamp. There
+///    is no timestamp that could distinguish them.
+/// 3. A backend that bumps every item in the scope rather than the ones
+///    `record.items` names — the natural shape if the increment is written as
+///    a scope-wide `UPDATE` alongside the audit insert. The untouched item is
+///    in the corpus solely to catch it, and it is retrievable by the same
+///    query, so it cannot be missed for want of matching.
+///
+/// The recall's `at` is deliberately not `UNIX_EPOCH`: `last_accessed_at` must
+/// come from the audit record's own `at` (see `Backend::record_recall`), and a
+/// recall stamped at the epoch would agree with a backend that ignored `at`
+/// and wrote `created_at` instead.
+pub async fn recall_updates_access_statistics<F: BackendFactory>(factory: &F) {
+    use memorysafe_core::{Actor, AuditEvent, AuditRecord, ItemRef};
+
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let recalled = fx::item(&scope, "the cat sat on the mat");
+    let untouched = fx::item(&scope, "the cat sat on a rug");
+    for item in [recalled.clone(), untouched.clone()] {
+        backend
+            .apply(fx::admit_txn_embedded(&scope, item))
+            .await
+            .unwrap();
+    }
+
+    let before = backend
+        .retrieve_candidates(&scope, &query("cat", HardFilters::default()))
+        .await
+        .unwrap();
+    assert_eq!(
+        before.len(),
+        2,
+        "both items must be retrievable before the recall, or the comparison \
+         after it proves nothing"
+    );
+    for c in &before {
+        assert_eq!(
+            c.access_count, 0,
+            "an item that has never been recalled has access_count 0"
+        );
+        assert!(
+            c.last_accessed_at.is_none(),
+            "a never-accessed item is (None, 0), never (created_at, 0): got {:?}",
+            c.last_accessed_at
+        );
+    }
+
+    // One recall, naming exactly one of the two items.
+    let at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(3_600);
+    backend
+        .record_recall(AuditRecord::new(
+            scope.clone(),
+            AuditEvent::Recalled,
+            vec![ItemRef::from_item(&recalled)],
+            Actor::system(),
+            at,
+        ))
+        .await
+        .unwrap();
+
+    let after = backend
+        .retrieve_candidates(&scope, &query("cat", HardFilters::default()))
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 2, "the recall removed an item from the corpus");
+
+    let hit = after
+        .iter()
+        .find(|c| c.item.id == recalled.id)
+        .expect("the recalled item must still be retrievable");
+    assert_eq!(
+        hit.access_count, 1,
+        "record_recall did not increment the recalled item's access_count"
+    );
+    assert_eq!(
+        hit.last_accessed_at,
+        Some(at),
+        "last_accessed_at must be the audit record's own `at`, not a clock read \
+         and not created_at"
+    );
+
+    let skipped = after
+        .iter()
+        .find(|c| c.item.id == untouched.id)
+        .expect("the item the recall did not name must still be retrievable");
+    assert_eq!(
+        skipped.access_count, 0,
+        "record_recall bumped an item its record never referenced"
+    );
+    assert!(
+        skipped.last_accessed_at.is_none(),
+        "record_recall stamped an item its record never referenced: {:?}",
+        skipped.last_accessed_at
+    );
 }

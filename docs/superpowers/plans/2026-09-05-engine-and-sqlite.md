@@ -162,8 +162,11 @@ pub trait Backend: Send + Sync {
         -> Result<Vec<AuditRecord>, BackendError>;
     async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId)
         -> Result<PurgeReport, BackendError>;
+    async fn audit_aggregates(&self, tenant: &TenantId)
+        -> Result<Vec<AuditAggregate>, BackendError>;
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
-    async fn import(&self, stream: ImportStream) -> Result<ImportReport, BackendError>;
+    async fn import(&self, destination: &TenantId, stream: ImportStream)
+        -> Result<ImportReport, BackendError>;
 }
 
 // memorysafe-engine
@@ -267,7 +270,7 @@ CREATE TABLE audit (
   actor      TEXT NOT NULL,                   -- JSON
   policy     TEXT
 );
-CREATE INDEX idx_audit_scope_at ON audit(subject, namespace, at);
+CREATE INDEX idx_audit_scope_at ON audit(subject, namespace, at, id DESC);
 
 CREATE TABLE idempotency (
   key            TEXT PRIMARY KEY,
@@ -2317,16 +2320,19 @@ pub struct AuditFilter {
     /// a total order — `at` is whole seconds and cannot separate rows written
     /// in the same second, so a time-based cursor would repeat or skip them.
     pub after: Option<AuditId>,
-    // NOTE for the task that implements `Backend::audit`: `limit` defaults to
-    // 100 and carries no truncation signal, so a compliance query built from
-    // `AuditFilter::default()` silently stops at 100 rows with no way for the
-    // caller to know. Either surface a `truncated` flag on the result or make
-    // the caller choose explicitly before that method ships.
     pub item: Option<ItemId>,
     #[serde(with = "time::serde::timestamp::option")]
     pub since: Option<OffsetDateTime>,
     #[serde(with = "time::serde::timestamp::option")]
     pub until: Option<OffsetDateTime>,
+    /// Maximum rows to return. Defaults to 100.
+    ///
+    /// No `truncated` flag, and none is needed: `after` is a ULID cursor, so
+    /// a caller detects the end of the log from the page size alone —
+    /// `returned.len() < limit` means exhausted. `Backend::audit` states the
+    /// rule and requires implementations to return exactly
+    /// `min(limit, remaining)`; a backend that returns a short page for any
+    /// other reason breaks the signal.
     pub limit: usize,
 }
 
@@ -2616,6 +2622,25 @@ pub struct ScoredCandidate {
     pub value: Score,
     pub fragility: Score,
     pub estimated_tokens: u32,
+    /// When this item was last recalled. `retrieve_candidates` and
+    /// `neighbours` populate it; `record_recall` advances it.
+    ///
+    /// **A never-recalled item is `None`, never `Some(created_at)`.** `value`
+    /// weighs recency, `fragility` weighs access-recovery cost, and
+    /// `compose`'s replay quota is reserved for high-fragility *or
+    /// long-unaccessed* items — a feature that exists to resurface what is
+    /// never recalled, so an old item recalled yesterday must not look like
+    /// one never recalled at all. The distinction is also undetectable in this
+    /// workspace's own fixtures if it is not held: `fx::item` pins
+    /// `created_at` to `UNIX_EPOCH`, so `Some(created_at)` and "never
+    /// accessed" would be the same value everywhere the suite looks.
+    ///
+    /// Not on `MemoryItem`: that type is serialised into exports and digested
+    /// into identity records, so a per-read counter on it would change an
+    /// item's serialisation on every read. The ranking structs are ephemeral.
+    #[serde(with = "time::serde::timestamp::option")]
+    pub last_accessed_at: Option<OffsetDateTime>,
+    pub access_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2809,6 +2834,8 @@ mod tests {
             value: Score::clamped(0.6),
             fragility: Score::clamped(0.2),
             estimated_tokens: 12,
+            last_accessed_at: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
+            access_count: 3,
         };
         let ws = p.compose(&req, std::slice::from_ref(&candidate), &compose_ctx).unwrap();
         assert!(ws.items.is_empty(), "AlwaysAdmit composes nothing by design");
@@ -2820,6 +2847,11 @@ mod tests {
                 item: sample_item(),
                 value: Score::clamped(0.3),
                 fragility: Score::clamped(0.9),
+                // Never recalled: `(None, 0)`, not `(Some(created_at), 0)`.
+                // `sample_item().created_at` is the Unix epoch, so the two
+                // would be indistinguishable here if the second were allowed.
+                last_accessed_at: None,
+                access_count: 0,
             }],
             // Not the last page — a policy that only ever sees `true` here is
             // never tested on the partial-view case it must handle.
@@ -2973,6 +3005,15 @@ pub struct MaintenanceCandidate {
     pub item: MemoryItem,
     pub value: Score,
     pub fragility: Score,
+    /// The same access statistics `ScoredCandidate` carries. Maintenance is
+    /// where they matter most: "expensive to relearn and nobody has looked at
+    /// it in a year" is a different eviction candidate from "expensive to
+    /// relearn and recalled yesterday", and without these a policy sorting
+    /// eviction candidates can only reach for `created_at`, which says nothing
+    /// about use. `(None, 0)` for an item never recalled.
+    #[serde(with = "time::serde::timestamp::option")]
+    pub last_accessed_at: Option<OffsetDateTime>,
+    pub access_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4244,18 +4285,68 @@ pub trait Backend: Send + Sync {
     async fn list(&self, scope: &Scope, page: &Page)
         -> Result<Vec<MemoryItem>, BackendError>;
 
+    /// Ordered by `AuditId`, descending (newest first), with `filter.after`
+    /// continuing a previous page at `id < after`. Both `since` and `until`
+    /// are inclusive.
+    ///
+    /// **Truncation is detectable from the page size, so there is no
+    /// `truncated` flag.** Return exactly `min(filter.limit, rows still
+    /// matching after the cursor)` — never fewer for an internal batch size
+    /// or a partial read, never more. Given that, `returned.len() <
+    /// filter.limit` means the log is exhausted, and a caller pages by
+    /// re-issuing with `after` set to the last row's `AuditId`. A flag would
+    /// be a second encoding of what the cursor already carries, and the two
+    /// could disagree. `filter.after` appears in no conformance test, so this
+    /// doc comment is the only thing pinning either rule down.
     async fn audit(&self, scope: &Scope, filter: &AuditFilter)
         -> Result<Vec<AuditRecord>, BackendError>;
 
+    /// Erases a subject within a tenant. This is the *subject* erasure API and
+    /// the one with a conformance test; tenant erasure is an out-of-band
+    /// operator action with no method here — see `aggregates`' module doc.
     async fn purge_subject(
         &self,
         tenant: &TenantId,
         subject: &SubjectId,
     ) -> Result<PurgeReport, BackendError>;
 
+    /// Every audit aggregate held for `tenant`, keyed by tenant + policy
+    /// version + event class + day bucket and by nothing finer. The whole
+    /// argument — why no subject, why no namespace, why days rather than
+    /// hours, what it costs, and what residual it accepts — lives in the
+    /// `aggregates` module doc.
+    ///
+    /// The consequence for an implementer: **a cascading `purge_subject` must
+    /// not delete aggregate rows.** They name no subject and no namespace, so
+    /// there is nothing in them for the purge to be erasing; storing them in,
+    /// or cascading them from, the audit detail table destroys the one
+    /// artifact designed to outlive the detail.
+    ///
+    /// Ordered ascending by `day`, then `policy.to_string()`, then the event's
+    /// serialised snake_case name.
+    async fn audit_aggregates(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<AuditAggregate>, BackendError>;
+
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
 
-    async fn import(&self, stream: ImportStream) -> Result<ImportReport, BackendError>;
+    /// `destination` is authority for where the import lands, and is compared
+    /// against **every** record's own tenant — items and audit rows alike. A
+    /// record that disagrees rejects the whole import; it is never retargeted,
+    /// and an audit row's scope is never rewritten to fit. Because every
+    /// record is checked against the destination, a separate "the stream may
+    /// not span tenants" check is strictly implied and must not be written.
+    /// The payload's subject and namespace are preserved as written. A
+    /// header-only stream is valid and imports nothing. See the full contract
+    /// on `Backend::import` in `memorysafe-backend/src/lib.rs`; the asymmetry
+    /// with `export` is deliberate — `export` narrows a read within a tenant,
+    /// `import` authorises a write into one.
+    async fn import(
+        &self,
+        destination: &TenantId,
+        stream: ImportStream,
+    ) -> Result<ImportReport, BackendError>;
 
     /// Set a namespace's budget. Used by the conformance suite and by admin APIs.
     async fn set_budget(
@@ -4445,15 +4536,40 @@ pub fn item_with(
 }
 
 /// Same as `item`, but with a caller-supplied `created_at` instead of the
-/// fixed `UNIX_EPOCH` above. `item`'s timestamp is pinned so most conformance
-/// runs are deterministic and comparable, but that pin means many items tie
-/// under `ORDER BY created_at` — exactly the shape a real bulk import
-/// produces, and pagination must stay stable across it. Tests that need
-/// distinct, ordered timestamps (Task 17's `pagination_is_stable`) use this
-/// builder instead of forking `item` or reaching into its fields directly.
+/// fixed `UNIX_EPOCH` above.
+///
+/// `item`'s pinned timestamp makes a corpus built from it **fully tied** under
+/// `ORDER BY created_at` — the shape a real bulk import produces. That case is
+/// not avoided by this builder; it is covered directly by
+/// `retrieval::list_tie_break_is_total_over_identical_timestamps`, which uses
+/// `item`/`item_with_id` precisely *because* everything ties there and the
+/// tie-break is then the only thing ordering the pages.
+///
+/// This builder serves the two tests that need distinct, increasing
+/// timestamps: `retrieval::list_pages_are_disjoint_and_complete` (which
+/// isolates offset/limit arithmetic from ordering) and
+/// `retrieval::list_orders_oldest_first_by_created_at` (which can only observe
+/// sort direction where the primary key varies).
 pub fn item_at(scope: &Scope, body: &str, created_at: OffsetDateTime) -> MemoryItem {
     let mut i = item(scope, body);
     i.created_at = created_at;
+    i
+}
+
+/// Same as `item`, but with a caller-supplied `ItemId` — `item_at`'s
+/// counterpart for the tie-break key.
+///
+/// `ItemId::new()` is `ulid::Ulid::generate()`, and `ulid_id!` documents that
+/// lexicographic order equals creation order only "up to the timestamp's
+/// millisecond resolution", so ids minted in a tight loop are randomly ordered
+/// relative to each other. Any test asserting an id order must supply literal
+/// ULIDs through `ItemId::parse` and insert them in a deliberately
+/// non-ascending order, or it passes by coin flip — and passes
+/// deterministically for the wrong reason whenever the loop straddles a
+/// millisecond boundary.
+pub fn item_with_id(scope: &Scope, id: ItemId, body: &str) -> MemoryItem {
+    let mut i = item(scope, body);
+    i.id = id;
     i
 }
 
@@ -4835,7 +4951,9 @@ fn a_transaction_with_an_idempotency_key_and_payload_digest_is_valid() {
 
 **Interfaces:**
 - Consumes: `BackendFactory`, `fx`.
-- Produces: `sensitivity_ceiling_is_enforced_in_the_query`, `tag_and_kind_filters_narrow_results`, `vector_search_ranks_by_similarity`, `keyword_search_finds_exact_terms`, `hybrid_beats_either_alone`, `pagination_is_stable`, `pending_embedding_items_are_excluded_when_asked`, `capacity_accounting_tracks_items_and_bytes`, `concurrent_admits_do_not_double_count`, `eviction_releases_capacity`.
+- Produces: `sensitivity_ceiling_is_enforced_in_the_query`, `tag_and_kind_filters_narrow_results`, `vector_search_ranks_by_similarity`, `keyword_search_finds_exact_terms`, `hybrid_beats_either_alone`, `list_pages_are_disjoint_and_complete`, `pending_embedding_items_are_excluded_when_asked`, `capacity_accounting_tracks_items_and_bytes`, `concurrent_admits_do_not_double_count`, `eviction_releases_capacity`.
+
+**`list_pages_are_disjoint_and_complete` was called `pagination_is_stable`.** It was renamed to what it actually proves. "Stable" reads as tie-break stability — the one property it does not check, since it sorts and dedups the collected ids before asserting, which is right for disjointness and destroys every trace of order. The contract task that renamed it added the two tests that do check ordering: `list_orders_oldest_first_by_created_at` (distinct timestamps, rejects a backend paging descending) and `list_tie_break_is_total_over_identical_timestamps` (a fully tied corpus, rejects a backend whose tie-break is not total). The three cannot be merged: on a tied corpus an ascending and a descending backend produce identical output, and on distinct timestamps nothing ever ties.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -5183,23 +5301,17 @@ pub async fn hybrid_returns_both_signal_sources<F: BackendFactory>(factory: &F) 
     assert!(exact.relevance > 0.0);
 }
 
-/// Two pages must not overlap or drop rows.
+/// Three pages must not overlap and must not drop rows: page *disjointness*
+/// and completeness, and nothing else. Rejects a backend whose `OFFSET`
+/// arithmetic is off by one — a real bug that survives a perfect total order.
 ///
-/// `fx::item` pins every `created_at` to `OffsetDateTime::UNIX_EPOCH` so most
-/// conformance runs are deterministic — see its doc comment. That is exactly
-/// wrong for this test: with all 25 rows tied on `created_at`, a `list()`
-/// that orders by timestamp alone (the natural choice) sorts them in no
-/// stable order at all, and `LIMIT`/`OFFSET` over an unstable sort can
-/// return the same row on two pages while dropping another entirely. That
-/// would fail here looking like a backend bug when it is really a fixture
-/// bug — the corpus, not the backend, created the tie. `fx::item_at` gives
-/// each item its own increasing timestamp so this corpus contains no ties.
-/// `Backend::list`'s doc comment (`memorysafe-backend/src/lib.rs`) still
-/// requires implementations to break ties with a unique key, because a real
-/// corpus (a bulk import, say) can absolutely produce them — this fixture
-/// change makes the present test deterministic, it does not remove that
-/// requirement.
-pub async fn pagination_is_stable<F: BackendFactory>(factory: &F) {
+/// The corpus uses `fx::item_at`, so nothing ties and no tie-break is
+/// involved: an overlap or a dropped row here can only be a paging bug.
+/// Direction is covered by `list_orders_oldest_first_by_created_at` and
+/// totality by `list_tie_break_is_total_over_identical_timestamps`; the
+/// assertions below sort and dedup the ids, which destroys the evidence either
+/// of those needs.
+pub async fn list_pages_are_disjoint_and_complete<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
 
@@ -5523,9 +5635,13 @@ and extend `run!`:
         retrieval::keyword_search_finds_exact_terms,
         retrieval::keyword_search_escapes_user_input,
         retrieval::hybrid_returns_both_signal_sources,
-        retrieval::pagination_is_stable,
+        retrieval::list_pages_are_disjoint_and_complete,
+        retrieval::list_orders_oldest_first_by_created_at,
+        retrieval::list_tie_break_is_total_over_identical_timestamps,
         retrieval::pending_embedding_items_are_excluded_when_asked,
         retrieval::cross_model_vectors_are_rejected,
+        retrieval::neighbours_break_ties_before_truncating_at_k,
+        retrieval::recall_updates_access_statistics,
         capacity::capacity_accounting_tracks_items_and_bytes,
         capacity::eviction_releases_capacity,
         capacity::concurrent_admits_do_not_double_count,
@@ -5918,7 +6034,10 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
     let exported = source.export(&selector).await.unwrap();
 
     let target = factory.create().await;
-    let report = target.import(exported.clone()).await.unwrap();
+    let report = target
+        .import(&selector.tenant, exported.clone())
+        .await
+        .unwrap();
     assert_eq!(report.items_imported, 3);
     assert_eq!(report.vectors_imported, 3);
     assert_eq!(
@@ -6001,7 +6120,10 @@ pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
     let exported = source.export(&selector).await.unwrap();
 
     let target = factory.create().await;
-    let first = target.import(exported.clone()).await.unwrap();
+    let first = target
+        .import(&selector.tenant, exported.clone())
+        .await
+        .unwrap();
     assert_eq!(first.items_imported, 1);
     assert!(
         target
@@ -6012,7 +6134,7 @@ pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
         "include_audit: false must not import any audit rows"
     );
 
-    let second = target.import(exported).await.unwrap();
+    let second = target.import(&selector.tenant, exported).await.unwrap();
     assert_eq!(second.items_imported, 0);
     assert_eq!(second.items_skipped_existing, 1);
     assert_eq!(
@@ -6067,9 +6189,19 @@ and extend `run!`:
         lifecycle::purge_subject_leaves_other_subjects_intact,
         lifecycle::export_import_round_trips_exactly,
         lifecycle::import_is_idempotent,
+        lifecycle::import_rejects_a_later_record_whose_tenant_disagrees,
+        lifecycle::audit_aggregates_survive_a_cascading_purge,
 ```
 
-The suite now stands at **27 conformance tests** (4 isolation + 5 atomicity + 9 retrieval + 4 capacity + 5 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified.
+The suite now stands at **33 conformance tests** (4 isolation + 5 atomicity + 13 retrieval + 4 capacity + 7 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified.
+
+Six of those were added after Tasks 17 and 18 shipped, by the contract task that changed `Backend::import`'s signature and put access statistics on the ranking structs — the last point at which adding conformance tests and changing trait signatures cost nothing, because no `impl Backend` existed yet. They are listed in the `run!` snippets above so those snippets match the file rather than the day it was written:
+`retrieval::list_orders_oldest_first_by_created_at`,
+`retrieval::list_tie_break_is_total_over_identical_timestamps`,
+`retrieval::neighbours_break_ties_before_truncating_at_k`,
+`retrieval::recall_updates_access_statistics`,
+`lifecycle::import_rejects_a_later_record_whose_tenant_disagrees`, and
+`lifecycle::audit_aggregates_survive_a_cascading_purge`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -6099,6 +6231,8 @@ git commit -m "feat(backend): conformance tests for audit, purge, and portabilit
 - Produces: `SqliteBackend::open(root: PathBuf) -> SqliteBackend`, `SqliteBackend::with_max_open(root, n)`, `TenantManager::with_conn<T>(tenant, f)`, `TenantManager::with_write<T>(tenant, f)`, `schema::SCHEMA_VERSION`, `schema::initialise(&Connection)`.
 
 **Design:** one database file per tenant, named `<tenant>.db` under the root. `TenantId` validation from Task 2 already forbids `/`, `..`, and control characters, so the name is safe as a path component. Reads run concurrently under WAL; writes for a given tenant are serialized through a per-tenant `tokio::sync::Mutex`, which is what makes the capacity accounting correct.
+
+**This task also creates the `audit_aggregates` table.** Its key is policy name, policy version, event class, and day bucket — and **nothing else**: no subject column, no namespace column. `memorysafe_backend::aggregates` carries the full argument; the short version is that a cascading purge deletes items, vectors, audit, idempotency and capacity all by subject, so a namespace column here would make an aggregate row the sole surviving artifact naming a purged subject's namespace. Store the histogram bucket counts as ten integers plus the `SCORE_HISTOGRAM_VERSION` the row was written under, and do **not** give the table a foreign key to `audit` or include it in `purge::subject`'s sweep — `lifecycle::audit_aggregates_survive_a_cascading_purge` fails if you do. The two columns `items.last_access` and `items.access_count` are also read for the first time from Task 21 onward; they have been declared since this task and unread until now.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6362,7 +6496,7 @@ CREATE TABLE IF NOT EXISTS audit (
   actor      TEXT NOT NULL,
   policy     TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_audit_scope_at ON audit(subject, namespace, at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_scope_at ON audit(subject, namespace, at, id DESC);
 
 CREATE TABLE IF NOT EXISTS idempotency (
   key            TEXT PRIMARY KEY,
@@ -6558,6 +6692,8 @@ git commit -m "feat(sqlite): per-tenant database files, schema, and pooled conne
 ---
 
 ## Task 20: SQLite — items and audit
+
+**Also increments the aggregates.** Every audit row this task writes updates the matching `audit_aggregates` row in the same transaction — same key, count + 1, and the assessment's `value`/`fragility` bucketed with `memorysafe_backend::aggregates::score_bucket`. Same transaction, not a follow-up write: an aggregate that can diverge from the detail rows it summarises is worse than no aggregate. `record_recall` additionally bumps `items.last_access` and `items.access_count` for every item its `AuditRecord::items` references, in that same transaction — see `Backend::record_recall`.
 
 **Files:**
 - Create: `crates/memorysafe-backend-sqlite/src/items.rs`
@@ -7028,8 +7164,13 @@ impl Backend for SqliteBackend {
     async fn export(&self, _s: &ScopeSelector) -> Result<ExportStream, BackendError> {
         Ok(vec![])
     }
-    async fn import(&self, _s: ImportStream) -> Result<ImportReport, BackendError> {
+    async fn import(&self, _t: &TenantId, _s: ImportStream)
+        -> Result<ImportReport, BackendError> {
         Ok(ImportReport::default())
+    }
+    async fn audit_aggregates(&self, _t: &TenantId)
+        -> Result<Vec<AuditAggregate>, BackendError> {
+        Ok(vec![])
     }
 }
 ```
@@ -7288,7 +7429,13 @@ pub fn search(
         scored.push((item, score));
     }
 
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // Tie-break by ascending `ItemId` before truncating at `k`: this
+    // function is the over-fetch source for both `neighbours` (`k` is the
+    // caller's `k`) and `retrieve_candidates` (`k` is `query.limit * 4`), so
+    // an untied truncation here drops candidates nondeterministically
+    // upstream of fusion — a downstream tie-break on the fused set cannot
+    // recover a candidate this truncation already discarded.
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
     scored.truncate(k);
     Ok(scored)
 }
@@ -7316,7 +7463,7 @@ Replace the placeholder `neighbours` in `lib.rs`:
                 let hits = vectors::search(c, &scope, &probe, k)?;
                 Ok(hits
                     .into_iter()
-                    .map(|(item, score)| ScoredCandidate {
+                    .map(|(item, access, score)| ScoredCandidate {
                         estimated_tokens: estimate_tokens(&item.body),
                         item,
                         relevance: score,
@@ -7324,6 +7471,16 @@ Replace the placeholder `neighbours` in `lib.rs`:
                         keyword_score: None,
                         value: memorysafe_core::Score::ZERO,
                         fragility: memorysafe_core::Score::ZERO,
+                        // `last_access`/`access_count` are the two columns the
+                        // schema has declared since Task 19 and nothing read
+                        // until now. Select them alongside `ITEM_COLUMNS` and
+                        // return them from `vectors::search` as their own
+                        // tuple element — they must NOT go on `MemoryItem`,
+                        // which is exported and digested. A row that has never
+                        // been recalled reads back `(None, 0)`, never
+                        // `(created_at, 0)`.
+                        last_accessed_at: access.last_accessed_at,
+                        access_count: access.access_count,
                     })
                     .collect())
             })
@@ -7420,8 +7577,18 @@ async fn hybrid_returns_both_signal_sources() {
 }
 
 #[tokio::test]
-async fn pagination_is_stable() {
-    retrieval::pagination_is_stable(&SqliteFactory).await;
+async fn list_pages_are_disjoint_and_complete() {
+    retrieval::list_pages_are_disjoint_and_complete(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn list_orders_oldest_first_by_created_at() {
+    retrieval::list_orders_oldest_first_by_created_at(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn list_tie_break_is_total_over_identical_timestamps() {
+    retrieval::list_tie_break_is_total_over_identical_timestamps(&SqliteFactory).await;
 }
 
 #[tokio::test]
@@ -7645,6 +7812,11 @@ pub fn candidates(
                 keyword_score,
                 value: Score::ZERO,
                 fragility: Score::ZERO,
+                // From the item row's `last_access`/`access_count` columns,
+                // carried through the merge map beside the item. `(None, 0)`
+                // for a row never recalled.
+                last_accessed_at: access.last_accessed_at,
+                access_count: access.access_count,
             }
         })
         .collect();
@@ -7730,6 +7902,8 @@ git commit -m "feat(sqlite): FTS5 keyword search with escaping and hybrid fusion
 ---
 
 ## Task 23: SQLite — capacity accounting, merge, and idempotency
+
+**Also increments the aggregates** for the audit rows this task's paths write (merges, evictions under capacity pressure), on the same terms as Task 20: same transaction as the audit row, same key, same bucketing.
 
 **Files:**
 - Create: `crates/memorysafe-backend-sqlite/src/capacity.rs`
@@ -8109,7 +8283,7 @@ Add `pub mod capacity;` and `use rusqlite::params;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 27 conformance tests minus the 5 lifecycle ones, i.e. 22 conformance tests plus 12 unit tests, all ok.
+Expected: PASS — 33 conformance tests minus the 7 lifecycle ones, i.e. 26 conformance tests plus 12 unit tests, all ok.
 
 - [ ] **Step 5: Commit**
 
@@ -8132,7 +8306,7 @@ git commit -m "feat(sqlite): locked capacity accounting, merge, and idempotent w
 - Consumes: everything in the crate.
 - Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and a single `full_conformance_suite` test.
 
-**Milestone: the complete 27-test conformance suite passes.** From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
+**Milestone: the complete 33-test conformance suite passes.** From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -8215,14 +8389,17 @@ use crate::tenant::SqlResultExt;
 use crate::{capacity, items, vectors};
 use base64::Engine as _;
 use memorysafe_backend::{
-    BackendError, ExportRecord, ExportStream, ExportVector, ImportReport, ImportStream,
-    ScopeSelector,
+    BackendError, ExportRecord, ExportStream, ExportVector, FORMAT_VERSION, ImportReport,
+    ImportStream, ScopeSelector,
 };
-use memorysafe_core::{AuditFilter, Protection, Scope};
+use memorysafe_core::{AuditFilter, Protection, Scope, TenantId};
 use memorysafe_embed::QuantizedVector;
 use rusqlite::{Connection, params};
 
-pub const FORMAT_VERSION: u32 = 1;
+// `FORMAT_VERSION` is `memorysafe-backend`'s, not a private copy. "A supported
+// format version" is a property of the format, not of whichever backend is
+// reading the stream; two backends each declaring their own constant is one
+// silent divergence away from a SQLite export Postgres refuses.
 
 pub fn export(
     conn: &Connection,
@@ -8283,11 +8460,24 @@ pub fn export(
     }
 
     if sel.include_audit {
+        // Collect across every scope before sorting: `audit::query` returns
+        // each scope's rows newest-first (descending `AuditId`, per this
+        // commit's fix to that function), but `Backend::export`'s contract
+        // is one global run ascending by `AuditId` — appending each scope's
+        // descending run back to back would satisfy neither order.
+        //
+        // `limit: 100_000` truncates silently for a tenant with more audit
+        // rows than that — the same defect `AuditFilter::limit`'s doc
+        // comment warns about (see `crates/memorysafe-core/src/audit.rs`).
+        // Not resolved here.
+        let mut audit_rows = Vec::new();
         for scope in scopes {
             let filter = AuditFilter { limit: 100_000, ..Default::default() };
-            for record in crate::audit::query(conn, &scope, &filter)? {
-                out.push(ExportRecord::Audit { audit: Box::new(record) });
-            }
+            audit_rows.extend(crate::audit::query(conn, &scope, &filter)?);
+        }
+        audit_rows.sort_by(|a, b| a.id.cmp(&b.id));
+        for record in audit_rows {
+            out.push(ExportRecord::Audit { audit: Box::new(record) });
         }
     }
 
@@ -8296,6 +8486,7 @@ pub fn export(
 
 pub fn import(
     conn: &mut Connection,
+    destination: &TenantId,
     stream: ImportStream,
 ) -> Result<ImportReport, BackendError> {
     let tx = conn.transaction().map_err(|e| crate::tenant::storage_error(e, false))?;
@@ -8312,6 +8503,18 @@ pub fn import(
             }
             ExportRecord::Item { mut item, vector } => {
                 let scope: Scope = item.scope.clone();
+                // Every record is compared against `destination` — never
+                // against another record. No record's tenant is authority for
+                // any other's, so a disagreement rejects the whole import
+                // rather than being retargeted. `subject` and `namespace` are
+                // preserved exactly as written; only the tenant is checked,
+                // and it is checked rather than assigned.
+                if scope.tenant != *destination {
+                    return Err(BackendError::MalformedImport(format!(
+                        "item {} names tenant {} but the destination is {destination}",
+                        item.id, scope.tenant
+                    )));
+                }
                 // Import is idempotent: an item already present is skipped
                 // rather than duplicated or overwritten.
                 if items::exists(&tx, &scope, &item.id)? {
@@ -8355,6 +8558,16 @@ pub fn import(
                 }
             }
             ExportRecord::Audit { audit } => {
+                // The same comparison, so audit rows need no rule of their
+                // own: same tenant as the destination, preserve the row
+                // byte-exact; different, reject. The scope is never rewritten
+                // to make the row fit — a rewritten audit row is a forged one.
+                if audit.scope.tenant != *destination {
+                    return Err(BackendError::MalformedImport(format!(
+                        "audit row {} names tenant {} but the destination is {destination}",
+                        audit.id, audit.scope.tenant
+                    )));
+                }
                 crate::audit::insert(&tx, &audit)?;
                 report.audit_imported += 1;
             }
@@ -8383,35 +8596,37 @@ Replace the last three placeholders in `lib.rs`:
             .await
     }
 
-    async fn import(&self, stream: ImportStream) -> Result<ImportReport, BackendError> {
-        // Every record in a stream belongs to one tenant; take it from the
-        // first item and reject a stream that mixes tenants.
-        let tenant = stream
-            .iter()
-            .find_map(|r| match r {
-                ExportRecord::Item { item, .. } => Some(item.scope.tenant.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                BackendError::MalformedImport("stream contains no items".into())
-            })?;
-        if stream.iter().any(|r| matches!(
-            r, ExportRecord::Item { item, .. } if item.scope.tenant != tenant
-        )) {
-            return Err(BackendError::MalformedImport(
-                "a stream may not span tenants".into(),
-            ));
-        }
-        self.tenants.with_write(&tenant, move |c| portability::import(c, stream)).await
+    async fn import(&self, destination: &TenantId, stream: ImportStream)
+        -> Result<ImportReport, BackendError>
+    {
+        // Deliberately no "a stream may not span tenants" check and no
+        // "stream contains no items" rejection.
+        //
+        // The span check is strictly implied: `portability::import` compares
+        // every record against `destination`, so two records cannot disagree
+        // with each other without at least one of them disagreeing with the
+        // destination first. A second rule that is true only by implication
+        // has no test of its own, cannot fail today, and silently stops being
+        // implied the day someone weakens the first.
+        //
+        // The empty-stream rejection existed only to derive a tenant from the
+        // first item. The destination is now a parameter, so there is nothing
+        // left to derive and nothing left to reject: a header-only stream is
+        // a valid export of an empty tenant, and the round trip has to
+        // survive it.
+        let dest = destination.clone();
+        self.tenants
+            .with_write(destination, move |c| portability::import(c, &dest, stream))
+            .await
     }
 ```
 
-`ScopeSelector` needs `Clone`; confirm the derive from Task 14. Add `pub mod portability;` and `pub mod purge;`.
+`ScopeSelector` needs `Clone`; confirm the derive from Task 14. Add `pub mod portability;` and `pub mod purge;`. `lib.rs` no longer needs `ExportRecord` — nothing in it inspects the stream now.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite && cargo clippy -p memorysafe-backend-sqlite --all-targets -- -D warnings`
-Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 27 conformance test names and passes.
+Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 33 conformance test names and passes.
 
 - [ ] **Step 5: Commit**
 
@@ -8594,13 +8809,19 @@ mod tests {
         );
     }
 
-    // The tests above state this function's contract. Its arithmetic is
-    // additionally pinned by mutation-killer tests not reproduced here —
+    // The tests above state this function's contract. **Task 25 must also
+    // write** four mutation-killer tests pinning the arithmetic, not
+    // reproduced here because they would bury the contract tests above
+    // under linearity checks:
     // `the_sparser_branch_is_linear_between_the_baseline_and_zero`,
     // `the_denser_branch_is_linear_between_the_baseline_and_one`,
     // `typical_density_at_the_lower_extreme_scores_one_half_without_dividing_by_zero`,
-    // and `typical_density_at_the_upper_extreme_scores_one_half_without_dividing_by_zero`
-    // — see `crates/memorysafe-policy/src/fragility.rs`.
+    // and `typical_density_at_the_upper_extreme_scores_one_half_without_dividing_by_zero`.
+    // None of these four exist anywhere in this repository yet — they are
+    // not merely omitted from this listing, they have not been written.
+    // The "Do not fold the two branches" warning in `score`'s doc comment
+    // depends on the linearity pair among them to actually catch a
+    // regression; without writing them, that warning is unenforced prose.
 }
 ```
 
@@ -8707,13 +8928,17 @@ impl BaselineConfig {
 ```rust
 use crate::config::BaselineConfig;
 use memorysafe_core::{RedundancyAssessment, Score, ScoredCandidate};
-use std::cmp::Reverse;
 
 pub use crate::config::Verdict;
 
 /// Redundancy is the similarity of the closest existing memory. Neighbours
-/// arrive sorted from the engine, but the sort is repeated here so the
-/// function is correct in isolation and testable with hand-built fixtures.
+/// arrive sorted from the engine, but the sort is repeated here — with an
+/// explicit tie-break, not by relying on a stable sort to inherit order
+/// from an already-sorted input — so the function is correct in isolation
+/// and testable with hand-built fixtures given in any order. The tie-break
+/// (ascending `ItemId`) matches `RedundancyAssessment::near_duplicates`'s
+/// documented rule, so `best()` names a deterministic merge target
+/// regardless of the order `neighbours` arrived in.
 pub fn assess(
     neighbours: &[ScoredCandidate],
     cfg: &BaselineConfig,
@@ -8725,7 +8950,7 @@ pub fn assess(
         // relevance marginally above 1.0 from f32 rounding must not error.
         .map(|n| (n.item.id.clone(), Score::clamped(n.relevance)))
         .collect();
-    near.sort_by_key(|x| Reverse(x.1));
+    near.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let best = neighbours.iter().map(|n| n.relevance).fold(0.0f32, f32::max);
     RedundancyAssessment { score: Score::clamped(best), near_duplicates: near }
@@ -8901,6 +9126,11 @@ pub fn candidate(body: &str, relevance: f32) -> ScoredCandidate {
         value: Score::clamped(0.5),
         fragility: Score::clamped(0.5),
         estimated_tokens: 10,
+        // Never recalled by default. `compose`'s replay-staleness tests set
+        // this explicitly; a fixture that defaulted it to the item's
+        // `created_at` would make every candidate look freshly accessed.
+        last_accessed_at: None,
+        access_count: 0,
     }
 }
 ```
@@ -9846,7 +10076,19 @@ fn fits(req: &RecallRequest, tokens: u32, items: usize) -> bool {
 /// fragile, or it has not been touched in a long time. This is `replay` from
 /// the continual-learning lineage, applied to a context window.
 fn replay_due(c: &ScoredCandidate, ctx: &ComposeContext, cfg: &BaselineConfig) -> bool {
-    let stale = ctx.now - c.item.created_at >= Duration::days(cfg.replay_stale_days as i64);
+    // Staleness is measured from the last *recall*, not from creation. The
+    // replay quota exists to resurface what is never recalled, so an old item
+    // recalled yesterday is not stale and must not win a reserved slot.
+    // Measuring from `created_at` inverts the feature: it promotes exactly the
+    // items that are already being used.
+    //
+    // A never-recalled item falls back to `created_at`, because its age is the
+    // only proxy available for "how long has nobody looked at this". That
+    // fallback is a decision taken here, visibly, which is why
+    // `last_accessed_at` is `None` rather than a backend-invented
+    // `Some(created_at)` — the policy can see it is guessing.
+    let since_access = c.last_accessed_at.unwrap_or(c.item.created_at);
+    let stale = ctx.now - since_access >= Duration::days(cfg.replay_stale_days as i64);
     c.fragility.get() >= 0.8 || (stale && c.fragility.get() >= 0.5)
 }
 
@@ -10355,6 +10597,8 @@ mod tests {
             value: Score::clamped(0.5),
             fragility: Score::clamped(0.5),
             estimated_tokens: 5,
+            last_accessed_at: None,
+            access_count: 0,
         }
     }
 
@@ -11239,6 +11483,18 @@ pub async fn admit_context(
                 value: memorysafe_core::Score::clamped(0.5),
                 fragility: memorysafe_core::Score::clamped(0.5),
                 item,
+                // OPEN: `Backend::list` returns bare `MemoryItem`s, and the
+                // access statistics deliberately do not live on that type, so
+                // this path has no source for them. `(None, 0)` here means
+                // "unknown" but reads to a policy as "never recalled", which
+                // is the wrong answer for a frequently-recalled item offered
+                // for eviction. Before `admit` is allowed to weigh staleness,
+                // the listing path needs to carry the statistics — a `list`
+                // that returns them beside each item, or a dedicated read.
+                // Flagged by the contract task that added these fields; not
+                // solved there.
+                last_accessed_at: None,
+                access_count: 0,
             })
             .collect()
     } else {
@@ -12174,6 +12430,13 @@ impl Engine {
                 value: memorysafe_core::Score::clamped(0.5),
                 fragility: memorysafe_core::Score::clamped(0.5),
                 item,
+                // OPEN: same gap as the `admit` path above — `Backend::list`
+                // returns bare `MemoryItem`s and the access statistics are not
+                // on that type. `(None, 0)` reads as "never recalled", which
+                // is the wrong answer for a hot item, and maintenance is
+                // precisely where staleness is supposed to matter.
+                last_accessed_at: None,
+                access_count: 0,
             })
             .collect();
         let ctx = MaintainContext {
@@ -12500,6 +12763,8 @@ git commit -m "feat(engine): content-addressed embedding cache and scope stats c
 ---
 
 ## Task 36: Engine — retention profiles
+
+**`AuditRetention::aggregate` is enforced here.** It is the only span that applies to `audit_aggregates` rows; `detail` and `purge_cascade` govern the audit detail table and must not reach the aggregate table. An aggregate row expires on its own span or not at all.
 
 **Files:**
 - Create: `crates/memorysafe-engine/src/retention.rs`
@@ -12841,7 +13106,9 @@ git commit -m "feat(engine): four named audit retention profiles honoured on sub
 
 **Interfaces:**
 - Consumes: `Backend::export`, `Backend::import`.
-- Produces: `Engine::export(&ScopeSelector) -> Result<ExportStream, EngineError>`, `Engine::export_ndjson(&ScopeSelector) -> Result<String, EngineError>`, `Engine::export_markdown(&ScopeSelector) -> Result<String, EngineError>`, `Engine::import_ndjson(&str) -> Result<ImportReport, EngineError>`, `Engine::import`.
+- Produces: `Engine::export(&ScopeSelector) -> Result<ExportStream, EngineError>`, `Engine::export_ndjson(&ScopeSelector) -> Result<String, EngineError>`, `Engine::export_markdown(&ScopeSelector) -> Result<String, EngineError>`, `Engine::import_ndjson(&str, &TenantId) -> Result<ImportReport, EngineError>`, `Engine::import(&TenantId, ImportStream)`.
+
+**Why the engine grows the destination too:** `Backend::import` takes the tenant it writes into, and the engine cannot invent one — it has no basis to guess, and guessing from the payload is exactly the property the backend parameter removed. It is passed straight through.
 
 **Why markdown too:** the spec's portable archive is "newline-delimited JSON plus a rendered markdown view of the items for human reading." The JSON is the round-trip format; the markdown is what makes "your memory is yours" mean something a person can actually open.
 
@@ -12871,9 +13138,13 @@ fn scope() -> Scope {
     Scope::new("acme", "user-42", "agent").unwrap()
 }
 
+fn tenant() -> TenantId {
+    TenantId::new("acme").unwrap()
+}
+
 fn selector(include_audit: bool) -> ScopeSelector {
     ScopeSelector {
-        tenant: TenantId::new("acme").unwrap(),
+        tenant: tenant(),
         subject: None,
         namespace: None,
         include_audit,
@@ -12899,7 +13170,7 @@ async fn ndjson_round_trips_through_a_fresh_engine() {
     assert!(ndjson.lines().count() >= 4, "header plus three items");
 
     let target = engine();
-    let report = target.import_ndjson(&ndjson).await.unwrap();
+    let report = target.import_ndjson(&ndjson, &tenant()).await.unwrap();
     assert_eq!(report.items_imported, 3);
 
     let mut before = source.review(&scope(), &Default::default()).await.unwrap();
@@ -12938,8 +13209,8 @@ async fn importing_the_same_stream_twice_changes_nothing_the_second_time() {
     let ndjson = source.export_ndjson(&selector(false)).await.unwrap();
 
     let target = engine();
-    target.import_ndjson(&ndjson).await.unwrap();
-    let second = target.import_ndjson(&ndjson).await.unwrap();
+    target.import_ndjson(&ndjson, &tenant()).await.unwrap();
+    let second = target.import_ndjson(&ndjson, &tenant()).await.unwrap();
 
     assert_eq!(second.items_imported, 0);
     assert_eq!(second.items_skipped_existing, 3);
@@ -12964,7 +13235,7 @@ async fn an_import_cannot_downgrade_sensitivity_or_forge_a_pin() {
             .replace("           ", "")
     );
 
-    e.import_ndjson(&ndjson).await.unwrap();
+    e.import_ndjson(&ndjson, &tenant()).await.unwrap();
     let stored = e.review(&scope(), &Default::default()).await.unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(
@@ -12982,7 +13253,7 @@ async fn an_import_cannot_downgrade_sensitivity_or_forge_a_pin() {
 #[tokio::test]
 async fn malformed_ndjson_is_rejected_with_a_useful_error() {
     let e = engine();
-    let err = e.import_ndjson("{not json at all").await.unwrap_err();
+    let err = e.import_ndjson("{not json at all", &tenant()).await.unwrap_err();
     assert!(err.to_string().contains("line 1"), "the error must name the bad line: {err}");
 }
 
@@ -13022,7 +13293,11 @@ impl Engine {
     /// backend already forces `protection` back to `Normal`; this recomputes the
     /// sensitivity the same way a write would, and keeps whichever level is
     /// higher so an import can never lower a stored classification.
-    pub async fn import(&self, stream: ImportStream) -> Result<ImportReport, EngineError> {
+    pub async fn import(
+        &self,
+        destination: &TenantId,
+        stream: ImportStream,
+    ) -> Result<ImportReport, EngineError> {
         let reassessed: ImportStream = stream
             .into_iter()
             .map(|record| match record {
@@ -13043,7 +13318,7 @@ impl Engine {
                 other => other,
             })
             .collect();
-        Ok(self.backend.import(reassessed).await?)
+        Ok(self.backend.import(destination, reassessed).await?)
     }
 
     /// The round-trip format: one JSON object per line.
@@ -13059,7 +13334,16 @@ impl Engine {
         Ok(out)
     }
 
-    pub async fn import_ndjson(&self, ndjson: &str) -> Result<ImportReport, EngineError> {
+    /// `destination` is passed straight through to `Backend::import`. The
+    /// engine does not derive it from the stream: an authorising caller — the
+    /// HTTP route's API key, the CLI's `--scope` — already knows which tenant
+    /// it is writing into, and deriving it here would put the payload back in
+    /// charge of its own destination.
+    pub async fn import_ndjson(
+        &self,
+        ndjson: &str,
+        destination: &TenantId,
+    ) -> Result<ImportReport, EngineError> {
         let mut stream: ImportStream = Vec::new();
         for (i, line) in ndjson.lines().enumerate() {
             if line.trim().is_empty() {
@@ -13070,7 +13354,7 @@ impl Engine {
             })?;
             stream.push(record);
         }
-        self.import(stream).await
+        self.import(destination, stream).await
     }
 
     /// A human-readable rendering. This is what makes "your memory is yours"
@@ -13333,7 +13617,7 @@ proptest! {
             let ndjson = source.export_ndjson(&selector).await.unwrap();
 
             let target = engine();
-            target.import_ndjson(&ndjson).await.unwrap();
+            target.import_ndjson(&ndjson, &selector.tenant).await.unwrap();
 
             let page = memorysafe_backend::Page { offset: 0, limit: 1000 };
             let mut before = source.review(&scope(), &page).await.unwrap();
@@ -13775,7 +14059,7 @@ git commit -m "feat(engine): pending-embedding backfill and explicit re-embeddin
 - `cargo test --workspace --all-features` is green.
 - `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 - The CI purity job confirms `memorysafe-core` and `memorysafe-policy` pull in no I/O crates.
-- `SqliteBackend` passes all 27 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
+- `SqliteBackend` passes all 33 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
 - The five invariants pass at 64 proptest cases in release mode.
 - An engine can be constructed and driven end to end from a Rust test with no server, no network, and no model files.
 - No item is left permanently unsearchable: `pending_embedding` has a backfill path, and changing embedder is an explicit audited migration.

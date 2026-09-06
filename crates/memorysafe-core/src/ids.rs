@@ -68,6 +68,27 @@ scope_component!(Namespace, "namespace");
 
 macro_rules! ulid_id {
     ($name:ident) => {
+        /// A ULID: a 48-bit millisecond timestamp followed by 80 bits of
+        /// randomness, encoded as a canonical 26-character Crockford Base32
+        /// string. Every ordering contract this crate documents on `ItemId`
+        /// and `AuditId` — `Backend::list`'s, `retrieve_candidates`'s,
+        /// `neighbours`'s, `AuditFilter::after`'s — leans on one property of
+        /// that encoding: lexicographic (byte) order of the string equals
+        /// numeric order of the 128-bit value, which equals creation order
+        /// up to the timestamp's millisecond resolution. The derived `Ord`
+        /// below is not an arbitrary choice of comparison; it is that
+        /// property.
+        ///
+        /// This holds only because every value is the same length:
+        /// Crockford Base32's digits are ASCII-ordered the same as their
+        /// numeric value (`0`-`9` sort before `A`-`Z`), so byte comparison
+        /// of two equal-length encodings agrees with numeric comparison —
+        /// but would not if the lengths differed. `parse` enforces the
+        /// canonical 26-character form via `ulid::Ulid::from_string`, so
+        /// every value built through this crate's own API satisfies it;
+        /// `Deserialize` does not route through `parse` (the inner field is
+        /// a plain `String`), so a value arriving from outside this process
+        /// is not guaranteed to.
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         pub struct $name(String);
 

@@ -82,6 +82,30 @@ pub struct ScoredCandidate {
     pub value: Score,
     pub fragility: Score,
     pub estimated_tokens: u32,
+    /// When this item was last recalled. `Backend::retrieve_candidates` and
+    /// `Backend::neighbours` populate it; `Backend::record_recall` advances it.
+    ///
+    /// **A never-recalled item is `None`, never `Some(created_at)`.** The two
+    /// must stay distinguishable: `value` weighs recency and `fragility`
+    /// weighs access-recovery cost, and `compose`'s replay quota is reserved
+    /// for high-fragility *or long-unaccessed* items — a feature that exists
+    /// to resurface what is never recalled. Defaulting to `created_at` makes
+    /// an old item recalled yesterday look identical to one never recalled at
+    /// all, which is precisely backwards. It would also be undetectable in
+    /// this workspace's own tests: `fx::item` pins `created_at` to
+    /// `UNIX_EPOCH`, so in every conformance fixture `Some(created_at)` and
+    /// "never accessed" would be the same value.
+    ///
+    /// These two fields live here and on `MaintenanceCandidate`, and
+    /// deliberately **not** on `MemoryItem`: that type is serialised into
+    /// exports and digested into identity records, so a per-read counter on it
+    /// would change an item's serialisation on every read. The ranking structs
+    /// are ephemeral — never digested, never exported.
+    #[serde(with = "time::serde::timestamp::option")]
+    pub last_accessed_at: Option<OffsetDateTime>,
+    /// How many times this item has been recalled. `0` for an item never
+    /// recalled, which pairs with `last_accessed_at: None`.
+    pub access_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

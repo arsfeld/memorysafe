@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 27-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
+**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 33-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
 
 **Architecture:** A second Cargo workspace, in its own closed repository, with the open-source repository vendored as a git submodule at `vendor/memorysafe` and consumed through path dependencies. One crate, `memorysafe-backend-postgres`, implements the `Backend` trait frozen at the end of Plan 1 Task 24. Every operation runs inside a transaction that first sets a transaction-local `memorysafe.tenant_id` GUC and `search_path`; the pool's connections run as a non-superuser role, so the RLS policy — not the query text — is what makes cross-tenant reads return nothing. Vector search generates candidates through a pgvector HNSW index and then reranks them exactly in Rust with `QuantizedVector::dot`, the same function the SQLite backend scores with, so both backends order identically.
 
@@ -59,8 +59,11 @@ pub trait Backend: Send + Sync {
         -> Result<Vec<AuditRecord>, BackendError>;
     async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId)
         -> Result<PurgeReport, BackendError>;
+    async fn audit_aggregates(&self, tenant: &TenantId)
+        -> Result<Vec<AuditAggregate>, BackendError>;
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
-    async fn import(&self, stream: ImportStream) -> Result<ImportReport, BackendError>;
+    async fn import(&self, destination: &TenantId, stream: ImportStream)
+        -> Result<ImportReport, BackendError>;
     async fn set_budget(&self, scope: &Scope, budget: Budget) -> Result<(), BackendError>;
 }
 ```
@@ -91,17 +94,27 @@ pub trait BackendFactory: Send + Sync {
 pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) where F::B: 'static;
 ```
 
-Fixtures live in `memorysafe_backend::conformance::fx`: `embedder()` (a `DeterministicEmbedder` at **dim 256**, embedder id `deterministic-256`), `item`, `item_with`, `item_at`, `vector_for`, `admit_txn`, `admit_txn_embedded`, `evict_txn`, `evict_txn_at`.
+Fixtures live in `memorysafe_backend::conformance::fx`: `embedder()` (a `DeterministicEmbedder` at **dim 256**, embedder id `deterministic-256`), `item`, `item_with`, `item_at`, `item_with_id`, `vector_for`, `admit_txn`, `admit_txn_embedded`, `evict_txn`, `evict_txn_at`.
 
-### The 27 conformance tests
+### The 33 conformance tests
 
 | Group | Tests |
 |---|---|
 | `isolation` (4) | `tenants_are_isolated`, `subjects_are_isolated`, `namespaces_are_separated`, `audit_is_scoped` |
 | `atomicity` (5) | `admit_evict_and_audit_commit_together`, `a_failed_transaction_leaves_no_trace`, `every_mutation_writes_exactly_one_audit_record`, `idempotent_writes_replay_the_original_outcome`, `idempotency_conflict_on_different_payload` |
-| `retrieval` (9) | `sensitivity_ceiling_is_enforced_in_the_query`, `tag_and_kind_filters_narrow_results`, `vector_search_ranks_by_similarity`, `keyword_search_finds_exact_terms`, `keyword_search_escapes_user_input`, `hybrid_returns_both_signal_sources`, `pagination_is_stable`, `pending_embedding_items_are_excluded_when_asked`, `cross_model_vectors_are_rejected` |
+| `retrieval` (13) | `sensitivity_ceiling_is_enforced_in_the_query`, `tag_and_kind_filters_narrow_results`, `vector_search_ranks_by_similarity`, `keyword_search_finds_exact_terms`, `keyword_search_escapes_user_input`, `hybrid_returns_both_signal_sources`, `list_pages_are_disjoint_and_complete`, `list_orders_oldest_first_by_created_at`, `list_tie_break_is_total_over_identical_timestamps`, `pending_embedding_items_are_excluded_when_asked`, `cross_model_vectors_are_rejected`, `neighbours_break_ties_before_truncating_at_k`, `recall_updates_access_statistics` |
 | `capacity` (4) | `capacity_accounting_tracks_items_and_bytes`, `eviction_releases_capacity`, `concurrent_admits_do_not_double_count`, `scope_stats_reflect_the_corpus` |
-| `lifecycle` (5) | `audit_filter_narrows_by_event_and_time`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `export_import_round_trips_exactly`, `import_is_idempotent` |
+| `lifecycle` (7) | `audit_filter_narrows_by_event_and_time`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `export_import_round_trips_exactly`, `import_is_idempotent`, `import_rejects_a_later_record_whose_tenant_disagrees`, `audit_aggregates_survive_a_cascading_purge` |
+
+**`pagination_is_stable` no longer exists.** It was renamed to
+`list_pages_are_disjoint_and_complete` — what it actually proves. It sorts and
+dedups the collected ids before asserting, so it checks only that pages did not
+overlap or drop rows; "stable" read as tie-break stability, the property it does
+*not* check. The two tests that do check ordering,
+`list_orders_oldest_first_by_created_at` and
+`list_tie_break_is_total_over_identical_timestamps`, are new alongside it, and
+a backend that pages `list` **descending** passed the entire previous 27-test
+suite.
 
 ### One inconsistency in Plan 1 to resolve before starting
 
@@ -115,7 +128,7 @@ repo actually put it before Task 7 and import from there; this plan writes
 ### Behaviours the suite pins down that are easy to get wrong
 
 - `HardFilters::default().sensitivity_ceiling` is `Internal`, not `Restricted`. Fail closed.
-- `list` orders by `id ASC`. ULIDs are lexicographically time-ordered, which is what makes pagination stable under concurrent inserts.
+- `list` orders by `created_at ASC`, ties broken by `id ASC` — **ascending, oldest first**. `list_orders_oldest_first_by_created_at` rejects a descending backend, and `list_tie_break_is_total_over_identical_timestamps` rejects one whose tie-break is not total over a fully tied corpus. Neither test subsumes the other, and neither existed before Plan 1's contract task: a backend paging descending passed the whole 27-test suite.
 - `audit` orders newest first: `id DESC` (see `AuditFilter::after`'s doc comment in `memorysafe-core` — `at` is whole seconds and cannot separate rows written in the same second, so `id` alone is the total order).
 - Relevance fusion when both signals are present is `0.7 * vector + 0.3 * keyword`; when only one is present it is that one. Ties break by `item.id` ascending so ordering is total.
 - Keyword scores are squashed into `(0, 1]` as `r / (1 + r)` before fusion.
@@ -124,6 +137,9 @@ repo actually put it before Task 7 and import from there; this plan writes
 - A replayed idempotent write returns `AppliedWrite { replayed: true, .. }` with the **original** `item_id`.
 - `import` skips items that already exist rather than duplicating or overwriting them, and counts them in `items_skipped_existing`.
 - `purge_subject` must leave `report.audit_rows_removed + report.audit_rows_preserved` equal to the number of audit rows the subject had.
+- **`audit_aggregates` rows must survive `purge_subject`.** The `audit_aggregates` table is keyed by policy version, event class and day bucket, with **no subject and no namespace column** — see `memorysafe_backend::aggregates` for the whole argument. Do not give it a foreign key to `audit`, do not include it in the subject sweep, and do not add a subject or namespace column for query convenience: `lifecycle::audit_aggregates_survive_a_cascading_purge` fails on the first, and the module doc explains why the third is the one that matters. Every audit row written increments the matching aggregate in the same transaction.
+- **`retrieve_candidates` and `neighbours` populate `ScoredCandidate::last_accessed_at` and `access_count`** from the `items.last_access`/`items.access_count` columns the DDL already declares — a row never recalled reads back `(None, 0)`, never `(created_at, 0)`. `record_recall` increments both for every item its `AuditRecord::items` references, in the same transaction as the audit row.
+- **`import` takes the destination tenant** and compares it against every record — items and audit rows alike. A disagreement rejects the whole import; nothing is retargeted and no audit scope is rewritten. There is deliberately no separate "may not span tenants" check and no rejection of a header-only stream.
 
 ---
 
@@ -323,7 +339,7 @@ CREATE TABLE audit (
   policy     TEXT,
   PRIMARY KEY (tenant_id, id)
 ) PARTITION BY HASH (tenant_id);
-CREATE INDEX idx_audit_scope_at ON audit (tenant_id, subject, namespace, id DESC);
+CREATE INDEX idx_audit_scope_at ON audit (tenant_id, subject, namespace, at, id DESC);
 
 CREATE TABLE idempotency (
   tenant_id      TEXT NOT NULL,
@@ -402,7 +418,7 @@ The pool connects with whatever credentials `PgConfig::url` carries — typicall
 | 10 | Hard filters and keyword search | Hostile input cannot become an operator |
 | 11 | Hybrid retrieval | Retrieval conformance passes |
 | 12 | Capacity locking, merge, idempotency | Atomicity and capacity conformance pass |
-| 13 | Purge and portable export/import | The full 27-test suite passes |
+| 13 | Purge and portable export/import | The full 33-test suite passes |
 | 14 | `SchemaPerTenant` layout | The full suite passes under both layouts |
 | 15 | Cross-backend parity | SQLite and Postgres rank identically |
 | 16 | Schema-version guard and operator docs | Refuses a database from a newer version |
@@ -1561,7 +1577,7 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
         "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw
            ON vectors USING hnsw (embedding vector_ip_ops)".into(),
         "CREATE INDEX IF NOT EXISTS idx_audit_scope_at
-           ON audit (tenant_id, subject, namespace, id DESC)".into(),
+           ON audit (tenant_id, subject, namespace, at, id DESC)".into(),
     ]);
 
     for table in TENANT_TABLES {
@@ -2498,8 +2514,14 @@ impl Backend for PostgresBackend {
         Ok(vec![])
     }
 
-    async fn import(&self, _stream: ImportStream) -> Result<ImportReport, BackendError> {
+    async fn import(&self, _destination: &TenantId, _stream: ImportStream)
+        -> Result<ImportReport, BackendError> {
         Ok(ImportReport::default())
+    }
+
+    async fn audit_aggregates(&self, _tenant: &TenantId)
+        -> Result<Vec<AuditAggregate>, BackendError> {
+        Ok(vec![])
     }
 }
 ```
@@ -2743,6 +2765,11 @@ async fn vector_search_ranks_by_similarity() {
 #[tokio::test]
 async fn cross_model_vectors_are_rejected() {
     retrieval::cross_model_vectors_are_rejected(&shared()).await;
+}
+
+#[tokio::test]
+async fn neighbours_break_ties_before_truncating_at_k() {
+    retrieval::neighbours_break_ties_before_truncating_at_k(&shared()).await;
 }
 ```
 
@@ -2991,7 +3018,7 @@ Replace the `neighbours` placeholder in `lib.rs`:
 
         Ok(hits
             .into_iter()
-            .map(|(item, score)| ScoredCandidate {
+            .map(|(item, access, score)| ScoredCandidate {
                 estimated_tokens: estimate_tokens(&item.body),
                 item,
                 relevance: score,
@@ -2999,6 +3026,15 @@ Replace the `neighbours` placeholder in `lib.rs`:
                 keyword_score: None,
                 value: memorysafe_core::Score::ZERO,
                 fragility: memorysafe_core::Score::ZERO,
+                // `last_access`/`access_count` are the two `items` columns the
+                // DDL has always declared and nothing read until Plan 1's
+                // contract task. Select them alongside the item columns and
+                // return them from `vectors::search` as their own tuple
+                // element — they must NOT go on `MemoryItem`, which is
+                // exported and digested. A row never recalled reads back
+                // `(None, 0)`, never `(created_at, 0)`.
+                last_accessed_at: access.last_accessed_at,
+                access_count: access.access_count,
             })
             .collect())
     }
@@ -3459,13 +3495,28 @@ async fn hybrid_returns_both_signal_sources() {
 }
 
 #[tokio::test]
-async fn pagination_is_stable() {
-    retrieval::pagination_is_stable(&shared()).await;
+async fn list_pages_are_disjoint_and_complete() {
+    retrieval::list_pages_are_disjoint_and_complete(&shared()).await;
+}
+
+#[tokio::test]
+async fn list_orders_oldest_first_by_created_at() {
+    retrieval::list_orders_oldest_first_by_created_at(&shared()).await;
+}
+
+#[tokio::test]
+async fn list_tie_break_is_total_over_identical_timestamps() {
+    retrieval::list_tie_break_is_total_over_identical_timestamps(&shared()).await;
 }
 
 #[tokio::test]
 async fn pending_embedding_items_are_excluded_when_asked() {
     retrieval::pending_embedding_items_are_excluded_when_asked(&shared()).await;
+}
+
+#[tokio::test]
+async fn recall_updates_access_statistics() {
+    retrieval::recall_updates_access_statistics(&shared()).await;
 }
 ```
 
@@ -3547,7 +3598,7 @@ pub async fn candidates(
     let mut out: Vec<ScoredCandidate> = merged
         .into_values()
         .filter(|(item, _, _)| passes(item, &query.filters))
-        .map(|(item, vector_score, keyword_score)| ScoredCandidate {
+        .map(|(item, access, vector_score, keyword_score)| ScoredCandidate {
             estimated_tokens: estimate_tokens(&item.body),
             relevance: fuse(vector_score, keyword_score),
             item,
@@ -3555,6 +3606,11 @@ pub async fn candidates(
             keyword_score,
             value: Score::ZERO,
             fragility: Score::ZERO,
+            // From the item row's `last_access`/`access_count`, carried
+            // through the merge map beside the item. `(None, 0)` for a row
+            // never recalled.
+            last_accessed_at: access.last_accessed_at,
+            access_count: access.access_count,
         })
         .collect();
 
@@ -4154,7 +4210,7 @@ git commit -m "feat(pg): row-locked capacity accounting, merge, and idempotent w
 - Consumes: everything in the crate.
 - Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and the single `run_conformance_suite` entry point.
 
-**Milestone: the complete 27-test suite passes under `SharedPartitioned`.**
+**Milestone: the complete 33-test suite passes under `SharedPartitioned`.**
 
 **Why vectors are deleted explicitly when the cascade would do it.** `PurgeReport` counts what was removed, and a cascade reports nothing. Deleting vectors first makes the count exact and leaves the item delete with nothing to cascade to.
 
@@ -4269,14 +4325,18 @@ use crate::items::{item_columns, row_to_item};
 use crate::{audit, capacity, items, vectors};
 use base64::Engine as _;
 use memorysafe_backend::{
-    BackendError, ExportRecord, ExportStream, ExportVector, ImportReport, ImportStream,
-    ScopeSelector,
+    BackendError, ExportRecord, ExportStream, ExportVector, FORMAT_VERSION, ImportReport,
+    ImportStream, ScopeSelector,
 };
-use memorysafe_core::{AuditFilter, EmbedderId, Scope};
+use memorysafe_core::{AuditFilter, EmbedderId, Scope, TenantId};
 use memorysafe_embed::QuantizedVector;
 use sqlx::{PgConnection, Row};
 
-pub const FORMAT_VERSION: u32 = 1;
+// `FORMAT_VERSION` comes from `memorysafe-backend`, not from a private copy
+// here. "A supported format version" is a property of the format, not of
+// whichever backend is reading the stream; two backends each declaring their
+// own constant is one silent divergence away from a Postgres export SQLite
+// refuses.
 
 pub async fn export(
     conn: &mut PgConnection,
@@ -4332,11 +4392,24 @@ pub async fn export(
     }
 
     if sel.include_audit {
+        // Collect across every scope before sorting: `audit::query` returns
+        // each scope's rows newest-first (descending `AuditId`, per this
+        // commit's fix to that function), but `Backend::export`'s contract
+        // is one global run ascending by `AuditId` — appending each scope's
+        // descending run back to back would satisfy neither order.
+        //
+        // `limit: 100_000` truncates silently for a tenant with more audit
+        // rows than that — the same defect `AuditFilter::limit`'s doc
+        // comment warns about (see `crates/memorysafe-core/src/audit.rs`).
+        // Not resolved here.
+        let mut audit_rows = Vec::new();
         for scope in scopes {
             let filter = AuditFilter { limit: 100_000, ..Default::default() };
-            for record in audit::query(&mut *conn, &scope, &filter).await? {
-                out.push(ExportRecord::Audit { audit: Box::new(record) });
-            }
+            audit_rows.extend(audit::query(&mut *conn, &scope, &filter).await?);
+        }
+        audit_rows.sort_by(|a, b| a.id.cmp(&b.id));
+        for record in audit_rows {
+            out.push(ExportRecord::Audit { audit: Box::new(record) });
         }
     }
 
@@ -4345,6 +4418,7 @@ pub async fn export(
 
 pub async fn import(
     conn: &mut PgConnection,
+    destination: &TenantId,
     stream: ImportStream,
     vector_dim: u16,
 ) -> Result<ImportReport, BackendError> {
@@ -4361,6 +4435,18 @@ pub async fn import(
             }
             ExportRecord::Item { item, vector } => {
                 let scope = item.scope.clone();
+                // Every record is compared against `destination` — never
+                // against another record. No record's tenant is authority for
+                // any other's, so a disagreement rejects the whole import
+                // rather than being retargeted. RLS would refuse the write
+                // anyway, but with an error that names no record; this one
+                // does, and it fires before any row is attempted.
+                if scope.tenant != *destination {
+                    return Err(BackendError::MalformedImport(format!(
+                        "item {} names tenant {} but the destination is {destination}",
+                        item.id, scope.tenant
+                    )));
+                }
                 // Import is idempotent: an item already present is skipped
                 // rather than duplicated or overwritten.
                 if items::exists(&mut *conn, &scope, &item.id).await? {
@@ -4388,6 +4474,16 @@ pub async fn import(
                 }
             }
             ExportRecord::Audit { audit } => {
+                // The same comparison, so audit rows need no rule of their
+                // own: same tenant as the destination, preserve the row
+                // byte-exact; different, reject. The scope is never rewritten
+                // to make the row fit — a rewritten audit row is a forged one.
+                if audit.scope.tenant != *destination {
+                    return Err(BackendError::MalformedImport(format!(
+                        "audit row {} names tenant {} but the destination is {destination}",
+                        audit.id, audit.scope.tenant
+                    )));
+                }
                 audit::insert(&mut *conn, &audit).await?;
                 report.audit_imported += 1;
             }
@@ -4419,40 +4515,38 @@ Replace the last three placeholders in `lib.rs`:
         Ok(out)
     }
 
-    async fn import(&self, stream: ImportStream) -> Result<ImportReport, BackendError> {
-        // Every record in a stream belongs to one tenant; take it from the
-        // first item and reject a stream that mixes them. RLS would reject a
-        // foreign row anyway, but with an error that says nothing useful.
-        let tenant = stream
-            .iter()
-            .find_map(|r| match r {
-                ExportRecord::Item { item, .. } => Some(item.scope.tenant.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                BackendError::MalformedImport("stream contains no items".into())
-            })?;
-        if stream.iter().any(|r| {
-            matches!(r, ExportRecord::Item { item, .. } if item.scope.tenant != tenant)
-        }) {
-            return Err(BackendError::MalformedImport(
-                "a stream may not span tenants".into(),
-            ));
-        }
-
-        let mut tx = tenant_txn(self, &tenant).await?;
-        let report = portability::import(&mut tx, stream, self.config.vector_dim).await?;
+    async fn import(&self, destination: &TenantId, stream: ImportStream)
+        -> Result<ImportReport, BackendError>
+    {
+        // Deliberately no "a stream may not span tenants" check and no
+        // "stream contains no items" rejection.
+        //
+        // The span check is strictly implied: `portability::import` compares
+        // every record against `destination`, so two records cannot disagree
+        // with each other without at least one of them disagreeing with the
+        // destination first. A second rule that is true only by implication
+        // has no test of its own, cannot fail today, and silently stops being
+        // implied the day someone weakens the first.
+        //
+        // The empty-stream rejection existed only to derive a tenant from the
+        // first item. The destination is now a parameter, so there is nothing
+        // left to derive and nothing left to reject: a header-only stream is
+        // a valid export of an empty tenant, and the round trip has to
+        // survive it.
+        let mut tx = tenant_txn(self, destination).await?;
+        let report =
+            portability::import(&mut tx, destination, stream, self.config.vector_dim).await?;
         tx.commit().await.pg()?;
         Ok(report)
     }
 ```
 
-Add `pub mod portability;` and `pub mod purge;`, and import `ExportRecord` in `lib.rs`.
+Add `pub mod portability;` and `pub mod purge;`. `lib.rs` does not need `ExportRecord` — nothing in it inspects the stream.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-postgres && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — `postgres_passes_the_backend_conformance_suite` prints all 27 test names and passes.
+Expected: PASS — `postgres_passes_the_backend_conformance_suite` prints all 33 test names and passes.
 
 - [ ] **Step 5: Commit**
 
@@ -4474,7 +4568,7 @@ git commit -m "feat(pg): subject purge and portable export/import; full conforma
 - Consumes: `ddl::statements` (already branches on layout), `ensure_ready` (already lazy).
 - Produces: an advisory lock around `ensure_schema`, and a second full conformance run.
 
-**Milestone: the full 27-test suite passes under both layouts.**
+**Milestone: the full 33-test suite passes under both layouts.**
 
 **Most of this layout already exists** — `ddl::statements` omits the partitioning clause and the partition tables, and `ensure_ready` creates a tenant's schema on first use. Two things are missing, and both are the kind of bug that only appears under load.
 
@@ -4880,7 +4974,7 @@ async fn an_export_from_sqlite_imports_into_postgres() {
         include_audit: true,
     };
     let exported = sqlite.export(&selector).await.unwrap();
-    let report = target.import(exported).await.unwrap();
+    let report = target.import(&selector.tenant, exported).await.unwrap();
     assert_eq!(report.items_imported, 6);
     assert_eq!(report.vectors_imported, 6);
 

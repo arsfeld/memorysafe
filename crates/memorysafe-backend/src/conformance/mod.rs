@@ -89,9 +89,13 @@ where
         retrieval::keyword_search_finds_exact_terms,
         retrieval::keyword_search_escapes_user_input,
         retrieval::hybrid_returns_both_signal_sources,
-        retrieval::pagination_is_stable,
+        retrieval::list_pages_are_disjoint_and_complete,
+        retrieval::list_orders_oldest_first_by_created_at,
+        retrieval::list_tie_break_is_total_over_identical_timestamps,
         retrieval::pending_embedding_items_are_excluded_when_asked,
         retrieval::cross_model_vectors_are_rejected,
+        retrieval::neighbours_break_ties_before_truncating_at_k,
+        retrieval::recall_updates_access_statistics,
         capacity::capacity_accounting_tracks_items_and_bytes,
         capacity::eviction_releases_capacity,
         capacity::concurrent_admits_do_not_double_count,
@@ -101,5 +105,7 @@ where
         lifecycle::purge_subject_leaves_other_subjects_intact,
         lifecycle::export_import_round_trips_exactly,
         lifecycle::import_is_idempotent,
+        lifecycle::import_rejects_a_later_record_whose_tenant_disagrees,
+        lifecycle::audit_aggregates_survive_a_cascading_purge,
     );
 }

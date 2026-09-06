@@ -149,11 +149,14 @@ pub struct AuditFilter {
     /// a total order — `at` is whole seconds and cannot separate rows written
     /// in the same second, so a time-based cursor would repeat or skip them.
     pub after: Option<AuditId>,
-    // NOTE for the task that implements `Backend::audit`: `limit` defaults to
-    // 100 and carries no truncation signal, so a compliance query built from
-    // `AuditFilter::default()` silently stops at 100 rows with no way for the
-    // caller to know. Either surface a `truncated` flag on the result or make
-    // the caller choose explicitly before that method ships.
+    /// Maximum rows to return. Defaults to 100.
+    ///
+    /// No `truncated` flag, and none is needed: `after` is a ULID cursor, so
+    /// a caller detects the end of the log from the page size alone —
+    /// `returned.len() < limit` means exhausted. `Backend::audit` states the
+    /// rule and requires implementations to return exactly
+    /// `min(limit, remaining)`; a backend that returns a short page for any
+    /// other reason breaks the signal.
     pub limit: usize,
 }
 

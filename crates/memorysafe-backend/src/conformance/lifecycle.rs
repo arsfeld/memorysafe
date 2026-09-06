@@ -1,6 +1,6 @@
 use super::{BackendFactory, fx};
-use crate::portability::ScopeSelector;
-use crate::{Backend, Page};
+use crate::portability::{ExportRecord, ImportStream, ScopeSelector};
+use crate::{Backend, BackendError, Page};
 use memorysafe_core::{AuditEvent, AuditFilter, Scope, SubjectId, TenantId};
 use std::collections::BTreeSet;
 use time::{Duration, OffsetDateTime};
@@ -335,7 +335,10 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
     let exported = source.export(&selector).await.unwrap();
 
     let target = factory.create().await;
-    let report = target.import(exported.clone()).await.unwrap();
+    let report = target
+        .import(&selector.tenant, exported.clone())
+        .await
+        .unwrap();
     assert_eq!(report.items_imported, 3);
     assert_eq!(report.vectors_imported, 3);
     assert_eq!(
@@ -418,7 +421,10 @@ pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
     let exported = source.export(&selector).await.unwrap();
 
     let target = factory.create().await;
-    let first = target.import(exported.clone()).await.unwrap();
+    let first = target
+        .import(&selector.tenant, exported.clone())
+        .await
+        .unwrap();
     assert_eq!(first.items_imported, 1);
     assert!(
         target
@@ -429,7 +435,7 @@ pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
         "include_audit: false must not import any audit rows"
     );
 
-    let second = target.import(exported).await.unwrap();
+    let second = target.import(&selector.tenant, exported).await.unwrap();
     assert_eq!(second.items_imported, 0);
     assert_eq!(second.items_skipped_existing, 1);
     assert_eq!(
@@ -439,5 +445,206 @@ pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
     assert_eq!(
         target.list(&scope, &Page::default()).await.unwrap().len(),
         1
+    );
+}
+
+/// The destination tenant is compared against **every** record, not just the
+/// first one.
+///
+/// **The implementation this exists to reject: one that reads the tenant from
+/// the first record and imports the rest on that authority.** That was the
+/// shape of both backend sketches before `import` took a destination, and it
+/// is the shape anyone re-derives from "every record in a stream belongs to
+/// one tenant". Such an implementation passes the naive all-agree case —
+/// `export_import_round_trips_exactly` and `import_is_idempotent` both feed it
+/// a single-tenant stream — and fails only here. So this is the *only* test in
+/// the suite where a first-record implementation is distinguishable from a
+/// per-record one, which is why the disagreeing record is deliberately not
+/// first: put it first and a first-record implementation passes by accident,
+/// having checked the one record it was ever going to check.
+///
+/// A cross-tenant record must reject the whole import rather than be
+/// retargeted into the destination. Retargeting would keep the write silent
+/// and merely relocate the differential — the caller would learn neither where
+/// the row landed nor that its scope had been rewritten. The assertions below
+/// therefore check both: that nothing from the stream is present in the
+/// destination, and that the agreeing record did not land either.
+pub async fn import_rejects_a_later_record_whose_tenant_disagrees<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let destination = TenantId::new("t").unwrap();
+    let mine = Scope::new("t", "s", "n").unwrap();
+    let theirs = Scope::new("other", "s", "n").unwrap();
+
+    let agreeing = fx::item(&mine, "belongs to the destination tenant");
+    let foreign = fx::item(&theirs, "belongs to somebody else entirely");
+
+    // Header, then an agreeing record, then a disagreeing one. The order is
+    // the whole point of the test — see the doc comment.
+    let stream: ImportStream = vec![
+        ExportRecord::Header {
+            format_version: crate::FORMAT_VERSION,
+            exported_at: 0,
+        },
+        ExportRecord::Item {
+            item: Box::new(agreeing.clone()),
+            vector: None,
+        },
+        ExportRecord::Item {
+            item: Box::new(foreign.clone()),
+            vector: None,
+        },
+    ];
+
+    let err = backend
+        .import(&destination, stream)
+        .await
+        .expect_err("a record whose tenant disagrees with the destination must reject the import");
+    assert!(
+        matches!(err, BackendError::MalformedImport(_)),
+        "expected MalformedImport for a cross-tenant record, got {err:?}"
+    );
+
+    // Rejected means rejected: not "the good records landed and the bad one
+    // did not". A partial import would leave the caller with a corpus it never
+    // asked for and no report describing it.
+    assert!(
+        backend
+            .list(&mine, &Page::default())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected import still wrote rows into the destination"
+    );
+    assert!(
+        backend.get(&mine, &agreeing.id).await.unwrap().is_none(),
+        "the agreeing record landed even though the import was rejected"
+    );
+    // And specifically: the foreign record was not quietly rewritten into the
+    // destination tenant. A backend that retargets rather than rejects fails
+    // here even if it also (wrongly) returned an error.
+    assert!(
+        backend.get(&mine, &foreign.id).await.unwrap().is_none(),
+        "the foreign record was retargeted into the destination tenant"
+    );
+    assert!(
+        backend
+            .list(&theirs, &Page::default())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected import wrote into the tenant the payload named"
+    );
+}
+
+/// Aggregates survive a cascading `purge_subject`. Detail rows do not.
+///
+/// **The implementation this exists to reject: one that stores aggregates in,
+/// or cascades them from, the audit detail table.** That is the natural shape
+/// — aggregates are derived from audit rows, they are written in the same
+/// transaction as the audit row that feeds them (Tasks 20 and 23), and
+/// `purge::subject` already sweeps `audit` by subject. One more table in the
+/// same `DELETE ... WHERE subject = ?` sweep, or an `ON DELETE CASCADE` from
+/// the audit row, and the aggregate is gone. Nothing else in the suite would
+/// notice: no other test reads an aggregate at all.
+///
+/// The case that makes it able to fail is the baseline read *before* the
+/// purge. Without it, "the aggregate still has the same count afterwards" is
+/// satisfied by a backend that never wrote one — both reads return nothing and
+/// the equality holds vacuously. So the count is asserted non-zero first, and
+/// the comparison afterwards is against that same value.
+///
+/// Only `Admitted` aggregates are compared. A backend may legitimately write
+/// its own `SubjectPurged` audit row and count it, exactly as `PurgeReport`'s
+/// doc allows for detail rows, so a whole-vector equality would fail a
+/// conformant backend.
+pub async fn audit_aggregates_survive_a_cascading_purge<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let tenant = TenantId::new("t").unwrap();
+    let subject = SubjectId::new("doomed").unwrap();
+    let scope = Scope::new("t", "doomed", "ns").unwrap();
+
+    for i in 0..3 {
+        backend
+            .apply(fx::admit_txn_embedded(
+                &scope,
+                fx::item(&scope, &format!("memory {i}")),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let admits_before: Vec<_> = backend
+        .audit_aggregates(&tenant)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.key.event == AuditEvent::Admitted)
+        .collect();
+    let counted_before: u64 = admits_before.iter().map(|a| a.count).sum();
+    assert_eq!(
+        counted_before, 3,
+        "the aggregate must exist and count the three admits before the purge, \
+         or 'aggregates survive' is satisfied vacuously by a backend that never \
+         wrote one"
+    );
+    assert_eq!(
+        backend
+            .audit(&scope, &AuditFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "the detail rows must exist before the purge too, so the contrast after \
+         it means something"
+    );
+
+    let report = backend.purge_subject(&tenant, &subject).await.unwrap();
+    assert_eq!(report.items_removed, 3, "the purge did not run");
+    // Detail rows are accounted for as removed or preserved, exactly as
+    // `purge_subject_removes_everything_for_that_subject` requires. Which of
+    // the two is the retention profile's business, not this test's — what is
+    // asserted here is that the aggregate's fate is not tied to either.
+    assert_eq!(
+        report.audit_rows_removed + report.audit_rows_preserved,
+        3,
+        "every pre-existing audit row must be accounted for"
+    );
+    assert_eq!(
+        backend
+            .audit(&scope, &AuditFilter::default())
+            .await
+            .unwrap()
+            .len() as u64,
+        report.audit_rows_preserved,
+        "the surviving detail rows must be exactly the ones the report says it \
+         preserved"
+    );
+
+    let after = backend.audit_aggregates(&tenant).await.unwrap();
+    let admits_after: Vec<_> = after
+        .iter()
+        .filter(|a| a.key.event == AuditEvent::Admitted)
+        .cloned()
+        .collect();
+    assert_eq!(
+        admits_after, admits_before,
+        "purge_subject destroyed or altered the audit aggregates; they name no \
+         subject and no namespace, so there is nothing in them for a subject \
+         purge to erase"
+    );
+
+    // And nothing that survived names the purged subject or its namespace.
+    // `AggregateKey` cannot represent either, so this can only fail if a
+    // backend smuggled one into a field that can hold text — the policy name,
+    // say. It is the residual claim the whole key design rests on, so it is
+    // asserted rather than assumed.
+    let json = serde_json::to_string(&after).unwrap();
+    assert!(
+        !json.contains("doomed"),
+        "an aggregate row that outlived the purge names the purged subject: {json}"
+    );
+    assert!(
+        !json.contains("\"ns\""),
+        "an aggregate row that outlived the purge names the namespace: {json}"
     );
 }
