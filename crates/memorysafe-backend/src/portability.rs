@@ -121,4 +121,27 @@ mod tests {
             other => panic!("expected ExportRecord::Audit, got {other:?}"),
         }
     }
+
+    #[test]
+    fn exported_vectors_round_trip_through_standard_padded_base64() {
+        use base64::Engine as _;
+        use memorysafe_embed::{DeterministicEmbedder, Embedder};
+
+        let embedder = DeterministicEmbedder::new(16);
+        let embedding = embedder.embed("round trip me").unwrap();
+        let q = QuantizedVector::from_embedding(&embedding);
+
+        let exported = ExportVector::from_quantized(&q);
+        assert_eq!(exported.embedder, q.embedder.to_string());
+        assert_eq!(exported.dim, q.dim);
+        assert_eq!(exported.scale, q.scale);
+
+        // Task 24's import decodes with a matching engine — pin that the
+        // encoding is STANDARD (padded), not STANDARD_NO_PAD or URL-safe, so
+        // a mismatch is caught here rather than surfacing only in import.
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&exported.q_base64)
+            .expect("STANDARD engine must decode what from_quantized produced");
+        assert_eq!(decoded, q.to_bytes());
+    }
 }

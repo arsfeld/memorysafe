@@ -2091,6 +2091,7 @@ mod tests {
             AuditEvent::Admitted,
             vec![ItemRef::from_item(&i)],
             Actor { kind: ActorKind::Agent, id: Some("agent-7".into()) },
+            OffsetDateTime::from_unix_timestamp(1_000_000).unwrap(),
         );
         let json = serde_json::to_string(&rec).unwrap();
         assert!(!json.contains("allergy"), "audit must not carry bodies: {json}");
@@ -2109,9 +2110,15 @@ mod tests {
         // clearing the other's field would pass every other test here, because
         // the golden test constructs its record with a struct literal.
         let scope = Scope::new("t", "s", "n").unwrap();
-        let rec = AuditRecord::new(scope, AuditEvent::Admitted, vec![], Actor::system())
-            .with_assessment(sample_assessment())
-            .with_decision(sample_decision());
+        let rec = AuditRecord::new(
+            scope,
+            AuditEvent::Admitted,
+            vec![],
+            Actor::system(),
+            OffsetDateTime::from_unix_timestamp(1_000_000).unwrap(),
+        )
+        .with_assessment(sample_assessment())
+        .with_decision(sample_decision());
         // Equality, not `is_some()`: a builder that ignored its argument and
         // stored some other value would pass an is_some check.
         assert_eq!(rec.assessment.as_ref(), Some(&sample_assessment()));
@@ -2124,9 +2131,15 @@ mod tests {
 
         // And in the opposite order.
         let scope = Scope::new("t", "s", "n").unwrap();
-        let rec = AuditRecord::new(scope, AuditEvent::Forgotten, vec![], Actor::system())
-            .with_decision(sample_decision())
-            .with_assessment(sample_assessment());
+        let rec = AuditRecord::new(
+            scope,
+            AuditEvent::Forgotten,
+            vec![],
+            Actor::system(),
+            OffsetDateTime::from_unix_timestamp(1_000_000).unwrap(),
+        )
+        .with_decision(sample_decision())
+        .with_assessment(sample_assessment());
         assert_eq!(rec.assessment.as_ref(), Some(&sample_assessment()));
         assert_eq!(rec.decision.as_ref(), Some(&sample_decision()));
         assert_eq!(rec.event, AuditEvent::Forgotten, "new() ignored its event argument");
@@ -3757,20 +3770,50 @@ Append to `crates/memorysafe-backend/src/write.rs`:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use memorysafe_core::{Actor, AuditEvent, AuditRecord, Scope};
+    use memorysafe_core::{
+        Actor, AuditEvent, AuditRecord, Protection, Scope, SensitivityLevel, Source, SourceKind,
+    };
+    use time::OffsetDateTime;
+
+    fn scope() -> Scope {
+        Scope::new("t", "s", "n").unwrap()
+    }
 
     fn audit() -> AuditRecord {
+        audit_for(scope())
+    }
+
+    fn audit_for(scope: Scope) -> AuditRecord {
         AuditRecord::new(
-            Scope::new("t", "s", "n").unwrap(),
+            scope,
             AuditEvent::Admitted,
             vec![],
             Actor::system(),
+            OffsetDateTime::UNIX_EPOCH,
         )
+    }
+
+    fn item(scope: Scope) -> MemoryItem {
+        MemoryItem {
+            id: ItemId::new(),
+            scope,
+            body: "an item".into(),
+            kind: "fact".into(),
+            source: Source { kind: SourceKind::Agent, id: None },
+            occurred_at: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            tags: vec![],
+            attrs: Default::default(),
+            sensitivity: SensitivityLevel::Internal,
+            ttl: None,
+            protection: Protection::Normal,
+            pending_embedding: false,
+        }
     }
 
     #[test]
     fn a_write_transaction_always_carries_exactly_one_audit_record() {
-        let txn = WriteTransaction::new(Scope::new("t", "s", "n").unwrap(), audit());
+        let txn = WriteTransaction::new(scope(), audit());
         assert!(txn.upsert.is_none());
         assert!(txn.merge.is_none());
         assert!(txn.evictions.is_empty());
@@ -3779,7 +3822,7 @@ mod tests {
 
     #[test]
     fn upsert_and_merge_are_mutually_exclusive() {
-        let mut txn = WriteTransaction::new(Scope::new("t", "s", "n").unwrap(), audit());
+        let mut txn = WriteTransaction::new(scope(), audit());
         txn.merge = Some(MergeWrite {
             target: memorysafe_core::ItemId::new(),
             body: "merged".into(),
@@ -3789,11 +3832,44 @@ mod tests {
             byte_size: 6,
         });
         assert!(txn.is_valid());
+        txn.upsert = Some(ItemWrite { item: item(scope()), vector: None });
+        assert!(!txn.is_valid(), "a transaction may not both insert and merge");
+    }
+
+    #[test]
+    fn a_transaction_is_invalid_when_the_upserted_items_scope_disagrees() {
+        let mut txn = WriteTransaction::new(scope(), audit());
+        txn.upsert = Some(ItemWrite { item: item(scope()), vector: None });
+        assert!(txn.is_valid(), "a well-formed upsert must be valid");
+
+        // Same tenant, different subject: the item would be written under one
+        // subject while the transaction — and its vector row — are filed
+        // under another.
         txn.upsert = Some(ItemWrite {
-            item: None,
+            item: item(Scope::new("t", "other-subject", "n").unwrap()),
             vector: None,
         });
-        assert!(!txn.is_valid(), "a transaction may not both insert and merge");
+        assert!(
+            !txn.is_valid(),
+            "an upserted item whose scope disagrees with the transaction's scope must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_transaction_is_invalid_when_the_audit_records_scope_disagrees() {
+        let valid = WriteTransaction::new(scope(), audit());
+        assert!(valid.is_valid(), "a well-formed transaction must be valid");
+
+        // Same tenant, different namespace: the audit trail would point at a
+        // namespace this write never touched.
+        let mismatched = WriteTransaction::new(
+            scope(),
+            audit_for(Scope::new("t", "s", "other-ns").unwrap()),
+        );
+        assert!(
+            !mismatched.is_valid(),
+            "an audit record whose scope disagrees with the transaction's scope must be rejected"
+        );
     }
 }
 ```
@@ -3919,9 +3995,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// An item plus its already-computed vector. Backends never embed.
+///
+/// `item` is not `Option`: `QuantizedVector` carries no `ItemId`, so
+/// `ItemWrite { item: None, vector: Some(v) }` would name no row to attach
+/// the vector to — an unaddressable state with no legitimate construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ItemWrite {
-    pub item: Option<MemoryItem>,
+    pub item: MemoryItem,
     pub vector: Option<QuantizedVector>,
 }
 
@@ -3962,8 +4042,29 @@ impl WriteTransaction {
         }
     }
 
+    /// A transaction is invalid if it both inserts and merges, or if its
+    /// scope-bearing fields disagree about which scope this write belongs to.
+    ///
+    /// `scope`, the upserted item's own `scope`, and `audit.scope` are three
+    /// independently-settable public fields, and a real backend reads
+    /// different ones for different rows: the item row is keyed on the
+    /// item's own scope, the vector row and the tenant file are keyed on
+    /// `scope`, and the audit row is keyed on `audit.scope`. If they
+    /// disagreed, the row, its vector, and its own audit trail would each be
+    /// filed under a different subject or namespace — the compliance surface
+    /// this product sells would point somewhere else. `MergeWrite` carries
+    /// no scope of its own, so there is nothing to check there; a merge is
+    /// always addressed by `scope`.
     pub fn is_valid(&self) -> bool {
-        !(self.upsert.is_some() && self.merge.is_some())
+        if self.upsert.is_some() && self.merge.is_some() {
+            return false;
+        }
+        if let Some(w) = &self.upsert
+            && w.item.scope != self.scope
+        {
+            return false;
+        }
+        self.audit.scope == self.scope
     }
 }
 
@@ -4312,14 +4413,18 @@ pub fn admit_txn(
     item: MemoryItem,
     vector: Option<QuantizedVector>,
 ) -> WriteTransaction {
+    // The audit fires at the same instant the item was created, not a fresh
+    // clock read — `at` is supplied, never sampled, per the convention
+    // `AuditRecord::new` documents.
     let audit = AuditRecord::new(
         scope.clone(),
         AuditEvent::Admitted,
         vec![ItemRef::from_item(&item)],
         Actor::system(),
+        item.created_at,
     );
     let mut txn = WriteTransaction::new(scope.clone(), audit);
-    txn.upsert = Some(ItemWrite { item: Some(item), vector });
+    txn.upsert = Some(ItemWrite { item, vector });
     txn
 }
 
@@ -4331,8 +4436,13 @@ pub fn admit_txn_embedded(scope: &Scope, item: MemoryItem) -> WriteTransaction {
 
 /// A transaction that evicts items without inserting anything.
 pub fn evict_txn(scope: &Scope, evictions: Vec<ItemId>) -> WriteTransaction {
-    let audit =
-        AuditRecord::new(scope.clone(), AuditEvent::Forgotten, vec![], Actor::system());
+    let audit = AuditRecord::new(
+        scope.clone(),
+        AuditEvent::Forgotten,
+        vec![],
+        Actor::system(),
+        OffsetDateTime::UNIX_EPOCH,
+    );
     let mut txn = WriteTransaction::new(scope.clone(), audit);
     txn.evictions = evictions;
     txn
@@ -6136,11 +6246,9 @@ impl Backend for SqliteBackend {
                 }
 
                 let mut item_id = None;
-                if let Some(w) = &txn.upsert
-                    && let Some(item) = &w.item
-                {
-                    items::insert(&tx, item)?;
-                    item_id = Some(item.id.clone());
+                if let Some(w) = &txn.upsert {
+                    items::insert(&tx, &w.item)?;
+                    item_id = Some(w.item.id.clone());
                 }
 
                 let audit_id = audit::insert(&tx, &txn.audit)?;
@@ -6503,14 +6611,12 @@ Add `pub mod vectors;` and wire vector insert/delete into `apply`:
                 }
 
                 let mut item_id = None;
-                if let Some(w) = &txn.upsert
-                    && let Some(item) = &w.item
-                {
-                    items::insert(&tx, item)?;
+                if let Some(w) = &txn.upsert {
+                    items::insert(&tx, &w.item)?;
                     if let Some(v) = &w.vector {
-                        vectors::insert(&tx, &item.id, &txn.scope, v)?;
+                        vectors::insert(&tx, &w.item.id, &txn.scope, v)?;
                     }
-                    item_id = Some(item.id.clone());
+                    item_id = Some(w.item.id.clone());
                 }
 ```
 
@@ -7179,16 +7285,14 @@ Rewrite `apply` in `lib.rs` to its final form:
 
                 let mut item_id = None;
 
-                if let Some(w) = &txn.upsert
-                    && let Some(item) = &w.item
-                {
-                    items::insert(&tx, item)?;
+                if let Some(w) = &txn.upsert {
+                    items::insert(&tx, &w.item)?;
                     if let Some(v) = &w.vector {
-                        vectors::insert(&tx, &item.id, &txn.scope, v)?;
+                        vectors::insert(&tx, &w.item.id, &txn.scope, v)?;
                     }
                     delta_items += 1;
-                    delta_bytes += item.byte_size() as i64;
-                    item_id = Some(item.id.clone());
+                    delta_bytes += w.item.byte_size() as i64;
+                    item_id = Some(w.item.id.clone());
                 }
 
                 if let Some(m) = &txn.merge {
@@ -10101,7 +10205,10 @@ impl Engine {
         };
 
         let refs: Vec<ItemRef> = item.as_ref().map(|i| vec![ItemRef::from_item(i)]).unwrap_or_default();
-        let audit = AuditRecord::new(req.scope.clone(), event, refs, req.actor.clone())
+        // `now`, already sampled above for `created_at`, not a second clock
+        // read — the item and its own audit row must agree on when this
+        // happened.
+        let audit = AuditRecord::new(req.scope.clone(), event, refs, req.actor.clone(), now)
             .with_assessment(assessment.clone())
             .with_decision(decision.clone());
 
@@ -10112,7 +10219,7 @@ impl Engine {
             blake3::hash(req.body.as_bytes()).to_hex().to_string()
         });
         if let Some(i) = item {
-            txn.upsert = Some(ItemWrite { item: Some(i), vector });
+            txn.upsert = Some(ItemWrite { item: i, vector });
         }
         txn.merge = merge;
 
@@ -10147,6 +10254,7 @@ impl Engine {
             AuditEvent::Rejected,
             vec![],
             req.actor.clone(),
+            OffsetDateTime::now_utc(),
         )
         .with_assessment(assessment.clone());
 
@@ -10639,6 +10747,7 @@ impl Engine {
                 AuditEvent::Recalled,
                 vec![],
                 Actor { kind: ActorKind::Agent, id: None },
+                OffsetDateTime::now_utc(),
             );
             let audit_id = self.backend.record_recall(audit).await?;
             return Ok(WorkingSet { audit_id: Some(audit_id), ..WorkingSet::empty() });
@@ -10676,11 +10785,14 @@ impl Engine {
 
         let refs: Vec<ItemRef> =
             composed.items.iter().map(|s| ItemRef::from_item(&s.item)).collect();
+        // Reuse `ctx.now`, already sampled above for the compose context,
+        // rather than a second clock read for the same logical recall.
         let audit = AuditRecord::new(
             req.scope.clone(),
             AuditEvent::Recalled,
             refs,
             Actor { kind: ActorKind::Agent, id: None },
+            ctx.now,
         );
         let audit_id = self.backend.record_recall(audit).await?;
 
@@ -10924,6 +11036,7 @@ impl Engine {
             AuditEvent::Forgotten,
             refs,
             Actor { kind: ActorKind::Human, id: None },
+            OffsetDateTime::now_utc(),
         );
         let mut txn = WriteTransaction::new(scope.clone(), audit);
         txn.evictions = targets.clone();
@@ -10949,11 +11062,12 @@ impl Engine {
             AuditEvent::Admitted,
             vec![ItemRef::from_item(&item)],
             Actor { kind: ActorKind::Human, id: None },
+            OffsetDateTime::now_utc(),
         );
         let mut txn = WriteTransaction::new(scope.clone(), audit);
         // Replace the row: delete then insert, in one transaction.
         txn.evictions = vec![id.clone()];
-        txn.upsert = Some(ItemWrite { item: Some(item), vector: None });
+        txn.upsert = Some(ItemWrite { item, vector: None });
 
         let applied = self.backend.apply(txn).await?;
         Ok(WriteOutcome {
@@ -10995,7 +11109,7 @@ Add `pub mod mutate;` and `pub use mutate::ForgetSelector;` to `lib.rs`.
         });
 ```
 
-and pass it as `ItemWrite { item: Some(item), vector }`.
+and pass it as `ItemWrite { item, vector }`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -11268,6 +11382,7 @@ impl Engine {
                 AuditEvent::MaintenanceRun,
                 vec![],
                 Actor { kind: ActorKind::System, id: None },
+                OffsetDateTime::now_utc(),
             );
             let mut txn = WriteTransaction::new(scope.clone(), audit);
             txn.evictions = to_forget;
@@ -12741,10 +12856,11 @@ impl Engine {
                 AuditEvent::Reembedded,
                 vec![ItemRef::from_item(&updated)],
                 Actor { kind: ActorKind::System, id: None },
+                OffsetDateTime::now_utc(),
             );
             let mut txn = WriteTransaction::new(scope.clone(), audit);
             txn.evictions = vec![item.id.clone()];
-            txn.upsert = Some(ItemWrite { item: Some(updated.clone()), vector: Some(vector) });
+            txn.upsert = Some(ItemWrite { item: updated.clone(), vector: Some(vector) });
 
             self.backend.apply(txn).await?;
             refs.push(ItemRef::from_item(&updated));

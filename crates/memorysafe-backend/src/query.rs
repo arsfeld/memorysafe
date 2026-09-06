@@ -104,6 +104,16 @@ mod tests {
             limit: 10,
         };
         assert!(text_only.is_valid());
+
+        // Whitespace-only text carries no query signal either; it must not
+        // be treated as "text was supplied".
+        let whitespace_only = CandidateQuery {
+            embedding: None,
+            text: Some("   ".into()),
+            filters: HardFilters::default(),
+            limit: 10,
+        };
+        assert!(!whitespace_only.is_valid());
     }
 
     #[test]

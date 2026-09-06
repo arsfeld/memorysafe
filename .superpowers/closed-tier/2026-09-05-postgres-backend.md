@@ -2430,11 +2430,9 @@ impl Backend for PostgresBackend {
         }
 
         let mut item_id = None;
-        if let Some(w) = &txn.upsert
-            && let Some(item) = &w.item
-        {
-            items::insert(&mut tx, item).await?;
-            item_id = Some(item.id.clone());
+        if let Some(w) = &txn.upsert {
+            items::insert(&mut tx, &w.item).await?;
+            item_id = Some(w.item.id.clone());
         }
 
         let audit_id = audit::insert(&mut tx, &txn.audit).await?;
@@ -4043,17 +4041,15 @@ Rewrite `apply` in `lib.rs` to its final form:
 
         let mut item_id = None;
 
-        if let Some(w) = &txn.upsert
-            && let Some(item) = &w.item
-        {
-            items::insert(&mut tx, item).await?;
+        if let Some(w) = &txn.upsert {
+            items::insert(&mut tx, &w.item).await?;
             if let Some(v) = &w.vector {
-                vectors::insert(&mut tx, &item.id, &txn.scope, v, self.config.vector_dim)
+                vectors::insert(&mut tx, &w.item.id, &txn.scope, v, self.config.vector_dim)
                     .await?;
             }
             delta_items += 1;
-            delta_bytes += item.byte_size() as i64;
-            item_id = Some(item.id.clone());
+            delta_bytes += w.item.byte_size() as i64;
+            item_id = Some(w.item.id.clone());
         }
 
         if let Some(m) = &txn.merge {
@@ -4336,7 +4332,7 @@ pub async fn export(
         for scope in scopes {
             let filter = AuditFilter { limit: 100_000, ..Default::default() };
             for record in audit::query(&mut *conn, &scope, &filter).await? {
-                out.push(ExportRecord::Audit { record: Box::new(record) });
+                out.push(ExportRecord::Audit { audit: Box::new(record) });
             }
         }
     }
@@ -4388,8 +4384,8 @@ pub async fn import(
                     report.vectors_imported += 1;
                 }
             }
-            ExportRecord::Audit { record } => {
-                audit::insert(&mut *conn, &record).await?;
+            ExportRecord::Audit { audit } => {
+                audit::insert(&mut *conn, &audit).await?;
                 report.audit_imported += 1;
             }
         }
