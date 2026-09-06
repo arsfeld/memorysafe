@@ -334,6 +334,51 @@ mod tests {
     /// is asserted empty first, so "there is an aggregate row" cannot be
     /// satisfied by a row that was already there — the mistake the pragma case
     /// in `schema.rs` records.
+    #[tokio::test]
+    async fn apply_increments_the_aggregates_in_the_same_write() {
+        let b = backend();
+        let s = scope("s", "n");
+
+        assert!(
+            aggregate_rows(&b, &s.tenant).await.is_empty(),
+            "the absence has to be established before the presence means anything"
+        );
+
+        let first = fx::item(&s, "the first memory");
+        b.apply(fx::admit_txn(&s, first.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            aggregate_rows(&b, &s.tenant).await,
+            vec![(None, None, "admitted".to_string(), 0, 1)],
+            "apply wrote an audit row without incrementing its aggregate"
+        );
+
+        // A second admit on the same day and event class is the *same* key, so
+        // it must raise the count rather than create a second row.
+        b.apply(fx::admit_txn(&s, fx::item(&s, "the second memory"), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            aggregate_rows(&b, &s.tenant).await,
+            vec![(None, None, "admitted".to_string(), 0, 2)]
+        );
+
+        // A different event class is a different key.
+        b.apply(fx::evict_txn(&s, vec![first.id.clone()]))
+            .await
+            .unwrap();
+        let mut rows = aggregate_rows(&b, &s.tenant).await;
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (None, None, "admitted".to_string(), 0, 2),
+                (None, None, "forgotten".to_string(), 0, 1),
+            ]
+        );
+    }
+
     /// `WriteTransaction::is_valid` accepts a merge-only transaction, and this
     /// build implements no merge. The dangerous outcome is not that the merge
     /// fails — it is that the *rest* of the transaction succeeds and `apply`
@@ -386,51 +431,6 @@ mod tests {
             aggregate_rows(&b, &s.tenant).await,
             before,
             "a refused transaction wrote an audit row and an aggregate"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_increments_the_aggregates_in_the_same_write() {
-        let b = backend();
-        let s = scope("s", "n");
-
-        assert!(
-            aggregate_rows(&b, &s.tenant).await.is_empty(),
-            "the absence has to be established before the presence means anything"
-        );
-
-        let first = fx::item(&s, "the first memory");
-        b.apply(fx::admit_txn(&s, first.clone(), None))
-            .await
-            .unwrap();
-        assert_eq!(
-            aggregate_rows(&b, &s.tenant).await,
-            vec![(None, None, "admitted".to_string(), 0, 1)],
-            "apply wrote an audit row without incrementing its aggregate"
-        );
-
-        // A second admit on the same day and event class is the *same* key, so
-        // it must raise the count rather than create a second row.
-        b.apply(fx::admit_txn(&s, fx::item(&s, "the second memory"), None))
-            .await
-            .unwrap();
-        assert_eq!(
-            aggregate_rows(&b, &s.tenant).await,
-            vec![(None, None, "admitted".to_string(), 0, 2)]
-        );
-
-        // A different event class is a different key.
-        b.apply(fx::evict_txn(&s, vec![first.id.clone()]))
-            .await
-            .unwrap();
-        let mut rows = aggregate_rows(&b, &s.tenant).await;
-        rows.sort();
-        assert_eq!(
-            rows,
-            vec![
-                (None, None, "admitted".to_string(), 0, 2),
-                (None, None, "forgotten".to_string(), 0, 1),
-            ]
         );
     }
 

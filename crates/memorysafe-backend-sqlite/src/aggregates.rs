@@ -22,15 +22,32 @@
 //! only by a race. The read-modify-write below is correct under that lock and
 //! under nothing weaker.
 //!
-//! **That lock is in-process, and it is not the only thing holding this up.**
-//! `with_write`'s mutex lives in one `TenantManager`, so two `SqliteBackend`
-//! values over one root — or a second process — are outside it. They are still
-//! safe, by a second mechanism: both callers of `increment` open their
-//! transaction with a *write* (`items::delete`, `items::insert` or
-//! `audit::insert`), so SQLite's own single-writer WAL lock is already held
-//! before the `SELECT` below runs, with `busy_timeout` from `schema::initialise`
-//! to wait for it. Reordering `increment` ahead of the first write in either
-//! caller would remove that second mechanism and leave only the in-process one.
+//! **That lock is in-process, and it is worth being exact about what covers
+//! the rest.** `with_write`'s mutex lives in one `TenantManager`, so two
+//! `SqliteBackend` values over one root — or a second process — are outside
+//! it. What covers them is that `audit::insert`'s `INSERT INTO audit` executes
+//! before `increment` on **both** call sites (`Backend::apply` and
+//! `Backend::record_recall`), so SQLite's single-writer WAL lock is already
+//! held by the time the read-modify-write below runs. Reordering `increment`
+//! ahead of that insert in either caller removes the second mechanism and
+//! leaves only the in-process one.
+//!
+//! **What is *not* covered, stated because the reassuring version of this
+//! paragraph was wrong.** `items::delete` opens with a `SELECT byte_size` and
+//! returns without writing at all when the row is absent, so on an eviction
+//! the transaction's first statement is a read — and nothing in this crate
+//! sets `TransactionBehavior`, so every transaction is `DEFERRED`. A DEFERRED
+//! transaction that reads first takes a WAL snapshot and upgrades later; if
+//! another connection committed in between, SQLite answers
+//! `SQLITE_BUSY_SNAPSHOT`, for which the busy handler is **not** invoked. So
+//! `busy_timeout` does not wait that case out — the caller must roll back and
+//! retry. Reachable only across processes or across two `SqliteBackend` values
+//! over one root, and only when `txn.evictions` is non-empty. The fix is
+//! `transaction_with_behavior(TransactionBehavior::Immediate)`, which takes
+//! the write lock up front and puts the wait back under `busy_timeout`; it is
+//! queued rather than done here because it is a behaviour change that deserves
+//! a test able to fail, and this claim is reasoned from the SQLite and
+//! rusqlite contracts rather than reproduced under contention.
 
 use crate::tenant::SqlResultExt;
 use memorysafe_backend::BackendError;
