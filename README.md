@@ -172,8 +172,7 @@ implementation could fail.
 
 ## Design documents
 
-The full design is in [`docs/superpowers/specs/`](docs/superpowers/specs/); the implementation
-plans are in [`docs/superpowers/plans/`](docs/superpowers/plans/). They are written to be read,
+The full design and implementation plans are in [`docs/`](docs/). They are written to be read,
 and they record the rejected alternatives and the reasons — usually the more useful half.
 
 ## Licence
