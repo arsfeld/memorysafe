@@ -5,6 +5,7 @@
 //! this one being bad.
 
 pub mod admit;
+pub mod compose;
 pub mod config;
 pub mod eviction;
 pub mod fragility;
@@ -78,11 +79,11 @@ impl GovernancePolicy for BaselinePolicy {
     }
     fn compose(
         &self,
-        _req: &RecallRequest,
-        _candidates: &[ScoredCandidate],
-        _ctx: &ComposeContext,
+        req: &RecallRequest,
+        candidates: &[ScoredCandidate],
+        ctx: &ComposeContext,
     ) -> Result<WorkingSet, PolicyError> {
-        unimplemented!("Task 28")
+        Ok(compose::working_set(req, candidates, ctx, &self.config))
     }
     fn maintain(&self, _ctx: &MaintainContext) -> Result<Vec<Decision>, PolicyError> {
         unimplemented!("Task 29")
