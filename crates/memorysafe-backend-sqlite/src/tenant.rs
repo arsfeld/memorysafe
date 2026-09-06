@@ -71,12 +71,19 @@ impl Pool {
         // Releasing the lock is what preflight F1 names as a race: two callers
         // can both miss for one tenant and both open the file, and in the
         // sketch the second `put` evicted the first while its holder kept
-        // using it — two live connections, and a `StdMutex<Connection>` that
-        // no longer serialises anything. What closes it here is that the
-        // loser's connection is **dropped before it is ever used**: the insert
-        // re-checks the cache under the same lock that publishes the winner,
-        // and yields. The cost of the race is one wasted open, not a second
-        // live handle.
+        // using it. The insert below **narrows** that: it re-checks the cache
+        // under the same lock that publishes the winner, so a loser whose
+        // winner is still cached drops its connection before ever using it —
+        // one wasted open instead of a second live handle.
+        //
+        // It does not close it, and the difference matters. If the winner has
+        // already been evicted by capacity pressure or a concurrent `forget`,
+        // the loser's re-check misses and it publishes its own handle: two
+        // live connections to one file. That is benign here only because it is
+        // the *same* state a plain LRU eviction produces — hold a handle, let
+        // capacity push it out, ask again — which needs no race at all and
+        // cannot be designed away while the pool is bounded. `with_write`'s
+        // per-tenant async mutex is what covers it, permanently.
         //
         // `create_dir_all` is here rather than in `TenantManager::new` so an
         // uncreatable root is a `BackendError` and not a panic in a library
@@ -90,11 +97,53 @@ impl Pool {
         self.opened.fetch_add(1, Ordering::Relaxed);
         let handle: Handle = Arc::new(StdMutex::new(conn));
 
-        let mut cache = self.cache.lock().expect("pool mutex");
-        if let Some(winner) = cache.get(key) {
-            return Ok(Arc::clone(winner));
+        // `push` rather than `put` so the entry the LRU drops comes back out
+        // and is released *after* the guard: dropping the last handle to a WAL
+        // database checkpoints it and unlinks the `-wal`/`-shm` sidecars, and
+        // that file I/O must not happen under the cross-tenant pool mutex —
+        // the same reason the open above is outside it.
+        let displaced = {
+            let mut cache = self.cache.lock().expect("pool mutex");
+            if let Some(winner) = cache.get(key) {
+                return Ok(Arc::clone(winner));
+            }
+            cache.push(key.to_owned(), Arc::clone(&handle))
+        };
+        drop(displaced);
+        Ok(handle)
+    }
+
+    /// Drops the cached handle for `key`, if any. The connection itself closes
+    /// only when the last `Arc` to it goes, and that close is deliberately
+    /// performed outside the pool lock — see `handle`.
+    fn evict(&self, key: &str) {
+        let evicted = {
+            let mut cache = self.cache.lock().expect("pool mutex");
+            cache.pop(key)
+        };
+        drop(evicted);
+    }
+
+    /// A handle whose connection mutex is not poisoned.
+    ///
+    /// A closure that panics while holding the connection poisons its mutex,
+    /// and a poisoned handle sitting in the cache fails **every** later call
+    /// for that tenant. Rather than let one panicking closure brick a tenant
+    /// for the process's lifetime, the poisoned handle is dropped from the
+    /// cache and the tenant is reopened. The poisoned connection is never
+    /// reused: it may be sitting inside a half-finished transaction, which is
+    /// exactly what `PoisonError` is warning about.
+    ///
+    /// Checked once and not in a loop. A connection opened a moment ago can
+    /// only be poisoned by another caller panicking in that window, and
+    /// retrying cannot fix a caller that panics every time — so the second
+    /// poisoning surfaces as a retryable error at the lock site instead.
+    fn healthy_handle(&self, key: &str) -> Result<Handle, BackendError> {
+        let handle = self.handle(key)?;
+        if handle.is_poisoned() {
+            self.evict(key);
+            return self.handle(key);
         }
-        cache.put(key.to_owned(), Arc::clone(&handle));
         Ok(handle)
     }
 }
@@ -115,13 +164,33 @@ impl Pool {
 /// per-tenant async mutex does.
 ///
 /// The consequence for Tasks 20–24: **a read-modify-write must go through
-/// [`Self::with_write`]**, never [`Self::with_conn`]. `with_conn` is for reads,
-/// which are safe to run concurrently under WAL.
+/// [`Self::with_write`]**, never [`Self::with_conn`].
 ///
 /// `memorysafe_backend::aggregates` requires that concurrent increments of one
 /// aggregate row cannot interleave and asks each backend to say which of an
 /// atomic upsert, a row lock or serialised writers it chose. This backend
 /// serialises the writers, here.
+///
+/// # This is a handle cache, not a connection pool
+///
+/// There is at most **one** pooled `Connection` per tenant, behind a
+/// `Mutex<Connection>`, so within a tenant reads serialise with each other and
+/// with writes. WAL buys cross-tenant concurrency and correctness in the
+/// transient two-connection case above — it does not buy concurrent readers
+/// within one tenant, and Task 21's recall-latency reasoning must not assume
+/// it does. Raising `max_open` raises the number of *tenants* held open, never
+/// the parallelism available to any one of them.
+///
+/// # A panicking closure does not brick the tenant
+///
+/// A closure that panics while holding the connection poisons its mutex.
+/// Left alone, that poisoned handle stays in the cache and fails every later
+/// call for the tenant with `retryable: false`, which nothing above will
+/// retry — one `unwrap` in one closure, and the tenant is gone for the life of
+/// the process. Instead the poisoned handle is dropped from the cache and the
+/// tenant reopened on the next call; the poisoned connection is never reused,
+/// since it may be inside a half-finished transaction. [`Self::forget`] is the
+/// manual equivalent and is no longer needed for this.
 ///
 /// # Deleting a tenant out from under a live manager
 ///
@@ -173,9 +242,13 @@ impl TenantManager {
     /// every in-flight `with_conn`/`with_write` for that tenant has returned.
     ///
     /// The tenant's write lock is deliberately kept: see the type doc.
+    ///
+    /// **Blocking.** If this drops the last handle, closing the connection
+    /// checkpoints the WAL and unlinks the `-wal`/`-shm` sidecars — file I/O,
+    /// synchronously, on the calling thread. From an async runtime, call it
+    /// inside `spawn_blocking`.
     pub fn forget(&self, tenant: &TenantId) {
-        let mut cache = self.pool.cache.lock().expect("pool mutex");
-        cache.pop(tenant.as_str());
+        self.pool.evict(tenant.as_str());
     }
 
     fn write_lock(&self, tenant: &TenantId) -> Arc<AsyncMutex<()>> {
@@ -187,8 +260,10 @@ impl TenantManager {
         )
     }
 
-    /// Runs `f` on the tenant's connection off the async runtime. Concurrent
-    /// readers are fine under WAL.
+    /// Runs `f` on the tenant's connection off the async runtime, on the
+    /// blocking pool. Reads for *different* tenants run concurrently; reads
+    /// for the same tenant do not — see "This is a handle cache, not a
+    /// connection pool" on the type.
     ///
     /// **Reads only.** The `Mutex<Connection>` this holds does not make `f`
     /// atomic — see the type doc — so a read-modify-write belongs in
@@ -201,8 +276,20 @@ impl TenantManager {
         let pool = Arc::clone(&self.pool);
         let key = tenant.as_str().to_string();
         tokio::task::spawn_blocking(move || {
-            let handle = pool.handle(&key)?;
-            let mut conn = handle.lock().expect("connection mutex");
+            let handle = pool.healthy_handle(&key)?;
+            let mut conn = match handle.lock() {
+                Ok(conn) => conn,
+                // Poisoned in the window between `healthy_handle`'s check and
+                // this lock. Evict so the next call opens a fresh connection,
+                // and say `retryable` — because after the eviction, it is.
+                Err(e) => {
+                    pool.evict(&key);
+                    return Err(storage_error(
+                        format!("tenant connection poisoned by an earlier panic: {e}"),
+                        true,
+                    ));
+                }
+            };
             f(&mut conn)
         })
         .await
@@ -358,6 +445,85 @@ mod tests {
             mgr.open_count(),
             7,
             "tenant-0 was still pooled, so `max_open` was not honoured"
+        );
+    }
+
+    /// The two pragmas the whole design rests on, asserted on a real tenant
+    /// file. Neither was asserted anywhere before this test existed, and by
+    /// this project's own standard an untested mechanism reads as removable.
+    ///
+    /// `PRAGMA foreign_keys` is a **no-op inside a transaction**, so the way
+    /// this breaks is a refactor that wraps the open path in one: no error, no
+    /// failing test in this crate, and the symptom surfaces tasks later as
+    /// vectors a purge left behind. WAL is what `with_conn`'s cross-tenant
+    /// concurrency and the transient two-connection case both rest on.
+    #[tokio::test]
+    async fn a_freshly_opened_tenant_is_in_wal_mode_with_foreign_keys_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = TenantManager::new(dir.path().to_path_buf(), 8);
+        let t = TenantId::new("t").unwrap();
+
+        let (journal, foreign_keys) = mgr
+            .with_conn(&t, |c| {
+                let journal: String = c.query_row("PRAGMA journal_mode", [], |r| r.get(0)).sql()?;
+                let foreign_keys: i64 =
+                    c.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).sql()?;
+                Ok((journal, foreign_keys))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(journal, "wal", "the tenant database is not in WAL mode");
+        assert_eq!(
+            foreign_keys, 1,
+            "foreign keys are off; the vectors cascade does nothing"
+        );
+        assert!(
+            dir.path().join("t.db-wal").exists(),
+            "no WAL sidecar beside the tenant file"
+        );
+    }
+
+    /// One `unwrap` in one closure must not take the tenant out for the life of
+    /// the process. A panic poisons the connection mutex; left alone, the
+    /// poisoned handle stays cached and every later call for that tenant fails
+    /// with `retryable: false`, which nothing above retries. The pool evicts it
+    /// and reopens instead.
+    #[tokio::test]
+    async fn a_panicking_closure_does_not_brick_the_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = TenantManager::new(dir.path().to_path_buf(), 8);
+        let t = TenantId::new("t").unwrap();
+
+        mgr.with_write(&t, |c| {
+            c.execute("INSERT INTO meta(key,value) VALUES('probe','kept')", [])
+                .sql()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(mgr.open_count(), 1);
+
+        let blown = mgr
+            .with_conn(&t, |_| -> Result<(), BackendError> {
+                panic!("a closure in Task 20 unwrapped something")
+            })
+            .await;
+        assert!(blown.is_err(), "a panicking closure returned Ok");
+
+        // The tenant still works, and its data is still there.
+        let value: String = mgr
+            .with_conn(&t, |c| {
+                c.query_row("SELECT value FROM meta WHERE key='probe'", [], |r| r.get(0))
+                    .sql()
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, "kept");
+        assert_eq!(
+            mgr.open_count(),
+            2,
+            "the poisoned handle was reused rather than evicted and reopened"
         );
     }
 

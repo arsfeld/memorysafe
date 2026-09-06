@@ -6372,7 +6372,7 @@ git commit -m "feat(backend): conformance tests for audit, purge, and portabilit
 
 **The ordering index states its collation explicitly on every text column.** `Backend::audit_aggregates` mandates that every ordering over a text column states its collation and every ordering over a nullable column states null placement, neither relying on a dialect default. `COLLATE BINARY` is SQLite's spelling of byte order; Postgres's is `COLLATE "C"`. `policy_name` and `policy_version` are nullable and must sort NULL first. State it in the query — **`ORDER BY … ASC NULLS FIRST`** — rather than relying on any default; the point of the mandate is that a reader can see the choice was made, and it holds whatever the default turns out to be.
 
-**Use `NULLS FIRST`, not `(policy_name IS NULL) DESC`, and the reason is not style.** Both satisfy the mandate — an earlier version of this paragraph prescribed the expression form — but `EXPLAIN QUERY PLAN` shows the expression form takes a **full sort** because it orders by a computed value the index cannot serve, while `ASC NULLS FIRST` uses `idx_aggregates_order`. Measured, not recollected. **A mandate with two satisfying forms gets satisfied by whichever is written first**, so this one names the form; the general clause on `Backend::audit_aggregates` stays semantic because the *spelling* differs by dialect (`COLLATE BINARY` here, `COLLATE "C"` in Postgres) and only the *requirement* transfers. `ordering_sql_states_collation_and_null_placement` is where that is asserted, and it lives in the purge-and-portability task, where the query builder it must read is written — not with the retrieval tasks. The two columns `items.last_access` and `items.access_count` are also read for the first time from Task 21 onward; they have been declared since this task and unread until now.
+**Use `NULLS FIRST`, not `(policy_name IS NULL) DESC`, and the reason is not style.** Both satisfy the mandate — an earlier version of this paragraph prescribed the expression form — but `EXPLAIN QUERY PLAN` shows the expression form falls back to a sort for the four key components after `day`, because it orders by a computed value that is not an index column. Measured, not recollected, and quoted rather than paraphrased: the expression form returns `SCAN audit_aggregates USING INDEX idx_aggregates_order` / `USE TEMP B-TREE FOR LAST 4 TERMS OF ORDER BY` — `day` is still served by the index — while `ASC NULLS FIRST` returns the first line alone. **A mandate with two satisfying forms gets satisfied by whichever is written first**, so this one names the form; the general clause on `Backend::audit_aggregates` stays semantic because the *spelling* differs by dialect (`COLLATE BINARY` here, `COLLATE "C"` in Postgres) and only the *requirement* transfers. `ordering_sql_states_collation_and_null_placement` is where that is asserted, and it lives in the purge-and-portability task, where the query builder it must read is written — not with the retrieval tasks. The two columns `items.last_access` and `items.access_count` are also read for the first time from Task 21 onward; they have been declared since this task and unread until now.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -9035,8 +9035,18 @@ use memorysafe_core::{AuditEvent, PolicyId, TenantId};
 ///
 /// **Collation and null placement are stated, not defaulted**, per the mandate
 /// on `Backend::audit_aggregates`. `COLLATE BINARY` is SQLite's spelling of
-/// byte order; `(policy_name IS NULL) DESC` puts policy-less rows first
-/// without relying on SQLite's NULL ordering being what we remember it to be.
+/// byte order; `ASC NULLS FIRST` puts policy-less rows first without relying
+/// on SQLite's NULL ordering being what we remember it to be.
+///
+/// **`NULLS FIRST` and not `(policy_name IS NULL) DESC`, which is what this
+/// said before.** Both satisfy the mandate and only the first is servable by
+/// `idx_aggregates_order`: the expression is not an index column, so SQLite
+/// sorts. Measured in Task 19 — the expression form returns `SCAN
+/// audit_aggregates USING INDEX idx_aggregates_order` /
+/// `USE TEMP B-TREE FOR LAST 4 TERMS OF ORDER BY`, the `NULLS FIRST` form the
+/// first line alone — and pinned there by
+/// `schema::tests::the_aggregate_ordering_index_serves_the_documented_order`,
+/// which asserts both halves so the note cannot go stale quietly.
 ///
 /// **The cursor runs the opposite way from `Backend::audit`'s, and this is the
 /// most likely thing to get wrong here.** `audit` pages **descending** and its
@@ -9093,10 +9103,8 @@ pub fn query(
                   OR (day = ?5 AND policy_name IS ?6 AND policy_version IS ?7
                       AND event COLLATE BINARY > ?8 COLLATE BINARY)))
              ORDER BY day ASC,
-                      (policy_name IS NULL) DESC,
-                      policy_name    COLLATE BINARY ASC,
-                      (policy_version IS NULL) DESC,
-                      policy_version COLLATE BINARY ASC,
+                      policy_name    COLLATE BINARY ASC NULLS FIRST,
+                      policy_version COLLATE BINARY ASC NULLS FIRST,
                       event          COLLATE BINARY ASC
              LIMIT ?9",
         )
@@ -9155,6 +9163,28 @@ one — do not write a second. `histogram_from_json` parses the stored JSON into
 padding: a histogram of the wrong width means the row was written under
 different `SCORE_HISTOGRAM_EDGES` than this build has, which
 `histogram_version` exists to make detectable.
+
+**Two query shapes here still sort, measured against the Task 19 schema with
+`EXPLAIN QUERY PLAN` and recorded rather than fixed.** Neither is a correctness
+problem and neither is Task 19's to solve — the index set is not the reason —
+but both are on paths that grow without bound, so a later reader should know
+they were seen and not missed:
+
+1. `WHERE day BETWEEN ? AND ? AND policy_name = ? AND policy_version = ?` gives
+   `SEARCH audit_aggregates USING INDEX idx_aggregates_key_policied
+   (policy_name=? AND policy_version=?)` / `USE TEMP B-TREE FOR ORDER BY`. It
+   takes the *uniqueness* index, whose leading column is `policy_name`, and then
+   sorts the whole ORDER BY. **That is the query
+   `memorysafe_backend::aggregates`' own module doc calls the primary one the
+   table exists to answer** ("how did behaviour change across policy 1.4"), so
+   it is the shape most worth measuring once real row counts exist. An index
+   leading `(policy_name, policy_version, day)` would serve it; do not add one
+   on this note alone, add it on a measurement against real data.
+2. A time-windowed *first* page of `audit` with no cursor
+   (`… AND at BETWEEN ? AND ? ORDER BY id DESC`) gives `SEARCH audit USING
+   INDEX idx_audit_scope_at (subject=? AND namespace=? AND at>? AND at<?)` /
+   `USE TEMP B-TREE FOR ORDER BY`. The cursor page — the one that repeats, and
+   the one `idx_audit_scope_id` was added for — does not sort.
 
 **The `ordering_sql_states_collation_and_null_placement` test the trait
 requires goes in this crate**, asserting over the string `query` builds rather

@@ -56,10 +56,13 @@ BEGIN
   INSERT INTO items_fts(rowid, body, tags) VALUES (new.rowid, new.body, new.tags);
 END;
 -- `items_fts` is an external-content table keyed on `items.rowid`, and `items`
--- has no INTEGER PRIMARY KEY, so VACUUM may renumber those rowids and leave
--- the index pointing at the wrong rows. Do not VACUUM a tenant database
--- without rebuilding the index afterwards
--- (INSERT INTO items_fts(items_fts) VALUES('rebuild')).
+-- has no INTEGER PRIMARY KEY, so SQLite's documented behaviour permits VACUUM
+-- to renumber those rowids and leave the index naming the wrong rows. The
+-- bundled SQLite does not actually renumber here, and
+-- `tests::vacuum_does_not_desynchronise_the_fts_index` asserts *that* rather
+-- than the precaution — so this stops being a remembered hazard and starts
+-- being a tripwire. If it ever fires, rebuild after VACUUM with
+-- `INSERT INTO items_fts(items_fts) VALUES('rebuild')`.
 
 CREATE TABLE IF NOT EXISTS vectors (
   item_id   TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
@@ -169,6 +172,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregates_key_policy_less
 -- column rather than left to the engine's default, per the mandate on
 -- `Backend::audit_aggregates`; `COLLATE BINARY` is SQLite's spelling of byte
 -- order and Postgres's is `COLLATE "C"`.
+--
+-- **To use this index, spell the mandated null placement `ASC NULLS FIRST` and
+-- not `(policy_name IS NULL) DESC`.** Both satisfy the mandate; only the first
+-- is servable, because the second orders by a computed value that is not an
+-- index column. Measured with EXPLAIN QUERY PLAN, not recollected: the
+-- expression form comes back `USE TEMP B-TREE FOR LAST 4 TERMS OF ORDER BY`
+-- (`day` is still served by this index, the four key components after it are
+-- sorted), while the `NULLS FIRST` form uses the index for all of them.
+-- `tests::the_aggregate_ordering_index_serves_the_documented_order` asserts
+-- both halves, so if a future SQLite makes the expression form servable the
+-- test fails rather than this note going quietly stale.
 CREATE INDEX IF NOT EXISTS idx_aggregates_order ON audit_aggregates(
   day,
   policy_name    COLLATE BINARY,
@@ -178,17 +192,49 @@ CREATE INDEX IF NOT EXISTS idx_aggregates_order ON audit_aggregates(
 "#;
 
 /// Applies pragmas and DDL. Idempotent — safe on every open.
+///
+/// **The pragmas must be applied outside a transaction.** `PRAGMA
+/// foreign_keys` is a **no-op inside one** — SQLite ignores it silently, with
+/// no error — so wrapping the open path in a transaction would turn the
+/// `vectors` cascade off without breaking anything here, and the symptom would
+/// surface tasks later as vectors left behind by a purge.
+/// `tenant::tests::a_freshly_opened_tenant_is_in_wal_mode_with_foreign_keys_on`
+/// asserts the pragmas on a real tenant file and
+/// `tests::initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector`
+/// buy, so the silent version of that refactor now has something to break.
 pub fn initialise(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.execute_batch(DDL)?;
+
+    // `INSERT OR IGNORE` and then check, never an UPSERT. An unconditional
+    // UPSERT makes the marker write-only: v1 code opening a v2 file rewrites
+    // it *down* to 1 and carries on against a schema it does not understand,
+    // and v2 code opening a v1 file writes 2 over an unmigrated database. Both
+    // destroy the only evidence of what the file actually is. Refusing to open
+    // is the whole value of storing a version, and there is no migration path
+    // to offer instead while `SCHEMA_VERSION` is 1.
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?1)",
         [SCHEMA_VERSION.to_string()],
     )?;
+    let stored: String = conn.query_row(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+        [],
+        |r| r.get(0),
+    )?;
+    if stored != SCHEMA_VERSION.to_string() {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "database is at schema version {stored} and this build expects \
+                 {SCHEMA_VERSION}; there is no migration path, and opening it \
+                 would overwrite the marker"
+            )),
+        ));
+    }
     Ok(())
 }
 
@@ -431,6 +477,116 @@ mod tests {
         assert!(
             window.contains("idx_audit_scope_at"),
             "the time-window index was dropped rather than kept: {window}"
+        );
+    }
+
+    /// `foreign_keys=ON` is set by `initialise` and nothing else in this crate
+    /// visibly depends on it, so without this the cascade could be off for
+    /// several tasks before anyone noticed.
+    ///
+    /// **This starts from `OFF` on purpose, and the reason is a measurement.**
+    /// The bundled SQLite is compiled with `SQLITE_DEFAULT_FOREIGN_KEYS=1` — a
+    /// fresh connection reads `1` before `initialise` touches it, which is
+    /// *not* upstream SQLite's default. So a test that only asserted the end
+    /// state would stay green with `initialise`'s pragma line deleted, and
+    /// green with it wrapped in a transaction, where `PRAGMA foreign_keys` is a
+    /// documented **silent no-op** (probed on 3.53.2: set to `ON` inside a
+    /// transaction, it still reads `0`). Both mutants were run against the
+    /// end-state version of this test and both survived. Forcing `OFF` first is
+    /// what kills them, and it is also what the crate would face if `bundled`
+    /// were ever swapped for a system libsqlite3.
+    #[test]
+    fn initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        initialise(&conn).unwrap();
+
+        let on: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(on, 1, "initialise did not turn foreign keys on");
+
+        insert_item(&conn, "i1", "body", "tag");
+        conn.execute(
+            "INSERT INTO vectors(item_id, subject, namespace, embedder, dim, scale, q)
+             VALUES ('i1', 's', 'n', 'test', 4, 1.0, x'00010203')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM items WHERE id = 'i1'", [])
+            .unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "the vector outlived its item");
+    }
+
+    /// The `schema_version` marker is only worth storing if a mismatch refuses
+    /// to open. An unconditional UPSERT made it write-only: v1 code opening a
+    /// v2 file would rewrite the marker *down* and carry on against a schema it
+    /// does not understand, destroying the only evidence of what the file is.
+    #[test]
+    fn a_database_from_another_schema_version_is_refused_rather_than_relabelled() {
+        let conn = db();
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+            [(SCHEMA_VERSION + 1).to_string()],
+        )
+        .unwrap();
+
+        let err = initialise(&conn).unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("schema version"),
+            "expected a version refusal, got: {message}"
+        );
+
+        // And the marker was not overwritten on the way out.
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, (SCHEMA_VERSION + 1).to_string());
+    }
+
+    /// `items_fts` is external-content over `items.rowid`, and `items` has no
+    /// INTEGER PRIMARY KEY, so SQLite's documented behaviour permits VACUUM to
+    /// renumber those rowids and leave the index naming the wrong rows —
+    /// silently, with the symptom being a search that returns the wrong
+    /// document. The bundled SQLite does not in fact renumber here, and this
+    /// asserts *that* rather than the precaution: the day it changes, this test
+    /// says so instead of a recall quietly going wrong.
+    #[test]
+    fn vacuum_does_not_desynchronise_the_fts_index() {
+        let conn = db();
+        insert_item(&conn, "i1", "alpha", "one");
+        insert_item(&conn, "i2", "beta", "two");
+        conn.execute("DELETE FROM items WHERE id = 'i1'", [])
+            .unwrap();
+
+        conn.execute_batch("VACUUM").unwrap();
+        conn.execute_batch("INSERT INTO items_fts(items_fts) VALUES('integrity-check')")
+            .unwrap();
+
+        let rowid: i64 = conn
+            .query_row(
+                "SELECT rowid FROM items_fts WHERE items_fts MATCH 'beta'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let id: String = conn
+            .query_row("SELECT id FROM items WHERE rowid = ?1", [rowid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            id, "i2",
+            "VACUUM renumbered rowids and the FTS index now names the wrong row"
         );
     }
 
