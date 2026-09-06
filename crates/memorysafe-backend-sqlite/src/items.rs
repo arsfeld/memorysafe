@@ -24,12 +24,28 @@ fn source_kind_str(k: SourceKind) -> &'static str {
     }
 }
 
-fn source_kind_from(s: &str) -> SourceKind {
+/// **Errors on an unrecognised string rather than falling back to a default,
+/// and the fallback is what made three of these arms untestable.**
+///
+/// `fx::item` — the conformance suite's only fixture constructor — pins
+/// `SourceKind::Agent`, which is exactly what the old `_ => SourceKind::Agent`
+/// produced for a broken arm. So the fixture's chosen value and the catch-all's
+/// fallback were *the same value*, and no test built on that fixture could ever
+/// observe `"session"` or `"tool"` failing to parse, however many were added.
+/// With no fallback value there is nothing for a fixture to coincide with.
+///
+/// Erroring is safe here because the writer is exhaustive: [`source_kind_str`]
+/// matches every `SourceKind` variant with no catch-all, so the only strings
+/// that can reach this function are ones it produced. Anything else is
+/// corruption, and corruption becoming `Agent` silently is worse than a read
+/// that fails.
+fn source_kind_from(s: &str) -> rusqlite::Result<SourceKind> {
     match s {
-        "session" => SourceKind::Session,
-        "tool" => SourceKind::Tool,
-        "human" => SourceKind::Human,
-        _ => SourceKind::Agent,
+        "agent" => Ok(SourceKind::Agent),
+        "session" => Ok(SourceKind::Session),
+        "tool" => Ok(SourceKind::Tool),
+        "human" => Ok(SourceKind::Human),
+        other => Err(unreadable_enum("source_kind", other)),
     }
 }
 
@@ -41,15 +57,41 @@ fn protection_parts(p: Protection) -> (&'static str, Option<i64>) {
     }
 }
 
-fn protection_from(kind: &str, until: Option<i64>) -> Protection {
+/// Errors on an unrecognised string, for the reason on [`source_kind_from`] —
+/// and the stakes here are higher. `fx::item` pins `Protection::Normal`, which
+/// is what the old catch-all returned, so a broken `"pinned"` arm turned a
+/// **pinned item into an evictable one** with no error anywhere.
+/// `Protection::Pinned`'s own doc says no policy may evict a pinned item and
+/// the engine refuses any decision that tries; a silent downgrade in the reader
+/// defeats that without ever reaching a policy.
+///
+/// The `"protected"` arm keeps its own fallback deliberately: a row whose
+/// `protected_until` is absent or not a valid timestamp has no protection
+/// window to honour, and `Normal` is the correct reading of it rather than a
+/// default standing in for an unknown.
+fn protection_from(kind: &str, until: Option<i64>) -> rusqlite::Result<Protection> {
     match kind {
-        "pinned" => Protection::Pinned,
-        "protected" => match until.and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok()) {
-            Some(until) => Protection::Protected { until },
-            None => Protection::Normal,
-        },
-        _ => Protection::Normal,
+        "normal" => Ok(Protection::Normal),
+        "pinned" => Ok(Protection::Pinned),
+        "protected" => Ok(
+            match until.and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok()) {
+                Some(until) => Protection::Protected { until },
+                None => Protection::Normal,
+            },
+        ),
+        other => Err(unreadable_enum("protection", other)),
     }
+}
+
+/// A stored enum string the writer could not have produced.
+fn unreadable_enum(column: &str, got: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::other(format!(
+            "{column} holds {got:?}, which no writer in this crate emits"
+        ))),
+    )
 }
 
 /// The columns `row_to_item` reads, in one place so a `SELECT` and the row
@@ -77,7 +119,7 @@ pub fn row_to_item(row: &Row<'_>, tenant: &str) -> rusqlite::Result<MemoryItem> 
         body: row.get("body")?,
         kind: row.get("kind")?,
         source: Source {
-            kind: source_kind_from(&row.get::<_, String>("source_kind")?),
+            kind: source_kind_from(&row.get::<_, String>("source_kind")?)?,
             id: row.get("source_id")?,
         },
         occurred_at: occurred.and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok()),
@@ -88,7 +130,7 @@ pub fn row_to_item(row: &Row<'_>, tenant: &str) -> rusqlite::Result<MemoryItem> 
         sensitivity: SensitivityLevel::from_ordinal(sensitivity)
             .unwrap_or(SensitivityLevel::Restricted),
         ttl: ttl.map(Duration::seconds),
-        protection: protection_from(&protection, protected_until),
+        protection: protection_from(&protection, protected_until)?,
         pending_embedding: pending != 0,
     })
 }
@@ -334,6 +376,51 @@ mod tests {
     /// decode. `Protection::Protected` in particular is the only variant that
     /// uses the second column, so a `protection_from` that ignored
     /// `protected_until` would be invisible against `Normal` or `Pinned`.
+    /// The construction, not the coverage. Three arms of these two readers were
+    /// untestable for a structural reason: `fx::item` pins `SourceKind::Agent`
+    /// and `Protection::Normal`, which were **exactly** what the old catch-alls
+    /// returned — so the fixture's value and the fallback value were the same
+    /// value, and no test built on that fixture could ever see a broken arm.
+    ///
+    /// Adding tests could not fix that. Removing the fallback does: with an
+    /// error in its place there is no value for a fixture to coincide with.
+    /// This test pins the error, so the fallback cannot come back.
+    #[test]
+    fn an_unwritable_enum_string_is_an_error_rather_than_a_silent_default() {
+        for (column, bad) in [("source_kind", "daemon"), ("protection", "sealed")] {
+            let conn = db();
+            let sk = if column == "source_kind" {
+                bad
+            } else {
+                "agent"
+            };
+            let pr = if column == "protection" {
+                bad
+            } else {
+                "normal"
+            };
+            conn.execute(
+                &format!(
+                    "INSERT INTO items (id, subject, namespace, body, kind, source_kind,
+                         created_at, tags, attrs, sensitivity, protection, byte_size)
+                     VALUES ('01M1VHV0H1QXXT4BPAT4Z8351R', 's', 'n', 'b', 'fact', '{sk}',
+                             0, '[]', '{{}}', 1, '{pr}', 3)"
+                ),
+                [],
+            )
+            .unwrap();
+
+            let err = list(&conn, &scope("s", "n"), &Page::default()).expect_err(&format!(
+                "an unknown {column} must not be read as a default"
+            ));
+            let text = format!("{err:?}");
+            assert!(
+                text.contains(bad),
+                "the error must name the unreadable value; got {text}"
+            );
+        }
+    }
+
     #[test]
     fn every_column_survives_a_round_trip_including_the_ones_with_defaults() {
         let conn = db();
