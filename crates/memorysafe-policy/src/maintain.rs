@@ -43,9 +43,18 @@
 //!   here tries to remember across pages, because `maintain` is pure and the
 //!   cursor belongs to the engine.
 //!
-//! `ctx.is_final_batch` is not read. Every step here acts only on evidence
-//! its own page carries, so none of them has anything to wait for; a step
-//! that summed across the whole namespace would need it.
+//! `ctx.is_final_batch` is not read **by this policy**. Every step here acts
+//! only on evidence its own page carries, so none has anything to wait for.
+//!
+//! That is the baseline's choice, not the field's purpose. A policy that
+//! deferred a decision until it had seen the whole corpus would read it, and
+//! **consolidation is the obvious candidate**: the best merge target for an
+//! item on this page may sit on a page not yet scanned, so a policy willing to
+//! accumulate across pages would hold its merges until `is_final_batch` and
+//! then choose globally, where this one merges within the page and leaves the
+//! rest to the next run. The engine computes the flag from
+//! `scanned < MAINTAIN_BATCH` and uses it to decide `next_cursor`, so it is
+//! real context a policy may need — not a dead field.
 
 use crate::config::BaselineConfig;
 use crate::{eviction, fragility, similarity};
@@ -117,6 +126,43 @@ fn capacity_reclaim(
     expired: &BTreeSet<ItemId>,
     policy: &PolicyId,
 ) -> Vec<Decision> {
+    // **Byte budgets are NOT deferred here — they are half-implemented, and
+    // this is the missing half.** Three of the four places that read
+    // `max_bytes` honour it; only this one does not:
+    //
+    //   * `Budget::is_bounded` returns true for a byte-only budget
+    //     (`max_items.is_some() || max_bytes.is_some()`), which core pins
+    //     deliberately in `standing_check_budget_is_bounded`.
+    //   * `CapacityState::pressure` maxes over both dimensions, so the
+    //     pressure signal on a byte-only budget is live and correct.
+    //   * `CapacityState::would_exceed` refuses an admission that would break
+    //     it — and `admit`'s make-room loop evicts until it stops refusing, so
+    //     ADMISSION already frees bytes.
+    //   * The early return below ignores `max_bytes` entirely.
+    //
+    // So a namespace with `max_bytes: Some(_)` and `max_items: None` reports
+    // pressure correctly, refuses writes once over, and never reclaims —
+    // permanently stuck, not merely unbounded. It also puts the two entry
+    // points into disagreement about one question: `admit` frees bytes to make
+    // room and `maintain` does not, which is the divergence `eviction::cost`
+    // exists to prevent, reappearing one level up.
+    //
+    // **The engine cost is worse than a no-op.** Task 32 gathers eviction
+    // candidates only when `capacity.budget.is_bounded()` — which a byte-only
+    // budget satisfies — so it will run the backend `list`, build the
+    // candidate vector, hand it over, and this early return will discard it
+    // without a decision or an audit row: work performed and silently thrown
+    // away, while from outside the namespace looks actively managed (pressure
+    // live, writes refused, candidates gathered on every write). Tense matters
+    // here: `is_bounded`'s behaviour is real and asserted today, but that
+    // consumer is not written yet, so the waste is latent rather than current.
+    // The reader being warned is the one who arrives after Task 32 lands.
+    //
+    // Do not write a comment here saying byte budgets are deferred: three of
+    // the four readers implement them, and a reader who believes the deferral
+    // will not go looking for the liveness bug. Owned by the engine's
+    // retention and capacity work; until that lands, a byte-only budget is a
+    // misconfiguration the engine should reject rather than a supported shape.
     let Some(max_items) = ctx.capacity.budget.max_items else {
         return Vec::new();
     };
@@ -621,28 +667,26 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_item_does_not_survive_its_own_ttl() {
-        // DIVERGENCE from the brief, which asserted the opposite ("a pinned
-        // item must never be evicted, TTL included") — see the task report.
-        // The brief's own Step 3 implementation contradicts its Step 1 test
-        // here: it calls `must_forget` with no pinned-item exemption, under a
-        // comment saying there deliberately is none. Three signals agree with
-        // the code and against the test:
+    fn a_pin_does_not_override_a_retention_limit() {
+        // **Expiry dominates pinning.** Settled: the plan asserted the
+        // opposite for several rounds and was amended to this. It was the lone
+        // outlier, against this task's own Step 3 code (`must_forget` is
+        // called with no pinned exemption, under a comment saying there
+        // deliberately is none), against `MemoryItem::must_forget`'s doc
+        // ("Expiry dominates protection; protection only governs eviction for
+        // capacity" — a pin would otherwise "silently override a legal
+        // retention limit"), and against core's own `expiry_dominates_pinning`
+        // test, which asserts `must_forget` is true for exactly this fixture.
+        // `maintain` is that method's only possible caller in the workspace, so
+        // a pinned exemption here would have made it dead letter.
         //
-        //   * `MemoryItem::must_forget`'s doc: "Expiry dominates protection;
-        //     protection only governs eviction for capacity." The method
-        //     exists ONLY to express that, and `maintain` is its only possible
-        //     caller anywhere in the workspace — exempting pinned items here
-        //     makes it dead letter and silently un-enforces the guarantee.
-        //   * `memorysafe_core`'s own `expiry_dominates_pinning` test asserts
-        //     `must_forget` is true for exactly this fixture.
-        //   * The governance argument: a pin that defeated a TTL would let any
-        //     caller opt out of a legal retention limit by pinning.
-        //
-        // The half of "pinning is absolute" that IS true — a pin blocks
-        // CAPACITY eviction — is asserted below and in
-        // `reclaim_never_touches_pinned_items`.
-        let mut pinned = item("pinned forever");
+        // A pin that outlived a retention limit would be a compliance failure
+        // in a product whose retention profiles are the feature. Pinning still
+        // governs capacity reclaim, which is the half it is for — see
+        // `reclaim_never_touches_pinned_items` and
+        // `a_pinned_item_within_its_ttl_survives_capacity_pressure`, and do not
+        // weaken either while changing this.
+        let mut pinned = item("pinned, but past its TTL");
         pinned.created_at = now() - Duration::days(10);
         pinned.ttl = Some(Duration::days(1));
         pinned.protection = Protection::Pinned;
@@ -725,8 +769,15 @@ mod tests {
 
     // ------------------------------------------------------------ reclaim --
 
+    // Named for what this corpus pins, which is the COUNT and not the order:
+    // all five fixtures share `STORED_VALUE`, `STORED_FRAGILITY` and the
+    // default `created_at`, so cost and age are both ties and no ranking is
+    // distinguishable here. The ranking is covered next door by
+    // `reclaim_takes_the_cheapest_to_lose_first_not_merely_the_oldest`, which
+    // varies value and fragility on purpose — do not weaken that one, and do
+    // not re-add a ranking claim to this name.
     #[test]
-    fn an_over_budget_namespace_reclaims_cheapest_first() {
+    fn an_over_budget_namespace_reclaims_down_to_its_budget() {
         let batch: Vec<MemoryItem> = (0..5).map(|i| item(&format!("memory {i}"))).collect();
         let ds = decisions(&ctx(batch, 5, Some(3)), &BaselineConfig::default(), pid());
         let evicted: usize = ds.iter().map(|d| d.evictions.len()).sum();
