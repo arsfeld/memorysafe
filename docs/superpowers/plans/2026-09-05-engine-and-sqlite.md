@@ -11279,11 +11279,24 @@ pub fn decisions(
     //                                                 `standing_check_budget_is_bounded`
     //   `CapacityState::pressure`   `capacity.rs:43`  reports it correctly
     //   `CapacityState::would_exceed` `capacity.rs:64` refuses the admission
-    //   `admit`'s make-room loop    `admit.rs:153-182` accumulates `freed_bytes`
-    //                                                 and EVICTS to fit — pinned by
-    //                                                 `a_byte_only_budget_frees_enough_
-    //                                                 room_after_one_eviction`
     //   `maintain::capacity_reclaim` HERE              ignores it
+    //
+    // **And one path enforces byte budgets WITHOUT reading the field**, which is a
+    // separate enumeration and was conflated with the one above twice:
+    //
+    //   `admit`'s make-room loop    `admit.rs:153-182` tracks `freed_bytes`/`used_bytes`
+    //                                                  and EVICTS to fit — it never
+    //                                                  names `max_bytes`, it asks
+    //                                                  `would_exceed`, which is already
+    //                                                  counted above. Pinned by
+    //                                                  `a_byte_only_budget_frees_enough_
+    //                                                  room_after_one_eviction`.
+    //
+    // **"Reads the field" and "behaviour depends on byte budgets" are different
+    // questions and the answer differs.** Three read it; a fourth enforces it through
+    // one of those three; `capacity_reclaim` does neither. An enumeration tells you
+    // what matches the pattern, not what the pattern means — which is the failure it
+    // cannot protect against, and the one that produced two wrong counts here.
     //
     // So a namespace with `max_bytes: Some(_)` and `max_items: None` reports
     // pressure, refuses writes once over, and **never reclaims**. Permanently
