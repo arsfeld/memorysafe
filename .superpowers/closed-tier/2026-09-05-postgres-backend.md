@@ -227,7 +227,7 @@ impl PgConfig {
 /// under `SharedPartitioned`; `<schema>_<folded tenant>_<hash>`, bounded to 63
 /// bytes, under `SchemaPerTenant`.
 pub fn schema_for_tenant(config: &PgConfig, tenant: &TenantId) -> String;
-pub const MAX_PREFIX_BYTES: usize = 45;
+pub const MAX_PREFIX_BYTES: usize = 46;
 
 // error.rs
 pub fn sqlx_error(e: sqlx::Error) -> BackendError;
@@ -825,17 +825,58 @@ mod tests {
     /// The prefix separates deployments — and, in the tests, separates one
     /// test's tenants from another's. Two configs with different prefixes must
     /// never land the same tenant in the same schema.
+    ///
+    /// **Two same-length prefixes cannot test this.** Equal lengths give equal
+    /// readable budgets, so the two names differ wherever the prefixes differ
+    /// and the assertion holds however the hash is computed — the test passes
+    /// against an implementation that ignores the prefix entirely. The pair
+    /// below differs in *length*, which is the axis the budget arithmetic
+    /// moves along.
     #[test]
     fn the_prefix_separates_otherwise_identical_tenants() {
         let one = PgConfig::new("postgres://localhost/x")
             .with_layout(PgLayout::SchemaPerTenant)
-            .with_schema("ms_test_1");
+            .with_schema("ms_test");
         let two = PgConfig::new("postgres://localhost/x")
             .with_layout(PgLayout::SchemaPerTenant)
-            .with_schema("ms_test_2");
+            .with_schema("ms_test_longer");
         let t = tenant("t");
         assert_ne!(schema_for_tenant(&one, &t), schema_for_tenant(&two, &t));
-        assert!(schema_for_tenant(&one, &t).starts_with("ms_test_1_"));
+        assert!(schema_for_tenant(&one, &t).starts_with("ms_test_"));
+    }
+
+    /// The one pair the budget arithmetic can actually collapse, and the
+    /// reason the hash covers the prefix.
+    ///
+    /// The readable budget shrinks by exactly what the prefix grows by, and
+    /// `_` is both the separator and what every illegal byte folds to. So a
+    /// tenant that folds to all underscores makes "one more prefix byte" and
+    /// "one fewer readable byte" the same edit. These two configs differ by a
+    /// single trailing `_` and, with the hash taken over the tenant alone,
+    /// produce byte-identical schema names — two deployments silently sharing
+    /// one tenant's tables.
+    ///
+    /// This is a regression test with a known-failing predecessor: it fails
+    /// against `blake3::hash(tenant)` and passes against the length-delimited
+    /// hash over `(prefix, tenant)`. Do not "simplify" the tenant to something
+    /// readable — the all-underscore fold is the whole mechanism.
+    #[test]
+    fn a_prefix_that_grows_by_one_underscore_cannot_absorb_the_readable_tenant() {
+        let short = PgConfig::new("postgres://localhost/x")
+            .with_layout(PgLayout::SchemaPerTenant)
+            .with_schema("p".repeat(20));
+        let long = PgConfig::new("postgres://localhost/x")
+            .with_layout(PgLayout::SchemaPerTenant)
+            .with_schema(format!("{}_", "p".repeat(20)));
+        let t = tenant(&"-".repeat(28));
+
+        let a = schema_for_tenant(&short, &t);
+        let b = schema_for_tenant(&long, &t);
+        assert_ne!(a, b, "two deployments were given the same schema: {a}");
+        // The premise, so a future change to the budget cannot make this test
+        // vacuous by simply moving the two names apart for an unrelated reason.
+        assert_eq!(a.len(), 63, "the collision needs both names at the limit");
+        assert_eq!(b.len(), 63);
     }
 
     /// `-` and `.` are legal in a TenantId and illegal, unquoted, in an
@@ -960,7 +1001,13 @@ const HASH_HEX_BYTES: usize = 16;
 const READABLE_BYTES: usize = 28;
 /// Longest `schema` prefix `SchemaPerTenant` supports while still leaving room
 /// for the hash. Documented so a misconfiguration is a known failure.
-pub const MAX_PREFIX_BYTES: usize = MAX_IDENT_BYTES - HASH_HEX_BYTES - 2;
+///
+/// `- 1`, not `- 2`, and the difference is not arithmetic taste. A prefix this
+/// long exhausts the readable budget, and the exhausted branch emits **one**
+/// separator (`{prefix}_{hash}`), not two. Subtracting 2 would make the
+/// constant conservative by a byte and its own doc sentence false: 46 would be
+/// supported while the constant called 45 the longest.
+pub const MAX_PREFIX_BYTES: usize = MAX_IDENT_BYTES - HASH_HEX_BYTES - 1;
 
 /// The schema holding a tenant's tables.
 ///
@@ -969,12 +1016,28 @@ pub const MAX_PREFIX_BYTES: usize = MAX_IDENT_BYTES - HASH_HEX_BYTES - 2;
 ///
 /// Three things are load-bearing:
 ///
-/// * **The hash.** A `TenantId` may be 240 bytes and an identifier may be 63,
-///   so a purely truncating scheme would map two long tenants onto one schema
-///   — a silent cross-tenant merge, which is the failure the OSS repo
-///   rejects uppercase tenant ids to avoid.
+/// * **The hash, over the prefix *and* the tenant.** A `TenantId` may be 240
+///   bytes and an identifier may be 63, so a purely truncating scheme would
+///   map two long tenants onto one schema — a silent cross-tenant merge, which
+///   is the failure the OSS repo rejects uppercase tenant ids to avoid.
+///
+///   Hashing the tenant alone is not enough, and the reason is subtle enough
+///   to state: the readable budget shrinks by exactly the number of bytes the
+///   prefix grows by, and `_` is simultaneously the separator and what every
+///   illegal byte folds to. So under a tenant that folds to all underscores,
+///   growing the prefix by one `_` and losing one underscore of readable
+///   tenant produces **the same string**. Concretely, prefix `"p"*20` with
+///   tenant `"-"*28`, and prefix `"p"*20 + "_"` with the same tenant, both
+///   yield `pppppppppppppppppppp___________________________<hash>`. With the
+///   hash covering the tenant only, that hash is equal too, and two
+///   deployments share a schema. Covering the prefix breaks it.
+///
+///   The prefix is fed **length-delimited**, not concatenated: plain
+///   `blake3(prefix ++ tenant)` maps `("ab", "c")` and `("a", "bc")` to one
+///   digest, which is the same defect one layer down.
 /// * **The prefix.** It separates deployments sharing a database, and it is
-///   what lets two test runs use tenant `"t"` without colliding.
+///   what lets two test runs use tenant `"t"` without colliding — but only
+///   because the hash covers it. See above.
 /// * **The folding.** `-` and `.` are legal in a `TenantId` and illegal in an
 ///   unquoted identifier; folding them to `_` means no call site has to quote.
 ///
@@ -987,7 +1050,16 @@ pub fn schema_for_tenant(config: &PgConfig, tenant: &TenantId) -> String {
         PgLayout::SharedPartitioned => config.schema.clone(),
         PgLayout::SchemaPerTenant => {
             let prefix = &config.schema;
-            let digest = blake3::hash(tenant.as_str().as_bytes()).to_hex();
+            // Length-delimited over (prefix, tenant) — see the doc above for
+            // the collision that hashing the tenant alone leaves open, and for
+            // why the length goes in rather than a separator byte.
+            let digest = {
+                let mut h = blake3::Hasher::new();
+                h.update(&(prefix.len() as u64).to_le_bytes());
+                h.update(prefix.as_bytes());
+                h.update(tenant.as_str().as_bytes());
+                h.finalize().to_hex()
+            };
             let hash = &digest[..HASH_HEX_BYTES];
 
             let budget = MAX_IDENT_BYTES
@@ -5458,7 +5530,9 @@ grant it `BYPASSRLS`, and do not point the pool at a role that already has it.
 by `tenant_id`, with RLS. `SchemaPerTenant` gives each tenant its own schema,
 created on first use, with RLS as well. Both pass the same conformance suite.
 Under `SchemaPerTenant` the configured `schema` becomes a prefix and must be at
-most 45 bytes.
+most `MAX_PREFIX_BYTES` (46) bytes — the hash is taken over the prefix as well
+as the tenant, so two deployments whose prefixes differ only in length cannot
+be handed the same schema.
 
 ## Changing the embedding model
 
