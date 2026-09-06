@@ -10507,7 +10507,69 @@ git commit -m "feat(policy): governed working set with MMR diversity and a repla
 - Consumes: `MaintainContext`, `BaselineConfig`.
 - Produces: `maintain::decisions(&MaintainContext, &BaselineConfig, PolicyId) -> Vec<Decision>`, and `GovernancePolicy::maintain` on `BaselinePolicy`.
 
-**What maintenance does, in order:** expire items past their TTL; release protection windows that have elapsed; reclaim capacity when a namespace is over budget, cheapest first, never touching pinned items. Each produces its own `Decision` with its own reason, so the audit trail says exactly why anything vanished.
+**What maintenance does, in order:** expire items past their TTL; release protection windows that have elapsed; **decay fragility against the current neighbourhood**; **consolidate near-duplicate survivors**; reclaim capacity when a namespace is over budget, cheapest first, never touching pinned items. Each produces its own `Decision` with its own reason, so the audit trail says exactly why anything vanished.
+
+The file-responsibility table gives `src/maintain.rs` as *"TTL, decay, consolidation, reclaim"*. All four are in scope for this task. Decay and consolidation are specified below because neither is inferable from its name — one of them is actively mis-suggested by it.
+
+### F-A — Fragility decay: the value can RISE, and the word says otherwise
+
+Decay recomputes each surviving item's fragility against the neighbourhood **as
+it now stands**, after this run's expiries and reclaims have removed items. It
+is not a monotonic downward adjustment of a stored number.
+
+**The contract that must be tested: removing an item's neighbours makes it MORE
+fragile, not less.** `fragility::score(neighbours, stats)` is a function of how
+recoverable an item would be if lost, so an item whose corroborating neighbours
+have just been expired is *harder* to relearn than it was this morning — and
+`score` returns `Score::ONE` outright when `neighbours` is empty. So the same
+maintenance run that deletes an item's neighbours must raise that item's
+fragility, and may raise it enough to earn it a protection window it did not
+have before.
+
+**Why this needs an explicit contract test rather than a branch.** An
+implementation written from the word "decay" alone will only ever decrease
+values — and it will pass every test also written from that word. The term of
+art hides the case. The test must be derived from this paragraph:
+
+> Two items, A and B, mutually each other's only neighbour. Expire B on TTL in
+> this run. Assert A's fragility after the run is **strictly greater** than
+> before it, and that the resulting `Decision` carries the raised value in its
+> evidence rather than the stale one.
+
+Falsify it before believing it: implement decay as `fragility * decay_factor`
+and confirm the assertion fails. A decay that cannot go up is the plausible
+wrong implementation this test exists to reject.
+
+### F-B — Consolidation: `maintain` decides it, the engine applies it
+
+Consolidation merges two items that both already exist and have both survived
+this run's expiries. `maintain` emits a `Decision` whose action is
+`Action::Merge { into, strategy }` naming the absorbed item and its target.
+
+**This is not the admission-path merge with different arguments.** On the
+admission path the incoming item has no id, no audit history and no stored
+embedding — it is merged before it ever exists. Here both sides exist: the
+absorbed item has an `ItemId` that other rows reference, audit records naming
+it, and an embedding. Reusing `admit`'s applier unchanged will lose all three.
+
+**Cross-lane contract, decided here so both sides build to the same thing:**
+
+- `maintain` is pure and returns the decision. It performs no I/O and does not
+  choose transaction boundaries.
+- **The engine's maintenance job applies the merge** — writing the merged
+  content to `into`, deleting the absorbed item, and doing both in one
+  transaction with the audit write.
+- **One `Merged` audit record names both items** in its `items: Vec<ItemRef>`,
+  rather than a `Merged` plus a `Forgotten`. The absorbed item's earlier audit
+  rows are not rewritten: a scope is never rewritten to make a row fit, and the
+  merge record is what makes the item's disappearance explicable.
+
+**Task 35 (engine — resumable maintenance job) must apply `Action::Merge` and
+must carry its own test for it.** That sentence is a cross-reference, and a
+cross-reference transfers the contract and not the coverage — every instance of
+this construct audited in this codebase has left the second side untested. Task
+35's test is therefore named as a requirement here and must not be treated as
+satisfied by this task's tests.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -10643,8 +10705,8 @@ fn reclaim_rank(item: &MemoryItem) -> i64 {
 
 pub fn decisions(
     ctx: &MaintainContext,
-    // Unused by the baseline: TTL, protection windows, and reclaim need no
-    // thresholds. Kept in the signature because decay will.
+    // TTL, protection windows and reclaim need no thresholds; decay and
+    // consolidation do (see F-A and F-B below), so this is used, not reserved.
     _cfg: &BaselineConfig,
     policy: PolicyId,
 ) -> Vec<Decision> {
@@ -12712,9 +12774,24 @@ git commit -m "feat(engine): forget, protect, and subject purge"
 
 **Interfaces:**
 - Consumes: `GovernancePolicy::maintain`, `Backend::list`, `Backend::apply`.
-- Produces: `MaintainCursor { offset: usize }`, `MaintainReport { scanned, forgotten, protection_released, next_cursor }`, `Engine::maintain(&Scope, Option<MaintainCursor>)`.
+- Produces: `MaintainCursor { offset: usize }`, `MaintainReport { scanned, forgotten, protection_released, consolidated, next_cursor }`, `Engine::maintain(&Scope, Option<MaintainCursor>)`.
 
 **Design constraint from the spec:** maintenance is an explicit, resumable job with a cursor — not a background thread that quietly mutates state. Every change it makes goes through the same atomic, audited path as a write.
+
+**This job must apply `Action::Merge`, and it needs its own test for it.** Task 29's
+`maintain` emits `Action::Merge { into, strategy }` for consolidation (see F-B
+there). Applying it means writing merged content to `into`, **deleting the absorbed
+item**, and writing **one `Merged` audit record naming both items** in its
+`items: Vec<ItemRef>` — all in a single transaction. It is not `admit`'s merge
+applier with different arguments: there the incoming item has no id, no audit
+history and no embedding, and here the absorbed side has all three.
+
+The requirement is restated here rather than referred to, deliberately. Task 29
+names it too, and a cross-reference between two tasks transfers the contract
+without transferring the coverage — every instance of that construct audited in
+this codebase has left the second side untested. A test in Task 29 that a merge
+decision is *produced* does not establish that this job *applies* it; those are the
+two sides, and this is the one that touches the backend.
 
 - [ ] **Step 1: Write the failing test**
 
