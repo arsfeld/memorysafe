@@ -94,6 +94,18 @@ pub fn score(cand: &Candidate, stats: &ScopeStats, cfg: &BaselineConfig) -> Scor
             let caller = Score::clamped(w as f32).get();
             cfg.caller_weight_weight * caller + (1.0 - cfg.caller_weight_weight) * base
         }
+        // Neutrality lives ENTIRELY in this arm returning `base` and nothing
+        // else. Do not fold this into one expression with the `Some` arm
+        // (e.g. `w.unwrap_or(base)` fed through the same formula, or worse,
+        // `unwrap_or(0.0)`/`unwrap_or(0.5)` standing in for "no opinion") —
+        // any of those computes `k*base + (1-k)*base`, which is only equal
+        // to `base` by the same coincidence a fixed-point check on this
+        // exact formula would need `k` to cooperate for, not by guarantee.
+        // Same failure shape as `fragility.rs`'s "do not fold the two
+        // branches back into one symmetric-looking expression" — a two-arm
+        // function that returns a blend looks like it wants to be one line,
+        // and that instinct is exactly what would quietly end this
+        // guarantee, with no test able to catch it once folded.
         None => base,
     };
     Score::clamped(blended)
@@ -269,48 +281,67 @@ mod tests {
     }
 
     #[test]
-    fn absence_of_caller_weight_is_a_fixed_point_of_the_blend() {
-        // If an absent `value_weight` is truly neutral, scoring a candidate
-        // with it absent, then re-scoring the SAME candidate with
-        // `value_weight` set to that first score, must reproduce the exact
-        // same number: with `C` the content/trust base and `k` the
-        // configured `caller_weight_weight`, a correct implementation gives
-        // `C` when absent, and re-feeding `C` as the caller's own weight
-        // gives `k*C + (1-k)*C = C` again — a fixed point that holds for ANY
-        // `k`, so this does not depend on today's default surviving
-        // unchanged, and needs no separately-maintained copy of the removed
-        // early-return formula to compare against.
+    fn feeding_the_base_score_back_as_caller_weight_confirms_complementary_coefficients() {
+        // NOT a test of neutrality. An absent `value_weight` returning
+        // `base` untouched is guaranteed BY CONSTRUCTION — see the `None =>
+        // base` arm in `score` and its own guard comment — so no test can
+        // fail on that arm short of someone editing it; asserting `first ==
+        // base` below is a fixture sanity check, not proof of anything.
         //
-        // A broken `unwrap_or(0.0)` shortcut discriminates cleanly: it gives
-        // `(1-k)*C` on the first pass (treating absence as an explicit zero),
-        // then `k*(1-k)*C + (1-k)*C = (1-k)(1+k)*C` on the second — which
-        // differs from the first pass for every `k != 0`, so `second == first`
-        // fails.
+        // What re-feeding a score back as its own caller weight actually
+        // verifies: with `C` the content/trust base and `k` the configured
+        // `caller_weight_weight`, the `Some` arm's two coefficients (`k` and
+        // `1-k`) must be genuinely complementary — sum to exactly 1 and draw
+        // from the SAME `base` — or `k*C + (1-k)*C` would not collapse back
+        // to `C`. That holds for ANY `k`, so this does not depend on today's
+        // default surviving unchanged.
         //
-        // The fixture pins specificity, lexical density, and source trust
-        // ALL to exactly 0.5: content = w*0.5+(1-w)*0.5 = 0.5 for ANY
-        // `content_specificity_weight`, and base = (1-t)*0.5+t*0.5 = 0.5 for
-        // ANY `source_trust_weight` — so C = 0.5 regardless of those two
-        // weights, a clean dyadic value so both passes land on the exact
-        // same f32 by construction rather than by floating-point luck.
-        let cfg = BaselineConfig::default();
-        let s = stats(); // median_item_bytes: 100
-        let cand = Candidate {
-            byte_size: 100,                      // 1x median -> specificity = 0.5
-            ..candidate_from("echo echo", None)  // lexical_density = 0.5; trust unset -> 0.5
+        // Base is fixed at 0.625, deliberately NOT 0.5. 0.5 is the fixed
+        // point of a "collapse absence to a midpoint default" bug — a `None`
+        // arm that used a hardcoded `w = 0.5` in place of `base` gives
+        // `k*0.5 + (1-k)*0.5 = 0.5` on the first pass too, so a 0.5 fixture
+        // cannot distinguish that bug from the correct implementation (this
+        // is the second time this crate's own fixtures have coincided at the
+        // fixed point of a symmetric operation — see the eviction-order
+        // fixture's note on picking values that do NOT let two formulas
+        // agree). At 0.625 the same bug instead gives
+        // `0.25*0.5 + 0.75*0.625 = 0.59375` on the first pass — already
+        // visibly different from the correct 0.625, so the fixture-sanity
+        // assertion below catches it immediately. Had that first number
+        // coincidentally matched 0.625 anyway, the fixed-point check would
+        // still catch it on the second pass: re-feeding 0.59375 (a REAL
+        // `value_weight`, so the bug's midpoint substitution no longer
+        // applies) gives `0.25*0.59375 + 0.75*0.625 = 0.6171875`, and
+        // `0.59375 != 0.6171875`. Do not simplify this back to a round
+        // number.
+        //
+        // Every number here is dyadic so both passes land on the exact same
+        // f32 by construction, not by floating-point luck:
+        // `content_specificity_weight` and `source_trust_weight` are
+        // overridden away from the crate's non-dyadic defaults (0.6/0.2);
+        // content is pinned to specificity alone (weight 1.0) at 1x the
+        // corpus median (0.5), trust to an explicit human source (1.0), and
+        // source_trust_weight to 0.25, giving
+        // base = 0.75*0.5 + 0.25*1.0 = 0.625 = 5/8 exactly.
+        let cfg = BaselineConfig {
+            content_specificity_weight: 1.0,
+            source_trust_weight: 0.25,
+            ..BaselineConfig::default() // caller_weight_weight stays the default 0.25
         };
+        let s = stats(); // median_item_bytes: 100
+        let mut cand = Candidate {
+            byte_size: 100, // 1x median -> specificity = 0.5
+            ..candidate_from("echo echo", None)
+        };
+        cand.attrs
+            .insert("source_kind".into(), serde_json::json!("human")); // trust = 1.0
 
         let first = score(&cand, &s, &cfg);
-        assert!(
-            first.get() > 0.0,
-            "fixture must have a non-zero base score, or the fixed-point check \
-             cannot fail: both a correct blend and a broken unwrap_or(0.0) \
-             agree trivially at zero"
-        );
         assert_eq!(
             first.get(),
-            0.5,
-            "content/trust base must independently be 0.5 here"
+            0.625,
+            "fixture arithmetic: 0.75*0.5 + 0.25*1.0 (also rules out a \
+             trivially vacuous zero base)"
         );
 
         let mut fed_back = cand.clone();
@@ -321,8 +352,8 @@ mod tests {
 
         assert_eq!(
             second, first,
-            "an absent value_weight must be a fixed point of the blend: re-feeding \
-             the absent score as the caller's own weight must reproduce it exactly"
+            "k*C + (1-k)*C must collapse back to C: the caller-weight and \
+             base-weight coefficients must be genuinely complementary"
         );
     }
 
