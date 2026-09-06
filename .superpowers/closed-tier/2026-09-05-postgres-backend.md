@@ -2056,6 +2056,67 @@ async fn the_tenant_guc_is_transaction_local() {
     }
 }
 
+/// `search_path` is set with `is_local => true` like the tenant GUC, and until
+/// now nothing checked that it is released. Its only test read it *inside* the
+/// transaction, which shows it is applied.
+///
+/// This is the leak that matters most under `SchemaPerTenant`, and it is not
+/// the one RLS covers. A stale `search_path` points the next borrower at
+/// another tenant's schema. Their reads still return nothing — the RLS policy
+/// exists on every copy of the table and their GUC names their own tenant — but
+/// their *writes* are accepted, because `WITH CHECK` asks whether the row is
+/// labelled for the writer and not whether this is the right table. The row
+/// lands correctly labelled in the wrong schema, and no policy can see it.
+///
+/// The connection is pinned rather than re-acquired in a loop: `sqlx` does not
+/// reliably hand back the same backend even at a small `max_connections`, so a
+/// loop over the pool inspects connections that never ran the transaction and
+/// passes whatever the setting does.
+#[tokio::test]
+async fn the_search_path_does_not_survive_the_transaction() {
+    use memorysafe_core::TenantId;
+    let config = support::test_config(PgLayout::SchemaPerTenant).await;
+    let backend = PostgresBackend::connect(config).await.unwrap();
+    let tenant = TenantId::new("acme").unwrap();
+    let schema = schema_for_tenant(backend.config(), &tenant);
+
+    let mut held = backend.app_pool().acquire().await.unwrap();
+
+    // The premise: without it, "the schema is absent afterwards" is also true
+    // of a connection that never had it.
+    let before: String = sqlx::query("SELECT current_setting('search_path') AS p")
+        .fetch_one(&mut *held)
+        .await
+        .unwrap()
+        .get("p");
+    assert!(
+        !before.contains(&schema),
+        "the pinned connection already had the tenant schema on its path: {before}"
+    );
+
+    {
+        let mut tx = backend.begin_for_test(&tenant).await.unwrap();
+        let inside: String = sqlx::query("SELECT current_setting('search_path') AS p")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap()
+            .get("p");
+        assert!(inside.starts_with(&schema), "search_path is {inside}");
+        tx.commit().await.unwrap();
+    }
+
+    let after: String = sqlx::query("SELECT current_setting('search_path') AS p")
+        .fetch_one(&mut *held)
+        .await
+        .unwrap()
+        .get("p");
+    assert!(
+        !after.contains(&schema),
+        "search_path leaked out of its transaction: {after} still names {schema}"
+    );
+}
+
+
 #[tokio::test]
 async fn the_transaction_sets_a_search_path_that_reaches_pgvector() {
     use memorysafe_core::TenantId;
@@ -2102,16 +2163,37 @@ use sqlx::{Postgres, Transaction};
 
 /// Opens the transaction every backend operation runs inside — reads included.
 ///
-/// Three settings, all transaction-local:
+/// Three settings, all set with `is_local => true`. **Two of the three have a
+/// test that can observe locality; one does not.** The distinction is stated
+/// because "all transaction-local" is a three-way claim that was asserted
+/// three times and verified once — `search_path`'s only test read it *inside*
+/// the transaction, which shows it is applied, not that it is released.
 ///
 /// * `search_path` puts the tenant's schema first and keeps `public` reachable
-///   for the `vector` type and the `<#>` operator.
+///   for the `vector` type and the `<#>` operator. **Locality matters more
+///   here than for the tenant GUC, and differently.** Under `SchemaPerTenant`
+///   a leaked `search_path` points the next borrower at another tenant's
+///   *schema*. Reads are still covered — `tenant_id` is in the DDL under both
+///   layouts and the RLS policy exists on every copy of the table, so a
+///   connection holding tenant A's GUC reads zero rows from tenant B's
+///   `items`. **Writes are not.** `WITH CHECK (tenant_id = <A>)` accepts a row
+///   labelled A, so A's row lands in B's schema: correctly labelled, wrongly
+///   placed, and invisible to RLS by construction, because RLS answers "may
+///   this row exist here" and not "is this the right table". Pinned by
+///   `the_search_path_does_not_survive_the_transaction`.
 /// * `memorysafe.tenant_id` is what the RLS policies compare against. With no
 ///   tenant claimed the policies see NULL — via `nullif(..., '')`, because an
 ///   undeclared custom GUC resets to the empty string rather than to unset —
 ///   so every comparison is NULL and every row is filtered. A bug that skips
 ///   this function fails closed.
-/// * `hnsw.iterative_scan` lets pgvector keep scanning when the scope
+/// * `hnsw.iterative_scan` — **untested for locality, deliberately.** A leak
+///   here changes recall on the next borrower's ANN scan, which is a quality
+///   regression and not an isolation failure, and no assertion available in
+///   this crate distinguishes "leaked" from "the plan did not use the index".
+///   Named rather than silently absent, so the two-of-three above is a
+///   measured count and not an oversight.
+///
+///   It lets pgvector keep scanning when the scope
 ///   predicate rejects most of what the index returns. Without it a selective
 ///   scope can starve an ANN result set; with it the recall loss is bounded.
 ///   It costs nothing on the plans where the index is not used.
