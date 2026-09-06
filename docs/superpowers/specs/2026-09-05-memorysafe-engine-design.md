@@ -311,10 +311,17 @@ Audit rows never store item bodies — only ids, content digests, and feature nu
 pub struct WorkingSet {
     pub items: Vec<SelectedItem>,   // each with reason + score breakdown
     pub budget_used: Budget,
-    pub omitted: Vec<OmittedItem>,  // considered and cut, with reason; capped at 50
+    pub omitted: Vec<OmittedItem>,  // a SAMPLE of what was considered and cut,
+                                    // with reason; capped at OMITTED_CAP (50)
+    pub omitted_total: usize,       // how many were cut before that truncation
     pub audit_id: AuditId,
 }
 ```
+
+`omitted` is a bounded sample and `omitted_total` is the true count; they differ
+exactly when the count exceeds the cap. Without the second field a caller cannot
+tell 50 omissions from 5000 — `omitted.len()` reads 50 for both — which is the
+question a caller tuning `RecallBudget` is actually asking.
 
 ---
 

@@ -125,8 +125,25 @@ pub struct OmittedItem {
 pub struct WorkingSet {
     pub items: Vec<SelectedItem>,
     pub tokens_used: u32,
-    /// Truncated to `OMITTED_CAP`.
+    /// A **sample** of what was considered and cut, truncated to
+    /// `OMITTED_CAP`. Read `omitted_total`, never `omitted.len()`, for how
+    /// many items were actually omitted.
     pub omitted: Vec<OmittedItem>,
+    /// How many items were omitted **before** the sample above was truncated.
+    ///
+    /// `omitted.len()` is the size of the reported sample and is bounded by
+    /// `OMITTED_CAP`; this is the true count and is not. The two are equal
+    /// exactly when the count is at or below `OMITTED_CAP`, and differ
+    /// whenever it exceeds it — which is precisely the case a caller needs to
+    /// detect and the one `omitted.len()` cannot report, since it reads 50
+    /// for 50 omissions and for 5000 alike.
+    ///
+    /// The distinction is not cosmetic: it is the difference between "your
+    /// budget cut a couple of near-misses" and "your budget discarded most of
+    /// the corpus", and a caller tuning `RecallBudget` is asking exactly that
+    /// question. Truncation without a count is a silent loss of the number
+    /// that would have answered it.
+    pub omitted_total: usize,
     /// Set by the engine after `record_recall`; the policy leaves it `None`.
     /// `None` means "not yet audited", and the type cannot distinguish that
     /// from "audited" — so nothing stops an unaudited working set reaching a
@@ -141,6 +158,7 @@ impl WorkingSet {
             items: vec![],
             tokens_used: 0,
             omitted: vec![],
+            omitted_total: 0,
             audit_id: None,
         }
     }
@@ -178,6 +196,81 @@ mod tests {
     #[test]
     fn omitted_list_is_capped_so_a_wide_recall_cannot_blow_up_the_response() {
         assert_eq!(OMITTED_CAP, 50);
+    }
+
+    /// The truncated sample and the true count are separate fields, and the
+    /// separation survives serialisation.
+    ///
+    /// **The implementation this rejects:** one that keeps only
+    /// `omitted: Vec<OmittedItem>` and lets a caller read `omitted.len()` as
+    /// "how many were cut". Above `OMITTED_CAP` that number is a constant —
+    /// 50 omitted and 5000 omitted are the same observation — so a caller
+    /// deciding "was my budget far too small?" cannot tell a near-miss from a
+    /// catastrophe. The serde half rejects a second, quieter variant: a
+    /// `#[serde(skip)]` on the new field, which keeps the distinction inside
+    /// the process and drops it at exactly the boundary — the MCP and HTTP
+    /// responses — where the caller who needs it lives.
+    ///
+    /// **Vacuous if** the fixture's `omitted_total` is ever set to
+    /// `omitted.len()`, or if the sample is built shorter than `OMITTED_CAP`:
+    /// either makes the two fields agree, and a type that discarded the count
+    /// and recomputed it from the sample would pass. The construction below
+    /// therefore fills the sample to exactly `OMITTED_CAP` and sets the total
+    /// two orders of magnitude above it, and asserts the two differ.
+    #[test]
+    fn the_omitted_sample_and_the_omitted_total_are_different_numbers() {
+        use crate::decision::{Reason, ReasonCode};
+        use crate::features;
+
+        let considered = 5_000;
+        let omitted: Vec<OmittedItem> = (0..OMITTED_CAP)
+            .map(|_| OmittedItem {
+                id: ItemId::new(),
+                reason: Reason::new(
+                    ReasonCode::BudgetExhausted,
+                    "considered but did not fit the budget",
+                    features! {},
+                ),
+            })
+            .collect();
+        let ws = WorkingSet {
+            items: vec![],
+            tokens_used: 0,
+            omitted,
+            omitted_total: considered,
+            audit_id: None,
+        };
+
+        assert_eq!(
+            ws.omitted.len(),
+            OMITTED_CAP,
+            "the reported sample is bounded by OMITTED_CAP"
+        );
+        assert_eq!(
+            ws.omitted_total, considered,
+            "the total is the number considered and cut, not the sample size"
+        );
+        assert_ne!(
+            ws.omitted.len(),
+            ws.omitted_total,
+            "omitted.len() must not be readable as the omission count: that is \
+             the whole reason omitted_total exists"
+        );
+
+        // The distinction has to reach a caller, not just exist in memory.
+        let json = serde_json::to_string(&ws).unwrap();
+        let back: WorkingSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.omitted_total, considered,
+            "omitted_total did not survive serialisation"
+        );
+        assert_eq!(back.omitted.len(), OMITTED_CAP);
+
+        // And an empty working set claims no omissions at all — the one case
+        // where the two numbers legitimately agree.
+        let empty = WorkingSet::empty();
+        assert_eq!(empty.omitted_total, 0);
+        assert!(empty.omitted.is_empty());
     }
 
     #[test]

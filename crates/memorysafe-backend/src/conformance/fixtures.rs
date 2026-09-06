@@ -214,6 +214,41 @@ pub const AUDIT_ORDER_ULIDS: [&str; 4] = [
     "01ARZ3NDEKTSV4RRFFQ69G5FB3",
 ];
 
+/// The six audit ids `lifecycle::audit_returns_min_of_the_limit_and_the_rows_that_remain`
+/// pins, in ascending order: an admit, then the **eviction**, then four more
+/// admits.
+///
+/// **The eviction is second, not last, and that placement is the test.** That
+/// test's sharp half asks for `events: [Forgotten]` under `limit: 3` over six
+/// rows, where exactly one row matches. A backend that applies the limit
+/// *before* the filter — taking the newest three rows and then filtering them
+/// in memory, which is what you get from paging a materialised "recent audit"
+/// view — returns nothing, because the newest three are all admits. A
+/// backend that filters first and then limits returns the one eviction. With
+/// the eviction placed last (newest) the two implementations agree and the
+/// test certifies both.
+///
+/// **Why literals rather than `AuditRecord::new`'s generated ids**, the same
+/// argument as [`AUDIT_ORDER_ULIDS`] and `item_with_id`: `new` sets
+/// `id: AuditId::new()`, the plain ULID generator, so six records minted
+/// microseconds apart are ordered *randomly* relative to each other. "Newest
+/// three" would then contain the eviction about half the time and the
+/// limit-then-filter backend would pass on a coin flip.
+///
+/// A separate family from `AUDIT_ORDER_ULIDS` rather than a reuse: that array
+/// has four entries with its eviction largest, which is the opposite of what
+/// is needed here, and changing it to suit this test would silently destroy
+/// `audit_filter_narrows_by_event_and_time`'s own disagreement between
+/// `at`-order and id-order.
+pub const AUDIT_TRUNCATION_ULIDS: [&str; 6] = [
+    "01ARZ3NDEKTSV4RRFFQ69G5FD0",
+    "01ARZ3NDEKTSV4RRFFQ69G5FD1",
+    "01ARZ3NDEKTSV4RRFFQ69G5FD2",
+    "01ARZ3NDEKTSV4RRFFQ69G5FD3",
+    "01ARZ3NDEKTSV4RRFFQ69G5FD4",
+    "01ARZ3NDEKTSV4RRFFQ69G5FD5",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +508,15 @@ mod tests {
     // the string, so this is exactly the comparison the assertion there makes
     // — and it is checkable today, unlike the conformance test itself, which
     // does not execute until a backend exists.
+    //
+    // Vacuous if `AUDIT_ORDER_ULIDS` is ever cut below two entries — a
+    // one-element array sorts equal to itself and `ids[3] > ids[2]` would not
+    // compile — or if its four literals are made equal to each other, since a
+    // constant array sorts to itself either way and no ordering is then under
+    // test. The array's own declaration is what prevents both: `[&str; 4]`
+    // fixes the length at four, and the four literals differ in their final
+    // character (`FB0`/`FB1`/`FB2`/`FB3`), which is also what makes the
+    // strict `ids[3] > ids[2]` below fail rather than pass on equal values.
     #[test]
     fn the_literal_audit_ulids_the_ordering_test_uses_parse_and_sort_ascending() {
         let ids: Vec<AuditId> = AUDIT_ORDER_ULIDS
@@ -493,6 +537,42 @@ mod tests {
             ids[3] > ids[2],
             "the eviction's id must exceed the third admit's, or `at`-ordering \
              and id-ordering do not disagree and the test cannot tell them apart"
+        );
+    }
+
+    // `AUDIT_TRUNCATION_ULIDS`' premise, and the reason it is a separate
+    // family from `AUDIT_ORDER_ULIDS`: the six literals ascend, and the
+    // eviction's id — index 1 — must be strictly below the newest three
+    // (indices 3, 4, 5). That is the whole discriminating power of
+    // `audit_returns_min_of_the_limit_and_the_rows_that_remain`'s filtered
+    // half: a backend that limits before it filters sees only indices 3..5
+    // and finds no eviction there.
+    //
+    // Vacuous if the array is cut below four entries (there would be no
+    // "newest three" to exclude index 1 from) or if the literals are made
+    // equal (every index would then be in every window). `[&str; 6]` fixes
+    // the length, and the assertion below compares against a strictly sorted
+    // copy, which equal literals would satisfy — so the strict `<` on the
+    // last line is what actually rules equality out.
+    #[test]
+    fn the_literal_truncation_ulids_ascend_with_the_eviction_below_the_newest_three() {
+        let ids: Vec<AuditId> = AUDIT_TRUNCATION_ULIDS
+            .iter()
+            .map(|s| AuditId::parse(s).expect("literal must be a canonical ULID"))
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, ids,
+            "AUDIT_TRUNCATION_ULIDS is written in the order its test assigns \
+             it — admit, eviction, then four admits, ascending; if it does not \
+             sort that way the test asserts the wrong rows"
+        );
+        assert!(
+            ids[1] < ids[3],
+            "the eviction's id must fall below the newest three, or a backend \
+             that applies `limit` before `events` cannot be told from one that \
+             filters first, and the test certifies both"
         );
     }
 

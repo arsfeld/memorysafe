@@ -1317,3 +1317,297 @@ pub async fn purge_subject_persists_the_record_it_was_given<F: BackendFactory>(f
          handed to it"
     );
 }
+
+/// `ScopeSelector`'s optional fields actually narrow the export.
+///
+/// **The implementation this rejects:** one whose `export` selects on
+/// `sel.tenant` alone and ignores `sel.subject` and `sel.namespace`. That is
+/// not a strawman — it is the natural SQLite shape, where a tenant *is* one
+/// database file and "export this tenant" is the whole query, so the two
+/// optional fields have nothing obvious to do. It passes every other test in
+/// this suite: `export_import_round_trips_exactly`, `import_is_idempotent`
+/// and `import_preserves_every_audit_id` all set `subject: None,
+/// namespace: None`, which is precisely the selector a tenant-wide export
+/// answers correctly.
+///
+/// Both directions are asserted for each field, because presence alone
+/// certifies the ignoring backend: it exports everything, so everything
+/// wanted is present. The absence assertions are what fail it.
+///
+/// **The two fields are narrowed one at a time, in two separate exports.** A
+/// single export setting both would be passed by a backend that honours
+/// `namespace` and ignores `subject` (or the reverse), since the corpus is
+/// arranged so either filter alone still excludes some records.
+///
+/// **Vacuity:** the test proves nothing if the corpus lives in a single
+/// namespace or belongs to a single subject — there would be nothing for a
+/// narrowing selector to exclude, and "only the matching records came back"
+/// would be true of the whole tenant. The fixture therefore spans two
+/// namespaces *and* two subjects, and asserts before exporting that all four
+/// items are readable, so a backend that simply stored nothing cannot pass by
+/// exporting an empty stream. `include_audit` is not re-tested here: it is
+/// already covered by `import_is_idempotent`, which exports with
+/// `include_audit: false` and asserts the target's audit is empty afterwards.
+pub async fn export_narrows_to_the_selectors_subject_and_namespace<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let tenant = TenantId::new("t").unwrap();
+
+    // Four items across two subjects and two namespaces, so that narrowing on
+    // either axis alone still leaves something out.
+    let mine_a = Scope::new("t", "s", "ns-a").unwrap();
+    let mine_b = Scope::new("t", "s", "ns-b").unwrap();
+    let theirs_a = Scope::new("t", "other", "ns-a").unwrap();
+    let theirs_b = Scope::new("t", "other", "ns-b").unwrap();
+
+    let mut ids = Vec::new();
+    for scope in [&mine_a, &mine_b, &theirs_a, &theirs_b] {
+        let item = fx::item(scope, &format!("a memory in {}", scope.key()));
+        ids.push(item.id.clone());
+        backend
+            .apply(fx::admit_txn(scope, item, None))
+            .await
+            .unwrap();
+    }
+    let (mine_a_id, mine_b_id, theirs_a_id, theirs_b_id) = (
+        ids[0].clone(),
+        ids[1].clone(),
+        ids[2].clone(),
+        ids[3].clone(),
+    );
+
+    for (scope, id) in [
+        (&mine_a, &mine_a_id),
+        (&mine_b, &mine_b_id),
+        (&theirs_a, &theirs_a_id),
+        (&theirs_b, &theirs_b_id),
+    ] {
+        assert!(
+            backend.get(scope, id).await.unwrap().is_some(),
+            "the corpus must exist before an export can be said to narrow it"
+        );
+    }
+
+    // Every `ItemId` an export stream carries, in order of appearance.
+    fn exported_ids(stream: &[ExportRecord]) -> Vec<memorysafe_core::ItemId> {
+        stream
+            .iter()
+            .filter_map(|r| match r {
+                ExportRecord::Item { item, .. } => Some(item.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Narrow on namespace only: both subjects' `ns-a` items, neither `ns-b`.
+    let by_namespace = backend
+        .export(&ScopeSelector {
+            tenant: tenant.clone(),
+            subject: None,
+            namespace: Some(memorysafe_core::Namespace::new("ns-a").unwrap()),
+            include_audit: false,
+        })
+        .await
+        .unwrap();
+    let got = exported_ids(&by_namespace);
+    assert!(
+        got.contains(&mine_a_id) && got.contains(&theirs_a_id),
+        "namespace: Some(ns-a) dropped an item that is in ns-a"
+    );
+    assert!(
+        !got.contains(&mine_b_id) && !got.contains(&theirs_b_id),
+        "namespace: Some(ns-a) exported an item from ns-b — the selector's \
+         namespace was ignored and the whole tenant came back"
+    );
+    assert_eq!(
+        got.len(),
+        2,
+        "namespace: Some(ns-a) must export exactly the two ns-a items"
+    );
+
+    // Narrow on subject only: both of `s`'s namespaces, neither of `other`'s.
+    let by_subject = backend
+        .export(&ScopeSelector {
+            tenant: tenant.clone(),
+            subject: Some(SubjectId::new("s").unwrap()),
+            namespace: None,
+            include_audit: false,
+        })
+        .await
+        .unwrap();
+    let got = exported_ids(&by_subject);
+    assert!(
+        got.contains(&mine_a_id) && got.contains(&mine_b_id),
+        "subject: Some(s) dropped an item belonging to s"
+    );
+    assert!(
+        !got.contains(&theirs_a_id) && !got.contains(&theirs_b_id),
+        "subject: Some(s) exported another subject's item — the selector's \
+         subject was ignored"
+    );
+    assert_eq!(
+        got.len(),
+        2,
+        "subject: Some(s) must export exactly the two items s owns"
+    );
+
+    // And both together select the single item at their intersection, so a
+    // backend that honours one field by accident of the other is caught.
+    let both = backend
+        .export(&ScopeSelector {
+            tenant,
+            subject: Some(SubjectId::new("s").unwrap()),
+            namespace: Some(memorysafe_core::Namespace::new("ns-a").unwrap()),
+            include_audit: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        exported_ids(&both),
+        vec![mine_a_id],
+        "subject and namespace together must select their intersection, one item"
+    );
+}
+
+/// `Backend::audit` returns exactly `min(filter.limit, rows still matching)`
+/// — pinned from both sides in one test, because either side alone leaves the
+/// other free.
+///
+/// **The implementation the short-page half rejects:** one that applies
+/// `limit` *before* `events`, taking the newest `limit` rows and filtering
+/// them afterwards. That is what you get from paging a materialised "recent
+/// audit" view, or from `SELECT * FROM (SELECT ... ORDER BY id DESC LIMIT ?)
+/// WHERE event = ?`, and it is invisible whenever the matching rows happen to
+/// be the newest ones. Here exactly one row of six matches and it is
+/// deliberately not among the newest three, so such a backend returns an
+/// empty page for a query with a matching row in the log — the caller
+/// concludes the subject was never touched. The same assertion also rejects a
+/// backend that treats a short page as an error, or that loops fetching until
+/// it has `limit` rows (which never terminates on an exhausted log): both
+/// come from reading `limit` as a promise of page size rather than a bound.
+///
+/// **The over-limit half** — a limit below the number of matching rows must
+/// truncate to exactly the limit — is not new coverage on its own;
+/// `audit_filter_narrows_by_event_and_time` already asserts `limit: 2`
+/// returns two of four rows. It is here so that one test pins the whole
+/// formula rather than half of it: `min` is a claim about both arguments, and
+/// a suite that checks each side in a different test can lose one without
+/// noticing the other has become unconstrained.
+///
+/// **Vacuity:** the short-page half proves nothing if the matching rows ever
+/// number at or above its limit, because `min` would then be the limit on
+/// both sides and the two halves would test the same thing. It also proves
+/// nothing if the eviction's audit id is among the newest three, since the
+/// limit-then-filter backend would find it and pass — which is exactly why
+/// the ids come from `fx::AUDIT_TRUNCATION_ULIDS` (eviction at index 1,
+/// ascending, four admits above it) rather than from `AuditRecord::new`'s
+/// generator, whose ids for six records written microseconds apart are
+/// ordered randomly relative to each other.
+pub async fn audit_returns_min_of_the_limit_and_the_rows_that_remain<F: BackendFactory>(
+    factory: &F,
+) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let ids: Vec<AuditId> = fx::AUDIT_TRUNCATION_ULIDS
+        .iter()
+        .map(|u| AuditId::parse(u).expect("literal must be a canonical ULID"))
+        .collect();
+
+    // Row 0: an admit, so the eviction below has something to evict.
+    let doomed = fx::item(&scope, "the first memory, soon evicted");
+    let mut first = fx::admit_txn(&scope, doomed.clone(), None);
+    first.audit.id = ids[0].clone();
+    backend.apply(first).await.unwrap();
+
+    // Row 1: the eviction — the only `Forgotten` row, and by id the second
+    // oldest of the six.
+    let mut evict = fx::evict_txn(&scope, vec![doomed.id.clone()]);
+    evict.audit.id = ids[1].clone();
+    let evicted = backend.apply(evict).await.unwrap();
+    assert_eq!(
+        evicted.audit_id, ids[1],
+        "apply must persist and return the AuditId it was given (the echo rule \
+         on `Backend`); every assertion below names the ids this test supplied"
+    );
+
+    // Rows 2..5: four more admits, all newer than the eviction by id.
+    for (i, id) in ids.iter().enumerate().skip(2) {
+        let mut txn = fx::admit_txn(&scope, fx::item(&scope, &format!("memory {i}")), None);
+        txn.audit.id = id.clone();
+        backend.apply(txn).await.unwrap();
+    }
+
+    // Fewer rows remain than the limit allows: all of them come back, and the
+    // short page is the caller's "exhausted" signal rather than an error.
+    let all = backend
+        .audit(
+            &scope,
+            &AuditFilter {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        all.len(),
+        6,
+        "a limit above the number of rows must return every row — not pad, not \
+         truncate to some internal batch size, not error"
+    );
+    assert!(
+        all.len() < 100,
+        "the point of this half is that the page is short; if the corpus ever \
+         reaches the limit it stops being the case under test"
+    );
+
+    // The sharp version: a filter matching one row, under a limit of three.
+    let forgotten = backend
+        .audit(
+            &scope,
+            &AuditFilter {
+                events: vec![AuditEvent::Forgotten],
+                limit: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        forgotten.len(),
+        1,
+        "one row matches and the limit is three, so exactly that row must come \
+         back. An empty page here means `limit` was applied before `events`: \
+         the newest three rows are all admits, so filtering them afterwards \
+         finds nothing and the caller is told the eviction never happened"
+    );
+    assert_eq!(
+        forgotten[0].id, ids[1],
+        "the row returned is not the eviction this test wrote"
+    );
+    assert_eq!(forgotten[0].event, AuditEvent::Forgotten);
+
+    // The complementary side: more rows match than the limit allows.
+    let limited = backend
+        .audit(
+            &scope,
+            &AuditFilter {
+                events: vec![AuditEvent::Admitted],
+                limit: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        limited.len(),
+        2,
+        "five rows match and the limit is two, so the page must be exactly two"
+    );
+    assert_eq!(
+        limited.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        vec![ids[5].clone(), ids[4].clone()],
+        "a truncated page must be the newest rows by AuditId, newest first — \
+         not an arbitrary two of the five that match"
+    );
+}
