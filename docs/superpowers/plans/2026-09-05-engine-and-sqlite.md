@@ -10998,15 +10998,35 @@ mod tests {
         assert!(decisions(&ctx(vec![fresh], 1, None), &BaselineConfig::default(), pid()).is_empty());
     }
 
+    // **Expiry dominates pinning.** This test asserted the opposite for several
+    // rounds, against this task's own Step 3 code (`must_forget` is called with
+    // no pinned exemption, under a comment saying there deliberately is none),
+    // against `MemoryItem::must_forget`'s doc (*"Expiry dominates protection;
+    // protection only governs eviction for capacity"* — a pin would otherwise
+    // *"silently override a legal retention limit"*), and against core's own
+    // test asserting `must_forget` is true for exactly this fixture. It was the
+    // lone outlier and it is inverted here.
+    //
+    // A pin that outlived a retention limit would be a compliance failure in a
+    // product whose retention profiles are the feature. Pinning still governs
+    // capacity reclaim, which is the half it is for — see
+    // `reclaim_never_touches_pinned_items`, and do not weaken that one while
+    // fixing this.
     #[test]
-    fn a_pinned_item_survives_its_own_ttl() {
-        let mut pinned = item("pinned forever");
+    fn a_pin_does_not_override_a_retention_limit() {
+        let mut pinned = item("pinned, but past its TTL");
         pinned.created_at = now() - Duration::days(10);
         pinned.ttl = Some(Duration::days(1));
         pinned.protection = Protection::Pinned;
+        let out = decisions(&ctx(vec![pinned], 1, None), &BaselineConfig::default(), pid());
+        assert_eq!(
+            out.len(),
+            1,
+            "expiry dominates pinning: a pinned item past its TTL must still be forgotten"
+        );
         assert!(
-            decisions(&ctx(vec![pinned], 1, None), &BaselineConfig::default(), pid()).is_empty(),
-            "a pinned item must never be evicted, TTL included"
+            matches!(out[0].action, Action::Forget { .. }),
+            "the decision must be Forget, not an eviction — the reason a caller sees              must say the retention limit expired, not that capacity was reclaimed"
         );
     }
 
