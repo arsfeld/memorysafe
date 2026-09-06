@@ -287,9 +287,14 @@ pub fn working_set(
     // `omitted` reports what THIS FUNCTION considered and cut — never items
     // the backend already excluded before `compose` saw them (the sensitivity
     // ceiling, scope, tag/kind filters, and any hard time-range filter are
-    // all applied in SQL, below the policy). `omitted.len()` is a count of
+    // all applied in SQL, below the policy). `omitted_total` is a count of
     // policy-level exclusions, not "how many results existed in the scope
     // minus how many came back".
+    //
+    // `omitted_total`, not `omitted.len()`: the latter is the size of the
+    // truncated sample and saturates at `OMITTED_CAP`, so it reads the same
+    // for 50 omissions and for 5000. The total is captured below BEFORE the
+    // `take`, because afterwards the number no longer exists to be recovered.
     //
     // Sorted by descending relevance, ties broken by ascending `ItemId` (the
     // same rule `ranked`'s own initial sort uses), and truncated to
@@ -323,6 +328,7 @@ pub fn working_set(
             .total_cmp(&a.relevance)
             .then_with(|| a.item.id.cmp(&b.item.id))
     });
+    let omitted_total = omitted_candidates.len();
     let omitted: Vec<OmittedItem> = omitted_candidates
         .into_iter()
         .take(OMITTED_CAP)
@@ -340,6 +346,7 @@ pub fn working_set(
         items: selected,
         tokens_used: tokens,
         omitted,
+        omitted_total,
         audit_id: None,
     }
 }
@@ -1371,12 +1378,19 @@ mod tests {
     }
 
     #[test]
-    fn the_omitted_list_is_capped() {
-        // Rejects: an `omitted` vector left unbounded, which lets a wide
-        // recall over a large corpus blow up the response.
+    fn the_omitted_list_is_capped_and_the_total_survives_the_cap() {
+        // Rejects two things: an `omitted` vector left unbounded, which lets a
+        // wide recall over a large corpus blow up the response; and an
+        // `omitted_total` computed from the truncated sample
+        // (`omitted_total: omitted.len()`), which would report 50 omissions
+        // whether 50 or 5000 were cut and so destroy the one number the field
+        // exists to carry.
+        //
         // Vacuous if fewer than `OMITTED_CAP + 1` candidates missed the
         // budget — 200 candidates against a 1-item budget guarantees 199
-        // omissions, comfortably past the cap.
+        // omissions, comfortably past the cap. THE FIXTURE MUST STAY ABOVE
+        // THE CAP: at or below it the two values are equal by definition, and
+        // the second assertion stops discriminating while still passing.
         let cands: Vec<_> = (0..200).map(|i| candidate(&format!("m{i}"), 0.5)).collect();
         let ws = working_set(
             &req(RecallMode::Search, 1),
@@ -1385,6 +1399,11 @@ mod tests {
             &BaselineConfig::default(),
         );
         assert_eq!(ws.omitted.len(), memorysafe_core::OMITTED_CAP);
+        assert_eq!(ws.omitted_total, 199, "200 candidates, 1 selected");
+        assert!(
+            ws.omitted_total > ws.omitted.len(),
+            "the total must outlive the truncation that hides it"
+        );
     }
 
     #[test]
