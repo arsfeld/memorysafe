@@ -71,13 +71,74 @@ pub struct BaselineConfig {
     /// long-unaccessed items.
     pub replay_quota: f32,
     /// MMR tradeoff: 1.0 is pure relevance, 0.0 is pure diversity.
+    ///
+    /// **Deliberately unchanged when the MMR fill moved from a pairwise `max`
+    /// to union coverage**, which is not the same as unexamined. Union
+    /// coverage is `>=` the pairwise max always, so the penalty term rose on
+    /// every candidate — but a penalty that rises by the SAME amount on every
+    /// candidate cannot change a ranking. What can is the penalty's
+    /// DISPERSION across candidates, and that is what `1.0 - mmr_lambda`
+    /// converts into power to overturn a relevance difference.
+    ///
+    /// Measured, on synthetic corpora spanning three shapes, the ratio
+    /// `sd(union) / sd(pairwise max)` across candidates runs from about
+    /// `1.03x` (terse facts, large vocabulary, few function words) to about
+    /// `1.90x` (prose, 45% function words), and is NOT monotone in the number
+    /// of items already selected — in a narrow-vocabulary scope it peaks near
+    /// `1.56x` and falls back toward `1.14x` as coverage saturates. Holding
+    /// the diversity term's ranking power fixed would therefore need
+    /// `mmr_lambda` anywhere in `0.70..=0.84`, varying by corpus AND by
+    /// position within a single recall. No constant does that, so there is no
+    /// well-defined target to recalibrate toward.
+    ///
+    /// Two further reasons not to move it. The extra dispersion is mostly the
+    /// signal the pairwise `max` was discarding, and damping a correction
+    /// with the tradeoff knob is the wrong response to fixing a biased
+    /// estimator. And what remains tracks FUNCTION-WORD density rather than
+    /// content redundancy (the `1.03x` and `1.90x` above differ in stopword
+    /// fraction, not in how alike the items actually are), so the lever for it
+    /// is a stopword-aware tokenizer in `similarity`, not a tuned constant
+    /// here that would hide the artifact instead of leaving it visible.
+    ///
+    /// Stated plainly, since a documented default invites being read as a
+    /// derived one: `0.70` is the conventional relevance-leaning MMR lambda,
+    /// not a value this project measured against a corpus. It was not
+    /// well-founded before this change either, and this change does not make
+    /// it worse-founded. The first real corpus should re-derive it.
     pub mmr_lambda: f32,
-    /// `compose::working_set`'s MMR fill: an item whose similarity to what is
-    /// already selected exceeds this is tagged `ReasonCode::DiversityCut`
-    /// rather than `ReasonCode::HighValue` in its evidence. Not a fragility
-    /// gate and not part of the ladder above — it never changes which item is
-    /// chosen, only how the choice is explained in the audit trail, so a
-    /// tenant override here is cosmetic rather than behavioural.
+    /// `compose::working_set`'s MMR fill: an item more than this fraction of
+    /// whose own content is already covered by the union of what is already
+    /// selected is tagged `ReasonCode::DiversityCut` rather than
+    /// `ReasonCode::HighValue` in its evidence. Not a fragility gate and not
+    /// part of the ladder above — it never changes which item is chosen, only
+    /// how the choice is explained in the audit trail, so a tenant override
+    /// here is cosmetic rather than behavioural.
+    ///
+    /// **Also deliberately unchanged under union coverage**, and for a
+    /// different reason than `mmr_lambda`'s. This is a SEMANTIC anchor, not a
+    /// distribution calibration: "more than half of this item's own content is
+    /// already present" is the same checkable English sentence before and
+    /// after, and the union form makes it TRUE on exactly the cases where the
+    /// pairwise `max` made it false. More rows will carry the tag; that is the
+    /// correction landing, not drift to be absorbed. Re-tuning the number to
+    /// hold the tag's firing rate flat would be fitting a durable audit label
+    /// to a desired appearance rather than to what the mechanism does — the
+    /// defect the `ExactDuplicate` -> `NearDuplicate` rename settled at
+    /// `3a504a3`, which this same change is already applying to the evidence
+    /// key beside it.
+    ///
+    /// And no value of this constant restores what changed. Union coverage is
+    /// monotonically non-decreasing as the working set fills, so the tag is
+    /// now partly a function of an item's POSITION in that set; raising the
+    /// threshold moves where the position cutoff falls without making the tag
+    /// position-independent again.
+    ///
+    /// The measured cost, flagged rather than tuned away: in a
+    /// narrow-vocabulary scope the tag fires on essentially every MMR pick
+    /// past about five selected items (synthetic corpus: `9.5% -> 100%` at ten
+    /// selected), at which point it separates nothing. That is the same
+    /// function-word artifact `mmr_lambda`'s note names, and it has the same
+    /// fix — a stopword-aware tokenizer, not a threshold move.
     pub diversity_cut_similarity: f32,
     /// Half-life in days for value decay during maintenance.
     pub value_half_life_days: f32,

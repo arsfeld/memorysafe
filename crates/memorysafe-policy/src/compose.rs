@@ -7,13 +7,22 @@
 //! of recall forever), and the remainder is filled by Maximal Marginal
 //! Relevance, trading relevance against dissimilarity to what has already
 //! been selected so the working set is not three paraphrases of one fact.
+//!
+//! The dissimilarity half of that trade is measured against the UNION of what
+//! is already selected, not against each selected item separately. Canonical
+//! MMR takes a `max` over pairwise similarities, which cannot see a candidate
+//! that is wholly covered by the selected set taken together but by no single
+//! member of it — `{x, y}` against a selected `[{x}, {y}]` scores `0.50`
+//! under a pairwise max and `1.00` under the union, and `1.00` is the truth:
+//! that candidate adds nothing. See `similarity::coverage`.
 
 use crate::config::BaselineConfig;
-use crate::similarity::overlap;
+use crate::similarity::{coverage, token_set};
 use memorysafe_core::{
     ComposeContext, OMITTED_CAP, OmittedItem, Reason, ReasonCode, RecallMode, RecallRequest,
     ScoredCandidate, SelectedItem, WorkingSet, features,
 };
+use std::collections::HashSet;
 use time::Duration;
 
 fn fits(req: &RecallRequest, tokens: u32, items: usize) -> bool {
@@ -79,14 +88,31 @@ pub fn working_set(
     });
 
     let mut selected: Vec<SelectedItem> = Vec::new();
+    // The union of every selected item's tokens, the `C` in the MMR fill's
+    // `|A ∩ C| / |A|` coverage penalty. Maintained incrementally as items are
+    // selected rather than rebuilt per candidate: the alternative re-tokenizes
+    // every selected body once for every candidate on every round, which is
+    // the cost the pairwise-`max` form actually paid.
+    let mut selected_tokens: HashSet<String> = HashSet::new();
     let mut chosen: Vec<usize> = Vec::new();
     let mut tokens: u32 = 0;
 
+    // `selected_tokens` is extended HERE, in the one place items enter
+    // `selected`, so the two cannot fall out of step — including on the
+    // replay path, which populates `selected` before the MMR fill runs and
+    // whose picks the coverage penalty must therefore already account for.
+    // Maintaining it in the MMR loop instead would silently narrow what the
+    // penalty is measured against. `Search` mode never reads the set, so the
+    // one tokenization per selected item it pays there is dead work; that is
+    // the price of an invariant no future push site can forget, and it is
+    // bounded by the item budget.
     let push = |selected: &mut Vec<SelectedItem>,
+                selected_tokens: &mut HashSet<String>,
                 tokens: &mut u32,
                 c: &ScoredCandidate,
                 reason: Reason| {
         *tokens += c.estimated_tokens;
+        selected_tokens.extend(token_set(&c.item.body));
         selected.push(SelectedItem {
             item: c.item.clone(),
             relevance: c.relevance,
@@ -102,6 +128,7 @@ pub fn working_set(
             chosen.push(i);
             push(
                 &mut selected,
+                &mut selected_tokens,
                 &mut tokens,
                 c,
                 Reason::new(
@@ -160,6 +187,7 @@ pub fn working_set(
             replayed += 1;
             push(
                 &mut selected,
+                &mut selected_tokens,
                 &mut tokens,
                 c,
                 Reason::new(
@@ -184,11 +212,8 @@ pub fn working_set(
                 if !fits(req, tokens + c.estimated_tokens, selected.len() + 1) {
                     continue;
                 }
-                let max_sim = selected
-                    .iter()
-                    .map(|s| overlap(&c.item.body, &s.item.body))
-                    .fold(0.0f32, f32::max);
-                let mmr = cfg.mmr_lambda * c.relevance - (1.0 - cfg.mmr_lambda) * max_sim;
+                let covered = coverage(&c.item.body, &selected_tokens);
+                let mmr = cfg.mmr_lambda * c.relevance - (1.0 - cfg.mmr_lambda) * covered;
                 // `ScoredCandidate::relevance` is a bare, unclamped `f32` by
                 // its own contract, and warns a degenerate zero-vector cosine
                 // can be NaN — reachable from the real producer, not just a
@@ -199,7 +224,7 @@ pub fn working_set(
                 // candidate that follows, so nothing could ever displace it.
                 // Skipping a non-finite `mmr` here, rather than only checking
                 // `c.relevance` for NaN, also excludes the (currently
-                // unreachable but not type-excluded) case of a NaN `max_sim`.
+                // unreachable but not type-excluded) case of a NaN `covered`.
                 if !mmr.is_finite() {
                     continue;
                 }
@@ -210,16 +235,18 @@ pub fn working_set(
             let Some((i, mmr)) = best else { break };
             let c = ranked[i];
             chosen.push(i);
-            let max_sim = selected
-                .iter()
-                .map(|s| overlap(&c.item.body, &s.item.body))
-                .fold(0.0f32, f32::max);
+            // Recomputed rather than carried out of the scan above: nothing
+            // has been pushed since, so this is the same number that produced
+            // `mmr`, and it now costs one candidate tokenization instead of
+            // the scan's whole pairwise sweep.
+            let covered = coverage(&c.item.body, &selected_tokens);
             push(
                 &mut selected,
+                &mut selected_tokens,
                 &mut tokens,
                 c,
                 Reason::new(
-                    if max_sim > cfg.diversity_cut_similarity {
+                    if covered > cfg.diversity_cut_similarity {
                         ReasonCode::DiversityCut
                     } else {
                         ReasonCode::HighValue
@@ -227,7 +254,17 @@ pub fn working_set(
                     "selected by relevance traded against redundancy with the set so far",
                     features! {
                         "relevance" => c.relevance,
-                        "max_similarity_to_selected" => max_sim,
+                        // NOT "max_similarity_to_selected", which this key was
+                        // called while the value above really was a max over
+                        // the selected items taken one at a time. Under the
+                        // union form that name is a false statement in a
+                        // durable audit record — the same defect the
+                        // `ExactDuplicate` -> `NearDuplicate` rename fixed at
+                        // `3a504a3`, and the reason the rename and the
+                        // semantic change had to land in one commit: either
+                        // ordering leaves a window in which the recorded name
+                        // does not describe the mechanism.
+                        "fraction_covered_by_selected" => covered,
                         "mmr" => mmr,
                     },
                 ),
@@ -306,6 +343,11 @@ pub fn working_set(
 mod tests {
     use super::*;
     use crate::config::BaselineConfig;
+    // The tests reach for the PAIRWISE form directly, as a guard: pinning
+    // `overlap(candidate, one_selected_item)` is what makes a union
+    // assertion non-vacuous, by fixing what the pairwise `max` this task
+    // replaced would have reported for the same fixture.
+    use crate::similarity::overlap;
     use crate::testkit::{candidate, scope};
     use memorysafe_core::{
         ReasonCode, RecallBudget, RecallMode, ScopeStats, Score, SensitivityLevel,
@@ -449,7 +491,7 @@ mod tests {
             "MMR should prefer a distinct item over a third paraphrase"
         );
         // NOT `DiversityCut`: this candidate has zero overlap with the
-        // selected seed, so `max_sim` is `0.0`, which is not above
+        // selected seed, so `covered` is `0.0`, which is not above
         // `cfg.diversity_cut_similarity` (default `0.5`) — its reason is
         // `HighValue`. The `DiversityCut`/`HighValue` boundary itself is
         // covered by
@@ -462,7 +504,7 @@ mod tests {
         // capable of failing. Asserting the actual reason code is the
         // falsifiable claim: mutating the `> cfg.diversity_cut_similarity`
         // comparison at the MMR reason site to `<` would flip this exact
-        // case (`max_sim == 0.0`) to `DiversityCut`, and this assertion
+        // case (`covered == 0.0`) to `DiversityCut`, and this assertion
         // would catch it.
         assert_eq!(ws.items[1].reason.code, ReasonCode::HighValue);
     }
@@ -471,7 +513,7 @@ mod tests {
     fn mmr_prefers_higher_relevance_when_similarity_is_tied_at_zero() {
         // Isolates the relevance term of the MMR trade: two remaining
         // candidates share the same (zero) similarity to what is already
-        // selected, so `(1 - lambda) * max_sim` contributes identically
+        // selected, so `(1 - lambda) * covered` contributes identically
         // (zero) to both regardless of the relevance term's shape.
         //
         // Rejects: the relevance term's SIGN being inverted. Verified: with
@@ -488,7 +530,7 @@ mod tests {
         // leave every assertion in this test passing: zeroing the
         // coefficient (`cfg.mmr_lambda * c.relevance` -> `0.0 * c.relevance`,
         // which degenerates every candidate's mmr to the identical value
-        // `0.0` here since `max_sim` is zero for all three, so the tie is
+        // `0.0` here since `covered` is zero for all three, so the tie is
         // broken by `ranked`'s own relevance-sorted order — reproducing the
         // right answer for the wrong reason), and `*` weakened to `+`
         // (`cfg.mmr_lambda * c.relevance` -> `cfg.mmr_lambda + c.relevance`,
@@ -573,75 +615,262 @@ mod tests {
     }
 
     #[test]
-    fn max_over_selected_understates_coverage_split_across_several_selected_items() {
-        // Characterizes a REGRESSION this file's directional `|A∩B|/|A|` fix
-        // introduces, pinned here deliberately rather than left to a report
-        // comment nobody re-reads. Three facts, because two invite the wrong
-        // repair:
+    fn mmr_weights_relevance_by_lambda_and_coverage_by_its_complement_and_not_the_reverse() {
+        // Found by reasoning, not by `cargo mutants`, which does not generate
+        // argument-swap mutations on the MMR expression:
+        //   `mmr_lambda * relevance - (1 - mmr_lambda) * covered`   (correct)
+        // against the two coefficients exchanged
+        //   `(1 - mmr_lambda) * relevance - mmr_lambda * covered`,
+        // which inverts what `mmr_lambda`'s own doc promises ("1.0 is pure
+        // relevance, 0.0 is pure diversity") into its opposite.
         //
-        // 1. THE VALUE IS WRONG. `"alpha beta"` as a candidate is entirely
-        //    covered by the selected set TAKEN TOGETHER — "alpha" is in the
-        //    first selected item, "beta" is in the second — so the true
-        //    penalty is `1.0` (it adds nothing new). The code computes
-        //    `0.5`, asserted below as what it actually does today, not as
-        //    the correct answer.
-        // 2. IT IS NEWLY WRONG. The previous formula (`shared / min(|a|,
-        //    |b|)`, uncapped multiset count) gave `1 / min(2, 1) = 1.0`
-        //    against EACH selected item here individually, so `max` over
-        //    them was already `1.0` — the old code got this specific case
-        //    right.
-        // 3. THE OLD ANSWER IS NOT RECOVERABLE BY REVERTING. Fact 2 alone
-        //    invites reverting to the old formula; that would be wrong. The
-        //    old formula's `1.0` here was not earned — it came from `min`
-        //    SATURATING to `1.0` across the entire subset-relation class,
-        //    where it was mostly wrong the OTHER direction: candidate
-        //    `"alpha beta gamma delta epsilon"` (5 tokens) against a
-        //    selected item containing only `"alpha"` also saturated to
-        //    `1 / min(5, 1) = 1.0` under the old formula, when the true
-        //    coverage is `0.2` (one of five tokens). Reverting `min` would
-        //    trade this one accidentally-correct split-coverage case for
-        //    every extending candidate this round's fix was written to
-        //    correct (see
-        //    `overlap_penalises_a_contained_candidate_fully_and_an_extending_one_only_partially`
-        //    above).
+        // Measured before writing this, rather than asserted: the exchange is
+        // NOT currently invisible — `a_zero_replay_quota_reserves_no_slots_
+        // even_for_a_maximally_fragile_stale_item` also fails under it,
+        // because a diversity-dominant score lets its deliberately dissimilar
+        // "rare fact" win a slot on dissimilarity alone. That is an incidental
+        // catch by a fixture built to prove something else entirely (that a
+        // zero quota reserves no slots), and its name, its comment and its
+        // assertions all describe the replay quota. Any reasonable future edit
+        // to it — a less dissimilar filler body, a different relevance spread —
+        // would remove the only thing standing between this expression and a
+        // silent inversion, and nothing would flag that it had. Hence a test
+        // that says so in its own name.
         //
-        // The actual fix for split coverage is a UNION-based measure —
-        // `|A ∩ (B1 ∪ B2 ∪ …)| / |A|` computed once against everything
-        // selected, rather than `max` over pairwise `|A ∩ Bi| / |A|` calls —
-        // and it is deferred to its own task, not attempted here: it
-        // changes what the audit-visible `"max_similarity_to_selected"`
-        // evidence key means, it re-derives `max_sim`'s contribution to the
-        // MMR score itself (so `mmr_lambda` would need re-calibration), and
-        // it changes the distribution `diversity_cut_similarity` is
-        // compared against. Four moving parts, none in this round's scope.
+        // Rejects: that exchange. The contest below is between a MORE
+        // relevant candidate that is substantially covered and a LESS
+        // relevant one that is not covered at all, with the relevance edge
+        // sized so the correct, relevance-leaning weights pick the covered
+        // one and the exchanged, diversity-leaning weights pick the other:
+        //   correct:  0.7*0.95 - 0.3*0.75 = 0.440  vs  0.7*0.60 = 0.420
+        //   exchanged: 0.3*0.95 - 0.7*0.75 = -0.240 vs 0.3*0.60 = 0.180
         //
-        // This is canonical MMR's own limitation (`max` over pairwise
-        // comparisons cannot see a union — see `overlap`'s own doc comment),
-        // not specific to this formula; the directional fix just changed
-        // WHICH inputs happen to expose it.
-        //
-        // This test hand-rolls the `.max(...)` the real MMR fill loop
-        // computes over `selected`, rather than driving it through
-        // `working_set`, so it stays green through the deferred union fix
-        // named above changing what happens at the real call site (a new
-        // union-based helper replacing this `max` call, or `working_set`
-        // calling something else entirely) — it pins the PAIRWISE
-        // `overlap` values here, which the union fix leaves as building
-        // blocks, not the call site's current use of `max` over them. If
-        // the union fix lands, this test's own `max_sim` line stops
-        // describing what `working_set` actually does and should be
-        // revisited alongside it, even though it would keep passing.
-        let candidate_body = "alpha beta";
-        let selected_1 = "alpha";
-        let selected_2 = "beta";
-        assert_eq!(overlap(candidate_body, selected_1), 0.5);
-        assert_eq!(overlap(candidate_body, selected_2), 0.5);
-        let max_sim = overlap(candidate_body, selected_1).max(overlap(candidate_body, selected_2));
-        assert_eq!(
-            max_sim, 0.5,
-            "known-wrong: truth is 1.0 (wholly covered by the selected set \
-             together); tracked here, not fixed — see the comment above"
+        // Vacuous if the relevance edge were large enough to win under
+        // either assignment, or small enough to lose under both — the guard
+        // below states the inequality the fixture has to satisfy in terms of
+        // `cfg.mmr_lambda` itself, so a future change to that default fails
+        // here loudly instead of silently making this test stop
+        // discriminating.
+        let cfg = BaselineConfig::default();
+        let seed = "one two three four five six seven eight";
+        let covered_but_relevant = "one two three four five six alpha beta";
+        let uncovered_but_less_relevant = "gamma delta epsilon zeta eta theta iota kappa";
+        assert_eq!(overlap(covered_but_relevant, seed), 0.75);
+        assert_eq!(overlap(uncovered_but_less_relevant, seed), 0.0);
+
+        let (rel_covered, rel_uncovered) = (0.95f32, 0.60f32);
+        assert!(
+            cfg.mmr_lambda * (rel_covered - rel_uncovered) > (1.0 - cfg.mmr_lambda) * 0.75,
+            "the relevance edge must outweigh the coverage penalty under the CORRECT weights, \
+             or this fixture cannot tell the two coefficient assignments apart"
         );
+
+        let mut cands = vec![
+            candidate(seed, 0.99),
+            candidate(covered_but_relevant, rel_covered),
+            candidate(uncovered_but_less_relevant, rel_uncovered),
+        ];
+        for c in &mut cands {
+            c.fragility = Score::ZERO;
+            c.item.created_at = ctx().now;
+        }
+        // Two slots: the seed takes the first, and the second is the contest.
+        let ws = working_set(&req(RecallMode::WorkingSet, 2), &cands, &ctx(), &cfg);
+        let bodies: Vec<&str> = ws.items.iter().map(|s| s.item.body.as_str()).collect();
+        assert_eq!(
+            bodies,
+            vec![seed, covered_but_relevant],
+            "relevance carries the larger weight; a covered-but-more-relevant item still wins"
+        );
+    }
+
+    #[test]
+    fn a_candidate_split_across_two_selected_items_is_scored_as_fully_covered() {
+        // THE case the union form exists for, and the replacement for the
+        // characterization test that pinned this same fixture at the WRONG
+        // value (`0.5`) while `working_set` took a `max` over pairwise
+        // `overlap` calls. Not a repurposing of that fixture onto a new
+        // claim: the old test asserted `max` understates, this one asserts
+        // the union does not, and the value asserted is the one the old test
+        // named as the truth it could not yet claim.
+        //
+        // Rejects: the pairwise-`max` fill this task replaces. `"alpha beta"`
+        // is wholly covered by the two selected items TAKEN TOGETHER, but by
+        // neither of them alone — the two guards below pin each pairwise
+        // coverage at exactly `0.5`, so a `max` over them is `0.5` and both
+        // assertions below fail under it (the evidence value, and the reason
+        // code, since `0.5 > 0.5` is false and would tag `HighValue`).
+        //
+        // Vacuous if either selected item covered the candidate on its own —
+        // pinned by the two guards. Vacuous also if a coverage that
+        // saturated to `1.0` unconditionally could produce this answer; that
+        // is excluded by
+        // `union_coverage_is_neither_the_pairwise_max_nor_the_sum_of_the_pairwise_coverages`
+        // below, which pins a strictly intermediate value on a fixture with
+        // two selected items.
+        //
+        // Derived by hand, then confirmed: `mmr_lambda` 0.70, so round 1
+        // scores `0.7 * rel` against an empty selected set (nothing is
+        // covered yet) and takes `"alpha"` at 0.693; round 2 scores
+        // `"beta"` at `0.7*0.98 - 0.3*0` = 0.686 against `"alpha beta"` at
+        // `0.7*0.50 - 0.3*0.5` = 0.20 and takes `"beta"`; round 3 has only
+        // `"alpha beta"` left, now covered `2/2 = 1.00` by the union
+        // `{alpha, beta}`.
+        let cfg = BaselineConfig::default();
+        let split = "alpha beta";
+        let seed_x = "alpha";
+        let seed_y = "beta";
+        assert_eq!(overlap(split, seed_x), 0.5);
+        assert_eq!(overlap(split, seed_y), 0.5);
+
+        let mut cands = vec![
+            candidate(seed_x, 0.99),
+            candidate(seed_y, 0.98),
+            candidate(split, 0.50),
+        ];
+        for c in &mut cands {
+            c.fragility = Score::ZERO;
+            c.item.created_at = ctx().now;
+        }
+        let ws = working_set(&req(RecallMode::WorkingSet, 3), &cands, &ctx(), &cfg);
+        let bodies: Vec<&str> = ws.items.iter().map(|s| s.item.body.as_str()).collect();
+        assert_eq!(bodies, vec![seed_x, seed_y, split]);
+
+        let covered = *ws.items[2]
+            .reason
+            .evidence
+            .get("fraction_covered_by_selected")
+            .expect("the MMR fill must record the coverage that drove its choice");
+        assert_eq!(
+            covered, 1.0,
+            "a candidate wholly covered by the selected set TAKEN TOGETHER adds nothing new"
+        );
+        assert_eq!(
+            ws.items[2].reason.code,
+            ReasonCode::DiversityCut,
+            "full coverage is above the diversity-cut threshold, whatever it is set to below 1.0"
+        );
+    }
+
+    #[test]
+    fn union_coverage_is_neither_the_pairwise_max_nor_the_sum_of_the_pairwise_coverages() {
+        // Pins a STRICTLY INTERMEDIATE union coverage, which the all-or-
+        // nothing fixture above cannot: `1.00` is also what a coverage that
+        // saturated to `1.0` for any non-empty selected set would report,
+        // and `0.00`/`1.00`/`0.50` are all values some degenerate formula
+        // reaches by accident.
+        //
+        // Rejects three distinct wrong implementations at once, because the
+        // three disagree on this fixture by construction — the two selected
+        // items each cover 2 of the candidate's 4 tokens, and they SHARE one
+        // of those two:
+        //   pairwise max      = 0.50   (the implementation this task replaces)
+        //   sum of pairwise   = 1.00   (a union that double-counts `"beta"`)
+        //   saturate-to-one   = 1.00
+        //   union (correct)   = 0.75   ({alpha, beta, gamma} of 4)
+        //
+        // Vacuous if the two selected items' contributions were disjoint (sum
+        // would equal union) or nested (max would equal union) — pinned by
+        // the two guards below, which fix each pairwise coverage at 0.5 while
+        // the asserted union is 0.75, a value neither 0.5 nor 1.0.
+        //
+        // Derived by hand, then confirmed: round 1 takes `"alpha beta rain"`
+        // (0.693 against 0.686 and 0.42, all uncovered); round 2 scores
+        // `"beta gamma stone"` at `0.7*0.98 - 0.3*(1/3)` = 0.586 against the
+        // candidate at `0.7*0.60 - 0.3*0.5` = 0.27; round 3 has only the
+        // candidate left, covered `3/4` by the union
+        // `{alpha, beta, rain, gamma, stone}`.
+        let cfg = BaselineConfig::default();
+        let first = "alpha beta rain";
+        let second = "beta gamma stone";
+        let cand = "alpha beta gamma delta";
+        assert_eq!(overlap(cand, first), 0.5);
+        assert_eq!(overlap(cand, second), 0.5);
+
+        let mut cands = vec![
+            candidate(first, 0.99),
+            candidate(second, 0.98),
+            candidate(cand, 0.60),
+        ];
+        for c in &mut cands {
+            c.fragility = Score::ZERO;
+            c.item.created_at = ctx().now;
+        }
+        let ws = working_set(&req(RecallMode::WorkingSet, 3), &cands, &ctx(), &cfg);
+        let bodies: Vec<&str> = ws.items.iter().map(|s| s.item.body.as_str()).collect();
+        assert_eq!(bodies, vec![first, second, cand]);
+
+        let covered = *ws.items[2]
+            .reason
+            .evidence
+            .get("fraction_covered_by_selected")
+            .expect("the MMR fill must record the coverage that drove its choice");
+        assert_eq!(
+            covered, 0.75,
+            "three of the candidate's four tokens are in the union; the shared one counts once"
+        );
+        assert_eq!(ws.items[2].reason.code, ReasonCode::DiversityCut);
+    }
+
+    #[test]
+    fn coverage_counts_a_replay_selected_item_and_not_only_the_mmr_selected_ones() {
+        // NOT a union-versus-max discriminator, and says so rather than
+        // borrowing the credibility of the two above: only ONE item is
+        // selected when the coverage under test is computed, and union and
+        // max agree on every one-item selected set. What it discriminates is
+        // WHERE the running union is maintained.
+        //
+        // Rejects: a union accumulated inside the MMR fill loop rather than
+        // at every push to `selected`. The replay quota populates `selected`
+        // BEFORE the MMR loop runs, and the `max` this task replaces read
+        // `selected` in full — replay picks included — so a union that only
+        // saw MMR picks would silently narrow what the penalty is measured
+        // against. Under that implementation the coverage here is `0.0`, not
+        // `0.75`, and the reason code is `HighValue`, not `DiversityCut`.
+        //
+        // Vacuous if the replay item shared no tokens with the candidate
+        // (0.0 either way) or all of them (1.0, which the saturating-coverage
+        // objection above applies to) — three of the candidate's four tokens
+        // are in the replay item, so the value is strictly between.
+        //
+        // Derived by hand, then confirmed: `replay_quota` 0.20 against a
+        // 5-item budget reserves `floor(5 * 0.2) = 1` slot; the ordinary
+        // candidate is not replay-due (fragility zero, created now) so the
+        // fragile stale item takes it despite ranking last on relevance;
+        // the MMR loop then scores the one remaining candidate against a
+        // selected set of exactly that replay pick, covering 3 of its 4
+        // tokens.
+        let cfg = BaselineConfig::default();
+        let mut replayed = candidate("alpha beta gamma", 0.01);
+        replayed.fragility = Score::ONE;
+        replayed.item.created_at = OffsetDateTime::UNIX_EPOCH;
+        let mut ordinary = candidate("alpha beta gamma delta", 0.90);
+        ordinary.fragility = Score::ZERO;
+        ordinary.item.created_at = ctx().now;
+        assert_eq!(overlap(&ordinary.item.body, &replayed.item.body), 0.75);
+
+        let ws = working_set(
+            &req(RecallMode::WorkingSet, 5),
+            &[ordinary, replayed],
+            &ctx(),
+            &cfg,
+        );
+        assert_eq!(ws.items.len(), 2);
+        assert_eq!(
+            ws.items[0].reason.code,
+            ReasonCode::ReplayDue,
+            "the reserved slot must be spent before the MMR fill, or this proves nothing"
+        );
+        let covered = *ws.items[1]
+            .reason
+            .evidence
+            .get("fraction_covered_by_selected")
+            .expect("the MMR fill must record the coverage that drove its choice");
+        assert_eq!(
+            covered, 0.75,
+            "the replay pick is in `selected` and must count toward what is already covered"
+        );
+        assert_eq!(ws.items[1].reason.code, ReasonCode::DiversityCut);
     }
 
     #[test]

@@ -13,6 +13,8 @@
 //! so this token-set proxy is what a pure policy has to work with. It is
 //! crude, and every caller's own doc says what it is trusted for.
 
+use std::collections::HashSet;
+
 /// Cheap textual proxy for "how much of `a`'s own content is already covered
 /// by `b`". The backend's vectors are not carried through to the policy, so
 /// this proxy works over token sets instead of embeddings — crude, but it
@@ -47,30 +49,58 @@
 /// denominator, pulling the ratio down), the contained candidate scores
 /// `1.00` (all of it is already covered, so it should be penalised fully).
 ///
-/// **A gap this leaves deliberately**, for any caller that compares against a
-/// SET rather than a single item: a candidate covered by that set taken
-/// together, but by no single member of it, is not detected. The caller
-/// (`working_set`'s MMR fill) takes a `max` over
-/// pairwise `overlap` calls against each selected item individually, and
-/// `max` over pairwise comparisons cannot see a union that only emerges
-/// across several of them. This is canonical MMR's own property — it is
-/// defined pairwise against the selected set — not a defect introduced here.
+/// **Comparing against a SET, not a single item**, is `coverage`'s job below,
+/// not this function's. A candidate covered by a set of items taken together
+/// but by no single member of it is invisible to any `max` over pairwise
+/// `overlap` calls — that is canonical MMR's own property, since MMR is
+/// defined pairwise against the selected set — so `working_set`'s MMR fill
+/// asks `coverage` against the union of what it has selected instead. Use
+/// `overlap` when the question really is about one other item (both of
+/// `maintain`'s uses are), and `coverage` when it is about a set.
 pub fn overlap(a: &str, b: &str) -> f32 {
-    let toks = |s: &str| -> std::collections::HashSet<String> {
-        s.split_whitespace().map(|t| t.to_lowercase()).collect()
-    };
-    let (ta, tb) = (toks(a), toks(b));
+    coverage(a, &token_set(b))
+}
+
+/// The SET form of `overlap`: `|A ∩ C| / |A|`, the fraction of `a`'s own
+/// distinct tokens already present in the union `C` of some collection of
+/// other items' tokens.
+///
+/// This is what a caller comparing against a SET needs, and it is strictly
+/// more than `max` over pairwise `overlap` calls can report:
+/// `coverage(a, B₁ ∪ B₂) ≥ max(overlap(a, b₁), overlap(a, b₂))` always, with
+/// the inequality strict exactly when `a`'s covered tokens are split across
+/// members rather than concentrated in one. It is NOT the sum of the pairwise
+/// coverages either — a token present in two members of the set is covered
+/// once, not twice.
+///
+/// The union is the caller's to maintain (`working_set` extends one set as
+/// items are selected), so this takes an already-built `C` rather than a
+/// slice of bodies to re-tokenize: one candidate tokenization per call
+/// instead of one per candidate per member.
+pub fn coverage(a: &str, covered: &HashSet<String>) -> f32 {
+    let ta = token_set(a);
     // Only `ta` (the candidate, `A`) needs an emptiness guard: `ta.is_empty()`
-    // risks dividing `0 / 0` (NaN). `tb` empty needs no special case —
-    // `ta.intersection(&tb)` is empty whenever `tb` is, regardless of `ta`'s
-    // contents, so `0 / ta.len()` already reads as the correct `0.0` on its
-    // own.
+    // risks dividing `0 / 0` (NaN). An empty `covered` needs no special case —
+    // `ta.intersection(covered)` is empty whenever `covered` is, regardless of
+    // `ta`'s contents, so `0 / ta.len()` already reads as the correct `0.0` on
+    // its own. That matters at the MMR fill's first round, where nothing has
+    // been selected yet and every candidate must score an uncovered `0.0`.
     if ta.is_empty() {
         return 0.0;
     }
-    let shared = ta.intersection(&tb).count();
+    let shared = ta.intersection(covered).count();
     shared as f32 / ta.len() as f32
 }
+
+/// The one tokenizer both forms above agree on: distinct, lower-cased,
+/// whitespace-split tokens. Public so a caller maintaining a running union
+/// (`compose::working_set`) builds it the same way the comparison reads it —
+/// two tokenizers that drifted apart would silently make every coverage
+/// number wrong in a way no single call site could show.
+pub fn token_set(s: &str) -> HashSet<String> {
+    s.split_whitespace().map(|t| t.to_lowercase()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
