@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 48-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
+**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 49-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
 
 **Architecture:** A second Cargo workspace, in its own closed repository, with the open-source repository vendored as a git submodule at `vendor/memorysafe` and consumed through path dependencies. One crate, `memorysafe-backend-postgres`, implements the `Backend` trait frozen at the end of Plan 1 Task 24. Every operation runs inside a transaction that first sets a transaction-local `memorysafe.tenant_id` GUC and `search_path`; the pool's connections run as a non-superuser role, so the RLS policy — not the query text — is what makes cross-tenant reads return nothing. Vector search generates candidates through a pgvector HNSW index and then reranks them exactly in Rust with `QuantizedVector::dot`, the same function the SQLite backend scores with, so both backends order identically.
 
@@ -97,7 +97,7 @@ pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) where F::B: '
 
 Fixtures live in `memorysafe_backend::conformance::fx`: `embedder()` (a `DeterministicEmbedder` at **dim 256**, embedder id `deterministic-256`), `item`, `item_with`, `item_at`, `item_with_id`, `vector_for`, `admit_txn`, `admit_txn_embedded`, `evict_txn`, `evict_txn_at`.
 
-### The 48 conformance tests
+### The 49 conformance tests
 
 The authoritative list is `run_conformance_suite`'s own `run!` in
 `crates/memorysafe-backend/src/conformance/mod.rs`; this table is transcribed
@@ -110,7 +110,7 @@ against that list. Recount, do not adjust by a difference.
 | `atomicity` (6) | `admit_evict_and_audit_commit_together`, `a_failed_transaction_leaves_no_trace`, `an_invalid_transaction_is_rejected_and_writes_nothing`, `every_mutation_writes_exactly_one_audit_record`, `idempotent_writes_replay_the_original_outcome`, `idempotency_conflict_on_different_payload` |
 | `retrieval` (13) | `sensitivity_ceiling_is_enforced_in_the_query`, `tag_and_kind_filters_narrow_results`, `vector_search_ranks_by_similarity`, `keyword_search_finds_exact_terms`, `keyword_search_escapes_user_input`, `hybrid_returns_both_signal_sources`, `list_pages_are_disjoint_and_complete`, `list_orders_oldest_first_by_created_at`, `list_tie_break_is_total_over_identical_timestamps`, `pending_embedding_items_are_excluded_when_asked`, `cross_model_vectors_are_rejected`, `neighbours_break_ties_before_truncating_at_k`, `recall_updates_access_statistics` |
 | `capacity` (4) | `capacity_accounting_tracks_items_and_bytes`, `eviction_releases_capacity`, `concurrent_admits_do_not_double_count`, `scope_stats_reflect_the_corpus` |
-| `lifecycle` (20) | `audit_filter_narrows_by_event_and_time`, `audit_returns_min_of_the_limit_and_the_rows_that_remain`, `audit_pages_by_the_after_cursor_without_repeating_a_row`, `audit_since_and_until_include_a_record_on_the_boundary`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `purge_subject_preserves_audit_when_asked`, `purge_subject_persists_the_record_it_was_given`, `apply_persists_the_audit_id_it_was_given`, `record_recall_persists_the_audit_id_it_was_given`, `import_preserves_every_audit_id`, `export_narrows_to_the_selectors_subject_and_namespace`, `export_orders_the_stream_by_kind_then_by_id`, `export_import_round_trips_exactly`, `import_is_idempotent`, `import_rejects_a_later_record_whose_tenant_disagrees`, `import_rejects_a_foreign_audit_record_even_when_every_item_agrees`, `audit_aggregates_survive_a_cascading_purge`, `audit_aggregates_page_in_the_documented_order`, `audit_aggregates_resume_from_a_cursor_that_names_no_stored_row` |
+| `lifecycle` (21) | `audit_filter_narrows_by_event_and_time`, `audit_returns_min_of_the_limit_and_the_rows_that_remain`, `audit_pages_by_the_after_cursor_without_repeating_a_row`, `audit_since_and_until_include_a_record_on_the_boundary`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `purge_subject_preserves_audit_when_asked`, `purge_subject_persists_the_record_it_was_given`, `apply_persists_the_audit_id_it_was_given`, `record_recall_persists_the_audit_id_it_was_given`, `import_preserves_every_audit_id`, `export_narrows_to_the_selectors_subject_and_namespace`, `export_orders_the_stream_by_kind_then_by_id`, `export_import_round_trips_exactly`, `import_is_idempotent`, `import_rejects_a_later_record_whose_tenant_disagrees`, `import_rejects_a_foreign_audit_record_even_when_every_item_agrees`, `audit_aggregates_survive_a_cascading_purge`, `audit_aggregates_page_in_the_documented_order`, `audit_aggregates_resume_from_a_cursor_that_names_no_stored_row`, `audit_aggregates_narrow_by_day_window_and_policy` |
 
 **`pagination_is_stable` no longer exists.** It was renamed to
 `list_pages_are_disjoint_and_complete` — what it actually proves. It sorts and
@@ -435,7 +435,7 @@ The pool connects with whatever credentials `PgConfig::url` carries — typicall
 | 10 | Hard filters and keyword search | Hostile input cannot become an operator |
 | 11 | Hybrid retrieval | Retrieval conformance passes |
 | 12 | Capacity locking, merge, idempotency | Atomicity and capacity conformance pass |
-| 13 | Purge and portable export/import | The full 48-test suite passes |
+| 13 | Purge and portable export/import | The full 49-test suite passes |
 | 14 | `SchemaPerTenant` layout | The full suite passes under both layouts |
 | 15 | Cross-backend parity | SQLite and Postgres rank identically |
 | 16 | Schema-version guard and operator docs | Refuses a database from a newer version |
@@ -4233,7 +4233,7 @@ Add `pub mod capacity;` and `use sqlx::Row;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-postgres`
-Expected: PASS — 28 conformance tests (everything but the 20 lifecycle ones) plus the unit tests, all ok.
+Expected: PASS — 28 conformance tests (everything but the 21 lifecycle ones) plus the unit tests, all ok.
 
 - [ ] **Step 5: Commit**
 
@@ -4256,7 +4256,7 @@ git commit -m "feat(pg): row-locked capacity accounting, merge, and idempotent w
 - Consumes: everything in the crate.
 - Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and the single `run_conformance_suite` entry point.
 
-**Milestone: the complete 48-test suite passes under `SharedPartitioned`.**
+**Milestone: the complete 49-test suite passes under `SharedPartitioned`.**
 
 **Why vectors are deleted explicitly when the cascade would do it.** `PurgeReport` counts what was removed, and a cascade reports nothing. Deleting vectors first makes the count exact and leaves the item delete with nothing to cascade to.
 
@@ -4649,7 +4649,7 @@ git commit -m "feat(pg): subject purge and portable export/import; full conforma
 - Consumes: `ddl::statements` (already branches on layout), `ensure_ready` (already lazy).
 - Produces: an advisory lock around `ensure_schema`, and a second full conformance run.
 
-**Milestone: the full 48-test suite passes under both layouts.**
+**Milestone: the full 49-test suite passes under both layouts.**
 
 **Most of this layout already exists** — `ddl::statements` omits the partitioning clause and the partition tables, and `ensure_ready` creates a tenant's schema on first use. Two things are missing, and both are the kind of bug that only appears under load.
 
@@ -5335,7 +5335,7 @@ git commit -m "feat(pg): refuse an incompatible schema or vector width at connec
 
 - `cargo test --workspace --all-features` is green, both with Docker (container harness) and against `MEMORYSAFE_TEST_DATABASE_URL` (external server). CI runs both.
 - `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --all -- --check` are clean.
-- `PostgresBackend` passes all **48** conformance tests **unmodified**, under `SharedPartitioned` and under `SchemaPerTenant`.
+- `PostgresBackend` passes all **49** conformance tests **unmodified**, under `SharedPartitioned` and under `SchemaPerTenant`.
 - The isolation tests prove the guarantee is structural: a query with no `tenant_id` predicate returns one tenant's rows, a connection with no tenant context reads nothing and writes nothing, a cross-tenant write is refused by `WITH CHECK`, and partitions cannot be read directly.
 - Vector relevance is bit-identical to the SQLite backend's, and hard filters select the same rows on both.
 - An export produced by the SQLite backend imports into Postgres and reproduces the corpus, vectors included.

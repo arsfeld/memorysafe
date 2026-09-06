@@ -195,29 +195,54 @@ impl Ord for AggregateKey {
     /// declaration order, in which `rejected` is second and `exported` sixth
     /// while the documented order sorts them tenth and second.
     ///
-    /// `policy` compares as `Option<String>` of `PolicyId::to_string()`, which
-    /// gives both halves of the documented rule at once: `Option`'s own
-    /// ordering puts `None` before every `Some`, and two `Some`s compare by
-    /// `name@version` as a single string. That last part is not cosmetic — a
-    /// backend comparing a name column and a numerically-typed version column
-    /// pairwise puts `baseline@9` before `baseline@10`, where the documented
-    /// string order puts `baseline@10` first.
+    /// `policy` compares as `Option<(&str, &str)>` — `None` before every
+    /// `Some`, then `name`, then `version` — and **not** by
+    /// `PolicyId::to_string()`, which is what this comparison used to do.
     ///
-    /// `String`'s `Ord` is **byte** order, and that is what forces
-    /// `Backend::audit_aggregates` to mandate `COLLATE "C"` rather than the
-    /// database's default collation: the conformance sweep compares a backend
-    /// against this function, so a backend sorting under any other collation
-    /// disagrees with the type it is being measured by. `PolicyId::new`
-    /// validates neither field, so case and punctuation both reach this
-    /// comparison — `B@1` precedes `a@1` here and would follow it under any
-    /// locale-aware collation.
+    /// **Why the render was abandoned.** `Display` is `{name}@{version}` and
+    /// `PolicyId` constrains neither field, so `PolicyId::new("a@b", "c")` and
+    /// `PolicyId::new("a", "b@c")` both render `"a@b@c"`. Ordering by the
+    /// render returned `Equal` for two keys that `==` says are different,
+    /// which breaks `Ord`'s agreement with `Eq` — the same defect the trailing
+    /// `tenant` component exists to avoid, one component to the left. Comparing
+    /// the pair instead is injective over `PolicyId` by construction: the pair
+    /// *is* the type, so two keys compare `Equal` exactly when they are equal.
+    /// A tie-break appended after the render would have closed the symptom
+    /// while leaving the documented rule (`to_string()`) as something an
+    /// implementer could implement faithfully and still get a different order.
     ///
-    /// The trailing `tenant` comparison has the same exposure and no test can
-    /// reach it: `TenantId` permits `-`, `_` and `.`, which glibc collations
-    /// reweight rather than compare positionally, but `audit_aggregates` takes
-    /// the tenant as a parameter so every row in one result set shares it. A
-    /// SQL implementation still wants `COLLATE "C"` on both text columns —
-    /// pinning only `policy` looks complete and is not.
+    /// It costs nothing on the cases anyone cares about: `baseline@10` still
+    /// precedes `baseline@9` (versions compare as text, so `"10" < "9"`), and
+    /// `B@1` still precedes `a@1`. What changes is only the pairs the render
+    /// could not separate, and pairs whose names differ around a character
+    /// below `@`.
+    ///
+    /// **Nothing else depends on the rendered form being the sort key**
+    /// (checked before the change): `PolicyId::to_string()` is written into the
+    /// audit detail table's `policy` column and into a shadow-diff report, both
+    /// of which store or display it, and no query anywhere orders by it. The
+    /// aggregate table keys on the two parts, so the pair that renders alike
+    /// occupies two rows rather than colliding into one — the render collision
+    /// was only ever an ordering ambiguity here, never a lost count, and this
+    /// removes the ambiguity instead of tie-breaking around it.
+    ///
+    /// `str`'s `Ord` is **byte** order, and that is what forces
+    /// `Backend::audit_aggregates` to mandate an explicit byte collation
+    /// rather than a database default: the conformance sweep compares a
+    /// backend against this function, so a backend sorting under any other
+    /// collation disagrees with the type it is being measured by.
+    ///
+    /// The trailing `tenant` comparison has the same collation exposure, and
+    /// **no conformance test can reach it**: `TenantId` permits `-`, `_` and
+    /// `.`, which a locale collation may reweight rather than compare
+    /// positionally, but `audit_aggregates` takes the tenant as a parameter, so
+    /// every row in one result set shares it and the comparison never fires
+    /// against a backend. `tests::ordering_by_tenant_is_last_so_it_never_perturbs_a_single_tenant_page`
+    /// does reach it, by comparing two keys directly — which is the only place
+    /// it can be reached at all, and why that test exists. A SQL implementation
+    /// still wants the explicit collation on **every** text column of the key —
+    /// `policy_name`, `policy_version` and `tenant` — since pinning one looks
+    /// complete and is not.
     ///
     /// `tenant` is compared **last**, after the three documented components.
     /// It takes no part in the documented order because `audit_aggregates` is
@@ -231,8 +256,13 @@ impl Ord for AggregateKey {
             .then_with(|| {
                 self.policy
                     .as_ref()
-                    .map(PolicyId::to_string)
-                    .cmp(&other.policy.as_ref().map(PolicyId::to_string))
+                    .map(|p| (p.name.as_str(), p.version.as_str()))
+                    .cmp(
+                        &other
+                            .policy
+                            .as_ref()
+                            .map(|p| (p.name.as_str(), p.version.as_str())),
+                    )
             })
             .then_with(|| self.event.as_str().cmp(other.event.as_str()))
             .then_with(|| self.tenant.as_str().cmp(other.tenant.as_str()))
@@ -548,6 +578,32 @@ mod tests {
              notice"
         );
 
+        // Two `PolicyId`s that render the same string still compare as
+        // different keys. `Display` is `{name}@{version}` and neither field is
+        // constrained, so ("a@b", "c") and ("a", "b@c") both render "a@b@c" —
+        // ordering by the render returned `Equal` for keys that `==` calls
+        // different, which is the `Ord`/`Eq` inconsistency the pair comparison
+        // removes at the root. Read from the rule: name first, and "a" is a
+        // prefix of "a@b", so the shorter name sorts first.
+        let split_late = key(5, Some(PolicyId::new("a", "b@c")), AuditEvent::Admitted);
+        let split_early = key(5, Some(PolicyId::new("a@b", "c")), AuditEvent::Admitted);
+        assert_eq!(
+            split_late.policy.as_ref().unwrap().to_string(),
+            split_early.policy.as_ref().unwrap().to_string(),
+            "the premise: these two render identically, or the case under test \
+             does not exist"
+        );
+        assert_ne!(
+            split_late, split_early,
+            "they are nonetheless different keys"
+        );
+        assert!(
+            split_late < split_early,
+            "policies compare by name then version, so ('a', 'b@c') precedes \
+             ('a@b', 'c'). Comparing the rendered string returns Equal here and \
+             makes Ord disagree with Eq"
+        );
+
         // And the comparison is over *bytes*, not a locale collation.
         // `PolicyId::new` validates neither field, so an uppercase or
         // punctuated policy name is reachable, and that is where SQLite's
@@ -604,7 +660,7 @@ mod tests {
                 v9,
             ],
             "the full documented order: day, then policy (None first, then \
-             name@version), then the event's serialised name"
+             name, then version), then the event's serialised name"
         );
     }
 

@@ -122,5 +122,6 @@ where
         lifecycle::audit_aggregates_survive_a_cascading_purge,
         lifecycle::audit_aggregates_page_in_the_documented_order,
         lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row,
+        lifecycle::audit_aggregates_narrow_by_day_window_and_policy,
     );
 }

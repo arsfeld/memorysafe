@@ -1512,7 +1512,8 @@ pub async fn export_narrows_to_the_selectors_subject_and_namespace<F: BackendFac
         .collect();
     assert!(
         exported_audit.contains(&audit_ids[0]),
-        "include_audit: true dropped the audit row of the very scope the          selector names — narrowing must exclude other scopes, not everything"
+        "include_audit: true dropped the audit row of the very scope the \
+         selector names — narrowing must exclude other scopes, not everything"
     );
     for (i, label) in [
         (1usize, "the same subject's other namespace"),
@@ -1521,7 +1522,9 @@ pub async fn export_narrows_to_the_selectors_subject_and_namespace<F: BackendFac
     ] {
         assert!(
             !exported_audit.contains(&audit_ids[i]),
-            "the export of one scope carried an audit row from {label}:              `ScopeSelector` narrowed the items and not the audit rows, which              is a cross-subject disclosure in the export path"
+            "the export of one scope carried an audit row from {label}: \
+             `ScopeSelector` narrowed the items and not the audit rows, which \
+             is a cross-subject disclosure in the export path"
         );
     }
     assert_eq!(
@@ -2059,14 +2062,19 @@ pub async fn export_orders_the_stream_by_kind_then_by_id<F: BackendFactory>(fact
     );
 }
 
-/// Eight aggregate rows spanning two days, both policy states, four `Some`
+/// Ten aggregate rows spanning two days, both policy states, six `Some`
 /// policies and two event classes — the corpus both aggregate-cursor tests
 /// page over. Returns the tenant it wrote into.
 ///
-/// Two of the four policies exist for the version hazard (`baseline@10` before
-/// `baseline@9` as text, the reverse as numbers) and two for the collation
-/// hazard (`B@1` before `a@1` as bytes, the reverse under any locale-aware
-/// collation).
+/// Two of the six policies exist for the version hazard (`baseline@10` before
+/// `baseline@9` as text, the reverse as numbers), two for the collation hazard
+/// (`B@1` before `a@1` as bytes, the reverse under any locale-aware
+/// collation), and two for the render collision: `("a@b", "c")` and
+/// `("a", "b@c")` are different policies that `Display` renders identically as
+/// `"a@b@c"`. A backend keying its aggregate table on the rendered string
+/// cannot tell them apart at all and merges their counts into one row, which
+/// the corpus size assertion catches deterministically rather than as a
+/// coin-flip ordering failure.
 ///
 /// Aggregates are produced by the write path, not by an API of their own: each
 /// `apply` writes one audit row and increments the aggregate keyed by that
@@ -2098,6 +2106,10 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
     // either.
     let upper_b = PolicyId::new("B", "1");
     let lower_a = PolicyId::new("a", "1");
+    // Same render, different policies. `Display` is `{name}@{version}` and
+    // neither field is constrained, so both of these are `"a@b@c"`.
+    let split_early = PolicyId::new("a@b", "c");
+    let split_late = PolicyId::new("a", "b@c");
 
     // (day 0, None, Admitted)
     let a = fx::item_at(&scope, "day zero, no policy", day0);
@@ -2128,6 +2140,18 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
     let f = fx::item_at(&scope, "day zero, lowercase policy", day0);
     let mut txn = fx::admit_txn(&scope, f, None);
     txn.audit = txn.audit.clone().with_decision(decision(lower_a));
+    backend.apply(txn).await.unwrap();
+
+    // (day 0, Some(a@b / c), Admitted) and (day 0, Some(a / b@c), Admitted):
+    // two keys that render the same string.
+    let g = fx::item_at(&scope, "day zero, name carries the separator", day0);
+    let mut txn = fx::admit_txn(&scope, g, None);
+    txn.audit = txn.audit.clone().with_decision(decision(split_early));
+    backend.apply(txn).await.unwrap();
+
+    let h = fx::item_at(&scope, "day zero, version carries the separator", day0);
+    let mut txn = fx::admit_txn(&scope, h, None);
+    txn.audit = txn.audit.clone().with_decision(decision(split_late));
     backend.apply(txn).await.unwrap();
 
     // (day 1, None, Admitted)
@@ -2176,6 +2200,12 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
 ///   `PolicyId::to_string()`, i.e. `name@version` as one string, so
 ///   `baseline@10` precedes `baseline@9`. A backend storing version as a
 ///   number reverses exactly that pair.
+/// - *A policy key built from the rendered `name@version`.* `Display` is not
+///   injective — `PolicyId` constrains neither field — so `("a@b", "c")` and
+///   `("a", "b@c")` both render `"a@b@c"`. A backend keying its aggregate
+///   table on that string merges two distinct policies' counts into one row,
+///   and one ordering by it returns `Equal` for keys that `==` calls
+///   different. The order is over the two parts, name then version.
 /// - *A locale collation on the policy column.* That comparison is over
 ///   **bytes**, and byte order is forced rather than preferred: this test
 ///   measures a backend against `AggregateKey`'s `Ord`, which compares through
@@ -2203,10 +2233,13 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
 /// the two `Some` policies sort the same numerically and lexically (the
 /// version hazard is invisible), or if no policy name reaches outside the
 /// range where byte order and locale collation agree (the collation hazard is
-/// invisible). The fixture is eight rows over two days, swept two at a time,
-/// with three policy-less rows, the `baseline@9` / `baseline@10` pair that
-/// inverts under numeric comparison, and the `B@1` / `a@1` pair that inverts
-/// under any locale-aware collation.
+/// invisible), or if no two policies render to the same string (the
+/// collision is invisible, and after the ordering changed to compare name and
+/// version separately nothing else would pin that it did). The fixture is ten
+/// rows over two days, swept two at a time, with three policy-less rows, the
+/// `baseline@9` / `baseline@10` pair that inverts under numeric comparison,
+/// the `B@1` / `a@1` pair that inverts under any locale-aware collation, and
+/// the `("a@b", "c")` / `("a", "b@c")` pair that renders identically.
 pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(factory: &F) {
     use crate::{AggregateKey, AuditAggregate};
 
@@ -2249,10 +2282,12 @@ pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(fa
 
     assert_eq!(
         swept.len(),
-        8,
-        "the corpus is eight distinct keys and every one must be visited \
-         exactly once; a smaller number means the sweep terminated early, a \
-         larger one means the cursor re-served rows it had already returned"
+        10,
+        "the corpus is ten distinct keys and every one must be visited exactly \
+         once. A smaller number means the sweep terminated early — or that the \
+         two policies rendering as `a@b@c` were keyed on the render and merged \
+         into one row, which is a lost count rather than a paging bug. A larger \
+         one means the cursor re-served rows it had already returned"
     );
     assert!(
         page_size < swept.len(),
@@ -2297,17 +2332,45 @@ pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(fa
     assert_eq!(
         keys.iter().filter(|k| k.policy.is_none()).count(),
         3,
-        "three of the six rows carry no policy; if that ever reaches zero this \
-         test stops exercising the ordering hazard it exists for"
+        "three of the corpus's rows carry no policy; if that ever reaches zero \
+         this test stops exercising the ordering hazard it exists for"
     );
     assert_eq!(
         keys.iter()
             .filter(|k| k.day == 0)
             .filter(|k| k.policy.is_some())
             .count(),
-        4,
-        "day zero must hold all four policied rows, or neither the \
-         name@version comparison nor the collation pair is exercised"
+        6,
+        "day zero must hold all six policied rows, or one of the three hazards \
+         — version comparison, collation, or the render collision — is not \
+         exercised at all"
+    );
+
+    // The render collision, asserted by name from the documented rule and not
+    // through `Ord`: policy compares by **name** and then by **version**, as
+    // two components, so `("a", "b@c")` precedes `("a@b", "c")` because `"a"`
+    // is a prefix of `"a@b"`. An ordering built on `Display` cannot separate
+    // these — both render `"a@b@c"` — so it returns `Equal` for keys that are
+    // not equal, and a backend storing the render as its key never has two
+    // rows here to order.
+    let by_parts = |name: &str, version: &str| {
+        keys.iter().position(|k| {
+            k.policy
+                .as_ref()
+                .is_some_and(|p| p.name == name && p.version == version)
+        })
+    };
+    let (late, early) = (by_parts("a", "b@c"), by_parts("a@b", "c"));
+    assert!(
+        late.is_some() && early.is_some(),
+        "both halves of the render-collision pair must be present as separate \
+         rows: a backend that keyed on the rendered policy string merged them"
+    );
+    assert!(
+        late < early,
+        "policy compares by name then version, so ('a', 'b@c') precedes \
+         ('a@b', 'c') — 'a' is a prefix of 'a@b'. Ordering by the rendered \
+         `name@version` returns Equal for this pair and pins nothing"
     );
 
     // The collation pair, asserted by position rather than through `Ord`:
@@ -2353,8 +2416,8 @@ pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(fa
     );
     assert_eq!(
         whole.iter().map(|a| a.count).sum::<u64>(),
-        8,
-        "eight audit rows, eight distinct keys, one event counted in each"
+        10,
+        "ten audit rows, ten distinct keys, one event counted in each"
     );
 }
 
@@ -2405,14 +2468,14 @@ pub async fn audit_aggregates_resume_from_a_cursor_that_names_no_stored_row<F: B
         .unwrap();
     assert_eq!(
         all.len(),
-        8,
+        10,
         "the corpus must exist before it can be resumed into"
     );
 
     // Day 0, policy `nonexistent@1.0.0`: no such row was ever written, and it
-    // sorts above every policy day zero holds ("B@1", "a@1", "baseline@10",
-    // "baseline@9" — all below "nonexistent@..." in byte order), so this
-    // coordinate sits after all five of day zero's rows and before all three
+    // sorts above every policy day zero holds — the names are "B", "a",
+    // "a@b" and "baseline", all below "nonexistent" in byte order — so this
+    // coordinate sits after all seven of day zero's rows and before all three
     // of day one's.
     let phantom = AggregateKey {
         tenant: tenant.clone(),
@@ -2466,4 +2529,172 @@ pub async fn audit_aggregates_resume_from_a_cursor_that_names_no_stored_row<F: B
         "resuming must return exactly the rows strictly greater than the \
          cursor, in the documented order"
     );
+}
+
+/// `AuditAggregateFilter`'s day window and its `policy` narrowing both narrow.
+///
+/// **Why this was missing.** `AuditAggregateFilter`'s doc says it "mirrors
+/// `AuditFilter`'s shape ... so there is one idiom for a bounded, resumable
+/// read across this trait rather than two", and `AuditFilter`'s `since`/`until`
+/// *are* covered — by `audit_filter_narrows_by_event_and_time`. The mirror
+/// carried the shape across and not the coverage: every
+/// `AuditAggregateFilter` literal in this suite set only `after` and `limit`,
+/// so a backend that ignored the day bounds and the policy narrowing and
+/// returned the whole set passed. A claim of structural similarity transfers
+/// structure, not tests, and a coverage check that reads the sentence sees a
+/// tested sibling and moves on.
+///
+/// **The implementations this rejects:**
+///
+/// - *Day bounds ignored.* Returns all seven rows where the window admits two.
+/// - *Day bounds treated as exclusive.* `since` and `until` are documented as
+///   **inclusive**, in whole-UTC-day units. The window here is `[1, 1]` — a
+///   single day, both bounds landing exactly on it — so an exclusive backend
+///   returns nothing at all. This is a deliberate departure from
+///   `audit_filter_narrows_by_event_and_time`, which places its bounds *off*
+///   every record's timestamp precisely so it does not depend on the
+///   inclusivity choice. That is right for a test of the window; it leaves the
+///   choice itself unpinned, and days are integers, so there is no "between two
+///   values" position available here that would still select a subset. Pinning
+///   it is therefore both possible and necessary, and this is where it happens.
+/// - *`policy` narrowing ignored.* Returns the policy-less rows too.
+/// - *`policy` matched on name alone.* The corpus holds `alpha@1` and
+///   `alpha@2`; a backend comparing only `policy_name` returns both where the
+///   filter names one.
+///
+/// **Vacuity:** a filter test whose expected set is everything cannot fail, so
+/// each of the three queries below selects a strict subset — two of seven, three
+/// of seven, one of seven — and each asserts presence *and* absence. Rows sit
+/// outside the window on both sides, so a backend clamping only one bound is
+/// caught; and the excluded policies include both a different name and the same
+/// name at a different version.
+pub async fn audit_aggregates_narrow_by_day_window_and_policy<F: BackendFactory>(factory: &F) {
+    use crate::AggregateKey;
+    use memorysafe_core::{Decision, PolicyId, Reason, ReasonCode};
+
+    let backend = factory.create().await;
+    let tenant = TenantId::new("t").unwrap();
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let alpha1 = PolicyId::new("alpha", "1");
+    let alpha2 = PolicyId::new("alpha", "2");
+    let beta = PolicyId::new("beta", "1");
+    let decision = |policy: PolicyId| {
+        Decision::retain(
+            policy,
+            Reason::new(ReasonCode::HighValue, "seeded", Default::default()),
+        )
+    };
+
+    // Seven rows over three days: day 0 and day 2 sit outside the window on
+    // either side, and `alpha@1` appears on all three days so the policy
+    // narrowing is not a disguised day filter.
+    let rows: [(i64, Option<PolicyId>); 7] = [
+        (0, None),
+        (0, Some(alpha1.clone())),
+        (1, None),
+        (1, Some(alpha1.clone())),
+        (2, Some(alpha1.clone())),
+        (2, Some(alpha2.clone())),
+        (2, Some(beta.clone())),
+    ];
+    for (day, policy) in &rows {
+        let at = OffsetDateTime::UNIX_EPOCH + Duration::days(*day);
+        let item = fx::item_at(&scope, &format!("day {day} under {policy:?}"), at);
+        let mut txn = fx::admit_txn(&scope, item, None);
+        if let Some(p) = policy {
+            txn.audit = txn.audit.clone().with_decision(decision(p.clone()));
+        }
+        backend.apply(txn).await.unwrap();
+    }
+
+    let read = |filter: AuditAggregateFilter| {
+        let tenant = tenant.clone();
+        let backend = &backend;
+        async move {
+            backend
+                .audit_aggregates(&tenant, &filter)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|a| a.key)
+                .collect::<Vec<AggregateKey>>()
+        }
+    };
+
+    let everything = read(AuditAggregateFilter {
+        limit: 100,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        everything.len(),
+        7,
+        "the corpus must exist before any narrowing means anything, and each of \
+         the seven rows must be its own key"
+    );
+
+    // The window is a single day, with both bounds exactly on it. Days are
+    // integers: there is no position between two of them, so this pins
+    // inclusivity rather than avoiding it.
+    let windowed = read(AuditAggregateFilter {
+        since: Some(1),
+        until: Some(1),
+        limit: 100,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        windowed.len(),
+        2,
+        "day one holds two rows. Seven means the day bounds were ignored; zero \
+         means they were applied exclusively, and `since`/`until` are documented \
+         as inclusive"
+    );
+    assert!(
+        windowed.iter().all(|k| k.day == 1),
+        "a row outside [1, 1] came back: {windowed:?}"
+    );
+
+    // Policy narrowing across every day, so it cannot be a day filter wearing
+    // a different name.
+    let by_policy = read(AuditAggregateFilter {
+        policy: Some(alpha1.clone()),
+        limit: 100,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        by_policy.len(),
+        3,
+        "alpha@1 appears once on each of the three days"
+    );
+    assert!(
+        by_policy.iter().all(|k| k.policy.as_ref() == Some(&alpha1)),
+        "the policy narrowing let through a row with another policy — or a \
+         policy-less row, which `policy: Some(..)` must exclude: {by_policy:?}"
+    );
+    assert!(
+        !by_policy.iter().any(|k| k.policy.as_ref() == Some(&alpha2)),
+        "alpha@2 came back for a filter naming alpha@1: the narrowing compares \
+         the policy name and ignores the version"
+    );
+
+    // Both together, selecting one row of seven.
+    let both = read(AuditAggregateFilter {
+        since: Some(1),
+        until: Some(1),
+        policy: Some(alpha1.clone()),
+        limit: 100,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        both.len(),
+        1,
+        "the window and the policy narrowing must intersect, not replace one \
+         another"
+    );
+    assert_eq!(both[0].day, 1);
+    assert_eq!(both[0].policy.as_ref(), Some(&alpha1));
 }
