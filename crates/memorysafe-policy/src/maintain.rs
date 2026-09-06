@@ -128,28 +128,28 @@ fn ttl_expiries(ctx: &MaintainContext, policy: &PolicyId) -> Vec<Decision> {
 /// admitting. This function used to be the one holdout, deciding "am I over
 /// budget?" from `max_items` alone: a namespace bounded only by `max_bytes`
 /// reported pressure, refused writes once full, and never reclaimed —
-/// permanently stuck while looking actively managed from the outside. That
-/// was the bug; the fix is to ask the same question `admit` already asks and
-/// reuse its answers rather than re-deriving them:
+/// permanently stuck while looking actively managed from the outside.
 ///
-/// * `CapacityState::would_exceed(0, 0)` — "is this state, with no further
-///   admission, already over budget on any bounded dimension" — is exactly
-///   `would_exceed`'s existing OR-of-both-dimensions check, called with a
-///   zero increment instead of a pending write. (Its doc comment names this
-///   as a second legitimate caller shape alongside admission's
-///   `would_exceed(1, item.byte_size())`.)
-/// * `MemoryItem::byte_size()`, accumulated into `freed_bytes` exactly as
-///   `admit`'s make-room loop accumulates it — never a second, parallel byte
-///   computation over the same field.
+/// The fix asks the same question `admit` already asks and reuses its
+/// answers rather than re-deriving them. A first draft of this fix called
+/// `CapacityState::would_exceed` and `MemoryItem::byte_size()` directly in a
+/// loop shaped just like `admit`'s — which recreated, one level down, the
+/// exact divergence this task exists to close: two near-identical
+/// implementations of "how many candidates does it take". Fixed by
+/// extracting `eviction::evictions_needed`, which both this function and
+/// `admit::decide` now call; see its doc comment for the shared mechanism
+/// and for `would_exceed(0, 0)` — the "is this state, with no further
+/// admission, already over" standing-check shape used below, as opposed to
+/// admission's `would_exceed(1, item.byte_size())`.
 ///
 /// This run's own expiries have already made room on BOTH dimensions —
 /// counting from `used_items`/`used_bytes` alone would reclaim a live item to
 /// free space that was about to be free anyway — so `expired`'s members are
-/// subtracted from both before anything else is asked. The loop below then
-/// evicts cheapest-first (unchanged: bytes and items together decide *how
-/// many*, `eviction::cost`/`reclaim_rank` alone decide *which*) until the
-/// projected state, with candidates removed one at a time, no longer exceeds
-/// on any dimension.
+/// subtracted from both, producing `after_expiry`, before anything else is
+/// asked. Ranking is unchanged and is this function's own job, not the
+/// shared helper's: `eviction::cost` first, `reclaim_rank` (age) as the
+/// tie-break — bytes and items together decide *how many* candidates go,
+/// never *which*.
 ///
 /// Computed BEFORE decay and consolidation even though its decisions are
 /// emitted after theirs: both of those read the surviving neighbourhood, and a
@@ -196,19 +196,14 @@ fn capacity_reclaim(
             .then_with(|| reclaim_rank(&a.item).cmp(&reclaim_rank(&b.item)))
     });
 
-    let mut freed_bytes = 0u64;
+    // `eviction::evictions_needed` is the one mechanism this loop and
+    // `admit`'s make-room loop both need — see its doc comment.  `(0, 0)` is
+    // the standing-check shape: nothing new is being admitted here, the
+    // question is only whether `after_expiry` is already over.
+    let needed = eviction::evictions_needed(after_expiry, &reclaimable, 0, 0);
+
     let mut out = Vec::new();
-    for (freed_items, candidate) in reclaimable.into_iter().enumerate() {
-        let freed_items = freed_items as u64;
-        let still_over = {
-            let mut projected = after_expiry;
-            projected.used_items = projected.used_items.saturating_sub(freed_items);
-            projected.used_bytes = projected.used_bytes.saturating_sub(freed_bytes);
-            projected.would_exceed(0, 0)
-        };
-        if !still_over {
-            break;
-        }
+    for candidate in &reclaimable[..needed] {
         let item = &candidate.item;
 
         // Each BOUNDED dimension's used/max pair is reported; an unbounded
@@ -222,17 +217,33 @@ fn capacity_reclaim(
         // claim about which number forced this one eviction — and the whole
         // point of this fix is that byte pressure must stop being invisible
         // to whoever reads this audit row.
+        //
+        // **`used_items`/`used_bytes` are `after_expiry`'s figures, not
+        // `ctx.capacity`'s raw pre-expiry ones.** The decision above was made
+        // against `after_expiry` — that is the state this run actually
+        // reasoned about — and reporting the pre-expiry numbers instead would
+        // misreport which dimension forced the reclaim whenever this run's
+        // own expiries move a dimension under its line (e.g. items satisfied
+        // post-expiry, bytes still over: the pre-expiry `used_items` would
+        // read as "items over" to an operator when they are not, and the
+        // pre-expiry `used_bytes` would overstate the byte overage by exactly
+        // the bytes the TTL step already freed). The raw pre-expiry values
+        // are not carried alongside them: an operator reasoning about this row
+        // needs to know what the DECISION saw, and a second, unlabelled pair
+        // of numbers describing a state the decision did NOT act on would be
+        // more likely to be misread as corroborating evidence than as
+        // context.
         let mut evidence = features! {
             "value" => candidate.value.get(),
             "fragility" => candidate.fragility.get(),
             "eviction_cost" => eviction::cost(candidate),
         };
         if let Some(max_items) = ctx.capacity.budget.max_items {
-            evidence.insert("used_items".to_string(), ctx.capacity.used_items as f64);
+            evidence.insert("used_items".to_string(), after_expiry.used_items as f64);
             evidence.insert("max_items".to_string(), max_items as f64);
         }
         if let Some(max_bytes) = ctx.capacity.budget.max_bytes {
-            evidence.insert("used_bytes".to_string(), ctx.capacity.used_bytes as f64);
+            evidence.insert("used_bytes".to_string(), after_expiry.used_bytes as f64);
             evidence.insert("max_bytes".to_string(), max_bytes as f64);
         }
 
@@ -250,7 +261,6 @@ fn capacity_reclaim(
             reasons: vec![],
             policy: policy.clone(),
         });
-        freed_bytes += item.byte_size();
     }
     out
 }
@@ -1214,6 +1224,86 @@ mod tests {
             evicted, 2,
             "228 bytes against a 150-byte budget needs two 76-byte evictions: {ds:?}"
         );
+    }
+
+    #[test]
+    fn a_mixed_budgets_reclaim_evidence_reports_the_post_expiry_state_not_the_raw_one() {
+        // Fix-round-1 regression test (review Important 2): the evidence
+        // must report the numbers the decision actually reasoned about
+        // (`after_expiry`), not `ctx.capacity`'s raw pre-expiry ones — the
+        // two disagree here on PURPOSE.
+        //
+        // Five 76-byte items, two of them expiring: `max_items: Some(3)`,
+        // `max_bytes: Some(200)`, `used_items: 5`, `used_bytes: 380` (5 * 76).
+        // Post-expiry: `used_items` drops to 3 — exactly AT `max_items`,
+        // satisfied, not over — while `used_bytes` drops to 228, still over
+        // `max_bytes` by 28. If the evidence reported the raw pre-expiry
+        // `used_items: 5` against `max_items: 3`, an operator would read this
+        // row as "items over by 2", which is false: the item dimension is
+        // fine, and it is bytes alone forcing this reclaim. One 76-byte
+        // eviction clears it (228 - 76 = 152 <= 200), so exactly one
+        // CapacityPressure decision is expected, on top of the two TTL
+        // expiries.
+        let mut e1 = item("aaaa");
+        e1.created_at = now() - Duration::days(10);
+        e1.ttl = Some(Duration::days(1));
+        let mut e2 = item("bbbb");
+        e2.created_at = now() - Duration::days(10);
+        e2.ttl = Some(Duration::days(1));
+        let k1 = item("cccc");
+        let k2 = item("dddd");
+        let k3 = item("eeee");
+        let k1_id = k1.id.clone();
+
+        let cap = CapacityState {
+            budget: Budget {
+                max_items: Some(3),
+                max_bytes: Some(200),
+            },
+            used_items: 5,
+            used_bytes: 380,
+        };
+        let ds = decisions(
+            &ctx_with_capacity(vec![e1, e2, k1, k2, k3], cap),
+            &BaselineConfig::default(),
+            pid(),
+        );
+
+        let ttl_count = ds
+            .iter()
+            .filter(|d| d.has_reason(ReasonCode::TtlExpired))
+            .count();
+        assert_eq!(ttl_count, 2, "both stale items must still expire: {ds:?}");
+
+        let reclaims: Vec<&Decision> = ds
+            .iter()
+            .filter(|d| d.has_reason(ReasonCode::CapacityPressure))
+            .collect();
+        assert_eq!(
+            reclaims.len(),
+            1,
+            "items are satisfied post-expiry (3 <= 3); only bytes force a \
+             reclaim, and one 76-byte eviction clears them: {ds:?}"
+        );
+        assert_eq!(
+            reclaims[0].subject.as_ref(),
+            Some(&k1_id),
+            "the tied keep-items reclaim in list order; the first is cheapest"
+        );
+
+        let r = &reclaims[0].evictions[0].reason;
+        assert_eq!(
+            evidence(r, "used_items"),
+            3.0,
+            "must report the POST-expiry item count (satisfied), not the raw 5"
+        );
+        assert_eq!(evidence(r, "max_items"), 3.0);
+        assert_eq!(
+            evidence(r, "used_bytes"),
+            228.0,
+            "must report the POST-expiry byte count, not the raw pre-expiry 380"
+        );
+        assert_eq!(evidence(r, "max_bytes"), 200.0);
     }
 
     // ------------------------------------------------ F-A: fragility decay --

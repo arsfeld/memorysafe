@@ -56,15 +56,15 @@ impl CapacityState {
     /// positional parameters with a named-field argument before doing so.
     ///
     /// **A second legitimate shape: `would_exceed(0, 0)`**, asking "is this
-    /// state, with no further admission, already over budget on any bounded
-    /// dimension" rather than "would admitting more break it". Zero
-    /// contributes nothing on either side of `saturating_add`, so this is
-    /// exactly the OR-of-both-dimensions comparison above, evaluated against
-    /// the state as it stands. `maintain::capacity_reclaim` uses this shape to
-    /// decide whether an already-computed (post-expiry, post-eviction)
-    /// projection is still over budget — a standing check, not an admission
-    /// check — and to decide when its reclaim loop can stop. A `(0, 0)` call
-    /// site is that standing check, not a transposition bug.
+    /// state, with no further admission, already over budget" rather than
+    /// "would admitting more break it" — zero contributes nothing on either
+    /// side of `saturating_add`, so this is the same OR-of-both-dimensions
+    /// comparison, evaluated against the state as it stands rather than
+    /// against a pending write. A `(0, 0)` call site is that standing check,
+    /// not a transposition bug. `memorysafe_policy::eviction::evictions_needed`
+    /// is built on exactly this pair of shapes (the pending-admission one and
+    /// this standing one) — see its doc comment for the fuller account of who
+    /// calls which and why.
     pub fn would_exceed(&self, items: u64, bytes: u64) -> bool {
         let items_over = self
             .budget
