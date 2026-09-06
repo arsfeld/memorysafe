@@ -12,6 +12,24 @@ pub const MAX_PAGE_LIMIT: usize = 1000;
 pub struct HardFilters {
     pub tags_any: Vec<String>,
     pub kinds: Vec<String>,
+    /// Bound results by when the remembered thing happened.
+    ///
+    /// **An item whose `occurred_at` is `None` matches neither bound.** Set
+    /// either field and every item with no occurrence time is excluded. That
+    /// is the intended reading — a filter asking what happened after a date
+    /// cannot be satisfied by an item that does not say when it happened, and
+    /// it fails closed, like `sensitivity_ceiling` above it.
+    ///
+    /// It is stated because it is otherwise an accident rather than a choice.
+    /// `occurred_at` is nullable, `NULL >= x` is `NULL`, and SQL drops the
+    /// row — so a backend gets this behaviour by writing the obvious
+    /// predicate and never deciding anything. And it is invisible in testing
+    /// by default: `conformance::fx::item` pins `occurred_at: None`, so under
+    /// any time filter the entire standard fixture corpus disappears, and a
+    /// test asserting an empty result would pass without the filter working
+    /// at all. A test of these fields must set `occurred_at` explicitly on
+    /// every item it expects back, and must include one item with `None` to
+    /// pin the exclusion.
     #[serde(with = "time::serde::timestamp::option")]
     pub occurred_after: Option<OffsetDateTime>,
     #[serde(with = "time::serde::timestamp::option")]
