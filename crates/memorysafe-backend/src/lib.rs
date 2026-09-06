@@ -332,6 +332,16 @@ pub trait Backend: Send + Sync {
     /// hand-written `Ord`, which encodes exactly this sequence and
     /// deliberately not the struct's field order — and a conformance test,
     /// `conformance::lifecycle::audit_aggregates_page_in_the_documented_order`.
+    ///
+    /// **The event sorts by its serialised name — `AuditEvent::as_str` — and
+    /// never by a stored ordinal.** `AuditEvent` has no `Ord` on purpose: a
+    /// derive would give declaration order, where `rejected` is second and
+    /// `exported` sixth, against an alphabetical tenth and second. This is not
+    /// a dialect split like the two below; it divides any two backends that
+    /// store the event differently, and storing an enum as an integer is an
+    /// established pattern in this codebase (`SensitivityLevel::ordinal`), so
+    /// a backend author following the local convention lands on the wrong
+    /// order by doing the idiomatic thing.
     /// Two hazards it exists to catch, neither visible from this paragraph
     /// alone: `None` before every `Some` is SQLite's default NULL ordering and
     /// the **opposite** of Postgres's, which needs an explicit `NULLS FIRST`;

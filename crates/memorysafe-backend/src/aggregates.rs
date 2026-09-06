@@ -140,34 +140,6 @@ pub fn day_bucket(at: OffsetDateTime) -> i64 {
     at.unix_timestamp().div_euclid(86_400)
 }
 
-/// The storage key for an event class: its serialised snake_case name.
-///
-/// `AggregateKey::event`'s doc says that name *is* the storage key, and
-/// `AggregateKey`'s ordering sorts by it, so both need it as a value. Taken
-/// from a `match` rather than from `serde_json` at comparison time for two
-/// reasons: an ordering that allocated two `String`s per comparison would be
-/// paid on every sort of every page, and the borrowed `&'static str` keeps
-/// `Ord` allocation-free. The risk that this table drifts from serde's is
-/// closed by `tests::the_event_sort_key_matches_what_serde_writes`, which
-/// checks every variant against the serialiser; and the `match` is exhaustive
-/// with no wildcard, so a new variant fails to compile here rather than
-/// silently acquiring another variant's sort position.
-pub fn event_sort_key(event: AuditEvent) -> &'static str {
-    match event {
-        AuditEvent::Admitted => "admitted",
-        AuditEvent::Rejected => "rejected",
-        AuditEvent::Merged => "merged",
-        AuditEvent::Forgotten => "forgotten",
-        AuditEvent::Recalled => "recalled",
-        AuditEvent::Exported => "exported",
-        AuditEvent::Imported => "imported",
-        AuditEvent::SubjectPurged => "subject_purged",
-        AuditEvent::Reembedded => "reembedded",
-        AuditEvent::PolicyChanged => "policy_changed",
-        AuditEvent::MaintenanceRun => "maintenance_run",
-    }
-}
-
 /// What an aggregate row is keyed by. There is no `subject` field and no
 /// `namespace` field, and the module doc says at length why not — the absence
 /// is the design, and a struct that cannot represent them is what keeps a
@@ -217,6 +189,12 @@ impl Ord for AggregateKey {
     /// `Backend::audit_aggregates` documents, in that order and not the field
     /// declaration order.
     ///
+    /// The event compares by `AuditEvent::as_str` — its serialised snake_case
+    /// name, which is also what a backend stores. Not by any derived ordering:
+    /// `AuditEvent` deliberately has none, because a derive would give
+    /// declaration order, in which `rejected` is second and `exported` sixth
+    /// while the documented order sorts them tenth and second.
+    ///
     /// `policy` compares as `Option<String>` of `PolicyId::to_string()`, which
     /// gives both halves of the documented rule at once: `Option`'s own
     /// ordering puts `None` before every `Some`, and two `Some`s compare by
@@ -256,7 +234,7 @@ impl Ord for AggregateKey {
                     .map(PolicyId::to_string)
                     .cmp(&other.policy.as_ref().map(PolicyId::to_string))
             })
-            .then_with(|| event_sort_key(self.event).cmp(event_sort_key(other.event)))
+            .then_with(|| self.event.as_str().cmp(other.event.as_str()))
             .then_with(|| self.tenant.as_str().cmp(other.tenant.as_str()))
     }
 }
@@ -517,37 +495,6 @@ mod tests {
             policy,
             event,
             day,
-        }
-    }
-
-    #[test]
-    fn the_event_sort_key_matches_what_serde_writes() {
-        // `event_sort_key` is a second copy of the snake_case names serde
-        // produces, kept for the borrow rather than the allocation. A second
-        // copy is only safe while something compares the two, so this is that
-        // something — and it is what makes the copy legitimate rather than a
-        // drift surface. Every variant, listed explicitly: a variant added to
-        // `AuditEvent` and forgotten here fails to compile in `event_sort_key`
-        // (no wildcard arm) and fails to appear in this list.
-        for event in [
-            AuditEvent::Admitted,
-            AuditEvent::Rejected,
-            AuditEvent::Merged,
-            AuditEvent::Forgotten,
-            AuditEvent::Recalled,
-            AuditEvent::Exported,
-            AuditEvent::Imported,
-            AuditEvent::SubjectPurged,
-            AuditEvent::Reembedded,
-            AuditEvent::PolicyChanged,
-            AuditEvent::MaintenanceRun,
-        ] {
-            let serialised = serde_json::to_string(&event).unwrap();
-            assert_eq!(
-                format!("\"{}\"", event_sort_key(event)),
-                serialised,
-                "the sort key and the storage key must be the same string"
-            );
         }
     }
 
