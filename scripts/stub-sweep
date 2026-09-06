@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Enumerate every `Backend` method and its first body line, so a stub is
+# identified by its BODY rather than by its signature shape.
+#
+# Why this is a script and not a remembered grep: the definition settled on
+# earlier is "a stub is not a syntactic shape; it is a body that ignores its
+# parameters" — and every ad-hoc pattern written since has been a
+# signature-shape pattern anyway. `async fn \w+\(\s*$|async fn \w+\(&self, _`
+# returns 10 against a tree with 8 stubs. Knowing the definition and reaching
+# for the pattern are different acts, and only the second one happens under
+# time pressure.
+#
+# Usage: stub-sweep [path-to-lib.rs]
+set -euo pipefail
+FILE="${1:-crates/memorysafe-backend-sqlite/src/lib.rs}"
+[ -f "$FILE" ] || { echo "no such file: $FILE" >&2; exit 1; }
+
+awk '/^impl Backend for/,/^\}$/' "$FILE" \
+| awk '
+  /^    async fn /{ name=$0; sub(/^    async fn /,"",name); sub(/[(<].*/,"",name);
+                    body=""; inbody=0 }
+  /\{[ ]*$/ && name!="" && !inbody { inbody=1; next }
+  inbody && /^    \}$/ {
+      stub = (body ~ /^Ok\(/) ? "STUB" : "    ";
+      if (stub == "STUB") n++;
+      m++;
+      printf "  %s  %-22s %s\n", stub, name, body;
+      name=""; inbody=0; next }
+  inbody && body=="" && NF>0 { body=$0; sub(/^ +/,"",body) }
+  END { printf "\n  stubs (body is a bare Ok(..)): %d of %d methods\n", n+0, m+0 }
+'

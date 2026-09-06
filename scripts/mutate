@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Apply one textual mutation, run the workspace suite, restore. Refuses to
+# report a verdict unless the mutation demonstrably applied AND compiled.
+#
+# Three ways a mutation run lies, all producing the SAME clean output as a
+# genuinely surviving mutant, all hit for real:
+#
+#   1. the anchor matched zero places, or several — nothing was mutated;
+#   2. the mutant did not compile — nothing was run;
+#   3. you grepped `^error` to catch (2) — but `cargo test` prints
+#      `error: test failed` on every SUCCESSFUL kill, so the check fires
+#      exactly when the mutation worked.
+#
+# Silence means "no test caught it" only after 1 and 2 are excluded.
+#
+# Usage: mutate <file> <anchor> <replacement> [label]
+set -uo pipefail
+FILE="$1"; ANCHOR="$2"; REPLACEMENT="$3"; LABEL="${4:-$ANCHOR}"
+[ -f "$FILE" ] || { echo "no such file: $FILE" >&2; exit 1; }
+
+BACKUP=$(mktemp); cp "$FILE" "$BACKUP"
+restore() { cp "$BACKUP" "$FILE"; rm -f "$BACKUP"; }
+trap restore EXIT
+
+python3 - "$FILE" "$ANCHOR" "$REPLACEMENT" <<'PY' || exit 3
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+n = s.count(sys.argv[2])
+if n != 1:
+    print(f"  ANCHOR MATCHED {n} PLACES — mutation NOT applied, no verdict")
+    sys.exit(3)
+p.write_text(s.replace(sys.argv[2], sys.argv[3]))
+PY
+
+OUT=$(cargo test --workspace --offline 2>&1)
+if echo "$OUT" | grep -qE 'error\[E|could not compile'; then
+    echo "  $LABEL: DID NOT COMPILE — no verdict"
+    echo "$OUT" | grep -E 'error\[E|could not compile' | head -3 | sed 's/^/      /'
+    exit 4
+fi
+read -r PASSED FAILED <<<"$(echo "$OUT" | awk '/^test result/{p+=$4; f+=$6} END{print p, f}')"
+if [ "${FAILED:-0}" -gt 0 ]; then
+    echo "  $LABEL: KILLED ($FAILED failed, $PASSED passed)"
+    echo "$OUT" | grep -E '^test .* FAILED|panicked at' | head -4 | sed 's/^/      /'
+else
+    echo "  $LABEL: SURVIVED ($PASSED passed) — equivalent mutant, or a real gap. Say which."
+fi
