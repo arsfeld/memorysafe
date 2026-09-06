@@ -79,12 +79,14 @@
 //! rather than done here, for the same reason as before: a behaviour change
 //! that deserves a test able to fail it.
 
+use crate::audit::event_from_str;
 use crate::tenant::SqlResultExt;
 use memorysafe_backend::BackendError;
 use memorysafe_backend::aggregates::{
     SCORE_HISTOGRAM_BUCKETS, SCORE_HISTOGRAM_VERSION, day_bucket, score_bucket,
 };
-use memorysafe_core::AuditRecord;
+use memorysafe_backend::{AggregateKey, AuditAggregate, AuditAggregateFilter};
+use memorysafe_core::{AuditRecord, PolicyId, TenantId};
 use rusqlite::{Connection, OptionalExtension, params};
 
 fn unreadable(field: &str, e: impl std::fmt::Display) -> BackendError {
@@ -225,6 +227,158 @@ pub fn increment(conn: &Connection, record: &AuditRecord) -> Result<(), BackendE
         .sql()?;
     }
     Ok(())
+}
+
+/// The read path's `ORDER BY`, in the documented key order — day first, then
+/// the policy's two parts, then the event name — with collation and null
+/// placement stated rather than defaulted, per the mandate on
+/// `Backend::audit_aggregates`. Lifted to a `const` so `query` and
+/// `tests::ordering_sql_states_collation_and_null_placement` read the same
+/// string rather than a literal copy that could drift from what actually
+/// runs.
+///
+/// `NULLS FIRST`, not `(policy_name IS NULL) DESC`: both satisfy the mandate,
+/// but only the first is servable by `idx_aggregates_order` — see Task 19's
+/// measurement, recorded on `schema`'s DDL comment for that index.
+pub(crate) const AGGREGATE_ORDER_SQL: &str = "day ASC,
+                      policy_name    COLLATE BINARY ASC NULLS FIRST,
+                      policy_version COLLATE BINARY ASC NULLS FIRST,
+                      event          COLLATE BINARY ASC";
+
+/// Parses a stored histogram column into the fixed-width array
+/// `AuditAggregate` carries. Rejects a wrong length rather than padding it:
+/// a histogram narrower or wider than `SCORE_HISTOGRAM_BUCKETS` means the row
+/// was written under a different `SCORE_HISTOGRAM_EDGES` than this build
+/// has — the case `histogram_version` exists to make detectable — and padding
+/// it would silently fold that mismatch into a value that looks computed.
+fn histogram_from_json(json: &str) -> Result<[u64; SCORE_HISTOGRAM_BUCKETS], BackendError> {
+    let v: Vec<u64> = serde_json::from_str(json).map_err(|e| unreadable("histogram", e))?;
+    let len = v.len();
+    v.try_into().map_err(|_| BackendError::Storage {
+        message: format!(
+            "aggregate row holds a histogram of width {len}, not \
+             {SCORE_HISTOGRAM_BUCKETS} — it was written under different \
+             SCORE_HISTOGRAM_EDGES than this build has"
+        ),
+        retryable: false,
+    })
+}
+
+/// One page of aggregates for `tenant`, matching `filter`.
+///
+/// **The ordering is the four-component key in `Backend::audit_aggregates`'s
+/// order**: `day`, then the policy's `name`, then its `version`, then the
+/// event's serialised name. Not the struct's field order, and not by
+/// `PolicyId::to_string()`, which is not injective — see `AGGREGATE_ORDER_SQL`
+/// and `AggregateKey::cmp`. `tenant` is the fifth component of
+/// `AggregateKey`'s `Ord` and is omitted from the SQL deliberately: it is a
+/// parameter of this query, so every row shares it.
+///
+/// **The cursor runs the opposite way from `Backend::audit`'s.** `audit` pages
+/// **descending** and its `after` selects ids **strictly less** than the
+/// cursor. This method pages **ascending** and `after` selects keys
+/// **strictly greater**.
+///
+/// The comparison is a lexicographic row comparison over four components,
+/// written out longhand rather than as SQL's `(a,b,c,d) > (w,x,y,z)`: the
+/// row-value form evaluates to NULL when any component is NULL, and the
+/// policy columns are NULL for the majority of event classes, so the row
+/// would be dropped and the page would come back short — which
+/// `AuditAggregateFilter::limit` defines as meaning the log is exhausted.
+///
+/// Returns exactly `min(filter.limit, rows still matching after the cursor)`,
+/// the same rule `Backend::audit` carries.
+pub fn query(
+    conn: &Connection,
+    tenant: &TenantId,
+    filter: &AuditAggregateFilter,
+) -> Result<Vec<AuditAggregate>, BackendError> {
+    // The cursor, decomposed. `after_present` is bound separately so the
+    // predicate can be switched off without a second SQL string.
+    let (a_day, a_name, a_version, a_event) = match &filter.after {
+        Some(k) => (
+            Some(k.day),
+            k.policy.as_ref().map(|p| p.name.clone()),
+            k.policy.as_ref().map(|p| p.version.clone()),
+            Some(k.event.as_str().to_string()),
+        ),
+        None => (None, None, None, None),
+    };
+
+    let sql = format!(
+        "SELECT policy_name, policy_version, event, day, count,
+                value_histogram, fragility_histogram, histogram_version
+         FROM audit_aggregates
+         WHERE (?1 IS NULL OR day >= ?1)
+           AND (?2 IS NULL OR day <= ?2)
+           AND (?3 IS NULL OR (policy_name IS ?3 AND policy_version IS ?4))
+           AND (?5 IS NULL OR (
+                 day > ?5
+              OR (day = ?5 AND (policy_name IS NOT NULL) > (?6 IS NOT NULL))
+              OR (day = ?5 AND (policy_name IS NULL) = (?6 IS NULL)
+                  AND coalesce(policy_name, '') COLLATE BINARY
+                    > coalesce(?6, '') COLLATE BINARY)
+              OR (day = ?5 AND policy_name IS ?6
+                  AND coalesce(policy_version, '') COLLATE BINARY
+                    > coalesce(?7, '') COLLATE BINARY)
+              OR (day = ?5 AND policy_name IS ?6 AND policy_version IS ?7
+                  AND event COLLATE BINARY > ?8 COLLATE BINARY)))
+         ORDER BY {AGGREGATE_ORDER_SQL}
+         LIMIT ?9"
+    );
+
+    let mut stmt = conn.prepare(&sql).sql()?;
+    let rows = stmt
+        .query_map(
+            params![
+                filter.since,
+                filter.until,
+                filter.policy.as_ref().map(|p| p.name.clone()),
+                filter.policy.as_ref().map(|p| p.version.clone()),
+                a_day,
+                a_name,
+                a_version,
+                a_event,
+                filter.limit as i64,
+            ],
+            |r| {
+                let name: Option<String> = r.get(0)?;
+                let version: Option<String> = r.get(1)?;
+                let event: String = r.get(2)?;
+                Ok((
+                    name,
+                    version,
+                    event,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .sql()?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (name, version, event, day, count, value, fragility, version_tag) = row.sql()?;
+        out.push(AuditAggregate {
+            key: AggregateKey {
+                tenant: tenant.clone(),
+                policy: match (name, version) {
+                    (Some(n), Some(v)) => Some(PolicyId::new(&n, &v)),
+                    _ => None,
+                },
+                event: event_from_str(&event)?,
+                day,
+            },
+            count: count as u64,
+            value_histogram: histogram_from_json(&value)?,
+            fragility_histogram: histogram_from_json(&fragility)?,
+            histogram_version: version_tag as u32,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -515,5 +669,68 @@ mod tests {
             "the row still advertises the edges it was created under while \
              holding a count bucketed by this build's"
         );
+    }
+
+    /// The mandate on `Backend::audit_aggregates`: every ordering over a text
+    /// column states its collation explicitly, and every ordering over a
+    /// nullable column states null placement explicitly, neither left to a
+    /// dialect default.
+    ///
+    /// Asserted against `AGGREGATE_ORDER_SQL`, the exact string `query`
+    /// builds its `ORDER BY` from — not a copied literal, which would drift
+    /// from what actually runs the moment one changed and not the other.
+    /// This checks *explicitness*, a different property from the
+    /// conformance sweep's check of the resulting *order*: a backend relying
+    /// on a default that happens to agree with the documented order produces
+    /// the right rows and still fails this test.
+    #[test]
+    fn ordering_sql_states_collation_and_null_placement() {
+        let sql = AGGREGATE_ORDER_SQL;
+        // Every text column this key orders by states its collation
+        // explicitly: day (not text, no collation needed), policy_name,
+        // policy_version and event — three `COLLATE BINARY`s.
+        assert_eq!(
+            sql.matches("COLLATE BINARY").count(),
+            3,
+            "expected an explicit COLLATE BINARY on each of policy_name, \
+             policy_version and event: {sql}"
+        );
+        // Every nullable column in the key states null placement explicitly
+        // — policy_name and policy_version, the two that can be NULL.
+        assert_eq!(
+            sql.matches("NULLS FIRST").count(),
+            2,
+            "expected an explicit NULLS FIRST on each of policy_name and \
+             policy_version: {sql}"
+        );
+        // And specifically on the nullable columns, not merely present
+        // somewhere in the string.
+        for nullable in ["policy_name", "policy_version"] {
+            let idx = sql.find(nullable).unwrap_or_else(|| {
+                panic!("column {nullable} does not appear in the ORDER BY: {sql}")
+            });
+            let clause = &sql[idx..];
+            let end = clause.find(',').unwrap_or(clause.len());
+            let clause = &clause[..end];
+            assert!(
+                clause.contains("COLLATE BINARY") && clause.contains("NULLS FIRST"),
+                "column {nullable}'s own ordering clause does not state both \
+                 collation and null placement: {clause}"
+            );
+        }
+    }
+
+    /// `histogram_from_json` rejects a histogram of the wrong width rather
+    /// than padding or truncating it — the read-side counterpart of
+    /// `increment`'s own width check.
+    #[test]
+    fn histogram_from_json_rejects_the_wrong_width() {
+        let err = histogram_from_json("[0,0,0]").unwrap_err();
+        assert!(matches!(err, BackendError::Storage { .. }));
+
+        let ok = histogram_from_json(
+            &serde_json::to_string(&vec![0u64; SCORE_HISTOGRAM_BUCKETS]).unwrap(),
+        );
+        assert!(ok.is_ok());
     }
 }

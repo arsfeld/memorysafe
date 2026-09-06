@@ -12,8 +12,23 @@
 
 use crate::tenant::SqlResultExt;
 use memorysafe_backend::BackendError;
-use memorysafe_core::{AuditFilter, AuditId, AuditRecord, Scope};
+use memorysafe_core::{AuditEvent, AuditFilter, AuditId, AuditRecord, Scope};
 use rusqlite::{Connection, params};
+
+/// The inverse of `AuditEvent::as_str`. A storage error rather than a panic:
+/// a row holding a string outside every variant's rendered name means the row
+/// is corrupt or was written by something other than this crate, and this
+/// runs inside `with_conn`/`with_write` closures where a panic poisons the
+/// tenant's connection (see `tenant`'s module doc). Used by
+/// `aggregates::query`, the read half of the aggregate table, which is the
+/// only place this crate needs to go from a stored event name back to an
+/// `AuditEvent`.
+pub(crate) fn event_from_str(s: &str) -> Result<AuditEvent, BackendError> {
+    serde_json::from_str(&format!("\"{s}\"")).map_err(|e| BackendError::Storage {
+        message: format!("stored audit event {s:?} does not match any AuditEvent: {e}"),
+        retryable: false,
+    })
+}
 
 pub fn insert(conn: &Connection, record: &AuditRecord) -> Result<AuditId, BackendError> {
     let policy = record.decision.as_ref().map(|d| d.policy.to_string());
@@ -81,6 +96,14 @@ pub fn query(
     if let Some(until) = filter.until {
         args.push(Box::new(until.unix_timestamp()));
         sql.push_str(&format!(" AND at <= ?{}", args.len()));
+    }
+    // The cursor. Rows page **descending** by `id`, so `after` — the last id
+    // of the previous page — excludes everything at or above it: `id <
+    // after`, strictly. `<=` would re-serve the cursor row itself on the next
+    // page, and `>` would walk the log backwards.
+    if let Some(after) = &filter.after {
+        args.push(Box::new(after.as_str().to_string()));
+        sql.push_str(&format!(" AND id < ?{}", args.len()));
     }
     // Ordered by id, descending (newest first) — see `AuditFilter::after`'s
     // doc comment in memorysafe-core: `at` is whole seconds and cannot

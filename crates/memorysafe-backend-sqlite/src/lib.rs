@@ -14,6 +14,8 @@ pub mod audit;
 pub mod capacity;
 pub mod items;
 pub mod keyword;
+pub mod portability;
+pub mod purge;
 pub mod retrieve;
 pub mod schema;
 pub mod tenant;
@@ -63,17 +65,13 @@ impl SqliteBackend {
     }
 }
 
-/// **Partial, and deliberately so.** Task 20 implements `get`, `list`,
-/// `audit`, `record_recall` and a first `apply` covering insert, evictions and
-/// the audit row. Task 21 adds vectors and a real `neighbours`. Task 22 adds
+/// Every method real. Task 20 implements `get`, `list`, `audit`,
+/// `record_recall` and a first `apply` covering insert, evictions and the
+/// audit row. Task 21 adds vectors and a real `neighbours`. Task 22 adds
 /// keyword search and a real `retrieve_candidates`. Task 23 adds merge,
 /// capacity accounting and idempotent writes to `apply`, plus real
-/// `capacity_state`, `scope_stats` and `set_budget`. Only `purge_subject`,
-/// `export`, `import` and the `audit_aggregates` *read* remain, in Task 24.
-/// The four methods that task owns return `Ok` defaults here so the crate
-/// compiles and the isolation and atomicity conformance tests can run at all;
-/// each is marked, and none is bound by a conformance test in this crate's
-/// `tests/conformance.rs` yet.
+/// `capacity_state`, `scope_stats` and `set_budget`. Task 24 closes the last
+/// four: `purge_subject`, `export`, `import` and the `audit_aggregates` read.
 #[async_trait]
 impl Backend for SqliteBackend {
     async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, BackendError> {
@@ -379,36 +377,60 @@ impl Backend for SqliteBackend {
     }
     async fn purge_subject(
         &self,
-        _t: &TenantId,
-        _s: &SubjectId,
-        _c: PurgeCascade,
-        _a: AuditRecord,
+        tenant: &TenantId,
+        subject: &SubjectId,
+        cascade: PurgeCascade,
+        audit: AuditRecord,
     ) -> Result<PurgeReport, BackendError> {
-        Ok(PurgeReport {
-            items_removed: 0,
-            vectors_removed: 0,
-            audit_rows_removed: 0,
-            audit_rows_preserved: 0,
-        })
+        let (tenant, subject) = (tenant.clone(), subject.clone());
+        self.tenants
+            .with_write(&tenant, move |c| {
+                purge::subject(c, &subject, cascade, &audit)
+            })
+            .await
     }
-    async fn export(&self, _s: &ScopeSelector) -> Result<ExportStream, BackendError> {
-        Ok(vec![])
+    async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError> {
+        let sel = sel.clone();
+        self.tenants
+            .with_conn(&sel.tenant.clone(), move |c| portability::export(c, &sel))
+            .await
     }
-    async fn import(&self, _t: &TenantId, _s: ImportStream) -> Result<ImportReport, BackendError> {
-        Ok(ImportReport::default())
+    async fn import(
+        &self,
+        destination: &TenantId,
+        stream: ImportStream,
+    ) -> Result<ImportReport, BackendError> {
+        // Deliberately no "a stream may not span tenants" check and no
+        // "stream contains no items" rejection.
+        //
+        // The span check is strictly implied: `portability::import` compares
+        // every record against `destination`, so two records cannot disagree
+        // with each other without at least one of them disagreeing with the
+        // destination first. A second rule that is true only by implication
+        // has no test of its own, cannot fail today, and silently stops being
+        // implied the day someone weakens the first.
+        //
+        // The empty-stream rejection existed only to derive a tenant from the
+        // first item. The destination is now a parameter, so there is nothing
+        // left to derive and nothing left to reject: a header-only stream is
+        // a valid export of an empty tenant, and the round trip has to
+        // survive it.
+        let dest = destination.clone();
+        self.tenants
+            .with_write(destination, move |c| portability::import(c, &dest, stream))
+            .await
     }
-    // Stubbed here and replaced in the portability task, alongside
-    // `purge_subject`, `export` and `import`. Three conformance tests depend on
-    // the real read — `audit_aggregates_survive_a_cascading_purge`,
-    // `audit_aggregates_page_in_the_documented_order` and
-    // `audit_aggregates_narrow_by_day_window_and_policy` — and this stub
-    // satisfies none of them.
     async fn audit_aggregates(
         &self,
-        _t: &TenantId,
-        _f: &AuditAggregateFilter,
+        tenant: &TenantId,
+        filter: &AuditAggregateFilter,
     ) -> Result<Vec<AuditAggregate>, BackendError> {
-        Ok(vec![])
+        let (tenant, filter) = (tenant.clone(), filter.clone());
+        self.tenants
+            .with_conn(&tenant.clone(), move |c| {
+                aggregates::query(c, &tenant, &filter)
+            })
+            .await
     }
 }
 
