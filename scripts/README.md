@@ -39,5 +39,14 @@ finding only if some input distinguishes the mutant from the original.
 
 `stub-sweep` becomes one when the count reaches zero — a step asserting it stays there is
 what makes "no method silently reverts to a stub" unwriteable rather than remembered.
-`mutate` cannot be a CI gate: it deliberately breaks the tree. It is a developer tool, and
-being in the repository makes it durable, not automatic.
+
+`mutate` is not a gate **yet**, and the reason is fixable rather than structural. It mutates
+the working tree in place, which is a property of this implementation and not of mutation
+testing: `cargo mutants` copies the tree and mutates the *copy*, which is why it runs in CI
+on other projects. It is already installed here — `cargo-mutants 27.1.0` — with no
+`mutants.toml` and no CI step.
+
+That distinction is worth stating precisely, because the first version of this file said
+`mutate` *"cannot"* be a gate and used it to justify keeping the script in a weaker
+category. **A "cannot" that is really a "have not" is the load-bearing kind of error**, and
+it was written by someone who had spent the day removing exactly that shape from tests.
