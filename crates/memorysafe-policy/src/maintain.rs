@@ -816,6 +816,38 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_item_within_its_ttl_survives_capacity_pressure() {
+        // The half pinning DOES still govern, in the one combination nothing
+        // else covers: a pin, a TTL that has NOT elapsed, and a namespace over
+        // budget, all at once.
+        //
+        // `reclaim_never_touches_pinned_items` gives its items no TTL at all,
+        // and `a_pinned_item_within_its_ttl_is_left_alone` applies no capacity
+        // pressure. So an implementation that treated "carries a TTL" as
+        // making a pinned item reclaimable passes both of those and evicts
+        // here. That is the mistake available to anyone who reads
+        // "expiry dominates pinning" and over-applies it: an ELAPSED TTL
+        // overrides a pin, merely having one does not.
+        //
+        // Rejects exactly that, and it is a live risk rather than a
+        // hypothetical — this module is where `must_forget` gained its first
+        // caller, so it is where the rule is most likely to be re-derived
+        // wrongly.
+        let mut batch: Vec<MemoryItem> = (0..4).map(|i| item(&format!("memory {i}"))).collect();
+        for b in &mut batch {
+            // Written now, expiring 30 days out: unambiguously within its TTL.
+            b.created_at = now();
+            b.ttl = Some(Duration::days(30));
+            b.protection = Protection::Pinned;
+        }
+        let ds = decisions(&ctx(batch, 4, Some(1)), &BaselineConfig::default(), pid());
+        assert!(
+            ds.is_empty(),
+            "a pin stopped governing capacity the moment a TTL was set: {ds:?}"
+        );
+    }
+
+    #[test]
     fn a_namespace_within_budget_produces_no_decisions() {
         let batch: Vec<MemoryItem> = (0..2).map(|i| item(&format!("memory {i}"))).collect();
         assert!(decisions(&ctx(batch, 2, Some(10)), &BaselineConfig::default(), pid()).is_empty());
