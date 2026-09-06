@@ -686,14 +686,30 @@ jobs:
       - run: cargo test --workspace --all-features
 ```
 
-Finally, move this plan out of the open repository:
+**Do not move this plan out of the open repository as part of this task.** The
+disposition of this file is a **pending decision by the repository owner** and is not
+an implementation step.
 
-```bash
-mkdir -p docs/plans
-git -C ../memorysafe mv docs/superpowers/plans/2026-09-05-postgres-backend.md /dev/null 2>/dev/null || true
-mv ../memorysafe/docs/superpowers/plans/2026-09-05-postgres-backend.md docs/plans/
-git -C ../memorysafe add -A && git -C ../memorysafe commit -m "docs: move the Postgres plan into the commercial repository"
-```
+A shell block previously stood here that attempted the move. It was removed because
+it did not work and was dangerous in the same breath:
+
+- `git mv <path> /dev/null` is not an operation, and the path it named
+  (`docs/superpowers/plans/…`) is not where this file lives
+  (`.superpowers/closed-tier/…`). It could never have succeeded.
+- `2>/dev/null || true` swallowed that failure silently, **guaranteeing the next line
+  ran anyway**.
+- That next line was `git -C ../memorysafe add -A && git -C ../memorysafe commit`,
+  which stages and commits **the entire working tree of the open repository** —
+  including whatever other agents have mid-write — under a message describing a move
+  that did not happen.
+
+So the block did nothing it intended and everything it should not, and the error
+handling is what connected the two. A bare failure on the first line would at least
+have stopped the sequence.
+
+**If and when the owner rules that this file moves, the move is a deliberate,
+reviewed operation on a public repository's history — not a `|| true` in a task
+step.** Nothing in this plan should attempt it.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -703,7 +719,9 @@ Expected: PASS — 1 test ok.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add -A
+# Stage explicit paths. Never `git add -A`: this plan's steps have run in a
+# worktree shared with other agents, where `-A` sweeps up their mid-write files.
+git add Cargo.toml crates/ .github/workflows/
 git commit -m "chore: scaffold the commercial Postgres backend workspace"
 ```
 
