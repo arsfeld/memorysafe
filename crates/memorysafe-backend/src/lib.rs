@@ -435,7 +435,7 @@ pub trait Backend: Send + Sync {
     /// `returned.len() < filter.limit` means exhausted.
     ///
     /// Rows are produced by the write paths (Tasks 20 and 23) and expired by
-    /// retention (Task 36). Neither is this method's business.
+    /// retention (Plan 1's retention-profiles task). Neither is this method's business.
     async fn audit_aggregates(
         &self,
         tenant: &TenantId,

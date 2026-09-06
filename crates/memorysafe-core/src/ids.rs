@@ -116,7 +116,7 @@ scope_component!(Namespace, "namespace");
 /// being true, the deferral stops being licensed.
 ///
 /// The `SubjectPurged` fallback that consumes this is the engine's
-/// `purge_scope` helper (Plan 1, Task 33).
+/// `purge_scope` helper (Plan 1's engine purge task).
 pub const PURGED_COMPONENT: &str = "_purged";
 
 // **Signature change here is not local**, for the same reason as

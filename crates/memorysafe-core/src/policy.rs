@@ -120,8 +120,8 @@ pub struct MaintenanceCandidate {
     /// `ScoredCandidate`'s pair is genuinely sourced from stored statistics —
     /// `Backend::retrieve_candidates` and `Backend::neighbours` populate it,
     /// `Backend::record_recall` advances it. `MaintenanceCandidate`'s two
-    /// producers (the `admit` path's eviction-candidate listing, Task 31, and
-    /// the resumable maintenance job's batch builder, Task 34) both build
+    /// producers (the `admit` path's eviction-candidate listing in the engine's
+    /// write pipeline, and the resumable maintenance job's batch builder) both build
     /// from `Backend::list`, which returns bare `MemoryItem`s with no access
     /// statistics attached — so both currently hard-code `(None, 0)` for
     /// every candidate, recalled or not. That collides with the definitive
@@ -132,7 +132,7 @@ pub struct MaintenanceCandidate {
     /// statistics beside each item, or a dedicated read. Flagged here, at the
     /// type, because a policy author reaches this struct at Task 27 (`admit`,
     /// via `eviction::cost`) — well before either engine sketch that carries
-    /// this same note (Task 31, Task 34) — and reads only this doc, not the
+    /// this same note — and reads only this doc, not the
     /// engine's. Not solved here.
     #[serde(with = "time::serde::timestamp::option")]
     pub last_accessed_at: Option<OffsetDateTime>,

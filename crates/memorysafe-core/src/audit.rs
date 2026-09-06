@@ -177,7 +177,7 @@ impl ItemRef {
 /// trail or an undeleted one, in the erasure path.
 ///
 /// The retention profile that chooses between these lives in the engine
-/// (`RetentionProfile`, Task 36); the backend is handed the decision, never
+/// (`RetentionProfile`); the backend is handed the decision, never
 /// the profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn purge_cascade_serializes_as_snake_case() {
-        // The wire form is load-bearing: `AuditRetention` (Task 36) is
+        // The wire form is load-bearing: `AuditRetention` is
         // deserialized from tenant configuration, so a variant renamed on the
         // wire silently turns a configured `preserve` into a parse error in
         // the one path that erases a subject.
