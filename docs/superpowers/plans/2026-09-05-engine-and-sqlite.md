@@ -4286,7 +4286,7 @@ git commit -m "feat(backend): Backend trait with atomic write transactions and h
 
 ```rust
 use super::{BackendFactory, fx};
-use crate::Page;
+use crate::{Backend, Page};
 use memorysafe_core::Scope;
 
 /// Two tenants writing identical content must never see each other's items.
@@ -4297,6 +4297,17 @@ pub async fn tenants_are_isolated<F: BackendFactory>(factory: &F) {
 
     let item_a = fx::item(&a, "tenant a private note");
     backend.apply(fx::admit_txn(&a, item_a.clone(), None)).await.unwrap();
+
+    // The emptiness assertions below only mean something if the write
+    // actually landed under tenant a — otherwise a no-op `apply`, or one
+    // that silently dropped the row, would pass this test too.
+    let listed_a = backend.list(&a, &Page::default()).await.unwrap();
+    assert!(listed_a.iter().any(|i| i.id == item_a.id), "tenant a lost its own item");
+    assert_eq!(
+        backend.get(&a, &item_a.id).await.unwrap().as_ref().map(|i| &i.id),
+        Some(&item_a.id),
+        "tenant a could not fetch its own item by id"
+    );
 
     let listed_b = backend.list(&b, &Page::default()).await.unwrap();
     assert!(listed_b.is_empty(), "tenant b saw {} of tenant a's items", listed_b.len());
@@ -4316,6 +4327,17 @@ pub async fn subjects_are_isolated<F: BackendFactory>(factory: &F) {
 
     let item_a = fx::item(&a, "subject a note");
     backend.apply(fx::admit_txn(&a, item_a.clone(), None)).await.unwrap();
+
+    // As in `tenants_are_isolated`: prove subject a actually has the item
+    // before trusting that subject b's emptiness means isolation and not a
+    // dropped write.
+    let listed_a = backend.list(&a, &Page::default()).await.unwrap();
+    assert!(listed_a.iter().any(|i| i.id == item_a.id), "subject a lost its own item");
+    assert_eq!(
+        backend.get(&a, &item_a.id).await.unwrap().as_ref().map(|i| &i.id),
+        Some(&item_a.id),
+        "subject a could not fetch its own item by id"
+    );
 
     assert!(backend.list(&b, &Page::default()).await.unwrap().is_empty());
     assert!(backend.get(&b, &item_a.id).await.unwrap().is_none());
