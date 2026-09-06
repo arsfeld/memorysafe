@@ -18,7 +18,7 @@ use memorysafe_core::MaintenanceCandidate;
 /// highly valuable item is only cheap to lose if it is also easily
 /// replaceable. It is the product of the two that decides.
 pub fn cost(candidate: &MaintenanceCandidate) -> f32 {
-    candidate.value.get() * (1.0 - candidate.fragility.get())
+    candidate.value.get() * candidate.fragility.get()
 }
 
 #[cfg(test)]
@@ -36,39 +36,73 @@ mod tests {
     }
 
     #[test]
-    fn cost_multiplies_value_by_the_room_left_by_fragility() {
-        assert_eq!(cost(&fixture(0.8, 0.5)), 0.4);
+    fn cost_is_the_product_of_value_and_fragility() {
+        assert_eq!(cost(&fixture(0.6, 0.5)), 0.3);
     }
 
     #[test]
-    fn zero_fragility_costs_exactly_the_value() {
-        assert_eq!(cost(&fixture(0.6, 0.0)), 0.6);
+    fn zero_fragility_costs_nothing_no_matter_the_value() {
+        // Fully replaceable content is cheap to lose regardless of how
+        // valuable it looked at write time — matches the doc's "a highly
+        // valuable item is only cheap to lose if it is also easily
+        // replaceable" at fragility's floor.
+        assert_eq!(cost(&fixture(1.0, 0.0)), 0.0);
+        assert_eq!(cost(&fixture(0.3, 0.0)), 0.0);
     }
 
     #[test]
-    fn maximum_fragility_costs_zero_regardless_of_value() {
-        // An irreplaceable item is never the "cheapest" by this formula, no
-        // matter how little content signal it carries.
-        assert_eq!(cost(&fixture(1.0, 1.0)), 0.0);
+    fn zero_value_costs_nothing_no_matter_the_fragility() {
+        // Worthless content is cheap to lose regardless of how irreplaceable
+        // it is — matches the doc's "a highly fragile item ... is only cheap
+        // to lose if it is also nearly worthless" at value's floor.
+        assert_eq!(cost(&fixture(0.0, 1.0)), 0.0);
+        assert_eq!(cost(&fixture(0.0, 0.4)), 0.0);
+    }
+
+    #[test]
+    fn maximum_value_and_fragility_together_cost_the_most() {
+        // The mirror of "low value and low fragility rank lowest": an item
+        // that is both maximally valuable and maximally irreplaceable is the
+        // single most expensive thing in scope to lose.
+        assert_eq!(cost(&fixture(1.0, 1.0)), 1.0);
     }
 
     #[test]
     fn cost_reflects_the_product_not_either_factor_alone() {
-        // P has BOTH lower value and lower fragility than Q, so ranking by
-        // value alone (ascending) or by fragility alone (ascending) would
-        // also put P first here — those simpler rankings agree with the
-        // product on this pair by coincidence, not because they are
-        // equivalent to it. Q's extreme fragility crushes its cost even
-        // though Q sits above P on both individual axes, so only the actual
-        // product predicts Q as the cheaper one to lose.
-        let p = fixture(0.5, 0.1); // cost = 0.45
-        let q = fixture(0.6, 0.95); // cost = 0.03
+        // A true product of two non-negative factors can never disagree with
+        // BOTH single-factor rankings on one pair at once: if X is smaller
+        // than Y on both value and fragility, X's product is smaller too, by
+        // construction. So each half below uses its own pair, moving value
+        // and fragility in OPPOSITE directions, to show that factor alone
+        // gives the wrong answer — together they cover both of the doc's
+        // "only cheap if also ..." claims.
+
+        // Value alone is not enough: X is far MORE valuable than Y, so a
+        // value-only ranking would keep X and evict Y first. The product
+        // says the opposite: X is nearly worthless to keep because it is so
+        // replaceable (low fragility), while Y, though less valuable, is
+        // nearly irreplaceable.
+        let x = fixture(0.9, 0.2); // cost = 0.9 * 0.2 = 0.18
+        let y = fixture(0.3, 0.9); // cost = 0.3 * 0.9 = 0.27
         assert!(
-            cost(&q) < cost(&p),
-            "Q must rank cheaper despite higher value AND higher fragility \
-             than P: cost(p)={}, cost(q)={}",
-            cost(&p),
-            cost(&q)
+            cost(&x) < cost(&y),
+            "X must be cheaper despite its higher value: cost(x)={}, cost(y)={}",
+            cost(&x),
+            cost(&y)
+        );
+
+        // Fragility alone is not enough: M is far MORE fragile than N, so a
+        // fragility-only ranking would keep M and evict N first. The product
+        // says the opposite: M is nearly worthless regardless of how
+        // irreplaceable it is, while N carries enough value to outweigh its
+        // comparatively ordinary fragility.
+        let m = fixture(0.1, 0.9); // cost = 0.1 * 0.9 = 0.09
+        let n = fixture(0.5, 0.5); // cost = 0.5 * 0.5 = 0.25
+        assert!(
+            cost(&m) < cost(&n),
+            "M must be cheaper despite its higher fragility: cost(m)={}, cost(n)={}",
+            cost(&m),
+            cost(&n)
         );
     }
 }
