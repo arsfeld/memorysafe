@@ -95,6 +95,23 @@ pub fn decide(
 
     let mut reasons = Vec::new();
     let protection = if fragile {
+        // `SensitivityConflict` and `ProtectedFragile` are mutually exclusive,
+        // and this `if`/`else` is the ONLY thing that makes them so — no test
+        // asserts it. That is deliberate: while the branches are structured
+        // this way, such a test would assert what the control flow already
+        // guarantees, which is a test that cannot fail and so proves nothing.
+        //
+        // The consequence is that the guarantee is invisible to anyone editing
+        // here. Do NOT rewrite this into two independent `if` statements, or
+        // into two unconditional pushes with the distinction made later — a
+        // natural-looking flattening, since each branch does the same kind of
+        // work. Either shape lets both reasons attach to one decision, and a
+        // governance record asserting an item is both a sensitivity conflict
+        // AND an ordinary fragility protection describes a state this policy
+        // does not have. Nothing in the suite would go red.
+        //
+        // If you do change the shape, the mutual-exclusivity assertion stops
+        // being vacuous and becomes necessary: write it in the same commit.
         if sensitive {
             // Both axes fire and they disagree about what to do. Keep it and
             // say so, rather than resolving it invisibly.
