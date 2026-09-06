@@ -308,6 +308,26 @@ mod tests {
         }
     }
 
+    // The premise `list_tie_break_is_total_over_identical_timestamps` and
+    // every other tied-corpus test rest on: every `item()` shares one
+    // `created_at`, so any order those tests observe comes from the
+    // tie-break, not from timestamp variation. The literal-ULID sort-order
+    // premise just above has its own direct assertion
+    // (`the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending`);
+    // this is its sibling for the timestamp side, previously missing, which
+    // is what made the asymmetry conspicuous in the first place.
+    #[test]
+    fn item_pins_created_at_to_the_unix_epoch() {
+        let s = scope();
+        assert_eq!(
+            item(&s, "a note").created_at,
+            OffsetDateTime::UNIX_EPOCH,
+            "item()'s pinned created_at is the premise the tied-corpus tests \
+             build on; a mutation that started sampling the clock would \
+             untie that corpus silently"
+        );
+    }
+
     #[test]
     fn evict_txn_at_uses_the_given_timestamp_not_the_default() {
         let s = scope();

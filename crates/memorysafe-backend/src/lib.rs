@@ -15,8 +15,8 @@ use memorysafe_core::{
 use thiserror::Error;
 
 pub use aggregates::{
-    AggregateKey, AuditAggregate, SCORE_HISTOGRAM_BUCKETS, SCORE_HISTOGRAM_EDGES,
-    SCORE_HISTOGRAM_VERSION,
+    AggregateKey, AuditAggregate, AuditAggregateFilter, SCORE_HISTOGRAM_BUCKETS,
+    SCORE_HISTOGRAM_EDGES, SCORE_HISTOGRAM_VERSION,
 };
 pub use portability::{
     ExportRecord, ExportStream, ExportVector, FORMAT_VERSION, ImportReport, ImportStream,
@@ -186,7 +186,15 @@ pub trait Backend: Send + Sync {
         subject: &SubjectId,
     ) -> Result<PurgeReport, BackendError>;
 
-    /// Every audit aggregate held for `tenant`.
+    /// Every audit aggregate held for `tenant` that matches `filter`.
+    ///
+    /// Mirrors `audit`'s shape rather than inventing a second idiom for a
+    /// bounded, resumable read: `filter` carries `since`/`until` **day**
+    /// bounds, an optional `policy` narrowing, a `limit`, and an `after`
+    /// cursor. The feature's primary query is a day range against one policy
+    /// version — "how did behaviour change across policy 1.4" — which the
+    /// original `audit_aggregates(&self, tenant)`, unbounded, unpaginated and
+    /// unfilterable, could not express at all.
     ///
     /// Aggregates are keyed by tenant + policy version + event class + day
     /// bucket, and by nothing finer — see the `aggregates` module doc, which
@@ -198,17 +206,36 @@ pub trait Backend: Send + Sync {
     /// the audit detail table destroys the one artifact that was designed to
     /// outlive the detail.
     ///
-    /// Ordered ascending by `day`, then by `policy.to_string()`, then by the
-    /// event's serialised snake_case name — the two forms that are the
-    /// storage keys. Stating the order costs nothing now and stops the same
+    /// **Ordering.** Rows are ordered ascending by the full key — `day`, then
+    /// `policy` (`None` sorts before every `Some`, and two `Some`s compare by
+    /// `to_string()`), then the event's serialised snake_case name — so
+    /// resumption via `after` is over a total order, not merely a mostly-total
+    /// one. Stating the order costs nothing now and stops the same
     /// cross-backend drift `list` and `audit` each had to have pinned down
     /// after the fact.
+    ///
+    /// **The cursor.** `filter.after`, when set, continues a previous page:
+    /// the next page is restricted to keys strictly greater than it in the
+    /// order above. `AggregateKey` is a value comparable without existing —
+    /// it names a coordinate in the key space, not a pointer to a stored row.
+    /// That is precisely what makes it safe as a cursor here: it resumes
+    /// correctly even when the row it names has since expired under
+    /// `AuditRetention::aggregate`, whereas a row-id cursor would name
+    /// nothing once its row was gone and would make the log look exhausted
+    /// for a reason unrelated to the caller's query.
+    ///
+    /// **Truncation is detectable from the page size, exactly as `audit`
+    /// documents — there is no `truncated` flag.** An implementation must
+    /// return exactly `min(filter.limit, rows still matching after the
+    /// cursor)` — never fewer for an internal batch size and never more.
+    /// `returned.len() < filter.limit` means exhausted.
     ///
     /// Rows are produced by the write paths (Tasks 20 and 23) and expired by
     /// retention (Task 36). Neither is this method's business.
     async fn audit_aggregates(
         &self,
         tenant: &TenantId,
+        filter: &AuditAggregateFilter,
     ) -> Result<Vec<AuditAggregate>, BackendError>;
 
     /// `Header` first, then `Item`s ascending by `ItemId`, then `Audit`
@@ -238,6 +265,21 @@ pub trait Backend: Send + Sync {
     /// what this became". The payload's `subject` and `namespace` are
     /// preserved exactly as written; only the tenant is checked, and it is
     /// checked rather than assigned.
+    ///
+    /// **Atomicity.** `import` is all-or-nothing: either every record in
+    /// `stream` is applied or none are. A conformance test already requires
+    /// this — no partial import survives a rejected stream — but until now
+    /// nothing said so; the trait doc stated only that a disagreement
+    /// "rejects the whole import", which reads as a property of that one
+    /// rejection path rather than of `import` itself. This paragraph is the
+    /// general statement: a validation failure (a disagreeing tenant, a
+    /// missing or unsupported `Header`, a malformed record) must leave the
+    /// destination exactly as it was before the call. What this does **not**
+    /// cover is a mid-stream storage error on an otherwise-valid stream —
+    /// whether such a backend leaves partial writes behind is
+    /// under-determined by this contract; it must not silently report
+    /// success over a partial result, but the specific guarantee in that
+    /// case is out of scope here.
     ///
     /// Because every record is compared against `destination`, records
     /// cannot disagree with *each other* either — a separate "the stream may

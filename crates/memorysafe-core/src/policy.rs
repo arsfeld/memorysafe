@@ -104,17 +104,36 @@ pub struct MaintenanceCandidate {
     pub value: Score,
     pub fragility: Score,
     /// When this item was last recalled, and how many times — the same pair
-    /// `ScoredCandidate` carries, and populated the same way. Maintenance is
-    /// where they matter most: "expensive to relearn and nobody has looked at
-    /// it in a year" is a different eviction candidate from "expensive to
-    /// relearn and recalled yesterday", and without these a policy sorting
-    /// eviction candidates can only reach for `created_at`, which says nothing
-    /// about use.
+    /// `ScoredCandidate` carries. Maintenance is where they matter most:
+    /// "expensive to relearn and nobody has looked at it in a year" is a
+    /// different eviction candidate from "expensive to relearn and recalled
+    /// yesterday", and without these a policy sorting eviction candidates can
+    /// only reach for `created_at`, which says nothing about use.
     ///
     /// **A never-recalled item is `(None, 0)`, never `(Some(created_at), 0)`.**
     /// See `ScoredCandidate::last_accessed_at` for why the distinction has to
     /// survive, and why the conformance fixtures cannot detect its loss if it
     /// does not.
+    ///
+    /// OPEN: **Not currently populated the same way `ScoredCandidate`'s pair
+    /// is, whatever an earlier version of this doc claimed.**
+    /// `ScoredCandidate`'s pair is genuinely sourced from stored statistics —
+    /// `Backend::retrieve_candidates` and `Backend::neighbours` populate it,
+    /// `Backend::record_recall` advances it. `MaintenanceCandidate`'s two
+    /// producers (the `admit` path's eviction-candidate listing, Task 31, and
+    /// the resumable maintenance job's batch builder, Task 34) both build
+    /// from `Backend::list`, which returns bare `MemoryItem`s with no access
+    /// statistics attached — so both currently hard-code `(None, 0)` for
+    /// every candidate, recalled or not. That collides with the definitive
+    /// "never accessed" encoding above: a frequently-recalled item offered
+    /// for eviction reads to the policy as though nobody has ever touched it.
+    /// Before `admit` or `maintain` may weigh staleness on this field, the
+    /// listing path needs an actual source for it — a `list` that returns
+    /// statistics beside each item, or a dedicated read. Flagged here, at the
+    /// type, because a policy author reaches this struct at Task 27 (`admit`,
+    /// via `eviction::cost`) — well before either engine sketch that carries
+    /// this same note (Task 31, Task 34) — and reads only this doc, not the
+    /// engine's. Not solved here.
     #[serde(with = "time::serde::timestamp::option")]
     pub last_accessed_at: Option<OffsetDateTime>,
     pub access_count: u64,

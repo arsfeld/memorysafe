@@ -106,6 +106,7 @@ where
         lifecycle::export_import_round_trips_exactly,
         lifecycle::import_is_idempotent,
         lifecycle::import_rejects_a_later_record_whose_tenant_disagrees,
+        lifecycle::import_rejects_a_foreign_audit_record_even_when_every_item_agrees,
         lifecycle::audit_aggregates_survive_a_cascading_purge,
     );
 }

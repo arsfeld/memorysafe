@@ -9562,14 +9562,19 @@ Append to `crates/memorysafe-policy/src/admit.rs`:
 mod tests {
     use super::*;
     use crate::config::BaselineConfig;
-    use crate::testkit::{candidate, candidate_from, scope};
+    use crate::testkit::{candidate, candidate_from, item, scope};
     use memorysafe_core::{
         Action, Budget, CapacityState, PolicyId, Protection, ReasonCode, ScopeStats,
         SensitivityLevel,
     };
     use time::OffsetDateTime;
 
-    fn ctx(used: u64, max: Option<u64>, evictable: Vec<ScoredCandidate>) -> AdmitContext {
+    // `evictable` is `Vec<MaintenanceCandidate>`, not `Vec<ScoredCandidate>`:
+    // it feeds `AdmitContext::eviction_candidates`, which carries no
+    // relevance because there is no recall query behind an eviction offer
+    // (see that field's doc). `candidate()` builds the other type and must
+    // not be used here.
+    fn ctx(used: u64, max: Option<u64>, evictable: Vec<MaintenanceCandidate>) -> AdmitContext {
         AdmitContext {
             scope: scope(),
             capacity: CapacityState {
@@ -9642,10 +9647,22 @@ mod tests {
     #[test]
     fn under_pressure_the_cheapest_items_are_evicted_first() {
         let cfg = BaselineConfig::default();
-        let mut cheap = candidate("cheap to lose", 0.5);
+        let mut cheap = MaintenanceCandidate {
+            item: item("cheap to lose"),
+            value: Score::clamped(0.5),
+            fragility: Score::clamped(0.5),
+            last_accessed_at: None,
+            access_count: 0,
+        };
         cheap.value = Score::clamped(0.1);
         cheap.fragility = Score::clamped(0.1); // eviction::cost = 0.1 * 0.1 = 0.01
-        let mut precious = candidate("expensive to lose", 0.5);
+        let mut precious = MaintenanceCandidate {
+            item: item("expensive to lose"),
+            value: Score::clamped(0.5),
+            fragility: Score::clamped(0.5),
+            last_accessed_at: None,
+            access_count: 0,
+        };
         precious.value = Score::clamped(0.9);
         precious.fragility = Score::clamped(0.9); // eviction::cost = 0.9 * 0.9 = 0.81
         let cheap_id = cheap.item.id.clone();
@@ -10041,6 +10058,52 @@ mod tests {
     }
 
     #[test]
+    fn an_old_but_recently_accessed_item_does_not_win_a_replay_slot() {
+        // The case the whole feature turns on: replay exists to resurface
+        // what is never recalled. Every other candidate in this module comes
+        // from `candidate()`, whose `last_accessed_at` is always `None` (see
+        // its own comment in `testkit.rs`) — so `replay_due`'s
+        // `last_accessed_at.unwrap_or(created_at)` fallback always takes the
+        // `unwrap_or` branch in every other test here, which is
+        // indistinguishable from a version that dropped `last_accessed_at`
+        // and read `created_at` unconditionally. A later "simplification"
+        // back to `created_at` alone would break none of them. This is the
+        // one fixture with a real `Some(_)`, and it exists to make exactly
+        // that regression detectable: old by creation, but not stale, because
+        // someone looked at it five days ago.
+        let mut relevant: Vec<_> =
+            (0..9).map(|i| candidate(&format!("relevant {i}"), 0.9)).collect();
+        for c in &mut relevant {
+            c.fragility = Score::ZERO;
+            c.item.created_at = ctx().now;
+        }
+        let mut old_but_used = candidate("an old fact someone checked five days ago", 0.05);
+        // >= 0.5 so it is eligible for a replay slot on staleness alone, but
+        // < 0.8 so the fragility-alone branch of `replay_due` cannot grant it
+        // one regardless of staleness — only the access-recency question
+        // decides this candidate.
+        old_but_used.fragility = Score::clamped(0.6);
+        old_but_used.item.created_at = OffsetDateTime::UNIX_EPOCH; // 365 days before `ctx().now`
+        old_but_used.last_accessed_at = Some(ctx().now - Duration::days(5)); // recently used
+        relevant.push(old_but_used);
+
+        let ws = working_set(
+            &req(RecallMode::WorkingSet, 5),
+            &relevant,
+            &ctx(),
+            &BaselineConfig::default(),
+        );
+        assert!(
+            ws.items
+                .iter()
+                .all(|s| !s.item.body.contains("five days ago")),
+            "an item accessed five days ago won a replay slot — its 365-day-old \
+             created_at was used for staleness instead of its recent \
+             last_accessed_at"
+        );
+    }
+
+    #[test]
     fn the_omitted_list_is_capped() {
         let cands: Vec<_> = (0..200).map(|i| candidate(&format!("m{i}"), 0.5)).collect();
         let ws = working_set(&req(RecallMode::Search, 1), &cands, &ctx(), &BaselineConfig::default());
@@ -10282,7 +10345,7 @@ Add `pub mod compose;`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy`
-Expected: PASS — 32 tests ok.
+Expected: PASS — 33 tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -10595,9 +10658,9 @@ Append to `crates/memorysafe-engine/src/validate.rs`:
 mod tests {
     use super::*;
     use memorysafe_core::{
-        Action, Budget, CapacityState, Eviction, ItemId, MemoryItem, PolicyId, Protection,
-        Reason, ReasonCode, ScopeStats, Scope, Score, ScoredCandidate, SensitivityLevel,
-        Source, SourceKind, WorkingSet, SelectedItem, features,
+        Action, Budget, CapacityState, Eviction, ItemId, MaintenanceCandidate, MemoryItem,
+        PolicyId, Protection, Reason, ReasonCode, ScopeStats, Scope, Score, ScoredCandidate,
+        SensitivityLevel, Source, SourceKind, WorkingSet, SelectedItem, features,
     };
     use time::OffsetDateTime;
 
@@ -10637,7 +10700,22 @@ mod tests {
         }
     }
 
-    fn ctx(evictable: Vec<ScoredCandidate>) -> AdmitContext {
+    // `AdmitContext::eviction_candidates` is `Vec<MaintenanceCandidate>`, not
+    // `Vec<ScoredCandidate>` — that field carries no relevance because there
+    // is no recall query behind an eviction offer. `candidate()` above builds
+    // the other type, for the `working_set` tests below that genuinely need
+    // `&[ScoredCandidate]`; this is its counterpart for eviction candidates.
+    fn maintenance_candidate(item: MemoryItem) -> MaintenanceCandidate {
+        MaintenanceCandidate {
+            item,
+            value: Score::clamped(0.5),
+            fragility: Score::clamped(0.5),
+            last_accessed_at: None,
+            access_count: 0,
+        }
+    }
+
+    fn ctx(evictable: Vec<MaintenanceCandidate>) -> AdmitContext {
         AdmitContext {
             scope: scope(),
             capacity: CapacityState {
@@ -10657,7 +10735,7 @@ mod tests {
 
     #[test]
     fn a_well_formed_decision_is_accepted() {
-        let c = candidate(item("evictable"));
+        let c = maintenance_candidate(item("evictable"));
         let d = Decision {
             subject: None,
             action: Action::Retain { protection: Protection::Normal },
@@ -10687,7 +10765,7 @@ mod tests {
     fn a_decision_evicting_a_pinned_item_is_refused() {
         let mut pinned = item("pinned");
         pinned.protection = Protection::Pinned;
-        let c = candidate(pinned);
+        let c = maintenance_candidate(pinned);
         let d = Decision {
             subject: None,
             action: Action::Retain { protection: Protection::Normal },
@@ -11520,11 +11598,17 @@ pub async fn admit_context(
                 item,
                 // OPEN: `Backend::list` returns bare `MemoryItem`s, and the
                 // access statistics deliberately do not live on that type, so
-                // this path has no source for them. `(None, 0)` here means
-                // "unknown" but reads to a policy as "never recalled", which
-                // is the wrong answer for a frequently-recalled item offered
-                // for eviction. Before `admit` is allowed to weigh staleness,
-                // the listing path needs to carry the statistics — a `list`
+                // this path has no source for them. `(None, 0)` is NOT
+                // "unknown" here — the ruling recorded at compose's staleness
+                // fallback (see `replay_due` in Task 28) makes `(None, 0)`
+                // mean the item has never been accessed, definitively,
+                // everywhere this pair appears. Passing it for an item whose
+                // access history is merely unavailable therefore states
+                // something false, not merely something imprecise: a
+                // frequently-recalled item offered for eviction reads to the
+                // policy as indistinguishable from one nobody has ever
+                // touched. Before `admit` is allowed to weigh staleness, the
+                // listing path needs to carry the real statistics — a `list`
                 // that returns them beside each item, or a dedicated read.
                 // Flagged by the contract task that added these fields; not
                 // solved there.

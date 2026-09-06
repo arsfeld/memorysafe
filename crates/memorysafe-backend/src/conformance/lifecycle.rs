@@ -1,7 +1,7 @@
 use super::{BackendFactory, fx};
 use crate::portability::{ExportRecord, ImportStream, ScopeSelector};
-use crate::{Backend, BackendError, Page};
-use memorysafe_core::{AuditEvent, AuditFilter, Scope, SubjectId, TenantId};
+use crate::{AuditAggregateFilter, Backend, BackendError, Page};
+use memorysafe_core::{Actor, AuditEvent, AuditFilter, AuditRecord, Scope, SubjectId, TenantId};
 use std::collections::BTreeSet;
 use time::{Duration, OffsetDateTime};
 
@@ -398,6 +398,34 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
         ids(&tgt_hits),
         "vector ranking changed across the round trip"
     );
+
+    // A stream of a `Header` and nothing else is valid and imports nothing —
+    // `Backend::import`'s doc says so explicitly, and `export` of a tenant
+    // that was never written to produces exactly that. This is the round
+    // trip's other edge, previously unchecked: nothing in this suite verified
+    // that a header-only stream survives instead of being rejected as
+    // malformed for lacking any content.
+    let untouched_tenant = TenantId::new("nobody-ever-wrote-here").unwrap();
+    let empty_selector = ScopeSelector {
+        tenant: untouched_tenant.clone(),
+        subject: None,
+        namespace: None,
+        include_audit: true,
+    };
+    let header_only = source.export(&empty_selector).await.unwrap();
+    assert_eq!(
+        header_only.len(),
+        1,
+        "an untouched tenant's export must be exactly the Header, nothing else"
+    );
+    assert!(matches!(header_only[0], ExportRecord::Header { .. }));
+    let header_only_report = target
+        .import(&untouched_tenant, header_only)
+        .await
+        .expect("a header-only stream is valid and must not be rejected");
+    assert_eq!(header_only_report.items_imported, 0);
+    assert_eq!(header_only_report.vectors_imported, 0);
+    assert_eq!(header_only_report.audit_imported, 0);
 }
 
 /// Importing the same stream twice must not duplicate anything.
@@ -536,6 +564,100 @@ pub async fn import_rejects_a_later_record_whose_tenant_disagrees<F: BackendFact
     );
 }
 
+/// The disagreement rule covers audit rows too, and is checked independently
+/// of the item check rather than folded into it.
+///
+/// `Backend::import`'s doc says audit rows "follow from the same comparison,
+/// not from a rule of their own" — but in both plan sketches the item-tenant
+/// check and the audit-tenant check are a distinct `if` in a distinct match
+/// arm, and until this test no conformance test ever put a foreign
+/// `ExportRecord::Audit` in a stream. A backend that checks every item's
+/// tenant and simply forgets the `ExportRecord::Audit` arm passes every other
+/// test in this suite — including
+/// `import_rejects_a_later_record_whose_tenant_disagrees`, whose stream
+/// always carries a foreign *item*, so that test's import is rejected
+/// regardless of whether the audit-row check exists at all.
+///
+/// **The implementation this exists to reject: exactly that backend.** Every
+/// item here agrees with `destination`; only the audit record's `scope`
+/// names a different tenant. With no foreign item to catch the mismatch
+/// first, only a real per-audit-row tenant check rejects this import — which
+/// is what makes this test able to fail where the other one cannot.
+pub async fn import_rejects_a_foreign_audit_record_even_when_every_item_agrees<
+    F: BackendFactory,
+>(
+    factory: &F,
+) {
+    let backend = factory.create().await;
+    let destination = TenantId::new("t").unwrap();
+    let mine = Scope::new("t", "s", "n").unwrap();
+    let theirs = Scope::new("other", "s", "n").unwrap();
+
+    let agreeing = fx::item(&mine, "belongs to the destination tenant");
+    let foreign_audit = AuditRecord::new(
+        theirs.clone(),
+        AuditEvent::Admitted,
+        vec![],
+        Actor::system(),
+        OffsetDateTime::UNIX_EPOCH,
+    );
+
+    let stream: ImportStream = vec![
+        ExportRecord::Header {
+            format_version: crate::FORMAT_VERSION,
+            exported_at: 0,
+        },
+        ExportRecord::Item {
+            item: Box::new(agreeing.clone()),
+            vector: None,
+        },
+        ExportRecord::Audit {
+            audit: Box::new(foreign_audit),
+        },
+    ];
+
+    let err = backend.import(&destination, stream).await.expect_err(
+        "an audit row whose tenant disagrees with the destination must reject the import",
+    );
+    assert!(
+        matches!(err, BackendError::MalformedImport(_)),
+        "expected MalformedImport for a cross-tenant audit row, got {err:?}"
+    );
+
+    // Rejected means rejected for this record class exactly as for items:
+    // the agreeing item must not have landed just because it, by itself,
+    // agreed with the destination.
+    assert!(
+        backend
+            .list(&mine, &Page::default())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected import still wrote rows into the destination"
+    );
+    assert!(
+        backend.get(&mine, &agreeing.id).await.unwrap().is_none(),
+        "the agreeing item landed even though the import was rejected for its \
+         accompanying audit row"
+    );
+    assert!(
+        backend
+            .audit(&mine, &AuditFilter::default())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected import must not write the agreeing tenant's audit either"
+    );
+    assert!(
+        backend
+            .audit(&theirs, &AuditFilter::default())
+            .await
+            .unwrap()
+            .is_empty(),
+        "the foreign audit row was retargeted or written into the tenant it named"
+    );
+}
+
 /// Aggregates survive a cascading `purge_subject`. Detail rows do not.
 ///
 /// **The implementation this exists to reject: one that stores aggregates in,
@@ -574,7 +696,7 @@ pub async fn audit_aggregates_survive_a_cascading_purge<F: BackendFactory>(facto
     }
 
     let admits_before: Vec<_> = backend
-        .audit_aggregates(&tenant)
+        .audit_aggregates(&tenant, &AuditAggregateFilter::default())
         .await
         .unwrap()
         .into_iter()
@@ -620,7 +742,10 @@ pub async fn audit_aggregates_survive_a_cascading_purge<F: BackendFactory>(facto
          preserved"
     );
 
-    let after = backend.audit_aggregates(&tenant).await.unwrap();
+    let after = backend
+        .audit_aggregates(&tenant, &AuditAggregateFilter::default())
+        .await
+        .unwrap();
     let admits_after: Vec<_> = after
         .iter()
         .filter(|a| a.key.event == AuditEvent::Admitted)
