@@ -13574,16 +13574,21 @@ and pass it as `ItemWrite { item, vector }`.
 Run: `cargo test -p memorysafe-engine`
 Expected: PASS — 84 tests ok.
 
-**Re-propagated after Task 35 landed 91, not 84.** Mutation testing found six
-genuine survivors this brief's own literal tests never reached — the
-untested `ForgetSelector::Kind` arm, a duplicate-id `forget` call, `protect`
-on a nonexistent item, the stored protection/action/reason values `protect`
-actually writes, `purge_subject`'s audit-row accounting under `Cascade`, its
-namespace choice across a multi-namespace subject, and its fallback for a
-subject owning nothing — plus a seventh, `protect`'s embedding hardcoded to
-`None`, the same failure mode Task 34 shipped once already. See Task 35's
-report for the full mutation evidence. Every count below this point is
-walked forward by the resulting +7.
+**Re-propagated after Task 35 landed 93, not 84.** Mutation testing found
+fourteen genuine survivors this brief's own literal tests never reached; a
+first review pass caught 12 with new/strengthened tests, leaving two more
+that a subsequent fix round closed: the untested `ForgetSelector::Kind` arm,
+a duplicate-id `forget` call, `protect` on a nonexistent item, the stored
+protection/action/reason values `protect` actually writes, `purge_subject`'s
+audit-row accounting under `Cascade`, its namespace choice across a
+multi-namespace subject, its fallback for a subject owning nothing,
+`protect`'s embedding hardcoded to `None` (the same failure mode Task 34
+shipped once already), `forget`'s per-id existence pre-check — misclassified
+as an equivalent mutant in the first pass, corrected to genuine once review
+found the unscoped `vectors::delete` it actually guards against — and
+`protect`'s silent reset of an item's accumulated access history. See Task
+35's report for the full mutation evidence. Every count below this point is
+walked forward by the resulting +9.
 
 - [ ] **Step 5: Commit**
 
@@ -13905,7 +13910,7 @@ pub use maintain::{MAINTAIN_BATCH, MaintainCursor, MaintainReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 96 tests ok (89 planned + the 7 propagated from Task 35's mutation-testing closures).
+Expected: PASS — 98 tests ok (89 planned + the 9 propagated from Task 35's mutation-testing closures).
 
 - [ ] **Step 5: Commit**
 
@@ -14123,7 +14128,7 @@ Add `pub mod cache;` and `pub use cache::{CacheConfig, EngineCache};` to `lib.rs
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 101 tests ok (94 planned + the 7 propagated from Task 35's mutation-testing closures).
+Expected: PASS — 103 tests ok (94 planned + the 9 propagated from Task 35's mutation-testing closures).
 
 - [ ] **Step 5: Commit**
 
@@ -14431,7 +14436,7 @@ Add `pub mod retention;` and
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 106 tests ok (99 planned + the 7 propagated from Task 35's mutation-testing closures).
+Expected: PASS — 108 tests ok (99 planned + the 9 propagated from Task 35's mutation-testing closures).
 
 - [ ] **Step 5: Commit**
 
@@ -14743,7 +14748,7 @@ Add `pub mod portability;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 113 tests ok (106 planned + the 7 propagated from Task 35's mutation-testing closures).
+Expected: PASS — 115 tests ok (106 planned + the 9 propagated from Task 35's mutation-testing closures).
 
 - [ ] **Step 5: Commit**
 
@@ -15018,7 +15023,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 118 memorysafe-engine tests (111 planned + the 7 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates.
+Expected: PASS — the whole workspace green: 5 invariants, 120 memorysafe-engine tests (111 planned + the 9 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates.
 
 - [ ] **Step 5: Commit**
 
@@ -15392,7 +15397,7 @@ pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine && cargo test --workspace --all-features`
-Expected: PASS — 125 engine tests ok (118 planned + the 7 propagated from Task 35's mutation-testing closures), whole workspace green.
+Expected: PASS — 127 engine tests ok (118 planned + the 9 propagated from Task 35's mutation-testing closures), whole workspace green.
 
 - [ ] **Step 5: Commit**
 

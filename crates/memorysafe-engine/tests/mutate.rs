@@ -1,9 +1,10 @@
+use memorysafe_backend::{Backend, CandidateQuery, HardFilters};
 use memorysafe_backend_sqlite::SqliteBackend;
 use memorysafe_core::{
-    Action, AuditEvent, AuditFilter, Namespace, PURGED_COMPONENT, Protection, ReasonCode, Scope,
-    SubjectId, TenantId,
+    Action, AuditEvent, AuditFilter, Namespace, PURGED_COMPONENT, Protection, ReasonCode,
+    RecallBudget, RecallMode, RecallRequest, Scope, SensitivityLevel, SubjectId, TenantId,
 };
-use memorysafe_embed::DeterministicEmbedder;
+use memorysafe_embed::{DeterministicEmbedder, Embedder};
 use memorysafe_engine::{Engine, EngineConfig, EngineError, ForgetSelector, RememberRequest};
 use memorysafe_policy::BaselinePolicy;
 use std::sync::Arc;
@@ -133,6 +134,66 @@ async fn forgetting_the_same_id_twice_reports_it_once() {
         f.forgotten,
         vec![id],
         "a duplicated selector must not be reported as two removals"
+    );
+}
+
+/// The existence pre-check on `ForgetSelector::Ids`
+/// (`self.backend.get(scope, &id).await?.is_some()`, in `mutate.rs`) looks
+/// removable: `ForgetOutcome` is unchanged with or without it, since it is
+/// built from what the backend actually evicted, never from the raw
+/// selector. It is not removable. `Backend::apply`'s eviction loop also
+/// calls `vectors::delete(&tx, id)`, unconditionally and unscoped — no
+/// subject or namespace predicate — two lines above the guard that produces
+/// `evicted`. Without the pre-check, naming another scope's item id (same
+/// tenant) leaves that item's row untouched but silently strips its vector.
+/// This seeds an item in a second scope, forgets from a different scope
+/// naming that item's id, and confirms the item survives both as a row
+/// (`review`) and as a vector (`Backend::neighbours` against its own
+/// recomputed embedding) — the property `ForgetOutcome` alone cannot show.
+#[tokio::test]
+async fn forgetting_an_id_from_another_scope_does_not_delete_its_vector() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = Arc::new(SqliteBackend::open(dir.keep()));
+    let embedder = Arc::new(DeterministicEmbedder::new(256));
+    let e = Engine::new(EngineConfig::new(
+        backend.clone(),
+        embedder.clone(),
+        Arc::new(BaselinePolicy::default()),
+    ));
+
+    let scope_b = Scope::new("acme", "user-99", "agent").unwrap();
+    let body = "a memory that belongs to an entirely different scope";
+    let id_b = e
+        .remember(RememberRequest::new(scope_b.clone(), body))
+        .await
+        .unwrap()
+        .item_id
+        .unwrap();
+
+    // Forget from scope A, naming B's id — same tenant, different scope.
+    let f = e
+        .forget(&scope(), ForgetSelector::Ids(vec![id_b.clone()]))
+        .await
+        .unwrap();
+    assert!(
+        f.forgotten.is_empty(),
+        "an id belonging to another scope must never be reported as forgotten"
+    );
+
+    // B's item row must survive.
+    let still_there = e.review(&scope_b, &Default::default()).await.unwrap();
+    assert_eq!(
+        still_there.len(),
+        1,
+        "cross-scope forget must not delete another scope's item"
+    );
+
+    // And B's vector must survive too.
+    let embedding = embedder.embed(body).unwrap();
+    let neighbours = backend.neighbours(&scope_b, &embedding, 5).await.unwrap();
+    assert!(
+        neighbours.iter().any(|c| c.item.id == id_b),
+        "the vector for an item outside the forget scope must survive"
     );
 }
 
@@ -279,6 +340,92 @@ async fn protecting_a_nonexistent_item_returns_not_found() {
     assert!(
         matches!(err, EngineError::NotFound(_)),
         "expected NotFound, got {err:?}"
+    );
+}
+
+/// `protect` deletes the item's row and reinserts it (see the comment at
+/// `txn.evictions` in `mutate.rs`). `items::insert` writes `MemoryItem`'s
+/// own fields only; the `items` table's `access_count` and `last_access`
+/// columns have no counterpart on `MemoryItem`, so they cannot be carried
+/// forward and silently revert to schema defaults on every `protect` call.
+/// This pins that current behaviour — deliberately not fixed here; see this
+/// task's report for whether preserving it is the right long-term answer.
+#[tokio::test]
+async fn protecting_an_item_resets_its_accumulated_access_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = Arc::new(SqliteBackend::open(dir.keep()));
+    let e = Engine::new(EngineConfig::new(
+        backend.clone(),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::default()),
+    ));
+
+    let id = e
+        .remember(RememberRequest::new(
+            scope(),
+            "a memory with a distinctive marker9000 token",
+        ))
+        .await
+        .unwrap()
+        .item_id
+        .unwrap();
+
+    // Accumulate real access history through the actual recall path —
+    // `Engine::recall` calls `Backend::record_recall`, which increments
+    // `access_count` and advances `last_access` for every returned item.
+    for _ in 0..3 {
+        e.recall(RecallRequest {
+            scope: scope(),
+            query: Some("marker9000".into()),
+            tags_any: vec![],
+            kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
+            mode: RecallMode::WorkingSet,
+            budget: RecallBudget {
+                max_tokens: Some(4000),
+                max_items: Some(5),
+            },
+            sensitivity_ceiling: SensitivityLevel::Restricted,
+        })
+        .await
+        .unwrap();
+    }
+
+    let query = CandidateQuery {
+        embedding: None,
+        text: Some("marker9000".into()),
+        filters: HardFilters {
+            sensitivity_ceiling: SensitivityLevel::Restricted,
+            ..HardFilters::default()
+        },
+        limit: 10,
+    };
+    let before = backend.retrieve_candidates(&scope(), &query).await.unwrap();
+    let before_stats = before
+        .iter()
+        .find(|c| c.item.id == id)
+        .expect("the item must be found before protect");
+    assert!(
+        before_stats.access_count > 0,
+        "the recall loop above must have accumulated access history"
+    );
+    assert!(before_stats.last_accessed_at.is_some());
+
+    e.protect(&scope(), &id, Protection::Pinned).await.unwrap();
+
+    let after = backend.retrieve_candidates(&scope(), &query).await.unwrap();
+    let after_stats = after
+        .iter()
+        .find(|c| c.item.id == id)
+        .expect("the item must still be found after protect");
+    assert_eq!(
+        after_stats.access_count, 0,
+        "protect's delete-then-reinsert silently resets access_count"
+    );
+    assert!(
+        after_stats.last_accessed_at.is_none(),
+        "protect's delete-then-reinsert silently resets last_accessed_at"
     );
 }
 
