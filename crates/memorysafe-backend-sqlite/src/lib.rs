@@ -108,7 +108,7 @@ impl Backend for SqliteBackend {
         self.tenants
             .with_write(&tenant, move |conn| {
                 let tx = conn
-                    .transaction()
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| tenant::storage_error(e, false))?;
                 let id = audit::insert(&tx, &record)?;
                 // A `Recalled` row is an audit row: it increments, like every
@@ -195,7 +195,7 @@ impl Backend for SqliteBackend {
                 }
 
                 let tx = conn
-                    .transaction()
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| tenant::storage_error(e, false))?;
                 // Must stay the transaction's first statement, ahead of the
                 // eviction loop below — this is an `INSERT OR IGNORE` (a

@@ -22,7 +22,7 @@ pub fn subject(
     audit: &AuditRecord,
 ) -> Result<PurgeReport, BackendError> {
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| crate::tenant::storage_error(e, false))?;
     let s = subject.as_str();
 

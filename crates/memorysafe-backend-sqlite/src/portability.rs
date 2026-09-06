@@ -61,12 +61,8 @@ pub fn export(conn: &Connection, sel: &ScopeSelector) -> Result<ExportStream, Ba
         })
         .sql()?;
 
-    let mut scopes = Vec::new();
     for row in rows {
         let (item, vector) = row.sql()?;
-        if !scopes.contains(&item.scope) {
-            scopes.push(item.scope.clone());
-        }
         out.push(ExportRecord::Item {
             item: Box::new(item),
             vector,
@@ -74,6 +70,50 @@ pub fn export(conn: &Connection, sel: &ScopeSelector) -> Result<ExportStream, Ba
     }
 
     if sel.include_audit {
+        // **The scopes come from the audit table, not from the items just
+        // exported.** Deriving them from the items made the audit loop
+        // quantify over an empty set for any scope whose items are gone —
+        // which is precisely the state `purge_subject(PurgeCascade::Preserve)`
+        // creates, and `purge`'s own comment calls those rows "the only
+        // remaining evidence that an erasure happened". Migrating such a
+        // tenant dropped it silently, and the same loss applied to any
+        // namespace emptied by eviction or retention.
+        //
+        // The frozen conformance suite cannot see it: every export there runs
+        // over a corpus whose audited scope still holds items, so the two
+        // sources of scopes agree.
+        let mut scope_stmt = conn
+            .prepare(
+                "SELECT DISTINCT subject, namespace FROM audit
+                  WHERE (?1 IS NULL OR subject = ?1) AND (?2 IS NULL OR namespace = ?2)
+                  ORDER BY subject, namespace",
+            )
+            .sql()?;
+        let tenant_for_scopes = sel.tenant.as_str().to_string();
+        let scope_rows = scope_stmt
+            .query_map(params![subject, namespace], move |r| {
+                let s: String = r.get(0)?;
+                let n: String = r.get(1)?;
+                // Not `.expect` — six of those were removed from this crate an
+                // hour ago for poisoning a tenant's connection mutex on one
+                // corrupt row. Writing a seventh here would have been the same
+                // defect, in the fix for a different one.
+                Scope::new(&tenant_for_scopes, &s, &n).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::other(format!(
+                            "audit holds an unreadable scope: {e}"
+                        ))),
+                    )
+                })
+            })
+            .sql()?;
+        let mut scopes = Vec::new();
+        for row in scope_rows {
+            scopes.push(row.sql()?);
+        }
+
         // Collect across every scope before sorting: `audit::query` returns
         // each scope's rows newest-first (descending `AuditId`), but
         // `Backend::export`'s contract is one global run ascending by
@@ -109,7 +149,7 @@ pub fn import(
     stream: ImportStream,
 ) -> Result<ImportReport, BackendError> {
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| crate::tenant::storage_error(e, false))?;
     let mut report = ImportReport::default();
     // `Backend::import`'s doc: "at least one Header must be present, and
@@ -356,6 +396,68 @@ mod tests {
             Protection::Protected { until },
             "Protection::Protected{{until}} did not survive export/import with \
              its exact timestamp"
+        );
+    }
+
+    /// **`export` collected the scopes to fetch audit for from the items it had
+    /// just exported.** So a scope whose items are gone but whose audit was
+    /// deliberately kept contributed no scope, the audit loop ran over an empty
+    /// set, and the export came back holding nothing.
+    ///
+    /// That is exactly the state `purge_subject(PurgeCascade::Preserve)`
+    /// creates, and `purge`'s own comment calls the preserved rows "the only
+    /// remaining evidence that an erasure happened". Migrating such a tenant
+    /// lost it silently — the same loss for any namespace emptied by eviction
+    /// or retention.
+    ///
+    /// Invisible to the frozen conformance suite because every export there
+    /// runs over a corpus whose audited scope still holds items.
+    #[test]
+    fn audit_is_exported_for_a_scope_whose_items_are_all_gone() {
+        use memorysafe_core::{Actor, AuditEvent, AuditFilter, AuditRecord};
+        let conn = db();
+        let sc = scope();
+        let item = item_with(SourceKind::Agent, memorysafe_core::Protection::Normal);
+        crate::items::insert(&conn, &item).unwrap();
+        crate::audit::insert(
+            &conn,
+            &AuditRecord::new(
+                sc.clone(),
+                AuditEvent::Forgotten,
+                vec![],
+                Actor::system(),
+                time::OffsetDateTime::UNIX_EPOCH,
+            ),
+        )
+        .unwrap();
+
+        // Erase the items, keep the audit — the compliance case.
+        crate::items::delete(&conn, &sc, &item.id).unwrap();
+        assert_eq!(
+            crate::audit::query(&conn, &sc, &AuditFilter::default())
+                .unwrap()
+                .len(),
+            1,
+            "the premise: the audit row was preserved and is readable"
+        );
+
+        let sel = ScopeSelector {
+            tenant: sc.tenant.clone(),
+            subject: None,
+            namespace: None,
+            include_audit: true,
+        };
+        let stream = export(&conn, &sel).unwrap();
+        let audits = stream
+            .iter()
+            .filter(|r| matches!(r, ExportRecord::Audit { .. }))
+            .count();
+        assert_eq!(
+            audits,
+            1,
+            "an audit row readable through Backend::audit was dropped by export; \
+             the stream held {} records",
+            stream.len()
         );
     }
 }
