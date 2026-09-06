@@ -56,6 +56,30 @@
 //! These are one rule, not three: **an absence assertion is worth nothing
 //! until the presence it is an absence of is pinned.**
 //!
+//! A fourth is not about the assertion at all, and it is the hardest to see:
+//!
+//! 4. **A second enforcement layer absorbs the bug in the first.** Where a rule
+//!    is enforced twice — pushed into SQL *and* re-checked in Rust, say — an
+//!    end-to-end test exercises only the outcome, so an error in either layer
+//!    is invisible while the other is correct. The backstop is doing its job
+//!    and that is exactly the problem: it converts a defect in the enforcement
+//!    point into a passing test.
+//!
+//!    **And it hides the dangerous direction specifically.** A layer that
+//!    becomes too *strict* still changes the result, because the backstop
+//!    cannot put back a row that was never fetched — so narrowing errors stay
+//!    visible. A layer that becomes too *permissive* is silently repaired by
+//!    the backstop. Measured here: widening the sensitivity ceiling by one
+//!    level in `filter_sql` passed the entire workspace; narrowing it by one
+//!    failed six tests; widening it with the Rust re-check disabled failed
+//!    `retrieval::sensitivity_ceiling_is_enforced_in_the_query` at once.
+//!
+//!    The fix is not to remove the second layer — it is a real net, and it
+//!    caught a real leak in that experiment. It is to test each layer where it
+//!    lives: call the SQL-building function directly, below the re-check, and
+//!    assert the boundary there. Defence in depth needs testing in depth, or
+//!    the depth is only ever exercised by accident.
+//!
 //! [`isolation::retrieval_never_crosses_a_scope_boundary`](super::isolation::retrieval_never_crosses_a_scope_boundary)
 //! implements all three and says so in its own comments. It is the shape to
 //! copy for any scope or filter test.
