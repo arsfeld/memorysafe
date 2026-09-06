@@ -641,39 +641,80 @@ mod tests {
     /// in `neighbours` to hardcode `(None, 0)` was run against the ten bound
     /// conformance tests and all ten stayed green — a mutant no test caught —
     /// which is what this test exists to close.
+    ///
+    /// **Both directions are asserted, and the never-recalled one is the
+    /// sharp half.** `AccessStats`'s own doc states, in bold, that a
+    /// never-recalled row must read back `(None, 0)` and never
+    /// `(Some(created_at), 0)`. A mutation in `vectors::access_stats` that
+    /// falls back to `created_at` when `last_access` is `NULL` — the exact
+    /// shape the doc warns about — left the whole workspace green until this
+    /// bystander item and its `is_none()` assertion existed: `fx::item` pins
+    /// `created_at` to `UNIX_EPOCH`, so a wrongly-defaulted
+    /// `Some(created_at)` carries the same instant a real recall at the
+    /// epoch would, and no assertion on the *timestamp* can tell them apart
+    /// — only the `Option` itself can, which is why this checks `is_none()`
+    /// rather than comparing against a value.
     #[tokio::test]
     async fn neighbours_reports_the_items_stored_access_statistics() {
         use memorysafe_embed::Embedder;
 
         let b = backend();
         let s = scope("s", "n");
-        let item = fx::item(&s, "the cat sat on the mat");
-        b.apply(fx::admit_txn_embedded(&s, item.clone()))
-            .await
-            .unwrap();
+        let recalled = fx::item(&s, "the cat sat on the mat");
+        let bystander = fx::item(&s, "the cat sat on a rug");
+        for item in [recalled.clone(), bystander.clone()] {
+            b.apply(fx::admit_txn_embedded(&s, item)).await.unwrap();
+        }
 
         let at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(3_600);
         let record = AuditRecord::new(
             s.clone(),
             AuditEvent::Recalled,
-            vec![ItemRef::from_item(&item)],
+            vec![ItemRef::from_item(&recalled)],
             Actor::system(),
             at,
         );
         b.record_recall(record).await.unwrap();
 
         let probe = fx::embedder().embed("the cat sat on the mat").unwrap();
-        let hits = b.neighbours(&s, &probe, 1).await.unwrap();
-
-        assert_eq!(hits.len(), 1);
+        // k = corpus size, so both come back regardless of ranking — the
+        // never-recalled assertion below needs the bystander present, not
+        // merely ranked highly enough to survive a smaller k.
+        let hits = b.neighbours(&s, &probe, 2).await.unwrap();
         assert_eq!(
-            hits[0].access_count, 1,
+            hits.len(),
+            2,
+            "both items must come back, or the never-recalled assertion below \
+             proves nothing"
+        );
+
+        let recalled_hit = hits
+            .iter()
+            .find(|h| h.item.id == recalled.id)
+            .expect("the recalled item must be among the hits");
+        assert_eq!(
+            recalled_hit.access_count, 1,
             "neighbours did not report the recalled item's access_count"
         );
         assert_eq!(
-            hits[0].last_accessed_at,
+            recalled_hit.last_accessed_at,
             Some(at),
             "neighbours did not report the recalled item's last_accessed_at"
+        );
+
+        let bystander_hit = hits
+            .iter()
+            .find(|h| h.item.id == bystander.id)
+            .expect("the never-recalled item must be among the hits");
+        assert_eq!(
+            bystander_hit.access_count, 0,
+            "a never-recalled item must report access_count 0"
+        );
+        assert!(
+            bystander_hit.last_accessed_at.is_none(),
+            "a never-recalled item must report last_accessed_at as None, not \
+             Some(created_at): got {:?}",
+            bystander_hit.last_accessed_at
         );
     }
 

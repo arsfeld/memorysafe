@@ -258,6 +258,60 @@ mod tests {
         );
     }
 
+    /// `search` and `scope_embedder` must not cross a subject boundary within
+    /// one tenant. The tenant is the file — that isolation is structural —
+    /// but subject/namespace is a query predicate here and nothing structural
+    /// enforces it.
+    ///
+    /// `isolation::retrieval_never_crosses_a_scope_boundary` owns this
+    /// property through the trait, but it reads through *both*
+    /// `retrieve_candidates` and `neighbours`, so it cannot bind until
+    /// `retrieve_candidates` exists (Task 22) — a deferral recorded in
+    /// `tests/conformance.rs`'s module doc. Until then, this crate-local test
+    /// is the only thing that can fail if either predicate is dropped:
+    /// neutralising `search`'s `WHERE i.subject = ?1 AND i.namespace = ?2`
+    /// (or `scope_embedder`'s `WHERE subject=?1 AND namespace=?2`) left the
+    /// whole workspace green before this test existed.
+    ///
+    /// Both scopes share the same embedder and dimension on purpose: if the
+    /// subject/namespace predicate were the only thing keeping them apart,
+    /// dropping it would let `elsewhere`'s probe match `home`'s row exactly
+    /// (the probe text is identical to the stored body), and `scope_embedder`
+    /// would report `home`'s model identity for a scope that holds no
+    /// vectors of its own.
+    #[test]
+    fn search_and_scope_embedder_are_scoped_by_subject_and_namespace() {
+        let c = conn();
+        let home = memorysafe_core::Scope::new("t", "s", "n").unwrap();
+        let elsewhere = memorysafe_core::Scope::new("t", "other-s", "n").unwrap();
+        let e = DeterministicEmbedder::new(256);
+
+        let item = memorysafe_backend::conformance::fx::item(&home, "alpha memory");
+        crate::items::insert(&c, &item).unwrap();
+        let q =
+            memorysafe_embed::QuantizedVector::from_embedding(&e.embed("alpha memory").unwrap());
+        insert(&c, &item.id, &home, &q).unwrap();
+
+        // A probe from a different subject, same tenant, must not see
+        // `home`'s vector — even though the probe matches it exactly.
+        let probe =
+            memorysafe_embed::QuantizedVector::from_embedding(&e.embed("alpha memory").unwrap());
+        let hits = search(&c, &elsewhere, &probe, 5).unwrap();
+        assert!(
+            hits.is_empty(),
+            "search leaked a vector across a subject boundary: {:?}",
+            hits.iter().map(|h| h.0.body.clone()).collect::<Vec<_>>()
+        );
+
+        // A scope with no vectors of its own must not report another
+        // subject's stored model identity.
+        assert_eq!(
+            scope_embedder(&c, &elsewhere).unwrap(),
+            None,
+            "scope_embedder leaked another subject's embedder identity"
+        );
+    }
+
     #[test]
     fn deleting_an_item_cascades_to_its_vector() {
         let c = conn();
