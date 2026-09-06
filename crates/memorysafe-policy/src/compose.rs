@@ -264,6 +264,21 @@ pub fn working_set(
                         // semantic change had to land in one commit: either
                         // ordering leaves a window in which the recorded name
                         // does not describe the mechanism.
+                        //
+                        // Read this value as a property of the item IN
+                        // CONTEXT, not of the item. Coverage is measured
+                        // against whatever was already selected, so the same
+                        // candidate scores differently depending on when it
+                        // was considered, and two identical candidates in one
+                        // working set get different numbers — the second
+                        // genuinely is more redundant than the first. That is
+                        // the intended behaviour and no threshold changes it;
+                        // it is a consequence of scoring against a growing
+                        // set rather than against a fixed corpus. An analyst
+                        // comparing this field ACROSS rows is comparing
+                        // items in different contexts, which the field name
+                        // says out loud and this note exists to make
+                        // unmissable.
                         "fraction_covered_by_selected" => covered,
                         "mmr" => mmr,
                     },
