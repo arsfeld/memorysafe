@@ -13,15 +13,20 @@ use time::OffsetDateTime;
 const OVERFETCH: usize = 8;
 
 /// Default item count when a caller's `RecallBudget::max_items` is `None`.
-/// Matches `RecallBudget::default()`'s own `max_items: Some(20)` — an
-/// unbounded item count would otherwise make an unbounded-looking recall
-/// over-fetch without limit before any policy or budget check runs.
+/// Matches `RecallBudget::default()`'s own `max_items: Some(20)`, so a
+/// caller who omits a budget entirely gets the same default item count as
+/// one who supplies `RecallBudget::default()` explicitly. This sets the
+/// *value* multiplied by `OVERFETCH` below; it does not bound the fetch —
+/// the `.clamp(MIN_CANDIDATES, MAX_CANDIDATES)` two lines down does that,
+/// and caps the result at `MAX_CANDIDATES` regardless of this default.
 const DEFAULT_MAX_ITEMS: usize = 20;
 
 /// Floor on the over-fetch limit. Below this, a tiny `max_items` (e.g. `1`)
 /// combined with `OVERFETCH` could hand the policy too few candidates to
 /// exercise diversity or the replay quota at all — composition needs a
 /// minimum working pool regardless of how small the caller's budget is.
+/// `10` itself is a conservative choice, not derived from a measured
+/// minimum working-set size.
 const MIN_CANDIDATES: usize = 10;
 
 /// Ceiling on the over-fetch limit. Chosen as a conservative bound on how
@@ -114,8 +119,23 @@ impl Engine {
             },
         };
 
-        // A policy may narrow the candidate set; it may never widen it.
+        // A policy may narrow the candidate set; it may never widen it. A
+        // policy caught doing so is a security event — it must leave an
+        // audit trail even though nothing is returned to the caller, the
+        // same way `write.rs`'s `handle_invalid_decision` audits an invalid
+        // write decision as `Rejected` before deciding what to return.
         if let Err(invalid) = validate::working_set(&composed, &candidates) {
+            let audit = AuditRecord::new(
+                req.scope.clone(),
+                AuditEvent::Rejected,
+                vec![],
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: None,
+                },
+                ctx.now,
+            );
+            self.backend.record_recall(audit).await?;
             return Err(EngineError::PolicyRefused(invalid.to_string()));
         }
 

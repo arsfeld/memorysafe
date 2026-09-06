@@ -153,6 +153,10 @@ async fn a_recall_over_an_empty_scope_is_empty_not_an_error() {
         .unwrap();
     assert!(ws.items.is_empty());
     assert!(ws.omitted.is_empty());
+    assert!(
+        ws.audit_id.is_some(),
+        "an empty recall is still a recall and must be audited"
+    );
 }
 
 #[tokio::test]

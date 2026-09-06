@@ -14,9 +14,9 @@
 use memorysafe_backend::Backend;
 use memorysafe_backend_sqlite::SqliteBackend;
 use memorysafe_core::{
-    AdmitContext, Assessed, Assessment, Candidate, ComposeContext, Decision, ItemId,
-    MaintainContext, MemoryItem, PolicyError, PolicyId, Protection, Reason, ReasonCode,
-    RecallBudget, RecallMode, RecallRequest, Scope, ScoredCandidate, SelectedItem,
+    AdmitContext, Assessed, Assessment, AuditEvent, AuditFilter, Candidate, ComposeContext,
+    Decision, ItemId, MaintainContext, MemoryItem, PolicyError, PolicyId, Protection, Reason,
+    ReasonCode, RecallBudget, RecallMode, RecallRequest, Scope, ScoredCandidate, SelectedItem,
     SensitivityLevel, Source, SourceKind, WorkingSet, features,
 };
 use memorysafe_embed::DeterministicEmbedder;
@@ -202,6 +202,33 @@ async fn a_policy_smuggling_an_unoffered_item_is_refused_not_returned() {
         }
         other => panic!("expected EngineError::PolicyRefused, got {other:?}"),
     }
+
+    // A policy caught trying to leak is a security event; it must leave an
+    // audit trail even though nothing was returned to the caller. Before
+    // this test, refusing here wrote no audit row at all — the same
+    // `AuditRecord` fields `record_recall` is given for a successful
+    // `Recalled` row, just under `AuditEvent::Rejected`, the way
+    // `write.rs`'s `handle_invalid_decision` audits an invalid write
+    // decision.
+    let audit = reader
+        .audit(
+            &scope(),
+            &AuditFilter {
+                events: vec![AuditEvent::Rejected],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        audit.len(),
+        1,
+        "a refused recall must leave exactly one Rejected audit row"
+    );
+    assert!(
+        audit[0].items.is_empty(),
+        "the refusal's audit row must not name the smuggled item"
+    );
 }
 
 #[tokio::test]

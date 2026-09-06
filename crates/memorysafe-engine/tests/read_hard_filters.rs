@@ -95,8 +95,16 @@ async fn recall_honors_the_kinds_filter() {
     );
 }
 
+/// `occurred_after` and `occurred_before` are two independent fields on
+/// `HardFilters`, and a single fixture that only ever sets one of them
+/// cannot tell "both bounds are forwarded" from "one is forwarded and the
+/// other is silently dropped" — confirmed by mutation testing: an earlier
+/// version of this file set only `occurred_after`, and hardcoding
+/// `occurred_before: None` inside `recall` survived every test in the
+/// crate. This test and `recall_honors_occurred_before` below each isolate
+/// one bound.
 #[tokio::test]
-async fn recall_honors_occurred_time_bounds() {
+async fn recall_honors_occurred_after() {
     let e = engine();
     let base = OffsetDateTime::UNIX_EPOCH;
     let mut early = RememberRequest::new(scope(), "a cats memory from early in the year");
@@ -116,6 +124,32 @@ async fn recall_honors_occurred_time_bounds() {
             .item
             .occurred_at
             .is_some_and(|t| t >= base + Duration::days(100))),
-        "an item before occurred_after reached a time-bounded recall"
+        "an item before occurred_after reached an occurred_after-filtered recall"
+    );
+}
+
+/// The sibling of the test above, isolating `occurred_before`.
+#[tokio::test]
+async fn recall_honors_occurred_before() {
+    let e = engine();
+    let base = OffsetDateTime::UNIX_EPOCH;
+    let mut early = RememberRequest::new(scope(), "a cats memory from early in the year");
+    early.occurred_at = Some(base);
+    e.remember(early).await.unwrap();
+    let mut late = RememberRequest::new(scope(), "a cats memory from late in the year");
+    late.occurred_at = Some(base + Duration::days(300));
+    e.remember(late).await.unwrap();
+
+    let mut req = base_req("cats");
+    req.occurred_before = Some(base + Duration::days(100));
+    let ws = e.recall(req).await.unwrap();
+
+    assert!(!ws.items.is_empty(), "the earlier item should still match");
+    assert!(
+        ws.items.iter().all(|s| s
+            .item
+            .occurred_at
+            .is_some_and(|t| t <= base + Duration::days(100))),
+        "an item after occurred_before reached an occurred_before-filtered recall"
     );
 }
