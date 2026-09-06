@@ -103,6 +103,21 @@ pub struct MaintenanceCandidate {
     pub item: MemoryItem,
     pub value: Score,
     pub fragility: Score,
+    /// When this item was last recalled, and how many times — the same pair
+    /// `ScoredCandidate` carries, and populated the same way. Maintenance is
+    /// where they matter most: "expensive to relearn and nobody has looked at
+    /// it in a year" is a different eviction candidate from "expensive to
+    /// relearn and recalled yesterday", and without these a policy sorting
+    /// eviction candidates can only reach for `created_at`, which says nothing
+    /// about use.
+    ///
+    /// **A never-recalled item is `(None, 0)`, never `(Some(created_at), 0)`.**
+    /// See `ScoredCandidate::last_accessed_at` for why the distinction has to
+    /// survive, and why the conformance fixtures cannot detect its loss if it
+    /// does not.
+    #[serde(with = "time::serde::timestamp::option")]
+    pub last_accessed_at: Option<OffsetDateTime>,
+    pub access_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -322,6 +337,8 @@ mod tests {
             value: Score::clamped(0.6),
             fragility: Score::clamped(0.2),
             estimated_tokens: 12,
+            last_accessed_at: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
+            access_count: 3,
         };
         let ws = p
             .compose(&req, std::slice::from_ref(&candidate), &compose_ctx)
@@ -338,6 +355,12 @@ mod tests {
                 item: sample_item(),
                 value: Score::clamped(0.3),
                 fragility: Score::clamped(0.9),
+                // Never recalled: `(None, 0)`, not `(Some(created_at), 0)`.
+                // `sample_item`'s `created_at` is the Unix epoch, so the two
+                // encodings would be indistinguishable here if the second were
+                // allowed — which is exactly why the first is the contract.
+                last_accessed_at: None,
+                access_count: 0,
             }],
             // Not the last page — a policy that only ever sees `true` here is
             // never tested on the partial-view case it must handle.
@@ -354,5 +377,16 @@ mod tests {
         assert_eq!(maintain_ctx.clone(), maintain_ctx);
         assert_eq!(maintain_ctx.batch[0].fragility.get(), 0.9);
         assert!(!maintain_ctx.is_final_batch);
+        // A never-recalled candidate is `(None, 0)`. `sample_item().created_at`
+        // is the Unix epoch, so asserting `is_none()` rather than a timestamp
+        // is what makes a backend that defaults to `created_at` visible here.
+        assert!(maintain_ctx.batch[0].last_accessed_at.is_none());
+        assert_eq!(maintain_ctx.batch[0].access_count, 0);
+        assert_eq!(
+            candidate.last_accessed_at,
+            Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
+            "ScoredCandidate dropped the access statistics it was handed"
+        );
+        assert_eq!(candidate.access_count, 3);
     }
 }

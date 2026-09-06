@@ -159,7 +159,8 @@ impl Engine {
     pub async fn scope_stats(&self, scope: &Scope) -> Result<ScopeStats, EngineError>;
     pub async fn export_ndjson(&self, sel: &ScopeSelector) -> Result<String, EngineError>;
     pub async fn export_markdown(&self, sel: &ScopeSelector) -> Result<String, EngineError>;
-    pub async fn import_ndjson(&self, ndjson: &str) -> Result<ImportReport, EngineError>;
+    pub async fn import_ndjson(&self, ndjson: &str, destination: &TenantId)
+        -> Result<ImportReport, EngineError>;
 }
 ```
 
@@ -1385,7 +1386,10 @@ impl Engine {
         tenant: &TenantId,
         actor: &Actor,
     ) -> Result<ImportReport, EngineError> {
-        let report = self.import_ndjson(ndjson).await?;
+        // `Engine::import_ndjson` takes the destination tenant explicitly (Plan
+        // 1 Task 37); this wrapper already has the authorised one in hand, so
+        // it passes it rather than letting the payload name its own target.
+        let report = self.import_ndjson(ndjson, tenant).await?;
         self.record_admin_event(
             tenant,
             AuditEvent::Imported,
@@ -4896,11 +4900,13 @@ git commit -m "feat(api): the memory routes, with decisions returned as successe
 - Produces: the routes `GET /v1/audit`, `POST /v1/maintain`, `GET /v1/export`, `POST /v1/import`,
   `DELETE /v1/subjects/{id}`, and `AuditResponse` with its `truncated` flag.
 
-**The `truncated` flag closes a note Plan 1 left open.** `AuditFilter::limit` defaults to 100 and
-carries no truncation signal, so "produce every audit row for this subject" — the compliance query
-— silently stops at 100 with no way for the caller to know. This route asks for one row more than
-the caller wanted, returns the caller's page, and says whether there were more. Paging continues
-with `after=<last audit id>`.
+**The `truncated` flag is this route's convenience, not a missing contract.** `Backend::audit`
+already makes truncation detectable: it returns exactly `min(limit, remaining)`, so
+`returned.len() < limit` means the log is exhausted and a full page means "ask again with
+`after=<last audit id>`". An HTTP caller should not have to infer that from a length, so this
+route asks the engine for one row more than the caller wanted, returns the caller's page, and
+says whether there were more. It must derive `truncated` that way — from the extra row — and
+never from a flag the backend does not return.
 
 **Export and import are audited here because the actor is here.** `export_ndjson_as` and
 `import_ndjson_as` (Task 2) take the `Actor`, and this route supplies the one the API key names.

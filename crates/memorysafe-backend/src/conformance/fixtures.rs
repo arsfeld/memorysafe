@@ -52,15 +52,55 @@ pub fn item_with(
 }
 
 /// Same as `item`, but with a caller-supplied `created_at` instead of the
-/// fixed `UNIX_EPOCH` above. `item`'s timestamp is pinned so most conformance
-/// runs are deterministic and comparable, but that pin means many items tie
-/// under `ORDER BY created_at` — exactly the shape a real bulk import
-/// produces, and pagination must stay stable across it. Tests that need
-/// distinct, ordered timestamps (Task 17's `pagination_is_stable`) use this
-/// builder instead of forking `item` or reaching into its fields directly.
+/// fixed `UNIX_EPOCH` above.
+///
+/// `item`'s pinned timestamp makes a corpus built from it **fully tied** under
+/// `ORDER BY created_at` — exactly the shape a real bulk import produces. That
+/// case is not avoided by this builder; it is covered directly, by
+/// `retrieval::list_tie_break_is_total_over_identical_timestamps`, which
+/// builds its corpus from `item` (and `item_with_id`) precisely *because*
+/// everything ties there and the tie-break is then the only thing ordering the
+/// pages.
+///
+/// This builder exists for the two tests that need the opposite corpus —
+/// distinct, increasing timestamps:
+///
+/// - `retrieval::list_pages_are_disjoint_and_complete`, which isolates the
+///   offset/limit arithmetic from ordering entirely: with no ties, no
+///   tie-break is involved, so an overlap or a dropped row can only be a
+///   paging bug.
+/// - `retrieval::list_orders_oldest_first_by_created_at`, which can only
+///   observe sort *direction* where the primary key actually varies. On a
+///   tied corpus an ascending and a descending backend produce identical
+///   output, so direction is unobservable there.
+///
+/// Use this rather than forking `item` or reaching into its fields directly.
 pub fn item_at(scope: &Scope, body: &str, created_at: OffsetDateTime) -> MemoryItem {
     let mut i = item(scope, body);
     i.created_at = created_at;
+    i
+}
+
+/// Same as `item`, but with a caller-supplied `ItemId` instead of a freshly
+/// generated one — `item_at`'s counterpart for the tie-break key.
+///
+/// **Why any test asserting an id order needs this.** `ItemId::new()` is
+/// `ulid::Ulid::generate()`, the plain generator, and nothing in this
+/// workspace uses a monotonic one. `ulid_id!`'s own doc comment says
+/// lexicographic order equals creation order only "up to the timestamp's
+/// millisecond resolution" — so ids minted inside one millisecond are ordered
+/// *randomly* relative to each other. A test that inserts items in a tight
+/// loop and expects ascending ids is therefore a coin flip, and worse, if the
+/// loop happens to straddle a millisecond boundary the ids come out ascending
+/// in insertion order and a backend applying no tie-break at all passes
+/// deterministically — looking stable while proving nothing.
+///
+/// Callers pass literal ULIDs through `ItemId::parse`, the same way
+/// `memorysafe-core`'s own tests do, and insert them in a deliberately
+/// non-ascending order.
+pub fn item_with_id(scope: &Scope, id: ItemId, body: &str) -> MemoryItem {
+    let mut i = item(scope, body);
+    i.id = id;
     i
 }
 
@@ -182,14 +222,16 @@ mod tests {
         assert!(evict_txn(&s, vec![ItemId::new()]).is_valid());
     }
 
-    // Task 17's `item_at` is the fixture `pagination_is_stable` depends on to
-    // avoid tied timestamps. A mutation that silently ignores the
-    // `created_at` argument (falling back to `item`'s pinned
-    // `UNIX_EPOCH`) would make every "distinct, increasing timestamp" in
-    // that test identical again — the exact bug this builder exists to
-    // avoid — and reintroduce the pagination flakiness this task was asked
-    // to fix. Assert the field directly, not just `is_valid()`: validity
-    // never inspects `created_at`, so it cannot catch that mutation.
+    // `item_at` is the fixture `list_pages_are_disjoint_and_complete` and
+    // `list_orders_oldest_first_by_created_at` both depend on for distinct
+    // timestamps. A mutation that silently ignores the `created_at` argument
+    // (falling back to `item`'s pinned `UNIX_EPOCH`) would make every
+    // "distinct, increasing timestamp" in those tests identical again,
+    // collapsing both corpora onto the tied one — which would leave sort
+    // direction unobservable and the disjointness test unable to separate a
+    // paging bug from a tie-break bug. Assert the field directly, not just
+    // `is_valid()`: validity never inspects `created_at`, so it cannot catch
+    // that mutation.
     #[test]
     fn item_at_uses_the_given_timestamp_not_the_default() {
         let s = scope();
@@ -211,6 +253,61 @@ mod tests {
     // assertion: `is_valid()` never inspects `audit.at`, so only checking
     // validity would pass even if the timestamp argument were silently
     // ignored.
+    // `item_with_id` is what makes
+    // `list_tie_break_is_total_over_identical_timestamps` and
+    // `neighbours_break_ties_before_truncating_at_k` deterministic rather than
+    // a coin flip: both assert an order that `ItemId::new()` cannot be relied
+    // on to produce, because ULIDs minted inside one millisecond are randomly
+    // ordered relative to each other. A builder that silently ignored its `id`
+    // argument would hand those tests generated ids again and reintroduce
+    // exactly that. `is_valid()` never inspects `id`, so assert the field.
+    #[test]
+    fn item_with_id_uses_the_given_id_not_a_generated_one() {
+        let s = scope();
+        let id = ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FA0").unwrap();
+        let i = item_with_id(&s, id.clone(), "a note");
+        assert_eq!(i.id, id);
+        assert!(admit_txn(&s, i, None).is_valid());
+    }
+
+    // The premise both id-ordering tests rest on: these literals are valid
+    // ULIDs, and their lexicographic order is the ascending numeric order the
+    // tests expect. `ItemId` derives `Ord` over the string, so this is the
+    // property the assertions there compare against — and it is checkable
+    // today, unlike the conformance tests themselves, which do not execute
+    // until a backend exists.
+    #[test]
+    fn the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending() {
+        for family in [
+            [
+                "01ARZ3NDEKTSV4RRFFQ69G5FA0",
+                "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+                "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+                "01ARZ3NDEKTSV4RRFFQ69G5FA3",
+                "01ARZ3NDEKTSV4RRFFQ69G5FA4",
+            ],
+            [
+                "01BX5ZZKBKACTAV9WEVGEMMVR0",
+                "01BX5ZZKBKACTAV9WEVGEMMVR1",
+                "01BX5ZZKBKACTAV9WEVGEMMVR2",
+                "01BX5ZZKBKACTAV9WEVGEMMVR3",
+                "01BX5ZZKBKACTAV9WEVGEMMVR9",
+            ],
+        ] {
+            let ids: Vec<ItemId> = family
+                .iter()
+                .map(|s| ItemId::parse(s).expect("literal must be a canonical ULID"))
+                .collect();
+            let mut sorted = ids.clone();
+            sorted.sort();
+            assert_eq!(
+                sorted, ids,
+                "the literals are written in the order the ordering tests assert; \
+                 if they do not sort that way, those tests assert the wrong sequence"
+            );
+        }
+    }
+
     #[test]
     fn evict_txn_at_uses_the_given_timestamp_not_the_default() {
         let s = scope();

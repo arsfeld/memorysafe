@@ -26,6 +26,15 @@ impl std::fmt::Display for PolicyId {
 
 /// Machine-queryable. These strings are a wire format stored in audit rows;
 /// renaming a variant is a breaking change.
+///
+/// **The break is tied to this commit, not to a release.** Audit aggregates
+/// (`memorysafe_backend::aggregates`) group by event class and policy version
+/// and are designed to outlive the detail rows they summarise, so a variant
+/// name becomes a *storage key* the moment the first aggregate row is written
+/// anywhere — by any deployment running any build from here on. Before that a
+/// rename was a refactor with a migration; after it, a rename orphans history
+/// that the detail rows can no longer be consulted to reconstruct. Do not
+/// treat "we have not shipped yet" as room to rename one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonCode {

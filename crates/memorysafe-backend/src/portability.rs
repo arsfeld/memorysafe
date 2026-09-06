@@ -2,6 +2,18 @@ use memorysafe_core::{AuditRecord, MemoryItem, Namespace, SubjectId, TenantId};
 use memorysafe_embed::QuantizedVector;
 use serde::{Deserialize, Serialize};
 
+/// The one export format version this workspace writes and accepts.
+///
+/// One constant, in the crate that owns the format, rather than one private
+/// `const` per backend. `Backend::import` requires every `Header` to carry a
+/// *supported* `format_version`, and "supported" is a property of the format,
+/// not of whichever backend happens to be reading the stream. Two backends
+/// each declaring their own copy is two places to bump and one silent
+/// divergence away from a SQLite export that Postgres refuses — the exact
+/// cross-backend drift the conformance suite exists to prevent, in the one
+/// path where the artifact has already left the building.
+pub const FORMAT_VERSION: u32 = 1;
+
 /// Selects what to export. `None` on a level means "all of them".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeSelector {
@@ -120,6 +132,24 @@ mod tests {
             ExportRecord::Audit { audit: got } => assert_eq!(*got, record),
             other => panic!("expected ExportRecord::Audit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_shared_format_version_is_the_one_the_header_carries() {
+        // `FORMAT_VERSION` is deliberately written down twice — here as the
+        // constant and below as a literal inside the golden line — so a bump
+        // cannot be made silently in one backend's private copy. There is no
+        // private copy any more; both backend sketches reference this.
+        assert_eq!(FORMAT_VERSION, 1);
+        let header = ExportRecord::Header {
+            format_version: FORMAT_VERSION,
+            exported_at: 0,
+        };
+        assert_eq!(
+            serde_json::to_string(&header).unwrap(),
+            r#"{"record":"header","format_version":1,"exported_at":0}"#,
+            "the shared constant no longer matches the wire format the suite pins"
+        );
     }
 
     #[test]
