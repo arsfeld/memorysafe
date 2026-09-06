@@ -66,7 +66,13 @@ pub struct SensitivityAssessment {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RedundancyAssessment {
     pub score: Score,
-    /// Descending by similarity. `Score` rather than a raw `f32`: cosine spans
+    /// Descending by similarity, ties broken by ascending `ItemId` — the
+    /// same tie-break the `Backend` trait's `retrieve_candidates` and
+    /// `neighbours` use, so this list cannot drift from the neighbours it
+    /// was built from. `best()` returns `.first()`, so this tie-break is
+    /// what makes it name a deterministic merge target: anchor to this
+    /// rule, not to "whatever order the backend happened to return
+    /// neighbours in". `Score` rather than a raw `f32`: cosine spans
     /// [-1, 1], but this list is filtered at `near_duplicate_floor` before it
     /// is built, so a negative similarity — meaning "definitely not a
     /// duplicate" — never belongs here.

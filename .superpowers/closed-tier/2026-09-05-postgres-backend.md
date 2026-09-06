@@ -116,7 +116,7 @@ repo actually put it before Task 7 and import from there; this plan writes
 
 - `HardFilters::default().sensitivity_ceiling` is `Internal`, not `Restricted`. Fail closed.
 - `list` orders by `id ASC`. ULIDs are lexicographically time-ordered, which is what makes pagination stable under concurrent inserts.
-- `audit` orders newest first: `at DESC, id DESC`.
+- `audit` orders newest first: `id DESC` (see `AuditFilter::after`'s doc comment in `memorysafe-core` — `at` is whole seconds and cannot separate rows written in the same second, so `id` alone is the total order).
 - Relevance fusion when both signals are present is `0.7 * vector + 0.3 * keyword`; when only one is present it is that one. Ties break by `item.id` ascending so ordering is total.
 - Keyword scores are squashed into `(0, 1]` as `r / (1 + r)` before fusion.
 - `retrieve_candidates` over-fetches `limit * 4` from each source before fusing, then truncates to `limit`.
@@ -323,7 +323,7 @@ CREATE TABLE audit (
   policy     TEXT,
   PRIMARY KEY (tenant_id, id)
 ) PARTITION BY HASH (tenant_id);
-CREATE INDEX idx_audit_scope_at ON audit (tenant_id, subject, namespace, at DESC, id DESC);
+CREATE INDEX idx_audit_scope_at ON audit (tenant_id, subject, namespace, id DESC);
 
 CREATE TABLE idempotency (
   tenant_id      TEXT NOT NULL,
@@ -1561,7 +1561,7 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
         "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw
            ON vectors USING hnsw (embedding vector_ip_ops)".into(),
         "CREATE INDEX IF NOT EXISTS idx_audit_scope_at
-           ON audit (tenant_id, subject, namespace, at DESC, id DESC)".into(),
+           ON audit (tenant_id, subject, namespace, id DESC)".into(),
     ]);
 
     for table in TENANT_TABLES {
@@ -2328,8 +2328,11 @@ pub async fn query(
         Some(filter.events.iter().map(|e| event_str(*e)).collect())
     };
 
-    // Newest first; id breaks ties so ordering is total at one-second
-    // resolution.
+    // Ordered by id, descending (newest first) — see `AuditFilter::after`'s
+    // doc comment in memorysafe-core: `at` is whole seconds and cannot
+    // separate rows written in the same second, so `id` alone is the total
+    // order, not a tie-break on `at`. `since`/`until` are inclusive, hence
+    // `>=`/`<=` rather than `>`/`<`.
     let rows = sqlx::query(
         "SELECT tenant_id, id, at, subject, namespace, event, items, assessment,
                 decision, actor
@@ -2338,7 +2341,7 @@ pub async fn query(
            AND ($4::text[] IS NULL OR event = ANY($4))
            AND ($5::bigint IS NULL OR at >= $5)
            AND ($6::bigint IS NULL OR at <= $6)
-         ORDER BY at DESC, id DESC
+         ORDER BY id DESC
          LIMIT $7",
     )
     .bind(scope.tenant.as_str())

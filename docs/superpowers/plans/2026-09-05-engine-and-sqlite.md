@@ -6882,10 +6882,12 @@ pub fn query(conn: &Connection, scope: &Scope, filter: &AuditFilter)
         args.push(Box::new(until.unix_timestamp()));
         sql.push_str(&format!(" AND at <= ?{}", args.len()));
     }
-    // Newest first; id breaks ties so ordering is total even at one-second
-    // resolution.
+    // Ordered by id, descending (newest first) — see `AuditFilter::after`'s
+    // doc comment in memorysafe-core: `at` is whole seconds and cannot
+    // separate rows written in the same second, so `id` alone is the total
+    // order, not a tie-break on `at`.
     args.push(Box::new(filter.limit as i64));
-    sql.push_str(&format!(" ORDER BY at DESC, id DESC LIMIT ?{}", args.len()));
+    sql.push_str(&format!(" ORDER BY id DESC LIMIT ?{}", args.len()));
 
     let tenant = scope.tenant.as_str().to_string();
     let mut stmt = conn.prepare(&sql).sql()?;
@@ -8523,6 +8525,63 @@ mod tests {
     }
 
     #[test]
+    fn density_at_the_corpus_mean_scores_exactly_one_half() {
+        // 0.5 is the calibration anchor downstream policy code reads
+        // directly (compose's fixed 0.5/0.8 thresholds mean "at least as
+        // sparse as typical" / "much sparser than typical"): a neighbourhood
+        // exactly as dense as the corpus's own mean similarity must land
+        // exactly at the midpoint — for any baseline, not by coincidence at
+        // one particular value.
+        let baseline = 0.42;
+        // A single neighbour at exactly the baseline: local_density = b / 1
+        // = b with no averaging rounding, so this is exact by construction
+        // rather than exact by coincidence (three neighbours all at 0.5
+        // would also land exactly on 0.5, but only because 1.5 / 3 happens
+        // to divide evenly).
+        let at_baseline = [candidate("a", baseline)];
+        assert_eq!(score(&at_baseline, &stats(baseline)).get(), 0.5);
+    }
+
+    #[test]
+    fn a_neighbour_identical_to_the_item_scores_exactly_zero() {
+        // local_density == 1.0 is the other calibration anchor: an exact
+        // duplicate neighbour is never fragile, however diffuse or tight the
+        // rest of the corpus is.
+        let identical = [candidate("a", 1.0)];
+        assert_eq!(score(&identical, &stats(0.3)).get(), 0.0);
+    }
+
+    #[test]
+    fn sparser_than_typical_scores_above_half_denser_scores_below() {
+        // The gradient either side of the 0.5 anchor: strictly sparser than
+        // corpus-typical must land strictly above 0.5, and strictly denser
+        // strictly below. This is the function's contract independent of
+        // what any particular caller currently computes as `local_density`
+        // — it must hold for every caller, including ones that only ever
+        // produce values on one side of the anchor today.
+        let baseline = 0.5;
+        let sparser = [candidate("a", 0.2)];
+        let denser = [candidate("a", 0.8)];
+        assert!(score(&sparser, &stats(baseline)).get() > 0.5);
+        assert!(score(&denser, &stats(baseline)).get() < 0.5);
+    }
+
+    #[test]
+    fn an_isolated_item_reaches_maximum_fragility_even_in_a_diffuse_corpus() {
+        // Regression guard: a shared-denominator rescale (normalising the
+        // sparser-than-typical side by the *upward* room, `1.0 - baseline`,
+        // instead of its own downward room) caps the reachable ceiling below
+        // 1.0 at any baseline under 0.5 — an item with literally no similar
+        // neighbours could never be judged maximally fragile in a diffuse
+        // corpus, no matter how isolated it actually is. At baseline 0.2 that
+        // broken shape returns 0.625; the correct shape must still reach the
+        // true ceiling.
+        let baseline = 0.2;
+        let no_similar_neighbours = [candidate("a", 0.0)];
+        assert_eq!(score(&no_similar_neighbours, &stats(baseline)).get(), 1.0);
+    }
+
+    #[test]
     fn fragility_is_calibrated_against_the_corpus_not_an_absolute() {
         // The same neighbours mean different things in a tight corpus versus
         // a diffuse one.
@@ -8534,6 +8593,14 @@ mod tests {
             "0.6 similarity is unusual in a tight corpus and ordinary in a diffuse one"
         );
     }
+
+    // The tests above state this function's contract. Its arithmetic is
+    // additionally pinned by mutation-killer tests not reproduced here —
+    // `the_sparser_branch_is_linear_between_the_baseline_and_zero`,
+    // `the_denser_branch_is_linear_between_the_baseline_and_one`,
+    // `typical_density_at_the_lower_extreme_scores_one_half_without_dividing_by_zero`,
+    // and `typical_density_at_the_upper_extreme_scores_one_half_without_dividing_by_zero`
+    // — see `crates/memorysafe-policy/src/fragility.rs`.
 }
 ```
 
@@ -8586,7 +8653,9 @@ pub enum Verdict {
 /// documented in the spec; tenants may override them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BaselineConfig {
-    /// At or above this, reject the write as an exact duplicate.
+    /// At or above this, the write is rejected. The verdict is decided by
+    /// cosine similarity, not content-digest identity, so two items at the
+    /// threshold can have different digests.
     pub duplicate_threshold: f32,
     /// At or above this (but below `duplicate_threshold`), merge.
     pub merge_threshold: f32,
@@ -8666,7 +8735,7 @@ pub fn assess(
 `crates/memorysafe-policy/src/fragility.rs`:
 
 ```rust
-use memorysafe_core::{Score, ScopeStats, ScoredCandidate};
+use memorysafe_core::{ScopeStats, Score, ScoredCandidate};
 
 /// How costly this memory would be to lose.
 ///
@@ -8678,6 +8747,32 @@ use memorysafe_core::{Score, ScopeStats, ScoredCandidate};
 /// absolute — 0.6 similarity is unusual in a tightly clustered corpus and
 /// unremarkable in a diffuse one. This is the "rare class" notion from the
 /// continual-learning lineage, expressed in embedding space.
+///
+/// `0.5` means corpus-typical density: a neighbourhood exactly as dense as
+/// `stats.mean_neighbour_similarity` scores exactly `0.5`. Each side of that
+/// midpoint is normalised by its OWN room, not by a shared denominator —
+/// sparser-than-typical by the room below the baseline (`baseline` itself),
+/// denser-than-typical by the room above it (`1.0 - baseline`). That keeps
+/// both `0.0` and `1.0` reachable at every baseline: normalising both sides
+/// by the same (upward) room would shrink the reachable ceiling as the
+/// baseline moves down — an item with literally no similar neighbours could
+/// then never reach maximum fragility in a diffuse corpus — so a fixed
+/// downstream threshold like "`>= 0.8` = much sparser than typical" would
+/// mean different things, or be unreachable outright, in different corpora.
+/// Do not fold the two branches back into one symmetric-looking expression;
+/// that shared-denominator shape was the actual defect this one fixes.
+///
+/// Downstream policy code reads the `0.5` midpoint and higher thresholds
+/// directly, so this mapping is this function's contract, not an
+/// implementation detail.
+///
+/// **Precondition:** `stats.mean_neighbour_similarity` must already be a
+/// meaningful corpus-level baseline in the sense of `ScopeStats`'s own doc
+/// comment on that field — this function reads it as-is and cannot verify
+/// that on its own, since `stats` and `neighbours` are independent parameters
+/// with no enforced relationship between them. Supplying it unmet (in
+/// particular, the field's `0.0`/`Default` "no data" value while
+/// `item_count < 2`) is a caller error, not a case this function detects.
 pub fn score(neighbours: &[ScoredCandidate], stats: &ScopeStats) -> Score {
     if neighbours.is_empty() {
         return Score::ONE;
@@ -8688,13 +8783,34 @@ pub fn score(neighbours: &[ScoredCandidate], stats: &ScopeStats) -> Score {
     let mut sims: Vec<f32> = neighbours.iter().map(|n| n.relevance).collect();
     sims.sort_by(|a, b| b.total_cmp(a));
     let k = sims.len().min(3);
-    let local_density: f32 = sims[..k].iter().sum::<f32>() / k as f32;
+    // Cosine can be negative; clamping alongside `baseline` below is what
+    // makes each branch's division safe BY CONSTRUCTION rather than by an
+    // epsilon floor (see the branch comments). This discards no real signal:
+    // neighbours anti-correlated with the item are exactly the "as sparse as
+    // it gets" case, which should map to `local_density = 0.0` regardless of
+    // how negative the raw cosine got.
+    let local_density: f32 = (sims[..k].iter().sum::<f32>() / k as f32).clamp(0.0, 1.0);
 
     let baseline = stats.mean_neighbour_similarity.clamp(0.0, 1.0);
-    // How much sparser than typical this neighbourhood is, normalised by the
-    // headroom above the corpus mean.
-    let headroom = (1.0 - baseline).max(1e-3);
-    let relative_sparsity = ((baseline - local_density) / headroom + 1.0) / 2.0;
+
+    // Each side of the `0.5` (corpus-typical) midpoint is normalised by its
+    // OWN room — see the doc comment above for why.
+    let relative_sparsity = if local_density < baseline {
+        // Sparser than typical, normalised by the room below the baseline.
+        // Reachable only when `baseline > 0` (`local_density >= 0` and
+        // `local_density < baseline`), so this division is never by zero.
+        0.5 + 0.5 * (baseline - local_density) / baseline
+    } else if local_density > baseline {
+        // Denser than typical, normalised by the room above it. Reachable
+        // only when `baseline < 1` (`local_density <= 1` and
+        // `local_density > baseline`), so this division is never by zero.
+        0.5 - 0.5 * (local_density - baseline) / (1.0 - baseline)
+    } else {
+        // Exactly typical. Kept as its own case rather than falling into
+        // either branch above: `local_density == baseline` at the extremes
+        // (both `0.0` or both `1.0`) would otherwise divide by zero there.
+        0.5
+    };
 
     Score::clamped(relative_sparsity)
 }
@@ -9202,7 +9318,7 @@ git commit -m "feat(policy): value scoring and pattern-based sensitivity detecti
 - Consumes: `Assessed`, `AdmitContext`, `BaselineConfig`, `Verdict`.
 - Produces: `admit::decide(&Assessed, &AdmitContext, &BaselineConfig, PolicyId) -> Decision`, and `GovernancePolicy::admit` on `BaselinePolicy`.
 
-**The rules, in order.** An exact duplicate is rejected. A near-duplicate is merged into its closest neighbour. Otherwise the item is retained — and if capacity is tight, evictions are selected ascending by `value × (1 − fragility)` until there is room. A candidate that is both highly fragile and highly sensitive gets `Protected` plus a `SensitivityConflict` reason, so the conflict is visible in the audit trail rather than silently resolved. If nothing is evictable and there is no room, the write is rejected with `BudgetExhausted` — never by silently exceeding the budget.
+**The rules, in order.** At or above `duplicate_threshold` the write is rejected. At or above `merge_threshold` it is merged into its closest neighbour. Otherwise the item is retained — and if capacity is tight, evictions are selected ascending by `value × (1 − fragility)` until there is room. A candidate that is both highly fragile and highly sensitive gets `Protected` plus a `SensitivityConflict` reason, so the conflict is visible in the audit trail rather than silently resolved. If nothing is evictable and there is no room, the write is rejected with `BudgetExhausted` — never by silently exceeding the budget.
 
 - [ ] **Step 1: Write the failing test**
 
