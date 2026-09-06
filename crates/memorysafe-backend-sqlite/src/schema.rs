@@ -2,8 +2,13 @@ use rusqlite::Connection;
 
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// The version marker's own table, created and read **before** anything else
+/// touches the file. Everything in `DDL` runs only once the version has been
+/// checked; see `initialise`.
+const META_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);";
+
 const DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS items (
   id                TEXT PRIMARY KEY,
@@ -193,21 +198,29 @@ CREATE INDEX IF NOT EXISTS idx_aggregates_order ON audit_aggregates(
 
 /// Applies pragmas and DDL. Idempotent — safe on every open.
 ///
+/// **The version is checked before anything durable is written.** Only
+/// `busy_timeout` (per-connection, nothing on disk) and `meta`'s own
+/// `CREATE TABLE IF NOT EXISTS` run ahead of it. That ordering is the whole
+/// point: `journal_mode=WAL` is a *persistent* change to the file header and
+/// the rest of `DDL` creates eleven more tables, so checking afterwards means
+/// refusing to open a database you have already converted and extended. An
+/// earlier version of this function did exactly that — probed against a
+/// "version 2" file, it took the table count from 1 to 12 and `journal_mode`
+/// from `delete` to `wal`, and only then declined.
+///
 /// **The pragmas must be applied outside a transaction.** `PRAGMA
 /// foreign_keys` is a **no-op inside one** — SQLite ignores it silently, with
 /// no error — so wrapping the open path in a transaction would turn the
-/// `vectors` cascade off without breaking anything here, and the symptom would
-/// surface tasks later as vectors left behind by a purge.
-/// `tenant::tests::a_freshly_opened_tenant_is_in_wal_mode_with_foreign_keys_on`
-/// asserts the pragmas on a real tenant file and
+/// `vectors` cascade off without breaking anything visible here, and the
+/// symptom would surface tasks later as vectors left behind by a purge.
 /// `tests::initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector`
-/// buy, so the silent version of that refactor now has something to break.
+/// is what breaks if that happens; it starts from a connection with foreign
+/// keys forced off, because this build has them on by default and an
+/// end-state assertion cannot see the difference.
 pub fn initialise(conn: &Connection) -> rusqlite::Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
+    // Per-connection only, and set first so the version read below waits
+    // rather than failing under a concurrent writer.
     conn.pragma_update(None, "busy_timeout", 5000)?;
-    conn.execute_batch(DDL)?;
 
     // `INSERT OR IGNORE` and then check, never an UPSERT. An unconditional
     // UPSERT makes the marker write-only: v1 code opening a v2 file rewrites
@@ -216,6 +229,7 @@ pub fn initialise(conn: &Connection) -> rusqlite::Result<()> {
     // destroy the only evidence of what the file actually is. Refusing to open
     // is the whole value of storing a version, and there is no migration path
     // to offer instead while `SCHEMA_VERSION` is 1.
+    conn.execute_batch(META_DDL)?;
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?1)",
         [SCHEMA_VERSION.to_string()],
@@ -230,11 +244,17 @@ pub fn initialise(conn: &Connection) -> rusqlite::Result<()> {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
             Some(format!(
                 "database is at schema version {stored} and this build expects \
-                 {SCHEMA_VERSION}; there is no migration path, and opening it \
-                 would overwrite the marker"
+                 {SCHEMA_VERSION}; there is no migration path, and this build \
+                 will not convert or extend a file it cannot read"
             )),
         ));
     }
+
+    // Past the gate: now the durable changes.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.execute_batch(DDL)?;
     Ok(())
 }
 
@@ -551,6 +571,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (SCHEMA_VERSION + 1).to_string());
+    }
+
+    /// The refusal must come **before** the file is converted and extended, not
+    /// after. On a real file, not in memory: `journal_mode` is a persistent
+    /// header change and an in-memory database cannot leave `memory`, so the
+    /// interesting assertion would be vacuous there.
+    #[test]
+    fn a_foreign_schema_version_is_refused_before_anything_durable_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key,value) VALUES('schema_version','2');",
+        )
+        .unwrap();
+        let journal_before: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            journal_before, "delete",
+            "the fixture is not in rollback mode"
+        );
+
+        let err = initialise(&conn).unwrap_err();
+        assert!(
+            format!("{err}").contains("schema version"),
+            "expected a version refusal, got: {err}"
+        );
+
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tables, 1,
+            "the refusal ran the DDL first: {tables} tables in a database this \
+             build has just declined to understand"
+        );
+        let journal_after: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            journal_after, journal_before,
+            "the refusal converted the file to WAL on its way out"
+        );
     }
 
     /// `items_fts` is external-content over `items.rowid`, and `items` has no

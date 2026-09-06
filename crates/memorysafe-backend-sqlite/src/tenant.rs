@@ -123,29 +123,6 @@ impl Pool {
         };
         drop(evicted);
     }
-
-    /// A handle whose connection mutex is not poisoned.
-    ///
-    /// A closure that panics while holding the connection poisons its mutex,
-    /// and a poisoned handle sitting in the cache fails **every** later call
-    /// for that tenant. Rather than let one panicking closure brick a tenant
-    /// for the process's lifetime, the poisoned handle is dropped from the
-    /// cache and the tenant is reopened. The poisoned connection is never
-    /// reused: it may be sitting inside a half-finished transaction, which is
-    /// exactly what `PoisonError` is warning about.
-    ///
-    /// Checked once and not in a loop. A connection opened a moment ago can
-    /// only be poisoned by another caller panicking in that window, and
-    /// retrying cannot fix a caller that panics every time — so the second
-    /// poisoning surfaces as a retryable error at the lock site instead.
-    fn healthy_handle(&self, key: &str) -> Result<Handle, BackendError> {
-        let handle = self.handle(key)?;
-        if handle.is_poisoned() {
-            self.evict(key);
-            return self.handle(key);
-        }
-        Ok(handle)
-    }
 }
 
 /// Owns one SQLite file per tenant. Connections are pooled with an LRU so a
@@ -276,20 +253,53 @@ impl TenantManager {
         let pool = Arc::clone(&self.pool);
         let key = tenant.as_str().to_string();
         tokio::task::spawn_blocking(move || {
-            let handle = pool.healthy_handle(&key)?;
-            let mut conn = match handle.lock() {
-                Ok(conn) => conn,
-                // Poisoned in the window between `healthy_handle`'s check and
-                // this lock. Evict so the next call opens a fresh connection,
-                // and say `retryable` — because after the eviction, it is.
-                Err(e) => {
-                    pool.evict(&key);
-                    return Err(storage_error(
-                        format!("tenant connection poisoned by an earlier panic: {e}"),
-                        true,
-                    ));
-                }
+            let handle = pool.handle(&key)?;
+            // The lock attempt is scoped so the borrow of `handle` ends before
+            // it is dropped below; the success path returns from inside it.
+            let poisoned = match handle.lock() {
+                Ok(mut conn) => return f(&mut conn),
+                // Poisoned: a previous closure panicked while holding this
+                // connection. Heal by dropping it and reopening — see "A
+                // panicking closure does not brick the tenant" on the type.
+                //
+                // One healing path, taken at the lock rather than behind an
+                // `is_poisoned()` pre-check. A pre-check needs a second,
+                // narrower branch for the window between checking and locking,
+                // and that branch is not reachable from any test — an untested
+                // branch on the recovery path is the shape this crate keeps
+                // finding. Locking first means the one path is the one the
+                // poison test exercises.
+                // The `PoisonError` carries a guard borrowing the mutex, so
+                // the message is taken out here and the error left behind —
+                // otherwise `handle` could not be dropped below.
+                Err(e) => e.to_string(),
             };
+
+            // Release the poisoned connection **before** reopening, both
+            // references. A closure that panicked inside a write transaction
+            // leaves that connection holding SQLite's write lock, so a
+            // replacement opened while it is still alive blocks for the whole
+            // `busy_timeout` and then fails: measured at 5.019s ending in
+            // `database is locked`, against 6.4ms and success once it is
+            // dropped.
+            pool.evict(&key);
+            drop(handle);
+
+            // Two callers healing the same tenant at once can each evict the
+            // other's fresh handle and end up on separate connections. That is
+            // the same two-connection state ordinary capacity pressure
+            // produces, which `with_write` already covers, so it is benign
+            // rather than unhandled.
+            let fresh = pool.handle(&key)?;
+            let mut conn = fresh.lock().map_err(|_| {
+                // Both attempts poisoned: another caller panicked in the
+                // window. `retryable` is the right advice — the next call runs
+                // this same healing path from the top.
+                storage_error(
+                    format!("tenant connection poisoned by an earlier panic: {poisoned}"),
+                    true,
+                )
+            })?;
             f(&mut conn)
         })
         .await
@@ -452,11 +462,20 @@ mod tests {
     /// file. Neither was asserted anywhere before this test existed, and by
     /// this project's own standard an untested mechanism reads as removable.
     ///
-    /// `PRAGMA foreign_keys` is a **no-op inside a transaction**, so the way
-    /// this breaks is a refactor that wraps the open path in one: no error, no
-    /// failing test in this crate, and the symptom surfaces tasks later as
-    /// vectors a purge left behind. WAL is what `with_conn`'s cross-tenant
-    /// concurrency and the transient two-connection case both rest on.
+    /// **Read what this covers narrowly.** It kills the deletion of
+    /// `journal_mode=WAL`. It does **not** kill anything on the foreign-key
+    /// side: the bundled SQLite is compiled with `DEFAULT_FOREIGN_KEYS` (it is
+    /// in `PRAGMA compile_options`), so a fresh connection reads `1` before
+    /// `initialise` touches it, and this assertion stays green with the
+    /// pragma line deleted *and* with it wrapped in a transaction, where it is
+    /// a documented silent no-op. Both mutants were run and both survived
+    /// here. This test cannot escape that masking, because the manager opens
+    /// the connection itself and nothing can force the pragma off first —
+    /// `schema::tests::initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector`
+    /// is the one that does, and it is what actually enforces the pragma.
+    /// What this test adds is the end state on a **real file** rather than
+    /// in memory, which is where WAL and the `-wal` sidecar can be seen at
+    /// all.
     #[tokio::test]
     async fn a_freshly_opened_tenant_is_in_wal_mode_with_foreign_keys_on() {
         let dir = tempfile::tempdir().unwrap();
@@ -555,6 +574,60 @@ mod tests {
             .unwrap();
         assert_eq!(value, "kept");
         assert_eq!(mgr.open_count(), 2, "`forget` did not drop the pool entry");
+    }
+
+    /// Healing must **release** the poisoned connection, not merely stop using
+    /// it. A closure that panics inside a write transaction leaves that
+    /// connection holding SQLite's write lock, and it keeps holding it for as
+    /// long as any `Arc` to it is alive. Evicting the cache's reference while
+    /// the healing caller still holds its own leaves the replacement blocking
+    /// on `busy_timeout` — 5s, and then `database is locked`, from a recovery
+    /// path whose entire purpose is that one bad closure cannot take a tenant
+    /// out.
+    ///
+    /// The bound is deliberately far below the 5s `busy_timeout` and far above
+    /// the ~7ms the healed path takes, so it discriminates without being
+    /// timing-sensitive.
+    #[tokio::test]
+    async fn healing_releases_the_write_lock_the_panicking_closure_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = TenantManager::new(dir.path().to_path_buf(), 8);
+        let t = TenantId::new("t").unwrap();
+
+        let blown = mgr
+            .with_write(&t, |c| -> Result<(), BackendError> {
+                c.execute_batch("BEGIN IMMEDIATE").sql()?;
+                c.execute(
+                    "INSERT INTO meta(key,value) VALUES('probe','uncommitted')",
+                    [],
+                )
+                .sql()?;
+                panic!("a closure in Task 20 unwrapped something mid-transaction")
+            })
+            .await;
+        assert!(blown.is_err(), "a panicking closure returned Ok");
+
+        let started = std::time::Instant::now();
+        let rows: i64 = mgr
+            .with_write(&t, |c| {
+                c.execute("INSERT INTO meta(key,value) VALUES('after','ok')", [])
+                    .sql()?;
+                c.query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0))
+                    .sql()
+            })
+            .await
+            .expect("the tenant did not recover from a panic inside a transaction");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the replacement connection waited on the poisoned one's write lock \
+             for {elapsed:?}; the poisoned connection was not dropped before \
+             the reopen"
+        );
+        // schema_version + after. The panicking transaction rolled back with
+        // the connection it was opened on.
+        assert_eq!(rows, 2, "the uncommitted write survived the panic");
     }
 
     /// **The rejected implementation is a `with_write` that acquires no lock at
