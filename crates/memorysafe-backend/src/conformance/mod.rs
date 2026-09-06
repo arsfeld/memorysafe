@@ -5,8 +5,10 @@
 //! lie. Backends call `run_conformance_suite` from their own integration test.
 
 pub mod atomicity;
+pub mod capacity;
 pub mod fixtures;
 pub mod isolation;
+pub mod retrieval;
 
 pub use fixtures as fx;
 
@@ -36,7 +38,14 @@ pub trait BackendFactory: Send + Sync {
 /// name promises more than it can check; read it as "the end state after a
 /// successful apply is internally consistent," not as proof the three
 /// writes committed as one transaction.
-pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) {
+///
+/// `F::B: 'static` is required because `capacity::concurrent_admits_do_not_double_count`
+/// hands `Arc<F::B>` to `tokio::spawn`, which demands a `'static` future.
+/// Every real backend owns its state outright and satisfies this trivially.
+pub async fn run_conformance_suite<F: BackendFactory>(factory: &F)
+where
+    F::B: 'static,
+{
     macro_rules! run {
         ($($test:path),* $(,)?) => {
             $(
@@ -56,5 +65,18 @@ pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) {
         atomicity::every_mutation_writes_exactly_one_audit_record,
         atomicity::idempotent_writes_replay_the_original_outcome,
         atomicity::idempotency_conflict_on_different_payload,
+        retrieval::sensitivity_ceiling_is_enforced_in_the_query,
+        retrieval::tag_and_kind_filters_narrow_results,
+        retrieval::vector_search_ranks_by_similarity,
+        retrieval::keyword_search_finds_exact_terms,
+        retrieval::keyword_search_escapes_user_input,
+        retrieval::hybrid_returns_both_signal_sources,
+        retrieval::pagination_is_stable,
+        retrieval::pending_embedding_items_are_excluded_when_asked,
+        retrieval::cross_model_vectors_are_rejected,
+        capacity::capacity_accounting_tracks_items_and_bytes,
+        capacity::eviction_releases_capacity,
+        capacity::concurrent_admits_do_not_double_count,
+        capacity::scope_stats_reflect_the_corpus,
     );
 }

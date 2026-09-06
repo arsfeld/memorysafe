@@ -64,6 +64,13 @@ pub trait Backend: Send + Sync {
 
     async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, BackendError>;
 
+    /// Must impose a *total* order over the scope's items. Ordering by
+    /// timestamp alone is insufficient: a bulk import can leave many rows
+    /// with an identical `created_at`, and an unstable sort under
+    /// `LIMIT`/`OFFSET` paging can then return the same row on two pages
+    /// while silently dropping another. Break ties with a unique key such as
+    /// `id` so paging stays stable regardless of how many rows share a
+    /// timestamp.
     async fn list(&self, scope: &Scope, page: &Page) -> Result<Vec<MemoryItem>, BackendError>;
 
     async fn audit(

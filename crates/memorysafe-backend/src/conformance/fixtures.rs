@@ -51,6 +51,19 @@ pub fn item_with(
     i
 }
 
+/// Same as `item`, but with a caller-supplied `created_at` instead of the
+/// fixed `UNIX_EPOCH` above. `item`'s timestamp is pinned so most conformance
+/// runs are deterministic and comparable, but that pin means many items tie
+/// under `ORDER BY created_at` — exactly the shape a real bulk import
+/// produces, and pagination must stay stable across it. Tests that need
+/// distinct, ordered timestamps (Task 17's `pagination_is_stable`) use this
+/// builder instead of forking `item` or reaching into its fields directly.
+pub fn item_at(scope: &Scope, body: &str, created_at: OffsetDateTime) -> MemoryItem {
+    let mut i = item(scope, body);
+    i.created_at = created_at;
+    i
+}
+
 pub fn vector_for(body: &str) -> QuantizedVector {
     QuantizedVector::from_embedding(&embedder().embed(body).unwrap())
 }
@@ -99,6 +112,7 @@ pub fn evict_txn(scope: &Scope, evictions: Vec<ItemId>) -> WriteTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::Duration;
 
     // Task 14's `WriteTransaction::is_valid()` rejects a transaction whose
     // upserted item, or whose audit record, disagrees with the transaction's
@@ -148,6 +162,28 @@ mod tests {
     fn evict_txn_produces_a_valid_transaction() {
         let s = scope();
         assert!(evict_txn(&s, vec![ItemId::new()]).is_valid());
+    }
+
+    // Task 17's `item_at` is the fixture `pagination_is_stable` depends on to
+    // avoid tied timestamps. A mutation that silently ignores the
+    // `created_at` argument (falling back to `item`'s pinned
+    // `UNIX_EPOCH`) would make every "distinct, increasing timestamp" in
+    // that test identical again — the exact bug this builder exists to
+    // avoid — and reintroduce the pagination flakiness this task was asked
+    // to fix. Assert the field directly, not just `is_valid()`: validity
+    // never inspects `created_at`, so it cannot catch that mutation.
+    #[test]
+    fn item_at_uses_the_given_timestamp_not_the_default() {
+        let s = scope();
+        let t = OffsetDateTime::UNIX_EPOCH + Duration::seconds(42);
+        let i = item_at(&s, "a note", t);
+        assert_eq!(i.created_at, t);
+        assert_ne!(
+            i.created_at,
+            OffsetDateTime::UNIX_EPOCH,
+            "item_at must not silently fall back to the default timestamp"
+        );
+        assert!(admit_txn(&s, i, None).is_valid());
     }
 
     // Task 16 introduces three transaction shapes `is_valid()` has never

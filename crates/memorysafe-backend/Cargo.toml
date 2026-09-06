@@ -13,7 +13,7 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
-tokio = { version = "1.53.1", features = ["rt", "macros", "sync"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 base64.workspace = true
 
 [lints]
