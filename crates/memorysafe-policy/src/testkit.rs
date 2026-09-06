@@ -1,8 +1,8 @@
 //! Fixture builders shared by this crate's unit tests.
 
 use memorysafe_core::{
-    ItemId, MemoryItem, Protection, Scope, Score, ScoredCandidate, SensitivityLevel, Source,
-    SourceKind,
+    Candidate, ItemId, MemoryItem, Protection, Scope, Score, ScoredCandidate, SensitivityLevel,
+    Source, SourceKind,
 };
 use time::OffsetDateTime;
 
@@ -40,5 +40,19 @@ pub fn candidate(body: &str, relevance: f32) -> ScoredCandidate {
         value: Score::clamped(0.5),
         fragility: Score::clamped(0.5),
         estimated_tokens: 10,
+    }
+}
+
+/// A pre-admission write candidate, for `value` and `sensitivity` tests, which
+/// operate on `Candidate` rather than the already-admitted `MemoryItem`.
+pub fn candidate_from(body: &str, hint: Option<SensitivityLevel>) -> Candidate {
+    Candidate {
+        body: body.to_string(),
+        kind: "fact".into(),
+        tags: vec![],
+        attrs: Default::default(),
+        sensitivity_hint: hint,
+        embedding: None,
+        byte_size: body.len() as u64,
     }
 }
