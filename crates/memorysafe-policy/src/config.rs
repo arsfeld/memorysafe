@@ -47,6 +47,15 @@ pub struct BaselineConfig {
     /// `value::score`'s content-signal tradeoff: 1.0 is pure specificity
     /// (length relative to the corpus median), 0.0 is pure lexical density.
     pub content_specificity_weight: f32,
+    /// Share of `value::score`'s blend given to an explicit caller-supplied
+    /// `Candidate.attrs["value_weight"]`, when present — spec §363's
+    /// "explicit caller weight", one weighted term alongside content
+    /// specificity and source trust (and, later, recency — Task 29), never a
+    /// substitute for them. The remaining `1.0 - this` share stays split
+    /// between content and source trust in their own existing ratio, so an
+    /// absent `value_weight` reproduces exactly what those two alone would
+    /// produce — see `value::score`'s doc comment for the full shape.
+    pub caller_weight_weight: f32,
     /// `value::specificity`'s floor under a scope's reported median item
     /// size, guarding the ratio when a scope has too little data (or a
     /// degenerate `0`) for the median to mean anything yet — see
@@ -90,6 +99,7 @@ impl Default for BaselineConfig {
             source_trust_tool: 0.7,
             source_trust_default: 0.5,
             content_specificity_weight: 0.6,
+            caller_weight_weight: 0.25,
             specificity_median_floor_bytes: 50,
             credential_token_min_len: 20,
             phone_digit_min_count: 10,

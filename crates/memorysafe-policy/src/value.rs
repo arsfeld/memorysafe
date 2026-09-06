@@ -48,21 +48,54 @@ fn source_trust(cand: &Candidate, cfg: &BaselineConfig) -> f32 {
     }
 }
 
-/// How useful this memory is likely to be. An explicit caller weight
-/// (`Candidate.attrs["value_weight"]`) dominates when supplied, because the
-/// caller knows things the corpus does not; otherwise value blends content
-/// signal (specificity and lexical density, per
-/// `cfg.content_specificity_weight`) with source trust, per
-/// `cfg.source_trust_weight`.
+/// How useful this memory is likely to be — spec §363's "weighted
+/// combination of content specificity, source trust, explicit caller
+/// weight, and recency" (recency excluded: `Candidate` carries no
+/// timestamps, and at admit time every candidate is equally recent —
+/// recency is realised as decay during maintenance, Task 29).
+///
+/// The blend is built in two stages, both driven by config so a reader can
+/// check each one against the spec sentence directly:
+///
+/// 1. `base` blends content signal (specificity and lexical density, mixed
+///    by `cfg.content_specificity_weight`) with source trust, mixed by
+///    `cfg.source_trust_weight` — this is the whole of `base`'s job, and it
+///    is exactly what `score` returns when no caller weight is supplied.
+/// 2. If `Candidate.attrs["value_weight"]` is present, it is folded in as a
+///    THIRD weighted term, not a replacement for the first two: the caller
+///    value (itself clamped to `[0,1]` before blending, so a 5.0 behaves
+///    exactly as 1.0 would, not merely as whatever the final clamp below
+///    happens to allow through) gets `cfg.caller_weight_weight`'s share, and
+///    `base` keeps the rest. A caller cannot make an item maximally valuable
+///    by assertion — the corpus- and trust-derived signal always keeps
+///    `1.0 - cfg.caller_weight_weight` of the vote.
+///
+/// **Absence is neutral, not zero.** `Candidate.attrs.get(...).and_then(...)`
+/// already distinguishes three inputs: the key missing, the key present with
+/// a non-numeric value (treated the same as missing — a malformed hint
+/// should not fail a write, but this does mean "absent" covers more than
+/// literally-absent; do not fold a fourth meaning into it without noting it
+/// here), and the key present with a number. Only the first two skip stage 2
+/// entirely and return `base` untouched — that is what makes an
+/// un-annotated item score identically to how it always did. `Some(0.0)` is
+/// NOT one of those two: it is the caller explicitly asserting "this is
+/// worthless," and it must drag the score down through stage 2 like any
+/// other caller value. Collapsing `Some(0.0)` into "absent" (e.g. an
+/// `unwrap_or(0.0)`-shaped shortcut) would be a governance system ignoring
+/// an explicit instruction from the only person who bothered to give one.
 pub fn score(cand: &Candidate, stats: &ScopeStats, cfg: &BaselineConfig) -> Score {
-    if let Some(w) = cand.attrs.get("value_weight").and_then(|v| v.as_f64()) {
-        return Score::clamped(w as f32);
-    }
-
     let content = cfg.content_specificity_weight * specificity(cand, stats, cfg)
         + (1.0 - cfg.content_specificity_weight) * lexical_density(cand);
     let trust = source_trust(cand, cfg);
-    let blended = (1.0 - cfg.source_trust_weight) * content + cfg.source_trust_weight * trust;
+    let base = (1.0 - cfg.source_trust_weight) * content + cfg.source_trust_weight * trust;
+
+    let blended = match cand.attrs.get("value_weight").and_then(|v| v.as_f64()) {
+        Some(w) => {
+            let caller = Score::clamped(w as f32).get();
+            cfg.caller_weight_weight * caller + (1.0 - cfg.caller_weight_weight) * base
+        }
+        None => base,
+    };
     Score::clamped(blended)
 }
 
@@ -116,14 +149,66 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_caller_weight_is_honoured() {
-        let cfg = BaselineConfig::default();
-        let mut weighted = candidate_from("a short note", None);
+    fn an_explicit_caller_weight_is_one_weighted_term_not_an_override() {
+        // Same fixture as `score_blends_content_and_trust_by_the_configured_weight`:
+        // base (content/trust alone) = 0.62. A caller weight of 1.0 must move
+        // the score TOWARD 1.0 by exactly `cfg.caller_weight_weight`'s share
+        // — 0.25*1.0 + 0.75*0.62 = 0.715 — not REPLACE it with 1.0, which is
+        // the defect this test exists to catch (the old early-return
+        // implementation would return exactly `Score::ONE` here).
+        let cfg = BaselineConfig::default(); // caller_weight_weight = 0.25
+        let plain = Candidate {
+            byte_size: 300,
+            ..candidate_from("echo echo", None)
+        };
+        let mut weighted = plain.clone();
         weighted
             .attrs
             .insert("value_weight".into(), serde_json::json!(1.0));
-        let plain = candidate_from("a short note", None);
-        assert!(score(&weighted, &stats(), &cfg) > score(&plain, &stats(), &cfg));
+
+        let base = score(&plain, &stats(), &cfg);
+        let w = score(&weighted, &stats(), &cfg);
+
+        assert!((base.get() - 0.62).abs() < 1e-6, "got {base:?}");
+        assert!((w.get() - 0.715).abs() < 1e-6, "got {w:?}");
+        assert!(w > base);
+        assert_ne!(
+            w.get(),
+            1.0,
+            "a caller weight of 1.0 must not override the computed score entirely"
+        );
+    }
+
+    #[test]
+    fn an_absent_caller_weight_differs_from_an_explicit_zero() {
+        // `None` (key not present) and `Some(0.0)` (key present, value zero)
+        // are different inputs to `attrs.get(...).and_then(as_f64)` and must
+        // produce different scores: absence is neutral (the base blend,
+        // untouched), while an explicit zero is the caller asserting "this
+        // is worthless" and must pull the score DOWN through the weighted
+        // blend. Collapsing the two (e.g. an `unwrap_or(0.0)` shortcut) would
+        // make an explicit zero indistinguishable from silence.
+        let cfg = BaselineConfig::default(); // caller_weight_weight = 0.25
+        let absent_cand = Candidate {
+            byte_size: 300,
+            ..candidate_from("echo echo", None)
+        };
+        let mut zeroed_cand = absent_cand.clone();
+        zeroed_cand
+            .attrs
+            .insert("value_weight".into(), serde_json::json!(0.0));
+
+        let absent = score(&absent_cand, &stats(), &cfg);
+        let zeroed = score(&zeroed_cand, &stats(), &cfg);
+
+        // base = 0.62 (see `score_blends_content_and_trust_by_the_configured_weight`).
+        assert!((absent.get() - 0.62).abs() < 1e-6, "got {absent:?}");
+        // 0.25*0.0 + 0.75*0.62 = 0.465
+        assert!((zeroed.get() - 0.465).abs() < 1e-6, "got {zeroed:?}");
+        assert!(
+            zeroed < absent,
+            "an explicit zero must drag the score down, not sit at the neutral base"
+        );
     }
 
     #[test]
@@ -140,24 +225,105 @@ mod tests {
     }
 
     #[test]
-    fn an_out_of_range_caller_weight_is_clamped() {
-        // Unlike the derived content/trust blend (which never leaves [0,1]
-        // given the current formula), a caller-supplied `value_weight` is
-        // not pre-validated and genuinely can be out of range before
-        // `Score::clamped` runs — the one case here that actually exercises
-        // the clamp rather than merely avoiding a panic.
+    fn an_out_of_range_caller_weight_is_clamped_before_blending() {
+        // A caller weight outside [0,1] must be treated exactly as its
+        // nearest valid extreme BEFORE it enters the blend — not merely
+        // relying on the final `Score::clamped` to mop up whatever comes out
+        // the other end. Those two are NOT the same thing once `value_weight`
+        // is a weighted term rather than an override: with
+        // `caller_weight_weight = 0.25` and base = 0.62 (see
+        // `score_blends_content_and_trust_by_the_configured_weight`), a
+        // weight of 5.0 blended WITHOUT input clamping gives
+        // 0.25*5.0 + 0.75*0.62 = 1.715, which the final clamp saturates to
+        // 1.0 — a different number from the correctly-clamped
+        // 0.25*1.0 + 0.75*0.62 = 0.715. Comparing against the weight's own
+        // valid extreme catches the difference; comparing against a bare
+        // `Score::ONE`/`Score::ZERO` (the old assertion, valid only for the
+        // early-return implementation) would not.
         let cfg = BaselineConfig::default();
-        let mut too_high = candidate_from("x", None);
-        too_high
-            .attrs
-            .insert("value_weight".into(), serde_json::json!(5.0));
-        assert_eq!(score(&too_high, &stats(), &cfg), Score::ONE);
+        let cand_with = |w: f64| {
+            let mut c = Candidate {
+                byte_size: 300,
+                ..candidate_from("echo echo", None)
+            };
+            c.attrs.insert("value_weight".into(), serde_json::json!(w));
+            c
+        };
+        let s = stats();
 
-        let mut too_low = candidate_from("x", None);
-        too_low
+        let too_high = score(&cand_with(5.0), &s, &cfg);
+        let at_max = score(&cand_with(1.0), &s, &cfg);
+        assert_eq!(
+            too_high, at_max,
+            "5.0 must score identically to 1.0, not saturate via the final clamp alone"
+        );
+        assert!((at_max.get() - 0.715).abs() < 1e-6, "got {at_max:?}");
+
+        let too_low = score(&cand_with(-3.0), &s, &cfg);
+        let at_min = score(&cand_with(0.0), &s, &cfg);
+        assert_eq!(
+            too_low, at_min,
+            "-3.0 must score identically to 0.0, not saturate via the final clamp alone"
+        );
+        assert!((at_min.get() - 0.465).abs() < 1e-6, "got {at_min:?}");
+    }
+
+    #[test]
+    fn absence_of_caller_weight_is_a_fixed_point_of_the_blend() {
+        // If an absent `value_weight` is truly neutral, scoring a candidate
+        // with it absent, then re-scoring the SAME candidate with
+        // `value_weight` set to that first score, must reproduce the exact
+        // same number: with `C` the content/trust base and `k` the
+        // configured `caller_weight_weight`, a correct implementation gives
+        // `C` when absent, and re-feeding `C` as the caller's own weight
+        // gives `k*C + (1-k)*C = C` again — a fixed point that holds for ANY
+        // `k`, so this does not depend on today's default surviving
+        // unchanged, and needs no separately-maintained copy of the removed
+        // early-return formula to compare against.
+        //
+        // A broken `unwrap_or(0.0)` shortcut discriminates cleanly: it gives
+        // `(1-k)*C` on the first pass (treating absence as an explicit zero),
+        // then `k*(1-k)*C + (1-k)*C = (1-k)(1+k)*C` on the second — which
+        // differs from the first pass for every `k != 0`, so `second == first`
+        // fails.
+        //
+        // The fixture pins specificity, lexical density, and source trust
+        // ALL to exactly 0.5: content = w*0.5+(1-w)*0.5 = 0.5 for ANY
+        // `content_specificity_weight`, and base = (1-t)*0.5+t*0.5 = 0.5 for
+        // ANY `source_trust_weight` — so C = 0.5 regardless of those two
+        // weights, a clean dyadic value so both passes land on the exact
+        // same f32 by construction rather than by floating-point luck.
+        let cfg = BaselineConfig::default();
+        let s = stats(); // median_item_bytes: 100
+        let cand = Candidate {
+            byte_size: 100,                      // 1x median -> specificity = 0.5
+            ..candidate_from("echo echo", None)  // lexical_density = 0.5; trust unset -> 0.5
+        };
+
+        let first = score(&cand, &s, &cfg);
+        assert!(
+            first.get() > 0.0,
+            "fixture must have a non-zero base score, or the fixed-point check \
+             cannot fail: both a correct blend and a broken unwrap_or(0.0) \
+             agree trivially at zero"
+        );
+        assert_eq!(
+            first.get(),
+            0.5,
+            "content/trust base must independently be 0.5 here"
+        );
+
+        let mut fed_back = cand.clone();
+        fed_back
             .attrs
-            .insert("value_weight".into(), serde_json::json!(-3.0));
-        assert_eq!(score(&too_low, &stats(), &cfg), Score::ZERO);
+            .insert("value_weight".into(), serde_json::json!(first.get() as f64));
+        let second = score(&fed_back, &s, &cfg);
+
+        assert_eq!(
+            second, first,
+            "an absent value_weight must be a fixed point of the blend: re-feeding \
+             the absent score as the caller's own weight must reproduce it exactly"
+        );
     }
 
     // The tests above only prove an ordering (`rich > thin`, `weighted >
