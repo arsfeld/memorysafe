@@ -214,6 +214,64 @@ pub fn delete(conn: &Connection, scope: &Scope, id: &ItemId) -> Result<u64, Back
     Ok(size.max(0) as u64)
 }
 
+/// Folds a new body and metadata into an existing item. Returns the byte-size
+/// delta so capacity accounting stays exact.
+///
+/// **Scoped the same way `get` is, and for the same reason.** The lookup
+/// below is `get(conn, scope, target)`, not a bare `SELECT ... WHERE id =
+/// ?1`, so a merge naming an id that belongs to a different subject or
+/// namespace fails with `MergeTargetMissing` exactly as if the id did not
+/// exist at all — it does not reach across the scope boundary to rewrite
+/// someone else's item. The `UPDATE` below repeats the same predicate rather
+/// than trusting the id alone, so the write path and the read path cannot
+/// drift apart on this even if a future edit changes one without the other.
+pub fn merge(
+    conn: &Connection,
+    scope: &Scope,
+    target: &ItemId,
+    body: &str,
+    tags: &[String],
+    attrs: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<i64, BackendError> {
+    let Some(existing) = get(conn, scope, target)? else {
+        return Err(BackendError::MergeTargetMissing(target.clone()));
+    };
+    let before = existing.byte_size() as i64;
+
+    let mut merged_tags = existing.tags.clone();
+    for t in tags {
+        if !merged_tags.contains(t) {
+            merged_tags.push(t.clone());
+        }
+    }
+    let mut merged_attrs = existing.attrs.clone();
+    for (k, v) in attrs {
+        merged_attrs.insert(k.clone(), v.clone());
+    }
+
+    let mut updated = existing;
+    updated.body = body.to_string();
+    updated.tags = merged_tags;
+    updated.attrs = merged_attrs;
+    let after = updated.byte_size() as i64;
+
+    conn.execute(
+        "UPDATE items SET body = ?4, tags = ?5, attrs = ?6, byte_size = ?7
+         WHERE id = ?1 AND subject = ?2 AND namespace = ?3",
+        params![
+            target.as_str(),
+            scope.subject.as_str(),
+            scope.namespace.as_str(),
+            updated.body,
+            serde_json::to_string(&updated.tags).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&updated.attrs).unwrap_or_else(|_| "{}".into()),
+            after,
+        ],
+    )
+    .sql()?;
+    Ok(after - before)
+}
+
 pub fn exists(conn: &Connection, scope: &Scope, id: &ItemId) -> Result<bool, BackendError> {
     let n: i64 = conn
         .query_row(
@@ -437,5 +495,160 @@ mod tests {
         assert_eq!(page(0), ids[0..2].to_vec());
         assert_eq!(page(2), ids[2..4].to_vec());
         assert!(page(4).is_empty());
+    }
+
+    /// `merge` folds the new tags and attrs into the existing ones rather
+    /// than replacing either wholesale, and returns the byte-size *delta* —
+    /// not the old size and not the new size — so capacity accounting can
+    /// apply it as a signed adjustment.
+    ///
+    /// Existing and supplied tags/attrs are deliberately disjoint except for
+    /// one shared tag, so folding is distinguishable from either "keep the
+    /// old set" (would lose `"added"`/`k-new`) or "replace with the new set"
+    /// (would lose `"kept"`/`k-old`).
+    #[test]
+    fn merge_folds_tags_and_attrs_and_returns_the_signed_byte_delta() {
+        let conn = db();
+        let s = scope("s", "n");
+        let mut existing = item(&s, "a short body");
+        existing.tags = vec!["kept".into(), "shared".into()];
+        existing
+            .attrs
+            .insert("k-old".into(), serde_json::Value::String("old".into()));
+        insert(&conn, &existing).unwrap();
+        let before = existing.byte_size() as i64;
+
+        let new_body = "a considerably longer replacement body than the original one";
+        let new_tags = vec!["shared".to_string(), "added".to_string()];
+        let mut new_attrs = BTreeMap::new();
+        new_attrs.insert("k-new".to_string(), serde_json::Value::String("new".into()));
+
+        let delta = merge(&conn, &s, &existing.id, new_body, &new_tags, &new_attrs).unwrap();
+
+        let stored = get(&conn, &s, &existing.id)
+            .unwrap()
+            .expect("merge target survives");
+        assert_eq!(stored.body, new_body);
+        let mut tags = stored.tags.clone();
+        tags.sort();
+        assert_eq!(
+            tags,
+            vec![
+                "added".to_string(),
+                "kept".to_string(),
+                "shared".to_string()
+            ],
+            "merge must fold tags rather than replacing or dropping either side"
+        );
+        assert_eq!(
+            stored.attrs.get("k-old").and_then(|v| v.as_str()),
+            Some("old"),
+            "merge dropped an attr the target already had"
+        );
+        assert_eq!(
+            stored.attrs.get("k-new").and_then(|v| v.as_str()),
+            Some("new"),
+            "merge dropped an attr it was supplied"
+        );
+
+        let after = stored.byte_size() as i64;
+        assert_eq!(
+            delta,
+            after - before,
+            "merge must return the signed byte-size delta, not the old or \
+             new size alone"
+        );
+        assert!(delta > 0, "the premise: the replacement body is longer");
+    }
+
+    /// A merge whose supplied tag already exists on the target must not
+    /// create a duplicate.
+    #[test]
+    fn merge_does_not_duplicate_a_tag_the_target_already_has() {
+        let conn = db();
+        let s = scope("s", "n");
+        let mut existing = item(&s, "body");
+        existing.tags = vec!["shared".into()];
+        insert(&conn, &existing).unwrap();
+
+        merge(
+            &conn,
+            &s,
+            &existing.id,
+            "body",
+            &["shared".to_string()],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let stored = get(&conn, &s, &existing.id).unwrap().unwrap();
+        assert_eq!(stored.tags, vec!["shared".to_string()]);
+    }
+
+    /// A shrinking merge returns a *negative* delta — the case that tells
+    /// apart "returns the delta" from "returns the new size", which would
+    /// also be positive here and pass a test that only ever grows the body.
+    #[test]
+    fn merge_returns_a_negative_delta_when_the_body_shrinks() {
+        let conn = db();
+        let s = scope("s", "n");
+        let existing = item(&s, "a body long enough to shrink meaningfully");
+        insert(&conn, &existing).unwrap();
+        let before = existing.byte_size() as i64;
+
+        let delta = merge(&conn, &s, &existing.id, "short", &[], &BTreeMap::new()).unwrap();
+        let stored = get(&conn, &s, &existing.id).unwrap().unwrap();
+        let after = stored.byte_size() as i64;
+
+        assert!(delta < 0, "expected a negative delta, got {delta}");
+        assert_eq!(delta, after - before);
+    }
+
+    /// `merge` cannot reach a target in a different subject or namespace: it
+    /// reports `MergeTargetMissing`, the same as if the id did not exist at
+    /// all, because the lookup goes through the scoped `get` rather than a
+    /// bare `SELECT ... WHERE id = ?1`.
+    #[test]
+    fn merge_target_lookup_is_scoped_by_subject_and_namespace() {
+        let conn = db();
+        let home = scope("s", "n");
+        let elsewhere = scope("other-s", "n");
+        let target = item(&elsewhere, "not home's item");
+        insert(&conn, &target).unwrap();
+
+        let err = merge(
+            &conn,
+            &home,
+            &target.id,
+            "stolen body",
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BackendError::MergeTargetMissing(id) if *id == target.id),
+            "expected MergeTargetMissing, got {err:?}"
+        );
+
+        let survivor = get(&conn, &elsewhere, &target.id)
+            .unwrap()
+            .expect("target untouched");
+        assert_eq!(
+            survivor.body, target.body,
+            "a cross-scope merge rewrote the target"
+        );
+    }
+
+    /// A target that genuinely does not exist reports the same error as one
+    /// that exists in a different scope — a caller cannot distinguish "wrong
+    /// scope" from "never existed" from the error alone, which is the point:
+    /// neither should leak whether a foreign id is in use.
+    #[test]
+    fn merge_target_missing_entirely_reports_merge_target_missing() {
+        let conn = db();
+        let s = scope("s", "n");
+        let ghost = ItemId::new();
+        let err = merge(&conn, &s, &ghost, "body", &[], &BTreeMap::new()).unwrap_err();
+        assert!(matches!(&err, BackendError::MergeTargetMissing(id) if *id == ghost));
     }
 }

@@ -28,15 +28,15 @@
 //! - `retrieval::keyword_search_escapes_user_input` (Task 22), paired with
 //!   `retrieval::keyword_search_finds_exact_terms`.
 //!
-//! The remaining three tests of the atomicity module are bound by the task
-//! that supplies the method they observe, and are deliberately absent rather
-//! than bound-and-failing:
+//! Task 23 adds merge, capacity accounting and idempotent writes to `apply`,
+//! and binds the four `capacity` conformance tests plus the three remaining
+//! `atomicity` ones below:
 //!
-//! - `atomicity::a_failed_transaction_leaves_no_trace` — requires a merge and
-//!   `BackendError::MergeTargetMissing`. Task 23.
+//! - `atomicity::a_failed_transaction_leaves_no_trace` — required a merge and
+//!   `BackendError::MergeTargetMissing`, both new in Task 23.
 //! - `atomicity::idempotent_writes_replay_the_original_outcome` and
-//!   `atomicity::idempotency_conflict_on_different_payload` — require the
-//!   `idempotency` table's read-write path. Task 23.
+//!   `atomicity::idempotency_conflict_on_different_payload` — required the
+//!   `idempotency` table's read-write path, also new in Task 23.
 //!
 //! `isolation::retrieval_never_crosses_a_scope_boundary` bound at Task 22: it
 //! reads through *both* `retrieve_candidates` and `neighbours`, and Task 21
@@ -47,7 +47,7 @@
 //! is real.
 
 use memorysafe_backend::conformance::retrieval;
-use memorysafe_backend::conformance::{BackendFactory, atomicity, isolation};
+use memorysafe_backend::conformance::{BackendFactory, atomicity, capacity, isolation};
 use memorysafe_backend_sqlite::SqliteBackend;
 
 /// Each test gets a backend rooted in its own `TempDir`. The directory is
@@ -174,4 +174,47 @@ async fn recall_updates_access_statistics() {
 #[tokio::test]
 async fn retrieval_never_crosses_a_scope_boundary() {
     isolation::retrieval_never_crosses_a_scope_boundary(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn capacity_accounting_tracks_items_and_bytes() {
+    capacity::capacity_accounting_tracks_items_and_bytes(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn eviction_releases_capacity() {
+    capacity::eviction_releases_capacity(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn concurrent_admits_do_not_double_count() {
+    capacity::concurrent_admits_do_not_double_count(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn scope_stats_reflect_the_corpus() {
+    capacity::scope_stats_reflect_the_corpus(&SqliteFactory).await;
+}
+
+// `admit_evict_and_audit_commit_together`,
+// `an_invalid_transaction_is_rejected_and_writes_nothing` and
+// `every_mutation_writes_exactly_one_audit_record` are NOT added here: the
+// items-and-audit task already bound all three, having found them satisfiable
+// once `apply` wrote items, evictions and the audit row together. Re-adding
+// them is a duplicate `#[tokio::test]` name in one module and does not
+// compile. Only `a_failed_transaction_leaves_no_trace` was genuinely deferred
+// to this task, because it needs a merge and `MergeTargetMissing`.
+#[tokio::test]
+async fn a_failed_transaction_leaves_no_trace() {
+    atomicity::a_failed_transaction_leaves_no_trace(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn idempotent_writes_replay_the_original_outcome() {
+    atomicity::idempotent_writes_replay_the_original_outcome(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn idempotency_conflict_on_different_payload() {
+    atomicity::idempotency_conflict_on_different_payload(&SqliteFactory).await;
 }

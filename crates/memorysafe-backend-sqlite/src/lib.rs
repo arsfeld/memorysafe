@@ -11,6 +11,7 @@
 
 pub mod aggregates;
 pub mod audit;
+pub mod capacity;
 pub mod items;
 pub mod keyword;
 pub mod retrieve;
@@ -28,7 +29,7 @@ use memorysafe_core::{
     AuditFilter, AuditId, AuditRecord, Budget, CapacityState, Embedding, ItemId, MemoryItem,
     PurgeCascade, Scope, ScopeStats, ScoredCandidate, SensitivityLevel, SubjectId, TenantId,
 };
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use std::path::PathBuf;
 use tenant::{SqlResultExt, TenantManager};
 
@@ -65,12 +66,13 @@ impl SqliteBackend {
 /// **Partial, and deliberately so.** Task 20 implements `get`, `list`,
 /// `audit`, `record_recall` and a first `apply` covering insert, evictions and
 /// the audit row. Task 21 adds vectors and a real `neighbours`. Task 22 adds
-/// keyword search and a real `retrieve_candidates`. Merge and capacity and
-/// idempotency arrive in Task 23, and purge/export/import plus the aggregate
-/// *read* in Task 24. The methods those remaining tasks own return `Ok`
-/// defaults here so the crate compiles and the isolation and atomicity
-/// conformance tests can run at all; each is marked, and none but the ones
-/// already real is bound by a conformance test in this crate's
+/// keyword search and a real `retrieve_candidates`. Task 23 adds merge,
+/// capacity accounting and idempotent writes to `apply`, plus real
+/// `capacity_state`, `scope_stats` and `set_budget`. Only `purge_subject`,
+/// `export`, `import` and the `audit_aggregates` *read* remain, in Task 24.
+/// The four methods that task owns return `Ok` defaults here so the crate
+/// compiles and the isolation and atomicity conformance tests can run at all;
+/// each is marked, and none is bound by a conformance test in this crate's
 /// `tests/conformance.rs` yet.
 #[async_trait]
 impl Backend for SqliteBackend {
@@ -152,57 +154,125 @@ impl Backend for SqliteBackend {
                     .into(),
             ));
         }
-        // `is_valid()` accepts a merge-only transaction, and this task does not
-        // implement merges — so without this guard `apply` performs the
-        // evictions, writes the audit row, commits, and returns `Ok` for a
-        // request whose merge half it silently discarded. A stub returning a
-        // default is recoverable; reporting success for work not done is not.
-        // The merge task removes this and implements the branch.
-        if txn.merge.is_some() {
-            return Err(BackendError::Storage {
-                message: "merge is not implemented in this build; refusing rather than \
-                          applying the rest of the transaction and reporting success"
-                    .into(),
-                retryable: false,
-            });
-        }
         let tenant = txn.scope.tenant.clone();
         self.tenants
             .with_write(&tenant, move |conn| {
+                // Idempotency is checked inside the write lock, so a retry
+                // racing the original cannot slip past. The lookup binds all
+                // three columns of the key — `subject`, `namespace` and
+                // `key` — never `key` alone: `idempotency`'s primary key is
+                // `(subject, namespace, key)` precisely because two subjects
+                // may choose the same caller-supplied key, and a lookup that
+                // ignored subject/namespace would replay one subject's
+                // stored `AppliedWrite` — `item_id` and `audit_id` included —
+                // to another. See `schema::idempotency`'s DDL comment.
+                if let Some(key) = &txn.idempotency_key {
+                    let prior: Option<(String, String)> = conn
+                        .query_row(
+                            "SELECT payload_digest, outcome FROM idempotency
+                             WHERE subject = ?1 AND namespace = ?2 AND key = ?3",
+                            params![
+                                txn.scope.subject.as_str(),
+                                txn.scope.namespace.as_str(),
+                                key
+                            ],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        // `.optional()`, not `.ok()`: only "no such row" may
+                        // fall through to a fresh apply below — a genuine
+                        // storage error must still propagate rather than be
+                        // read as "never applied before".
+                        .optional()
+                        .sql()?;
+                    if let Some((digest, outcome)) = prior {
+                        if txn.payload_digest.as_deref() != Some(digest.as_str()) {
+                            return Err(BackendError::IdempotencyConflict);
+                        }
+                        let mut replay: AppliedWrite = serde_json::from_str(&outcome)
+                            .map_err(|e| tenant::storage_error(e, false))?;
+                        replay.replayed = true;
+                        replay.replayed_outcome = Some(outcome);
+                        return Ok(replay);
+                    }
+                }
+
                 let tx = conn
                     .transaction()
                     .map_err(|e| tenant::storage_error(e, false))?;
+                capacity::ensure_row(&tx, &txn.scope)?;
 
+                let mut delta_items: i64 = 0;
+                let mut delta_bytes: i64 = 0;
                 let mut evicted = Vec::new();
+
                 for id in &txn.evictions {
-                    items::delete(&tx, &txn.scope, id)?;
+                    let size = items::delete(&tx, &txn.scope, id)?;
                     vectors::delete(&tx, id)?;
+                    if size > 0 {
+                        delta_items -= 1;
+                        delta_bytes -= size as i64;
+                    }
                     evicted.push(id.clone());
                 }
 
                 let mut item_id = None;
+
                 if let Some(w) = &txn.upsert {
                     items::insert(&tx, &w.item)?;
                     if let Some(v) = &w.vector {
                         vectors::insert(&tx, &w.item.id, &txn.scope, v)?;
                     }
+                    delta_items += 1;
+                    delta_bytes += w.item.byte_size() as i64;
                     item_id = Some(w.item.id.clone());
                 }
 
-                let audit_id = audit::insert(&tx, &txn.audit)?;
-                // Same transaction as the audit row, never a follow-up write:
-                // an aggregate that can diverge from the detail rows it
-                // summarises is worse than no aggregate.
-                aggregates::increment(&tx, &txn.audit)?;
-                tx.commit().map_err(|e| tenant::storage_error(e, false))?;
+                if let Some(m) = &txn.merge {
+                    let diff =
+                        items::merge(&tx, &txn.scope, &m.target, &m.body, &m.tags, &m.attrs)?;
+                    if let Some(v) = &m.vector {
+                        vectors::insert(&tx, &m.target, &txn.scope, v)?;
+                    }
+                    delta_bytes += diff;
+                    item_id = Some(m.target.clone());
+                }
 
-                Ok(AppliedWrite {
+                capacity::adjust(&tx, &txn.scope, delta_items, delta_bytes)?;
+                let audit_id = audit::insert(&tx, &txn.audit)?;
+                // Carried forward from Task 20's partial `apply`. This block
+                // replaces that one wholesale, so an increment omitted here
+                // is an aggregate table that is never written at all — which
+                // is how it was lost once already.
+                aggregates::increment(&tx, &txn.audit)?;
+
+                let applied = AppliedWrite {
                     item_id,
                     audit_id,
                     evicted,
                     replayed: false,
                     replayed_outcome: None,
-                })
+                };
+
+                if let Some(key) = &txn.idempotency_key {
+                    tx.execute(
+                        "INSERT INTO idempotency (key, subject, namespace, payload_digest,
+                             outcome, at)
+                         VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![
+                            key,
+                            txn.scope.subject.as_str(),
+                            txn.scope.namespace.as_str(),
+                            txn.payload_digest.clone().unwrap_or_default(),
+                            serde_json::to_string(&applied)
+                                .map_err(|e| tenant::storage_error(e, false))?,
+                            time::OffsetDateTime::now_utc().unix_timestamp(),
+                        ],
+                    )
+                    .sql()?;
+                }
+
+                tx.commit().map_err(|e| tenant::storage_error(e, false))?;
+                Ok(applied)
             })
             .await
     }
@@ -277,18 +347,25 @@ impl Backend for SqliteBackend {
             })
             .await
     }
-    async fn capacity_state(&self, _s: &Scope) -> Result<CapacityState, BackendError> {
-        Ok(CapacityState {
-            budget: Budget::UNBOUNDED,
-            used_items: 0,
-            used_bytes: 0,
-        })
+    async fn capacity_state(&self, scope: &Scope) -> Result<CapacityState, BackendError> {
+        let scope = scope.clone();
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| capacity::state(c, &scope))
+            .await
     }
-    async fn scope_stats(&self, _s: &Scope) -> Result<ScopeStats, BackendError> {
-        Ok(ScopeStats::default())
+    async fn scope_stats(&self, scope: &Scope) -> Result<ScopeStats, BackendError> {
+        let scope = scope.clone();
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| capacity::stats(c, &scope))
+            .await
     }
-    async fn set_budget(&self, _s: &Scope, _b: Budget) -> Result<(), BackendError> {
-        Ok(())
+    async fn set_budget(&self, scope: &Scope, budget: Budget) -> Result<(), BackendError> {
+        let scope = scope.clone();
+        self.tenants
+            .with_write(&scope.tenant.clone(), move |c| {
+                capacity::set_budget(c, &scope, budget)
+            })
+            .await
     }
     async fn purge_subject(
         &self,
@@ -449,94 +526,178 @@ mod tests {
         );
     }
 
-    /// `WriteTransaction::is_valid` accepts a merge-only transaction, and this
-    /// build implements no merge. The dangerous outcome is not that the merge
-    /// fails — it is that the *rest* of the transaction succeeds and `apply`
-    /// returns `Ok`, so the caller records a merge that never happened while
-    /// the evictions it was bundled with are permanent.
+    /// A merge folds into an existing item, adjusts capacity by the byte-size
+    /// delta `items::merge` returns (not by the item's absolute size, which
+    /// would double-count the bytes it already held), and writes one audit
+    /// row and one aggregate increment — on the same terms `apply`'s insert
+    /// path already had. This is the interaction no conformance test in this
+    /// crate's `capacity.rs` module reaches: `capacity_accounting_tracks_items_and_bytes`
+    /// and `eviction_releases_capacity` only ever admit or evict, never
+    /// merge.
     #[tokio::test]
-    async fn a_merge_is_refused_whole_rather_than_applied_in_part() {
+    async fn a_merge_folds_the_item_and_adjusts_capacity_by_the_delta_not_the_new_size() {
         let b = backend();
         let s = scope("s", "n");
 
-        let victim = fx::item(&s, "collateral");
-        b.apply(fx::admit_txn(&s, victim.clone(), None))
+        let target = fx::item(&s, "a short body");
+        b.apply(fx::admit_txn(&s, target.clone(), None))
             .await
             .unwrap();
-        let before = aggregate_rows(&b, &s.tenant).await;
+        let before_bytes = b.capacity_state(&s).await.unwrap().used_bytes;
+        assert_eq!(before_bytes, target.byte_size());
 
-        // Evictions *and* a merge: without the guard the evictions commit, the
-        // audit row is written, and the merge is silently dropped.
-        let mut txn = fx::evict_txn(&s, vec![victim.id.clone()]);
+        let new_body = "a considerably longer body than the one this item started with";
+        let audit = memorysafe_core::AuditRecord::new(
+            s.clone(),
+            AuditEvent::Merged,
+            vec![memorysafe_core::ItemRef::from_item(&target)],
+            Actor::system(),
+            target.created_at,
+        );
+        let mut txn = memorysafe_backend::WriteTransaction::new(s.clone(), audit);
         txn.merge = Some(memorysafe_backend::write::MergeWrite {
-            target: victim.id.clone(),
-            body: "merged text".into(),
-            tags: vec![],
+            target: target.id.clone(),
+            body: new_body.into(),
+            tags: vec!["merged-in".into()],
             attrs: Default::default(),
             vector: None,
-            byte_size: 11,
+            byte_size: new_body.len() as u64,
         });
-        assert!(
-            txn.is_valid(),
-            "the premise: this transaction is well-formed"
-        );
+        assert!(txn.is_valid(), "the premise: this transaction is valid");
 
-        let err = b.apply(txn).await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                BackendError::Storage {
-                    retryable: false,
-                    ..
-                }
-            ),
-            "expected a non-retryable refusal, got {err:?}"
-        );
-        assert!(
-            b.get(&s, &victim.id).await.unwrap().is_some(),
-            "the refusal wrote nothing, so the eviction bundled with the merge \
-             must not have taken effect"
+        let applied = b.apply(txn).await.unwrap();
+        assert_eq!(applied.item_id, Some(target.id.clone()));
+
+        let merged = b
+            .get(&s, &target.id)
+            .await
+            .unwrap()
+            .expect("target survives");
+        assert_eq!(merged.body, new_body);
+        assert_eq!(merged.tags, vec!["merged-in".to_string()]);
+
+        let after = b.capacity_state(&s).await.unwrap();
+        assert_eq!(
+            after.used_items, 1,
+            "a merge must not change the item count"
         );
         assert_eq!(
-            aggregate_rows(&b, &s.tenant).await,
-            before,
-            "a refused transaction wrote an audit row and an aggregate"
+            after.used_bytes,
+            merged.byte_size(),
+            "capacity must reflect the merged item's actual new size, which \
+             is only true if the delta `items::merge` returned was applied \
+             rather than the new size being added on top of the old"
+        );
+
+        let rows = aggregate_rows(&b, &s.tenant).await;
+        assert!(
+            rows.iter().any(|r| r.2 == "merged" && r.4 == 1),
+            "a merge must write exactly one aggregate increment: {rows:?}"
         );
     }
 
-    /// The guard's placement, not just its effect. `a_merge_is_refused_whole…`
-    /// stays green if the refusal is moved *inside* `with_write`, because the
-    /// uncommitted transaction rolls back and "wrote nothing" is preserved by a
-    /// second, unrelated mechanism. What that test cannot see is the tenant
-    /// database being created, the write lock taken and a transaction opened
-    /// for a request that was always going to be refused.
-    ///
-    /// A tenant's file appears the moment `TenantManager` opens a connection
-    /// for it, so an untouched root is exactly the observable form of "refused
-    /// before a connection is taken".
+    /// `items::merge`'s lookup is scoped by subject and namespace through
+    /// `items::get`, so a merge naming a target that exists but belongs to a
+    /// different subject reports `MergeTargetMissing` rather than rewriting
+    /// it. Mutated explicitly per the task's dispatch notes, which flagged
+    /// this predicate as the one most likely to have shipped unenforced —
+    /// two of the last three tasks each found exactly this shape of gap in a
+    /// different scoped predicate.
     #[tokio::test]
-    async fn a_refused_merge_never_opens_the_tenant_database() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let b = SqliteBackend::open(root.clone());
-        let s = scope("s", "n");
+    async fn a_merge_cannot_reach_a_target_in_a_different_scope() {
+        let b = backend();
+        let home = scope("s", "n");
+        let elsewhere = scope("other-s", "n");
 
-        let mut txn = fx::evict_txn(&s, vec![fx::item(&s, "never written").id]);
+        let target = fx::item(&elsewhere, "not home's item");
+        b.apply(fx::admit_txn(&elsewhere, target.clone(), None))
+            .await
+            .unwrap();
+
+        let mut txn = fx::admit_txn(&home, fx::item(&home, "irrelevant upsert"), None);
+        txn.upsert = None;
         txn.merge = Some(memorysafe_backend::write::MergeWrite {
-            target: fx::item(&s, "target").id,
-            body: "merged text".into(),
+            target: target.id.clone(),
+            body: "a body the target must never acquire".into(),
             tags: vec![],
             attrs: Default::default(),
             vector: None,
             byte_size: 11,
         });
-        b.apply(txn).await.unwrap_err();
+        assert!(txn.is_valid(), "the premise: this transaction is valid");
 
+        let err = b.apply(txn).await.unwrap_err();
         assert!(
-            !root.join(format!("{}.db", s.tenant.as_str())).exists(),
-            "the refusal opened a connection for the tenant: {:?}",
-            std::fs::read_dir(&root)
-                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+            matches!(err, BackendError::MergeTargetMissing(ref id) if *id == target.id),
+            "a merge reached across a scope boundary instead of reporting the \
+             target missing: {err:?}"
+        );
+
+        let survivor = b
+            .get(&elsewhere, &target.id)
+            .await
+            .unwrap()
+            .expect("the target must survive the rejected cross-scope merge");
+        assert_eq!(
+            survivor.body, target.body,
+            "the cross-scope merge target was rewritten"
+        );
+    }
+
+    /// Two subjects choosing the same idempotency key must not see each
+    /// other's outcome. `schema::tests::two_subjects_may_use_the_same_idempotency_key`
+    /// pins the DDL that makes this representable at all — the primary key
+    /// is `(subject, namespace, key)`, not `key` alone — but nothing in the
+    /// conformance suite pairs two subjects against one key (both idempotency
+    /// tests there use a single scope), so this crate-local test is what
+    /// guards `apply`'s lookup actually binding all three columns rather than
+    /// `key` alone, until a conformance test for this is queued before the
+    /// freeze.
+    #[tokio::test]
+    async fn two_subjects_replaying_the_same_idempotency_key_each_get_their_own_outcome() {
+        let b = backend();
+        let a = scope("subject-a", "n");
+        let z = scope("subject-z", "n");
+
+        let item_a = fx::item(&a, "subject a's memory");
+        let mut txn_a = fx::admit_txn(&a, item_a.clone(), None);
+        txn_a.idempotency_key = Some("shared-key".into());
+        txn_a.payload_digest = Some(item_a.digest());
+        let applied_a = b.apply(txn_a).await.unwrap();
+        assert!(!applied_a.replayed);
+
+        // Subject z uses the same key with its own, different payload. If
+        // the lookup bound `key` alone this would find subject a's row and
+        // — since the digests differ — fail with `IdempotencyConflict`
+        // rather than admitting subject z's own write.
+        let item_z = fx::item(&z, "subject z's memory");
+        let mut txn_z = fx::admit_txn(&z, item_z.clone(), None);
+        txn_z.idempotency_key = Some("shared-key".into());
+        txn_z.payload_digest = Some(item_z.digest());
+        let applied_z = b.apply(txn_z).await.unwrap();
+        assert!(
+            !applied_z.replayed,
+            "subject z's write was treated as a replay of subject a's outcome"
+        );
+        assert_ne!(
+            applied_z.item_id, applied_a.item_id,
+            "two subjects sharing an idempotency key collapsed into one outcome"
+        );
+
+        // And each subject, retried, replays its *own* stored outcome.
+        let retry_a_item = {
+            let mut i = fx::item(&a, "subject a's memory");
+            i.id = ItemId::new();
+            i
+        };
+        let mut retry_a = fx::admit_txn(&a, retry_a_item, None);
+        retry_a.idempotency_key = Some("shared-key".into());
+        retry_a.payload_digest = Some(item_a.digest());
+        let replayed_a = b.apply(retry_a).await.unwrap();
+        assert!(replayed_a.replayed);
+        assert_eq!(
+            replayed_a.item_id, applied_a.item_id,
+            "subject a's retry replayed the wrong subject's outcome"
         );
     }
 
