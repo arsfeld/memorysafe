@@ -91,7 +91,7 @@ pub trait BackendFactory: Send + Sync {
 pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) where F::B: 'static;
 ```
 
-Fixtures live in `memorysafe_backend::conformance::fx`: `embedder()` (a `DeterministicEmbedder` at **dim 256**, embedder id `deterministic-256`), `item`, `item_with`, `item_at`, `vector_for`, `admit_txn`, `admit_txn_embedded`, `evict_txn`.
+Fixtures live in `memorysafe_backend::conformance::fx`: `embedder()` (a `DeterministicEmbedder` at **dim 256**, embedder id `deterministic-256`), `item`, `item_with`, `item_at`, `vector_for`, `admit_txn`, `admit_txn_embedded`, `evict_txn`, `evict_txn_at`.
 
 ### The 27 conformance tests
 

@@ -8,6 +8,7 @@ pub mod atomicity;
 pub mod capacity;
 pub mod fixtures;
 pub mod isolation;
+pub mod lifecycle;
 pub mod retrieval;
 
 pub use fixtures as fx;
@@ -86,5 +87,10 @@ where
         capacity::eviction_releases_capacity,
         capacity::concurrent_admits_do_not_double_count,
         capacity::scope_stats_reflect_the_corpus,
+        lifecycle::audit_filter_narrows_by_event_and_time,
+        lifecycle::purge_subject_removes_everything_for_that_subject,
+        lifecycle::purge_subject_leaves_other_subjects_intact,
+        lifecycle::export_import_round_trips_exactly,
+        lifecycle::import_is_idempotent,
     );
 }

@@ -109,6 +109,24 @@ pub fn evict_txn(scope: &Scope, evictions: Vec<ItemId>) -> WriteTransaction {
     txn
 }
 
+/// Same as `evict_txn`, but with a caller-supplied `at` instead of the fixed
+/// `UNIX_EPOCH` above — mirrors `item`/`item_at`. `evict_txn` itself stays
+/// pinned so Task 16's tests are unaffected; tests that need distinct,
+/// ordered eviction timestamps (Task 18's
+/// `audit_filter_narrows_by_event_and_time`) use this builder instead.
+pub fn evict_txn_at(scope: &Scope, evictions: Vec<ItemId>, at: OffsetDateTime) -> WriteTransaction {
+    let audit = AuditRecord::new(
+        scope.clone(),
+        AuditEvent::Forgotten,
+        vec![],
+        Actor::system(),
+        at,
+    );
+    let mut txn = WriteTransaction::new(scope.clone(), audit);
+    txn.evictions = evictions;
+    txn
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +202,27 @@ mod tests {
             "item_at must not silently fall back to the default timestamp"
         );
         assert!(admit_txn(&s, i, None).is_valid());
+    }
+
+    // Task 18's `evict_txn_at` is `item_at`'s eviction-side counterpart:
+    // `audit_filter_narrows_by_event_and_time` needs the eviction's audit
+    // row at its own distinct timestamp, not `evict_txn`'s pinned
+    // `UNIX_EPOCH`. Same mutation risk as `item_at`, so the same direct
+    // assertion: `is_valid()` never inspects `audit.at`, so only checking
+    // validity would pass even if the timestamp argument were silently
+    // ignored.
+    #[test]
+    fn evict_txn_at_uses_the_given_timestamp_not_the_default() {
+        let s = scope();
+        let t = OffsetDateTime::UNIX_EPOCH + Duration::seconds(42);
+        let txn = evict_txn_at(&s, vec![ItemId::new()], t);
+        assert_eq!(txn.audit.at, t);
+        assert_ne!(
+            txn.audit.at,
+            OffsetDateTime::UNIX_EPOCH,
+            "evict_txn_at must not silently fall back to the default timestamp"
+        );
+        assert!(txn.is_valid());
     }
 
     // Task 16 introduces three transaction shapes `is_valid()` has never
