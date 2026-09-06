@@ -323,6 +323,52 @@ mod tests {
     }
 
     #[test]
+    fn a_byte_only_budget_frees_enough_room_after_one_eviction() {
+        // Every other capacity test uses `ctx()`, which hardcodes
+        // `max_bytes: None` — so nothing above exercises `freed_bytes`
+        // actually accumulating across the eviction loop. Mutation testing
+        // found exactly this: `freed_bytes += ...` regressed to `*=` (which
+        // leaves it stuck at zero from its `0` initial value) survived every
+        // test in this module, because none of them constrain on bytes. This
+        // sets up a bytes-only budget where one eviction frees enough bytes
+        // to fit — under the `*=` regression, `freed_bytes` never leaves
+        // zero, so the final check still sees the pre-eviction byte count
+        // and rejects with `BudgetExhausted` instead of retaining.
+        let cfg = BaselineConfig::default();
+        let victim = evictable("something large enough to evict", 0.1, 0.1);
+        let admit_ctx = AdmitContext {
+            scope: scope(),
+            capacity: CapacityState {
+                budget: Budget {
+                    max_items: None,
+                    max_bytes: Some(100),
+                },
+                used_items: 0,
+                used_bytes: 100,
+            },
+            eviction_candidates: vec![victim],
+            stats: ScopeStats::default(),
+            now: OffsetDateTime::UNIX_EPOCH,
+        };
+        let (c, a) = assessed(0.1, 0.8, 0.2, SensitivityLevel::Internal);
+        let d = decide(
+            &Assessed {
+                candidate: &c,
+                assessment: &a,
+            },
+            &admit_ctx,
+            &cfg,
+            pid(),
+        );
+        assert!(
+            matches!(d.action, Action::Retain { .. }),
+            "one eviction should have freed enough bytes to fit; got {:?}",
+            d.action
+        );
+        assert_eq!(d.evictions.len(), 1);
+    }
+
+    #[test]
     fn a_full_scope_with_nothing_evictable_rejects_rather_than_overflowing() {
         let cfg = BaselineConfig::default();
         let (c, a) = assessed(0.1, 0.8, 0.2, SensitivityLevel::Internal);
