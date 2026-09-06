@@ -22,6 +22,16 @@ base64 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# Denied because a property elsewhere depends on it. `memorysafe-core`'s enum
+# variants are all PascalCase, which is what makes every
+# `#[serde(rename_all = "snake_case")]` in the crate load-bearing rather than a
+# no-op — an attribute whose removal is undetectable because the default
+# already produces the asserted output is a vacuous test with no visible
+# defect. That property was previously enforced only by `-D warnings`, which
+# lives in CI and in the per-round clippy invocation and NOT in the build: a
+# plain `cargo test` compiled a lowercase variant with a warning. Denying it
+# here moves the guarantee from a habit to the build. It fires nowhere today.
+non_camel_case_types = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
