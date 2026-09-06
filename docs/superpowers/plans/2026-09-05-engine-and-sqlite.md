@@ -4222,13 +4222,17 @@ pub trait Backend: Send + Sync {
     async fn get(&self, scope: &Scope, id: &ItemId)
         -> Result<Option<MemoryItem>, BackendError>;
 
-    /// Must impose a *total* order over the scope's items. Ordering by
-    /// timestamp alone is insufficient: a bulk import can leave many rows
-    /// with an identical `created_at`, and an unstable sort under
-    /// `LIMIT`/`OFFSET` paging can then return the same row on two pages
-    /// while silently dropping another. Break ties with a unique key such as
-    /// `id` so paging stays stable regardless of how many rows share a
-    /// timestamp.
+    /// Ordered ascending by `created_at`, ties broken by ascending `id`
+    /// (`id` is a ULID — itself a total, time-sortable order — so breaking
+    /// ties by it never contradicts the primary sort). This must be a
+    /// *total* order: ordering by timestamp alone is insufficient, since a
+    /// bulk import can leave many rows with an identical `created_at`, and
+    /// an unstable sort under `LIMIT`/`OFFSET` paging can then return the
+    /// same row on two pages while silently dropping another. Every backend
+    /// must use this same key and direction — SQLite paging ascending while
+    /// Postgres paged descending would each "conform" to a total order
+    /// stated without one, which is exactly the cross-backend drift this
+    /// suite exists to prevent.
     async fn list(&self, scope: &Scope, page: &Page)
         -> Result<Vec<MemoryItem>, BackendError>;
 
@@ -4429,6 +4433,19 @@ pub fn item_with(
     i.kind = kind.to_string();
     i.tags = tags.iter().map(|t| t.to_string()).collect();
     i.sensitivity = sensitivity;
+    i
+}
+
+/// Same as `item`, but with a caller-supplied `created_at` instead of the
+/// fixed `UNIX_EPOCH` above. `item`'s timestamp is pinned so most conformance
+/// runs are deterministic and comparable, but that pin means many items tie
+/// under `ORDER BY created_at` — exactly the shape a real bulk import
+/// produces, and pagination must stay stable across it. Tests that need
+/// distinct, ordered timestamps (Task 17's `pagination_is_stable`) use this
+/// builder instead of forking `item` or reaching into its fields directly.
+pub fn item_at(scope: &Scope, body: &str, created_at: OffsetDateTime) -> MemoryItem {
+    let mut i = item(scope, body);
+    i.created_at = created_at;
     i
 }
 
@@ -4815,41 +4832,73 @@ fn query_with_limit(text: &str, filters: HardFilters, limit: usize) -> Candidate
 /// The security-critical one: a restricted item must never leave the database
 /// for a caller cleared only to Personal.
 ///
-/// The corpus here deliberately exceeds the query's `limit`, with the
-/// excluded items worded to dominate the ranking. That is not incidental:
-/// with a corpus smaller than `limit` (the original shape of this test — one
-/// item per level, `limit: 50`), a backend that applies the sensitivity
-/// ceiling inside its query and a backend that runs an unfiltered query and
-/// filters the ceiling out afterwards, in Rust, return byte-identical
-/// results, because nothing was ever truncated. The two strategies are
-/// indistinguishable and the test cannot tell a compliant backend from a
-/// dangerous one — which defeats the point of a test named for the ceiling
-/// being "enforced in the query". Do not "simplify" this back to one item
-/// per level; that silently removes the only thing this test actually
-/// checks.
+/// The corpus needs three properties, each closing a distinct way a ceiling
+/// bug could hide behind this test's original, weaker shape:
 ///
-/// Five `Restricted` items are worded to match the query text almost
-/// verbatim, so they rank at the very top for any reasonable vector or
-/// keyword scoring. Two admissible items mention the same topic only in
-/// passing, so they rank lower. Querying with `limit: 3` — fewer than the
-/// five `Restricted` items — means: a backend that ranks first and applies
-/// the sensitivity filter after `LIMIT` fills all 3 slots with `Restricted`
-/// rows and returns 0 allowed items; a backend that filters inside the query
-/// never considers the `Restricted` rows at all and returns exactly the 2
-/// items the caller is entitled to.
+/// 1. **It must exceed the query's `limit`, with the excluded items worded
+///    to dominate the ranking.** With a corpus smaller than `limit` (the
+///    original shape — one item per level, `limit: 50`), a backend that
+///    applies the ceiling inside its query and a backend that runs an
+///    unfiltered query and filters the ceiling out afterwards, in Rust,
+///    return byte-identical results, because nothing was ever truncated.
+///    The two strategies are indistinguishable and the test cannot tell a
+///    compliant backend from a dangerous one.
+/// 2. **The excluded pool must be large enough to survive a constant-factor
+///    over-fetch, not just a naive `SELECT *`.** `CandidateQuery::limit` is
+///    itself documented (`query.rs`) as an over-fetch knob the engine
+///    "typically sets 5-10x the recall budget," so a backend issuing
+///    `LIMIT limit * k` unfiltered and filtering afterwards is not a
+///    contrived worst case — it is the natural way to write a hybrid
+///    backend's per-arm fetch, and the original 5-item pool (corpus 7,
+///    `limit: 3`) fails to catch it: any `k >= 3` fetches the whole corpus
+///    unfiltered and returns the correct 2 rows regardless of where
+///    filtering happens. With 40 excluded items ranked 1..=40 and the 2
+///    admissible items ranked 41 and 42, reaching an admissible row needs
+///    `limit * k >= 41`, i.e. `k >= 14` at `limit: 3` — well past the
+///    documented 5-10x, so no plausible over-fetch factor leaks the
+///    diagnosis. Do not shrink this pool "for speed"; that is exactly the
+///    trim that would silently reopen this hole.
+/// 3. **The excluded pool must include a level immediately above the
+///    ceiling, not only one far above it.** A ceiling of `Personal`
+///    (ordinal 2) next to a corpus of only `Restricted` items (ordinal 4)
+///    cannot catch a backend whose SQL admits `level_ord <= ceiling_ord +
+///    1` — the single most likely off-by-one at the boundary — because
+///    ordinal 4 still fails that relaxed check exactly like the correct
+///    one (`level_ord <= ceiling_ord`). One `Sensitive` item (ordinal 3,
+///    immediately above the ceiling) among the top-ranked pool is wrongly
+///    admitted by an off-by-one query and correctly excluded by a
+///    compliant one, so both the count assertion and the per-item
+///    assertion below catch it.
+///
+/// The two admissible items share 4 of the query's 5 tokens — differing
+/// only in the discriminating first word ("restricted" vs. "public"/
+/// "personal") — rather than sharing only one token as the original
+/// wording did. That keeps their vector score well above any plausible
+/// recall floor in a hybrid backend's vector arm, so a failure here cannot
+/// be misdiagnosed as "ceiling applied after LIMIT" when it is really an
+/// unrelated recall-floor issue dropping a weakly-matching candidate.
 pub async fn sensitivity_ceiling_is_enforced_in_the_query<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
 
-    // Five distinct items (fresh `ItemId`s), identical wording, so each one
-    // ranks at the very top of this query.
-    for _ in 0..5 {
+    // 40 items, verbatim-identical to the query text, so every one of them
+    // ranks at the very top under any reasonable vector or keyword scorer.
+    // 39 are `Restricted` (ordinal 4); one is `Sensitive` (ordinal 3, the
+    // level immediately above the `Personal` ceiling) to catch an
+    // off-by-one at the boundary. See point 2 above for why 40, and point 3
+    // for why one of them is `Sensitive` rather than all `Restricted`.
+    for i in 0..40 {
+        let level = if i == 0 {
+            SensitivityLevel::Sensitive
+        } else {
+            SensitivityLevel::Restricted
+        };
         let item = fx::item_with(
             &scope,
             "restricted medical record about cats",
             "fact",
             &[],
-            SensitivityLevel::Restricted,
+            level,
         );
         backend
             .apply(fx::admit_txn_embedded(&scope, item))
@@ -4857,9 +4906,9 @@ pub async fn sensitivity_ceiling_is_enforced_in_the_query<F: BackendFactory>(fac
             .unwrap();
     }
     for (body, level) in [
-        ("a passing mention of cats", SensitivityLevel::Public),
+        ("public medical record about cats", SensitivityLevel::Public),
         (
-            "cats came up once in conversation",
+            "personal medical record about cats",
             SensitivityLevel::Personal,
         ),
     ] {
@@ -4885,9 +4934,10 @@ pub async fn sensitivity_ceiling_is_enforced_in_the_query<F: BackendFactory>(fac
     assert_eq!(
         hits.len(),
         2,
-        "expected exactly the 2 admissible items; fewer means the sensitivity \
-         ceiling was applied after LIMIT instead of inside the query, and the \
-         Restricted rows consumed the limit's slots"
+        "expected exactly the 2 admissible items; fewer means the ceiling was \
+         applied after LIMIT (or with too small an over-fetch margin) instead \
+         of inside the query, and more means a level above the ceiling — most \
+         likely Sensitive, at the ceiling+1 boundary — leaked through"
     );
     for h in &hits {
         assert!(
@@ -5015,7 +5065,11 @@ pub async fn keyword_search_finds_exact_terms<F: BackendFactory>(factory: &F) {
     assert!(hits[0].vector_score.is_none());
 }
 
-/// FTS5 syntax characters in user text must not become query operators.
+/// Syntax characters a keyword arm treats specially must not become query
+/// operators when they arrive as ordinary user text — whatever the
+/// backend's own search engine is (SQLite FTS5, Postgres full-text search,
+/// or anything else). Only the assertions below are the contract; nothing
+/// about them names one engine's syntax.
 ///
 /// The corpus here holds three items, not one. With only one item present —
 /// the original shape of this test — "matched everything" and "matched
@@ -5025,14 +5079,21 @@ pub async fn keyword_search_finds_exact_terms<F: BackendFactory>(factory: &F) {
 /// operator and match the whole scope. Three items make the two outcomes
 /// different sizes (`<= 1` vs. `3`), so an unescaped hostile string that
 /// turns into a match-everything query is actually caught.
+///
+/// None of the three bodies contains a standalone single-letter token.
+/// `"a AND b"` is one of the hostile inputs below; a keyword arm with
+/// AND-by-default semantics (FTS5's phrase escaping, Postgres's
+/// `plainto_tsquery`) treats it as an inert literal phrase and correctly
+/// matches nothing, but a *correctly escaped* arm with any-term OR
+/// semantics would still match every body containing a standalone `"a"`.
+/// The original corpus ("a normal memory" / "a third normal memory") had
+/// two such bodies, so it would fail this test for a compliant
+/// OR-semantics backend — the suite rejecting a correct implementation,
+/// which is worse than missing an incorrect one.
 pub async fn keyword_search_escapes_user_input<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
-    for body in [
-        "a normal memory",
-        "another normal memory",
-        "a third normal memory",
-    ] {
+    for body in ["alpha memory", "beta memory", "gamma memory"] {
         backend
             .apply(fx::admit_txn_embedded(&scope, fx::item(&scope, body)))
             .await
@@ -5440,6 +5501,12 @@ otherwise promises that `F::B` outlives the borrow of `factory`. Add a
 and `run_conformance_suite` (which calls every test, including this one,
 through the same generic `F`). Every real backend owns its state outright
 and satisfies this trivially.
+
+`run_conformance_suite`'s doc comment must also say it needs a
+multi-threaded Tokio runtime (e.g. `#[tokio::test(flavor = "multi_thread")]`):
+`tokio::spawn` also runs under `current_thread`, but there tasks only
+interleave at `.await` points, so `concurrent_admits_do_not_double_count`'s
+attempt to provoke a genuine concurrent write race loses most of its bite.
 
 Add `tokio` with the `rt-multi-thread` feature to `memorysafe-backend` for `tokio::spawn` in the concurrency test:
 
