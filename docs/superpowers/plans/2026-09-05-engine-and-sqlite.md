@@ -4401,7 +4401,7 @@ pub fn item(scope: &Scope, body: &str) -> MemoryItem {
         kind: "fact".into(),
         source: Source { kind: SourceKind::Agent, id: Some("conformance".into()) },
         occurred_at: None,
-        created_at: OffsetDateTime::now_utc(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
         tags: vec![],
         attrs: Default::default(),
         sensitivity: SensitivityLevel::Internal,
