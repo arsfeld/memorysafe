@@ -94,7 +94,8 @@ pub struct RecallRequest { pub scope: Scope, pub query: Option<String>, pub tags
 pub struct SelectedItem { pub item: MemoryItem, pub relevance: f32, pub reason: Reason }
 pub struct OmittedItem { pub id: ItemId, pub reason: Reason }
 pub struct WorkingSet { pub items: Vec<SelectedItem>, pub tokens_used: u32,
-    pub omitted: Vec<OmittedItem>, pub audit_id: Option<AuditId> }
+    pub omitted: Vec<OmittedItem>, pub omitted_total: usize,
+    pub audit_id: Option<AuditId> }
 pub struct Budget { pub max_items: Option<u64>, pub max_bytes: Option<u64> }
 pub struct CapacityState { pub budget: Budget, pub used_items: u64, pub used_bytes: u64 }
 pub struct ScopeStats { pub item_count: u64, pub total_bytes: u64,

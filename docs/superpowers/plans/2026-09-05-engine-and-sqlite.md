@@ -501,7 +501,14 @@ git commit -m "chore: scaffold cargo workspace and CI"
 
 **Interfaces:**
 - Consumes: Task 1's workspace.
-- Produces: `CoreError`, `ItemId::new()`, `ItemId::parse()`, `AuditId::new()`, `AuditId::parse()`, `TenantId::new(&str)`, `SubjectId::new(&str)`, `Namespace::new(&str)`, `Scope { tenant, subject, namespace }`, `Scope::key() -> String`.
+- Produces: `CoreError`, `ItemId::new()`, `ItemId::parse()`, `AuditId::new()`, `AuditId::parse()`, `TenantId::new(&str)`, `SubjectId::new(&str)`, `Namespace::new(&str)`, `Scope { tenant, subject, namespace }`, `Scope::key() -> String`, and `PURGED_COMPONENT`.
+
+`PURGED_COMPONENT` was added to `ids.rs` by a later contract commit, not by
+this task's sketch below: it is the reserved namespace a `SubjectPurged`
+record is filed under when the subject owned no items (Task 33's
+`purge_scope`). Core does not reject the name — enforcement is Plan 3's, named
+in the constant's own doc comment, which is authoritative and not reproduced
+here.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2672,8 +2679,17 @@ pub struct OmittedItem {
 pub struct WorkingSet {
     pub items: Vec<SelectedItem>,
     pub tokens_used: u32,
-    /// Truncated to `OMITTED_CAP`.
+    /// A **sample** of what was considered and cut, truncated to
+    /// `OMITTED_CAP`. Read `omitted_total`, never `omitted.len()`, for how
+    /// many items were actually omitted.
     pub omitted: Vec<OmittedItem>,
+    /// How many items were omitted **before** the sample above was truncated.
+    /// The two are equal exactly when the count is at or below `OMITTED_CAP`
+    /// and differ whenever it exceeds it — which is the case a caller needs
+    /// to detect and the one `omitted.len()` cannot report, reading 50 for 50
+    /// omissions and for 5000 alike. The full argument is on the field in
+    /// `crates/memorysafe-core/src/recall.rs`.
+    pub omitted_total: usize,
     /// Set by the engine after `record_recall`; the policy leaves it `None`.
     ///
     /// `None` means "not yet audited", and the type cannot distinguish that
@@ -2685,10 +2701,17 @@ pub struct WorkingSet {
 
 impl WorkingSet {
     pub fn empty() -> Self {
-        Self { items: vec![], tokens_used: 0, omitted: vec![], audit_id: None }
+        Self { items: vec![], tokens_used: 0, omitted: vec![], omitted_total: 0, audit_id: None }
     }
 }
 ```
+
+`omitted_total` and the test that pins it apart from `omitted.len()`
+(`recall::tests::the_omitted_sample_and_the_omitted_total_are_different_numbers`)
+were added by a later contract commit, together with
+`ids::tests::the_purged_component_literal_is_frozen_and_is_a_legal_component`.
+Neither test is reproduced here; `crates/memorysafe-core` is authoritative, on
+the same terms as the conformance tests Task 18 declines to re-sketch.
 
 Add to `crates/memorysafe-core/src/lib.rs`:
 
@@ -4313,15 +4336,9 @@ pub trait Backend: Send + Sync {
     async fn audit(&self, scope: &Scope, filter: &AuditFilter)
         -> Result<Vec<AuditRecord>, BackendError>;
 
-    /// Erases a subject within a tenant: items, vectors, idempotency records
-    /// and capacity accounting under either `cascade`; the subject's audit
-    /// detail only under `PurgeCascade::Cascade`. `audit` — the caller's
-    /// `SubjectPurged` record — is inserted either way, after the deletes and
-    /// in the same transaction, under the id it carries. Aggregates are never
-    /// touched. See the full contract on `Backend::purge_subject` in
-    /// `memorysafe-backend/src/lib.rs`, which carries why delete-before-insert
-    /// matters, what the engine no longer does around this call, and the
-    /// accounting equation on `PurgeReport`.
+    /// Erases a subject within a tenant. The contract lives on
+    /// `Backend::purge_subject` in `memorysafe-backend/src/lib.rs`, together
+    /// with the accounting equation on `PurgeReport`.
     async fn purge_subject(
         &self,
         tenant: &TenantId,
@@ -4330,14 +4347,10 @@ pub trait Backend: Send + Sync {
         audit: AuditRecord,
     ) -> Result<PurgeReport, BackendError>;
 
-    /// Every audit aggregate held for `tenant` that matches `filter`, keyed by
-    /// tenant + policy version + event class + day bucket and by nothing
-    /// finer. The consequence for an implementer: **a cascading
-    /// `purge_subject` must not delete aggregate rows.** See the full contract
-    /// on `Backend::audit_aggregates` in `memorysafe-backend/src/lib.rs` and
-    /// the `aggregates` module doc beside it — the ordering, the cursor, the
-    /// truncation rule, and why there is no subject and no namespace all live
-    /// there rather than here.
+    /// Every audit aggregate held for `tenant` that matches `filter`. The
+    /// contract lives on `Backend::audit_aggregates` in
+    /// `memorysafe-backend/src/lib.rs` and in the `aggregates` module doc
+    /// beside it.
     async fn audit_aggregates(
         &self,
         tenant: &TenantId,
@@ -4346,17 +4359,8 @@ pub trait Backend: Send + Sync {
 
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
 
-    /// `destination` is authority for where the import lands, and is compared
-    /// against **every** record's own tenant — items and audit rows alike. A
-    /// record that disagrees rejects the whole import; it is never retargeted,
-    /// and an audit row's scope is never rewritten to fit. Because every
-    /// record is checked against the destination, a separate "the stream may
-    /// not span tenants" check is strictly implied and must not be written.
-    /// The payload's subject and namespace are preserved as written. A
-    /// header-only stream is valid and imports nothing. See the full contract
-    /// on `Backend::import` in `memorysafe-backend/src/lib.rs`; the asymmetry
-    /// with `export` is deliberate — `export` narrows a read within a tenant,
-    /// `import` authorises a write into one.
+    /// Imports `stream` into the `destination` tenant. The contract lives on
+    /// `Backend::import` in `memorysafe-backend/src/lib.rs`.
     async fn import(
         &self,
         destination: &TenantId,
@@ -4912,6 +4916,7 @@ and extend the `run!` invocation in `run_conformance_suite`:
         isolation::audit_is_scoped,
         atomicity::admit_evict_and_audit_commit_together,
         atomicity::a_failed_transaction_leaves_no_trace,
+        atomicity::an_invalid_transaction_is_rejected_and_writes_nothing,
         atomicity::every_mutation_writes_exactly_one_audit_record,
         atomicity::idempotent_writes_replay_the_original_outcome,
         atomicity::idempotency_conflict_on_different_payload,
@@ -6219,6 +6224,9 @@ and extend `run!`:
 
 ```rust
         lifecycle::audit_filter_narrows_by_event_and_time,
+        lifecycle::audit_returns_min_of_the_limit_and_the_rows_that_remain,
+        lifecycle::audit_pages_by_the_after_cursor_without_repeating_a_row,
+        lifecycle::audit_since_and_until_include_a_record_on_the_boundary,
         lifecycle::purge_subject_removes_everything_for_that_subject,
         lifecycle::purge_subject_leaves_other_subjects_intact,
         lifecycle::purge_subject_preserves_audit_when_asked,
@@ -6226,6 +6234,8 @@ and extend `run!`:
         lifecycle::apply_persists_the_audit_id_it_was_given,
         lifecycle::record_recall_persists_the_audit_id_it_was_given,
         lifecycle::import_preserves_every_audit_id,
+        lifecycle::export_narrows_to_the_selectors_subject_and_namespace,
+        lifecycle::export_orders_the_stream_by_kind_then_by_id,
         lifecycle::export_import_round_trips_exactly,
         lifecycle::import_is_idempotent,
         lifecycle::import_rejects_a_later_record_whose_tenant_disagrees,
@@ -6233,9 +6243,9 @@ and extend `run!`:
         lifecycle::audit_aggregates_survive_a_cascading_purge,
 ```
 
-The suite now stands at **39 conformance tests** (4 isolation + 5 atomicity + 13 retrieval + 4 capacity + 13 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified. **The authoritative list is `run_conformance_suite`'s own `run!` in `crates/memorysafe-backend/src/conformance/mod.rs`** — every `pub async fn` across the conformance modules must appear in it, and that correspondence is checked by enumeration before each of these contract commits, not by reading this document.
+The suite now stands at **45 conformance tests** (4 isolation + 6 atomicity + 13 retrieval + 4 capacity + 18 lifecycle). This set is frozen at the end of Task 24; Plan 2's Postgres backend must pass it unmodified. **The authoritative list is `run_conformance_suite`'s own `run!` in `crates/memorysafe-backend/src/conformance/mod.rs`** — every `pub async fn` across the conformance modules must appear in it, and that correspondence is checked by enumeration before each of these contract commits, not by reading this document.
 
-Twelve of those were added after Tasks 17 and 18 shipped, by the contract tasks that changed `Backend::import`'s and `Backend::purge_subject`'s signatures, put access statistics on the ranking structs, and stated the echo rule — the last point at which adding conformance tests and changing trait signatures cost nothing, because no `impl Backend` existed yet. They are listed in the `run!` snippets above so those snippets match the file rather than the day it was written:
+Eighteen of those were added after Tasks 17 and 18 shipped, by the contract tasks that changed `Backend::import`'s and `Backend::purge_subject`'s signatures, put access statistics on the ranking structs, stated the echo rule, and closed the gaps the trait's own doc comments admitted nothing enforced — the last point at which adding conformance tests and changing trait signatures cost nothing, because no `impl Backend` existed yet. They are listed in the `run!` snippets above so those snippets match the file rather than the day it was written:
 `retrieval::list_orders_oldest_first_by_created_at`,
 `retrieval::list_tie_break_is_total_over_identical_timestamps`,
 `retrieval::neighbours_break_ties_before_truncating_at_k`,
@@ -6246,13 +6256,25 @@ Twelve of those were added after Tasks 17 and 18 shipped, by the contract tasks 
 `lifecycle::purge_subject_preserves_audit_when_asked`,
 `lifecycle::purge_subject_persists_the_record_it_was_given`,
 `lifecycle::apply_persists_the_audit_id_it_was_given`,
-`lifecycle::record_recall_persists_the_audit_id_it_was_given`, and
-`lifecycle::import_preserves_every_audit_id`.
+`lifecycle::record_recall_persists_the_audit_id_it_was_given`,
+`lifecycle::import_preserves_every_audit_id`,
+`atomicity::an_invalid_transaction_is_rejected_and_writes_nothing`,
+`lifecycle::export_narrows_to_the_selectors_subject_and_namespace`,
+`lifecycle::audit_returns_min_of_the_limit_and_the_rows_that_remain`,
+`lifecycle::audit_pages_by_the_after_cursor_without_repeating_a_row`,
+`lifecycle::audit_since_and_until_include_a_record_on_the_boundary`, and
+`lifecycle::export_orders_the_stream_by_kind_then_by_id`.
 
-**The five most recent are not reproduced above.** Their text lives in
-`crates/memorysafe-backend/src/conformance/lifecycle.rs`, which is authoritative; a
-sketch of a test that already exists in the tree can only drift from it, and this
-document has now lost that bet twice. Read them there.
+**The eleven most recent are not reproduced above.** Their text lives in
+`crates/memorysafe-backend/src/conformance/lifecycle.rs` and
+`.../atomicity.rs`, which are authoritative; a sketch of a test that already
+exists in the tree can only drift from it, and this document has now lost that
+bet twice. Read them there. The last six close contract claims the `Backend`
+trait itself recorded as unenforced — `WriteTransaction::is_valid` never
+reached through the trait, `ScopeSelector`'s optional fields, `audit`'s
+`min(limit, remaining)`, the `after` cursor, `since`/`until` inclusivity, and
+the export stream's order — and each of those doc comments now names the test
+that covers it.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -7270,6 +7292,11 @@ async fn vector_search_ranks_by_similarity() {
 async fn cross_model_vectors_are_rejected() {
     retrieval::cross_model_vectors_are_rejected(&SqliteFactory).await;
 }
+
+#[tokio::test]
+async fn neighbours_break_ties_before_truncating_at_k() {
+    retrieval::neighbours_break_ties_before_truncating_at_k(&SqliteFactory).await;
+}
 ```
 
 Append to `crates/memorysafe-backend-sqlite/src/vectors.rs`:
@@ -7573,7 +7600,7 @@ Add `pub mod vectors;` and wire vector insert/delete into `apply`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 3 unit tests plus 6 conformance tests ok.
+Expected: PASS — 3 unit tests plus 7 conformance tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -7646,6 +7673,11 @@ async fn list_tie_break_is_total_over_identical_timestamps() {
 #[tokio::test]
 async fn pending_embedding_items_are_excluded_when_asked() {
     retrieval::pending_embedding_items_are_excluded_when_asked(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn recall_updates_access_statistics() {
+    retrieval::recall_updates_access_statistics(&SqliteFactory).await;
 }
 ```
 
@@ -7942,7 +7974,7 @@ Replace the placeholder `retrieve_candidates` in `lib.rs`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 4 keyword unit tests plus 13 conformance tests ok.
+Expected: PASS — 4 keyword unit tests plus 17 conformance tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -8003,6 +8035,11 @@ async fn admit_evict_and_audit_commit_together() {
 #[tokio::test]
 async fn a_failed_transaction_leaves_no_trace() {
     atomicity::a_failed_transaction_leaves_no_trace(&SqliteFactory).await;
+}
+
+#[tokio::test]
+async fn an_invalid_transaction_is_rejected_and_writes_nothing() {
+    atomicity::an_invalid_transaction_is_rejected_and_writes_nothing(&SqliteFactory).await;
 }
 
 #[tokio::test]
@@ -8335,7 +8372,7 @@ Add `pub mod capacity;` and `use rusqlite::params;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite`
-Expected: PASS — 39 conformance tests minus the 13 lifecycle ones, i.e. 26 conformance tests plus 12 unit tests, all ok.
+Expected: PASS — 45 conformance tests minus the 18 lifecycle ones, i.e. 27 conformance tests plus 12 unit tests, all ok.
 
 - [ ] **Step 5: Commit**
 
@@ -8714,7 +8751,7 @@ Replace the last three placeholders in `lib.rs`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-sqlite && cargo clippy -p memorysafe-backend-sqlite --all-targets -- -D warnings`
-Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 39 conformance test names and passes.
+Expected: PASS — `sqlite_passes_the_backend_conformance_suite` prints all 45 conformance test names and passes.
 
 - [ ] **Step 5: Commit**
 
@@ -8905,8 +8942,6 @@ mod tests {
     // `the_denser_branch_is_linear_between_the_baseline_and_one`,
     // `typical_density_at_the_lower_extreme_scores_one_half_without_dividing_by_zero`,
     // and `typical_density_at_the_upper_extreme_scores_one_half_without_dividing_by_zero`.
-    // None of these four exist anywhere in this repository yet — they are
-    // not merely omitted from this listing, they have not been written.
     // The "Do not fold the two branches" warning in `score`'s doc comment
     // depends on the linearity pair among them to actually catch a
     // regression; without writing them, that warning is unenforced prose.
@@ -9241,17 +9276,23 @@ pure" becomes enforceable:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy`
-Expected: PASS — 9 tests ok.
+Expected: PASS — this task adds 17 tests; at least 17 in the crate.
 
-> **This count is known stale: it is low by 8, and so is every policy count after it.**
+> **The chain is anchored to what this plan specifies, and the expected lines read "at
+> least".**
 > The blocks above list 13 `#[test]` functions, and the comment closing `fragility.rs`'s
-> test module commissions 4 more by name (the mutation-killer set, which it states have
-> not been written anywhere yet). Executing this task as written therefore yields **17**,
-> not 9. The later `cargo test -p memorysafe-policy` counts inherit the same deficit:
-> Task 26's 18, Task 27's 25, Task 28's 33 and Task 29's 40 should read **26, 33, 41 and
-> 48**. The numbers are left uncorrected here because only this task's executor can
-> confirm 17 by running the crate; whoever confirms it must correct all five in one
-> change — see Global Constraints, "When you change a test count, propagate it".
+> test module commissions 4 more by name — the mutation-killer set. 13 + 4 = 17, which is
+> what this task specifies. The crate may legitimately hold more: it currently holds 18
+> for these files (`fragility.rs` 12, `redundancy.rs` 6, `config.rs` 0), one beyond the
+> mandate. An equality that drifts upward every time an implementer does more than the
+> minimum would false-alarm forever, so the counts here and in Tasks 26–29 are floors, not
+> equalities.
+>
+> **What the floor does not do: it cannot detect a deleted test.** A test vanishing from a
+> task leaves the crate total below the delta but still above every floor in the chain.
+> The per-task `adds N` is what catches that, by contradicting the block directly above
+> it. The floor only prevents false alarms when an implementer legitimately writes more
+> than the minimum.
 
 - [ ] **Step 5: Commit**
 
@@ -9625,10 +9666,7 @@ impl GovernancePolicy for BaselinePolicy {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy`
-Expected: PASS — 18 tests ok.
-
-> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
-> corrected together, not one at a time.
+Expected: PASS — this task adds 9 tests; at least 26 in the crate.
 
 - [ ] **Step 5: Commit**
 
@@ -10014,10 +10052,7 @@ Add `pub mod admit;` and `pub mod eviction;`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy`
-Expected: PASS — 25 tests ok.
-
-> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
-> corrected together, not one at a time.
+Expected: PASS — this task adds 7 tests; at least 33 in the crate.
 
 - [ ] **Step 5: Commit**
 
@@ -10413,10 +10448,17 @@ pub fn working_set(
         }
     }
 
-    let omitted: Vec<OmittedItem> = ranked
+    // Counted before truncating, not after: `omitted` is a bounded sample and
+    // `omitted_total` is the number of items actually cut. Deriving the total
+    // from `omitted.len()` would report 50 for every recall above the cap.
+    let cut: Vec<_> = ranked
         .iter()
         .enumerate()
         .filter(|(i, _)| !chosen.contains(i))
+        .collect();
+    let omitted_total = cut.len();
+    let omitted: Vec<OmittedItem> = cut
+        .into_iter()
         .take(OMITTED_CAP)
         .map(|(_, c)| OmittedItem {
             id: c.item.id.clone(),
@@ -10428,7 +10470,7 @@ pub fn working_set(
         })
         .collect();
 
-    WorkingSet { items: selected, tokens_used: tokens, omitted, audit_id: None }
+    WorkingSet { items: selected, tokens_used: tokens, omitted, omitted_total, audit_id: None }
 }
 ```
 
@@ -10447,10 +10489,7 @@ Add `pub mod compose;`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy`
-Expected: PASS — 33 tests ok.
-
-> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
-> corrected together, not one at a time.
+Expected: PASS — this task adds 8 tests; at least 41 in the crate.
 
 - [ ] **Step 5: Commit**
 
@@ -10728,10 +10767,7 @@ Add `pub mod maintain;`. `PolicyId` must derive `Clone`; confirm from Task 7.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-policy && cargo clippy -p memorysafe-policy --all-targets -- -D warnings`
-Expected: PASS — 40 tests ok. `BaselinePolicy` now implements all four trait methods.
-
-> **Low by 8** — see the note under Task 25's expected count; the five policy counts are
-> corrected together, not one at a time.
+Expected: PASS — this task adds 7 tests; at least 48 in the crate. `BaselinePolicy` now implements all four trait methods.
 
 - [ ] **Step 5: Commit**
 
@@ -10909,6 +10945,7 @@ mod tests {
             }],
             tokens_used: 5,
             omitted: vec![],
+            omitted_total: 0,
             audit_id: None,
         };
         assert!(matches!(
@@ -10929,6 +10966,7 @@ mod tests {
             }],
             tokens_used: 5,
             omitted: vec![],
+            omitted_total: 0,
             audit_id: None,
         };
         assert!(working_set(&ws, &[a, b]).is_ok());
@@ -12006,7 +12044,7 @@ async fn a_recall_over_an_empty_scope_is_empty_not_an_error() {
 async fn the_recall_audit_record_names_what_was_returned_and_what_was_cut() {
     let e = engine();
     seed(&e, &["alpha memory about cats", "beta memory about cats"]).await;
-    e.recall(recall("cats", SensitivityLevel::Restricted, 1)).await.unwrap();
+    let ws = e.recall(recall("cats", SensitivityLevel::Restricted, 1)).await.unwrap();
 
     let audit = e
         .audit(&scope(), &memorysafe_core::AuditFilter {
@@ -12017,7 +12055,15 @@ async fn the_recall_audit_record_names_what_was_returned_and_what_was_cut() {
         .unwrap();
 
     assert_eq!(audit.len(), 1);
-    assert!(!audit[0].items.is_empty(), "the recall audit must name the returned items");
+    // Compare ids, not emptiness. `!items.is_empty()` is satisfied by a
+    // backend that writes one arbitrary unrelated id, which would make the
+    // message's claim false while the assertion passed.
+    let audited: std::collections::BTreeSet<_> =
+        audit[0].items.iter().map(|r| r.id().clone()).collect();
+    let returned: std::collections::BTreeSet<_> =
+        ws.items.iter().map(|s| s.item.id.clone()).collect();
+    assert!(!returned.is_empty(), "the recall returned nothing, so there is nothing for the audit to name");
+    assert_eq!(audited, returned, "the recall audit must name exactly the returned items");
     let json = serde_json::to_string(&audit).unwrap();
     assert!(!json.contains("alpha memory"), "the recall audit leaked a body");
 }
@@ -12427,8 +12473,20 @@ impl Engine {
 
     /// The `SubjectPurged` record is built **here**, not in the backend:
     /// `Backend::purge_subject` inserts the record it is handed and mints
-    /// nothing (the echo rule on `Backend`), so the actor who ordered the
-    /// erasure is what ends up in the log.
+    /// nothing (the echo rule on `Backend`), so whatever actor this method
+    /// writes is what ends up in the log — which today is an anonymous
+    /// `ActorKind::Human`, not the actor who ordered the erasure.
+    ///
+    /// **Plumbing a real actor is deferred to Plan 3's Task 2** ("Engine —
+    /// per-tenant policy and retention, actor-attributed governance events"),
+    /// which is where engine methods start taking an `Actor` from the
+    /// boundary that has one. `Engine::purge_subject` has no actor parameter
+    /// to thread, and adding one here would change a signature that Plan 3's
+    /// HTTP route (`ops::purge_subject`), CLI command (`purge-subject`) and
+    /// engine tests all already call — so the gap is recorded rather than
+    /// closed. The same anonymous literal appears in `forget` and `protect`
+    /// above; it is engine-wide and pre-existing, not specific to this
+    /// method.
     ///
     /// `PurgeCascade::Cascade` is hard-coded here — it is `balanced`, the
     /// default profile's behaviour. Task 36 replaces this one expression with
@@ -12462,8 +12520,9 @@ impl Engine {
     /// the choice as given and never rewrites it, which is why the choice is
     /// made here and made explicitly. The subject's lexicographically first
     /// namespace, so the record lands beside the rows it is about — and
-    /// `_purged` when the subject owns no items at all (`Namespace` forbids a
-    /// leading dot but permits a leading underscore).
+    /// `memorysafe_core::PURGED_COMPONENT` (`_purged`) when the subject owns
+    /// no items at all (`Namespace` forbids a leading dot but permits a
+    /// leading underscore).
     ///
     /// **The fallback name is a plan-level choice, not a derived one**; a
     /// Task 33 executor may pick differently, but must pick, and must say so
@@ -12473,13 +12532,26 @@ impl Engine {
         tenant: &TenantId,
         subject: &SubjectId,
     ) -> Result<Scope, EngineError> {
+        // PLACEHOLDER, not the intended shape. `namespaces_of` learns one
+        // namespace by materialising the subject's entire corpus — item
+        // bodies included — into a `Vec`, in the erasure path. It stands in
+        // for a dedicated namespace query on `Backend` (something of the
+        // shape `namespaces(&self, tenant, subject) -> Vec<Namespace>`),
+        // which does not exist and is out of scope for this task. Do not ship
+        // this as the design; see `namespaces_of` below.
         let namespace = self
             .namespaces_of(tenant, subject)
             .await?
             .into_iter()
             .next()
             .unwrap_or_else(|| {
-                memorysafe_core::Namespace::new("_purged").expect("literal is a valid namespace")
+                // The constant, not a second copy of the literal: the name is
+                // stored in audit rows that outlive the subject, so two
+                // spellings is one silent divergence away from a compliance
+                // query that finds nothing. See `PURGED_COMPONENT`'s doc for
+                // what reserves it and what does not.
+                memorysafe_core::Namespace::new(memorysafe_core::PURGED_COMPONENT)
+                    .expect("the reserved component is a valid namespace")
             });
         Ok(Scope { tenant: tenant.clone(), subject: subject.clone(), namespace })
     }
@@ -12487,6 +12559,15 @@ impl Engine {
     /// Namespaces the subject owns, ascending. Derived from its items, which
     /// is enough for v1: a namespace with no items has nothing for a purge to
     /// be about.
+    ///
+    /// **The `export` call below is a placeholder.** It pulls every item the
+    /// subject owns, bodies and all, into memory in order to learn a list of
+    /// namespace names — during an erasure, which is the one path where
+    /// holding a subject's corpus in memory is least defensible, and whose
+    /// cost grows with the corpus rather than with the answer. The correct
+    /// shape is a namespace query on `Backend` that answers from an index;
+    /// adding one is a trait change and belongs with the next batch of
+    /// contract work, not here.
     async fn namespaces_of(
         &self,
         tenant: &TenantId,
@@ -13262,6 +13343,14 @@ pub enum RetentionProfile {
 }
 
 impl RetentionProfile {
+    /// **This match is exhaustive by construction and must stay that way.**
+    /// There is no `_ =>` arm, so adding a variant to `RetentionProfile`
+    /// makes this fail to compile until the new profile is given its own
+    /// literal. That failure is the feature. The compiler enforces it; this
+    /// comment exists to stop someone "fixing" the error with a wildcard arm,
+    /// which would silently hand a new profile another profile's retention —
+    /// a wrong `purge_cascade` there is a destroyed audit trail or an
+    /// undeleted one, discovered during an erasure.
     pub fn retention(self) -> AuditRetention {
         match self {
             RetentionProfile::Balanced => AuditRetention {
@@ -13944,7 +14033,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 39 backend conformance tests, and the unit and integration suites of all six crates.
+Expected: PASS — the whole workspace green: 5 invariants, 45 backend conformance tests, and the unit and integration suites of all six crates.
 
 - [ ] **Step 5: Commit**
 
@@ -14334,7 +14423,7 @@ git commit -m "feat(engine): pending-embedding backfill and explicit re-embeddin
 - `cargo test --workspace --all-features` is green.
 - `cargo clippy --all-targets --all-features -- -D warnings` is clean.
 - The CI purity job confirms `memorysafe-core` and `memorysafe-policy` pull in no I/O crates.
-- `SqliteBackend` passes all 39 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
+- `SqliteBackend` passes all 45 conformance tests. **The suite is now frozen** — Plan 2's Postgres backend must pass it unmodified, and any change to it is a change to the `Backend` contract.
 - The five invariants pass at 64 proptest cases in release mode.
 - An engine can be constructed and driven end to end from a Rust test with no server, no network, and no model files.
 - No item is left permanently unsearchable: `pending_embedding` has a backfill path, and changing embedder is an explicit audited migration.

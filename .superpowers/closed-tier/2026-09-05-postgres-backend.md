@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 33-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
+**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 45-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
 
 **Architecture:** A second Cargo workspace, in its own closed repository, with the open-source repository vendored as a git submodule at `vendor/memorysafe` and consumed through path dependencies. One crate, `memorysafe-backend-postgres`, implements the `Backend` trait frozen at the end of Plan 1 Task 24. Every operation runs inside a transaction that first sets a transaction-local `memorysafe.tenant_id` GUC and `search_path`; the pool's connections run as a non-superuser role, so the RLS policy — not the query text — is what makes cross-tenant reads return nothing. Vector search generates candidates through a pgvector HNSW index and then reranks them exactly in Rust with `QuantizedVector::dot`, the same function the SQLite backend scores with, so both backends order identically.
 
@@ -57,7 +57,8 @@ pub trait Backend: Send + Sync {
     async fn list(&self, scope: &Scope, page: &Page) -> Result<Vec<MemoryItem>, BackendError>;
     async fn audit(&self, scope: &Scope, filter: &AuditFilter)
         -> Result<Vec<AuditRecord>, BackendError>;
-    async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId)
+    async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId,
+        cascade: PurgeCascade, audit: AuditRecord)
         -> Result<PurgeReport, BackendError>;
     async fn audit_aggregates(&self, tenant: &TenantId)
         -> Result<Vec<AuditAggregate>, BackendError>;
@@ -96,15 +97,20 @@ pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) where F::B: '
 
 Fixtures live in `memorysafe_backend::conformance::fx`: `embedder()` (a `DeterministicEmbedder` at **dim 256**, embedder id `deterministic-256`), `item`, `item_with`, `item_at`, `item_with_id`, `vector_for`, `admit_txn`, `admit_txn_embedded`, `evict_txn`, `evict_txn_at`.
 
-### The 33 conformance tests
+### The 45 conformance tests
+
+The authoritative list is `run_conformance_suite`'s own `run!` in
+`crates/memorysafe-backend/src/conformance/mod.rs`; this table is transcribed
+from it and was last recounted by enumerating `pub async fn` per module
+against that list. Recount, do not adjust by a difference.
 
 | Group | Tests |
 |---|---|
 | `isolation` (4) | `tenants_are_isolated`, `subjects_are_isolated`, `namespaces_are_separated`, `audit_is_scoped` |
-| `atomicity` (5) | `admit_evict_and_audit_commit_together`, `a_failed_transaction_leaves_no_trace`, `every_mutation_writes_exactly_one_audit_record`, `idempotent_writes_replay_the_original_outcome`, `idempotency_conflict_on_different_payload` |
+| `atomicity` (6) | `admit_evict_and_audit_commit_together`, `a_failed_transaction_leaves_no_trace`, `an_invalid_transaction_is_rejected_and_writes_nothing`, `every_mutation_writes_exactly_one_audit_record`, `idempotent_writes_replay_the_original_outcome`, `idempotency_conflict_on_different_payload` |
 | `retrieval` (13) | `sensitivity_ceiling_is_enforced_in_the_query`, `tag_and_kind_filters_narrow_results`, `vector_search_ranks_by_similarity`, `keyword_search_finds_exact_terms`, `keyword_search_escapes_user_input`, `hybrid_returns_both_signal_sources`, `list_pages_are_disjoint_and_complete`, `list_orders_oldest_first_by_created_at`, `list_tie_break_is_total_over_identical_timestamps`, `pending_embedding_items_are_excluded_when_asked`, `cross_model_vectors_are_rejected`, `neighbours_break_ties_before_truncating_at_k`, `recall_updates_access_statistics` |
 | `capacity` (4) | `capacity_accounting_tracks_items_and_bytes`, `eviction_releases_capacity`, `concurrent_admits_do_not_double_count`, `scope_stats_reflect_the_corpus` |
-| `lifecycle` (7) | `audit_filter_narrows_by_event_and_time`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `export_import_round_trips_exactly`, `import_is_idempotent`, `import_rejects_a_later_record_whose_tenant_disagrees`, `audit_aggregates_survive_a_cascading_purge` |
+| `lifecycle` (18) | `audit_filter_narrows_by_event_and_time`, `audit_returns_min_of_the_limit_and_the_rows_that_remain`, `audit_pages_by_the_after_cursor_without_repeating_a_row`, `audit_since_and_until_include_a_record_on_the_boundary`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `purge_subject_preserves_audit_when_asked`, `purge_subject_persists_the_record_it_was_given`, `apply_persists_the_audit_id_it_was_given`, `record_recall_persists_the_audit_id_it_was_given`, `import_preserves_every_audit_id`, `export_narrows_to_the_selectors_subject_and_namespace`, `export_orders_the_stream_by_kind_then_by_id`, `export_import_round_trips_exactly`, `import_is_idempotent`, `import_rejects_a_later_record_whose_tenant_disagrees`, `import_rejects_a_foreign_audit_record_even_when_every_item_agrees`, `audit_aggregates_survive_a_cascading_purge` |
 
 **`pagination_is_stable` no longer exists.** It was renamed to
 `list_pages_are_disjoint_and_complete` — what it actually proves. It sorts and
@@ -339,6 +345,17 @@ CREATE TABLE audit (
   policy     TEXT,
   PRIMARY KEY (tenant_id, id)
 ) PARTITION BY HASH (tenant_id);
+-- Two indexes, because there are two query shapes and neither serves the
+-- other. `Backend::audit` orders by `id DESC` and pages `AuditFilter::after`
+-- on `id < after`; within a scope the `at`-leading index is ordered
+-- `at ASC, id DESC`, so it cannot answer that without sorting the whole
+-- scope — on a table that grows without bound and is read for compliance.
+-- And `at` cannot stand in for `id`: `AuditRecord::new` mints `id` at
+-- construction while taking `at` as a parameter, so the two orders genuinely
+-- diverge, which is what `audit_filter_narrows_by_event_and_time`
+-- demonstrates at `limit: 2`. The `at`-leading index stays for the
+-- `since`/`until` window filters.
+CREATE INDEX idx_audit_scope_id ON audit (tenant_id, subject, namespace, id DESC);
 CREATE INDEX idx_audit_scope_at ON audit (tenant_id, subject, namespace, at, id DESC);
 
 CREATE TABLE idempotency (
@@ -418,7 +435,7 @@ The pool connects with whatever credentials `PgConfig::url` carries — typicall
 | 10 | Hard filters and keyword search | Hostile input cannot become an operator |
 | 11 | Hybrid retrieval | Retrieval conformance passes |
 | 12 | Capacity locking, merge, idempotency | Atomicity and capacity conformance pass |
-| 13 | Purge and portable export/import | The full 33-test suite passes |
+| 13 | Purge and portable export/import | The full 45-test suite passes |
 | 14 | `SchemaPerTenant` layout | The full suite passes under both layouts |
 | 15 | Cross-backend parity | SQLite and Postgres rank identically |
 | 16 | Schema-version guard and operator docs | Refuses a database from a newer version |
@@ -1576,6 +1593,11 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
            ON vectors (tenant_id, subject, namespace, embedder, dim)".into(),
         "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw
            ON vectors USING hnsw (embedding vector_ip_ops)".into(),
+        // Two indexes for two query shapes; see the DDL above for why the
+        // `at`-leading one cannot serve `ORDER BY id DESC` or the
+        // `AuditFilter::after` cursor.
+        "CREATE INDEX IF NOT EXISTS idx_audit_scope_id
+           ON audit (tenant_id, subject, namespace, id DESC)".into(),
         "CREATE INDEX IF NOT EXISTS idx_audit_scope_at
            ON audit (tenant_id, subject, namespace, at, id DESC)".into(),
     ]);
@@ -2348,7 +2370,14 @@ pub async fn query(
     // doc comment in memorysafe-core: `at` is whole seconds and cannot
     // separate rows written in the same second, so `id` alone is the total
     // order, not a tie-break on `at`. `since`/`until` are inclusive, hence
-    // `>=`/`<=` rather than `>`/`<`.
+    // `>=`/`<=` rather than `>`/`<`; `audit_since_and_until_include_a_record_on_the_boundary`
+    // rejects the exclusive reading.
+    //
+    // `after` is `id < $7`, strictly smaller, because the list descends and
+    // "after" names a position in that order rather than a point in time.
+    // `audit_pages_by_the_after_cursor_without_repeating_a_row` rejects
+    // `id > after` (which re-serves rows forever), `id <= after` (which
+    // re-serves one) and any `at`-based cursor.
     let rows = sqlx::query(
         "SELECT tenant_id, id, at, subject, namespace, event, items, assessment,
                 decision, actor
@@ -2357,8 +2386,9 @@ pub async fn query(
            AND ($4::text[] IS NULL OR event = ANY($4))
            AND ($5::bigint IS NULL OR at >= $5)
            AND ($6::bigint IS NULL OR at <= $6)
+           AND ($7::text IS NULL OR id < $7)
          ORDER BY id DESC
-         LIMIT $7",
+         LIMIT $8",
     )
     .bind(scope.tenant.as_str())
     .bind(scope.subject.as_str())
@@ -2366,6 +2396,7 @@ pub async fn query(
     .bind(events)
     .bind(filter.since.map(|t| t.unix_timestamp()))
     .bind(filter.until.map(|t| t.unix_timestamp()))
+    .bind(filter.after.as_ref().map(|a| a.as_str()))
     .bind(filter.limit as i64)
     .fetch_all(conn)
     .await
@@ -2373,7 +2404,13 @@ pub async fn query(
 
     let mut out: Vec<AuditRecord> = rows.iter().map(row_to_record).collect::<Result<_, _>>()?;
     // `AuditFilter::item` has no column of its own; the ids live inside the
-    // `items` JSONB. Filtering in Rust keeps the index on (scope, at) useful.
+    // `items` JSONB. Filtering in Rust keeps the scope indexes useful — but
+    // note it happens *after* `LIMIT`, so a page can come back shorter than
+    // `min(filter.limit, rows still matching)` when `filter.item` is set,
+    // which `Backend::audit` forbids. No conformance test sets `filter.item`,
+    // so nothing catches it; resolving it is Plan 2's, and the choice is
+    // between a JSONB containment predicate in the WHERE clause and an
+    // expression index on the ids.
     if let Some(wanted) = &filter.item {
         out.retain(|r| r.items.iter().any(|i| &i.id == wanted));
     }
@@ -2394,7 +2431,7 @@ use memorysafe_backend::{
 };
 use memorysafe_core::{
     AuditFilter, AuditId, AuditRecord, Budget, CapacityState, Embedding, ItemId, MemoryItem,
-    Scope, ScopeStats, ScoredCandidate, SubjectId, TenantId,
+    PurgeCascade, Scope, ScopeStats, ScoredCandidate, SubjectId, TenantId,
 };
 use session::tenant_txn;
 
@@ -2501,6 +2538,8 @@ impl Backend for PostgresBackend {
         &self,
         _tenant: &TenantId,
         _subject: &SubjectId,
+        _cascade: PurgeCascade,
+        _audit: AuditRecord,
     ) -> Result<PurgeReport, BackendError> {
         Ok(PurgeReport {
             items_removed: 0,
@@ -4210,7 +4249,7 @@ git commit -m "feat(pg): row-locked capacity accounting, merge, and idempotent w
 - Consumes: everything in the crate.
 - Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and the single `run_conformance_suite` entry point.
 
-**Milestone: the complete 33-test suite passes under `SharedPartitioned`.**
+**Milestone: the complete 45-test suite passes under `SharedPartitioned`.**
 
 **Why vectors are deleted explicitly when the cascade would do it.** `PurgeReport` counts what was removed, and a cascade reports nothing. Deleting vectors first makes the count exact and leaves the item delete with nothing to cascade to.
 
@@ -4259,7 +4298,7 @@ Expected: FAIL — `purge_subject_removes_everything_for_that_subject` panics: `
 ```rust
 use crate::error::SqlxResultExt;
 use memorysafe_backend::{BackendError, PurgeReport};
-use memorysafe_core::{SubjectId, TenantId};
+use memorysafe_core::{AuditRecord, PurgeCascade, SubjectId, TenantId};
 use sqlx::PgConnection;
 
 /// Right-to-delete for one subject: a first-class operation rather than a
@@ -4269,7 +4308,23 @@ pub async fn subject(
     conn: &mut PgConnection,
     tenant: &TenantId,
     subject: &SubjectId,
+    cascade: PurgeCascade,
+    audit: &AuditRecord,
 ) -> Result<PurgeReport, BackendError> {
+    // Counted before anything is written. `Backend::purge_subject`'s report is
+    // an equation — `audit_rows_removed + audit_rows_preserved` equals the
+    // rows the subject held immediately before this call — and the record
+    // inserted at the end belongs to neither term, so counting after the
+    // insert would put it in `preserved` and break it.
+    let existing_audit: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit WHERE tenant_id = $1 AND subject = $2",
+    )
+    .bind(tenant.as_str())
+    .bind(subject.as_str())
+    .fetch_one(&mut *conn)
+    .await
+    .pg()?;
+
     // Vectors first, so the count is exact. Deleting items afterwards has
     // nothing left to cascade to.
     let vectors_removed = sqlx::query("DELETE FROM vectors WHERE tenant_id = $1 AND subject = $2")
@@ -4288,16 +4343,24 @@ pub async fn subject(
         .pg()?
         .rows_affected();
 
-    // `balanced`, the default retention profile, cascades audit with the
-    // subject. Profiles that preserve it are applied by the engine, which
-    // rewrites the rows before calling this.
-    let audit_rows_removed = sqlx::query("DELETE FROM audit WHERE tenant_id = $1 AND subject = $2")
-        .bind(tenant.as_str())
-        .bind(subject.as_str())
-        .execute(&mut *conn)
-        .await
-        .pg()?
-        .rows_affected();
+    // `cascade` decides the audit detail and nothing else. The engine no
+    // longer reads or rewrites audit rows around this call — it passes the
+    // retention profile's decision and the `SubjectPurged` record, and this
+    // function does delete-before-insert in one transaction. See
+    // `Backend::purge_subject`, which enumerates the five defects of the
+    // replay shape that was here before.
+    let audit_rows_removed = match cascade {
+        PurgeCascade::Cascade => {
+            sqlx::query("DELETE FROM audit WHERE tenant_id = $1 AND subject = $2")
+                .bind(tenant.as_str())
+                .bind(subject.as_str())
+                .execute(&mut *conn)
+                .await
+                .pg()?
+                .rows_affected()
+        }
+        PurgeCascade::Preserve => 0,
+    };
 
     for table in ["idempotency", "capacity"] {
         sqlx::query(&format!("DELETE FROM {table} WHERE tenant_id = $1 AND subject = $2"))
@@ -4308,11 +4371,20 @@ pub async fn subject(
             .pg()?;
     }
 
+    // After the deletes, inside the same transaction, under the id it carries
+    // — the echo rule on `Backend`. Inserting first and then sweeping under
+    // `Cascade` would delete the purge's own record: the erasure would eat the
+    // only evidence it ran.
+    crate::audit::insert(&mut *conn, audit).await?;
+
     Ok(PurgeReport {
         items_removed,
         vectors_removed,
         audit_rows_removed,
-        audit_rows_preserved: 0,
+        // Under `Preserve` nothing was deleted, so every pre-existing row
+        // survives; under `Cascade` they are all in `audit_rows_removed`. The
+        // record just inserted is in neither term.
+        audit_rows_preserved: existing_audit as u64 - audit_rows_removed,
     })
 }
 ```
@@ -4501,9 +4573,11 @@ Replace the last three placeholders in `lib.rs`:
         &self,
         tenant: &TenantId,
         subject: &SubjectId,
+        cascade: PurgeCascade,
+        audit: AuditRecord,
     ) -> Result<PurgeReport, BackendError> {
         let mut tx = tenant_txn(self, tenant).await?;
-        let report = purge::subject(&mut tx, tenant, subject).await?;
+        let report = purge::subject(&mut tx, tenant, subject, cascade, &audit).await?;
         tx.commit().await.pg()?;
         Ok(report)
     }
@@ -4568,7 +4642,7 @@ git commit -m "feat(pg): subject purge and portable export/import; full conforma
 - Consumes: `ddl::statements` (already branches on layout), `ensure_ready` (already lazy).
 - Produces: an advisory lock around `ensure_schema`, and a second full conformance run.
 
-**Milestone: the full 33-test suite passes under both layouts.**
+**Milestone: the full 45-test suite passes under both layouts.**
 
 **Most of this layout already exists** — `ddl::statements` omits the partitioning clause and the partition tables, and `ensure_ready` creates a tenant's schema on first use. Two things are missing, and both are the kind of bug that only appears under load.
 
@@ -5265,7 +5339,7 @@ git commit -m "feat(pg): refuse an incompatible schema or vector width at connec
 
 - **No `ANALYZE` scheduling or index tuning.** `hnsw.m` and `ef_construction` stay at pgvector's defaults, and autovacuum keeps statistics current. Tuning them without a real corpus would be guesswork, and the planner already falls back to an exact scan when the index would not help.
 - **No connection-level retry.** `BackendError::Storage` carries `retryable`; deciding what to do with it is the engine's job, and putting a retry loop here as well would double the attempt count invisibly.
-- **No audit retention enforcement.** `purge_subject` implements `Cascade`, the `balanced` profile's behaviour. The other three profiles are the engine's to apply, by rewriting audit rows before it calls the backend — Plan 1 Task 36.
+- **No retention *expiry*.** `purge_subject` honours both `PurgeCascade` values, because the trait takes the decision as a parameter; what Plan 2 does not do is expire rows on `AuditRetention::detail` or `::aggregate` spans. That sweep is the engine's — Plan 1 Task 36. The engine never reads, rewrites or replays audit rows around a purge: it chooses the profile's `purge_cascade`, builds the `SubjectPurged` record, and hands both to the backend, which does delete-before-insert in one transaction.
 - **No `Exported` / `Imported` / `PolicyChanged` audit events.** Plan 1 records these as deferred to the adapters, where a human or API actor exists to attribute them to.
 
 **Next:** Plan 3 — the MCP server, the HTTP API, the `msafe` CLI, and the shadow-evaluation harness.
