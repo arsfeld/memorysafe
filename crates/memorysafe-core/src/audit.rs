@@ -21,6 +21,71 @@ pub enum AuditEvent {
     MaintenanceRun,
 }
 
+impl AuditEvent {
+    /// The variant's serialised snake_case name — the one string that is
+    /// simultaneously the serde form, the value a backend stores, the key
+    /// `memorysafe_backend::AggregateKey` sorts by, and what
+    /// `Backend::audit_aggregates` means by "the event's serialised snake_case
+    /// name". Without it those are four independent encodings of the same
+    /// thing, free to drift.
+    ///
+    /// **`AuditEvent` deliberately has no `Ord`, and the absence is
+    /// load-bearing — do not add one for convenience.** Deriving it would give
+    /// *declaration* order, which is nothing like this order: `rejected` is
+    /// declared second and sorts tenth, `exported` is declared sixth and sorts
+    /// second. Anything ordering audit events must compare `as_str()`, and the
+    /// missing derive is what makes `a.event.cmp(&b.event)` a compile error
+    /// rather than a silently wrong answer. That is a rung above a comment,
+    /// which relies on being read, and above a test, which catches the mistake
+    /// only after it is written: it removes the option. The obvious unblock
+    /// when that error appears — adding `Ord` to the derive list — is the bug.
+    ///
+    /// No tiebreaker is needed alongside `as_str`, unlike
+    /// `memorysafe_backend::AggregateKey`, whose ordering has to append
+    /// `tenant` to stay consistent with `Eq`: `as_str` is injective over
+    /// variants, so ordering by it returns `Equal` only for the same variant
+    /// and already agrees with the derived `Eq`.
+    ///
+    /// The same trap has a storage form: a backend that stores the event as an
+    /// integer ordinal and orders by that column gets declaration order.
+    /// Storing an enum as an integer is an established pattern here —
+    /// `SensitivityLevel::ordinal` does it, and for a good reason — so a
+    /// backend author following the local convention lands on the wrong order
+    /// by doing the idiomatic thing. Order by the stored *name*.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuditEvent::Admitted => "admitted",
+            AuditEvent::Rejected => "rejected",
+            AuditEvent::Merged => "merged",
+            AuditEvent::Forgotten => "forgotten",
+            AuditEvent::Recalled => "recalled",
+            AuditEvent::Exported => "exported",
+            AuditEvent::Imported => "imported",
+            AuditEvent::SubjectPurged => "subject_purged",
+            AuditEvent::Reembedded => "reembedded",
+            AuditEvent::PolicyChanged => "policy_changed",
+            AuditEvent::MaintenanceRun => "maintenance_run",
+        }
+    }
+
+    /// Every variant, for exhaustive iteration in tests and for a backend that
+    /// needs to enumerate the event space. Adding a variant without adding it
+    /// here is caught by `tests::every_audit_event_name_matches_its_serde_form`.
+    pub const ALL: [AuditEvent; 11] = [
+        AuditEvent::Admitted,
+        AuditEvent::Rejected,
+        AuditEvent::Merged,
+        AuditEvent::Forgotten,
+        AuditEvent::Recalled,
+        AuditEvent::Exported,
+        AuditEvent::Imported,
+        AuditEvent::SubjectPurged,
+        AuditEvent::Reembedded,
+        AuditEvent::PolicyChanged,
+        AuditEvent::MaintenanceRun,
+    ];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorKind {
@@ -229,6 +294,35 @@ mod tests {
             protection: Protection::Normal,
             pending_embedding: false,
         }
+    }
+
+    #[test]
+    fn every_audit_event_name_matches_its_serde_form() {
+        // `as_str` is a second copy of the names serde writes, kept so that
+        // ordering and storage can borrow one instead of allocating. A second
+        // copy is only safe while something compares the two, and this is that
+        // something: serde's output is a stored wire format, so a drift here
+        // would rename a storage key silently.
+        //
+        // Vacuous if `ALL` is ever shortened — a variant left out of it is a
+        // variant this loop never checks — so the length is asserted against
+        // the count the array type fixes, and `as_str`'s match has no wildcard
+        // arm, which makes a new variant a compile error there rather than a
+        // silent omission here.
+        assert_eq!(AuditEvent::ALL.len(), 11);
+        for event in AuditEvent::ALL {
+            assert_eq!(
+                format!("\"{}\"", event.as_str()),
+                serde_json::to_string(&event).unwrap(),
+                "as_str and the serde form must be the same string: {event:?}"
+            );
+        }
+        // And the names are distinct, or the ordering they key would not be a
+        // total order over the event space.
+        let mut names: Vec<&str> = AuditEvent::ALL.iter().map(|e| e.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), AuditEvent::ALL.len());
     }
 
     #[test]

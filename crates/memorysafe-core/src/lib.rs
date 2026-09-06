@@ -21,7 +21,7 @@ pub use capacity::{Budget, CapacityState, ScopeStats};
 pub use decision::{Action, Decision, Eviction, MergeStrategy, PolicyId, Reason, ReasonCode};
 pub use embedding::{EmbedderId, Embedding};
 pub use error::CoreError;
-pub use ids::{AuditId, ItemId, Namespace, Scope, SubjectId, TenantId};
+pub use ids::{AuditId, ItemId, Namespace, PURGED_COMPONENT, Scope, SubjectId, TenantId};
 pub use item::{MemoryItem, Protection, Source, SourceKind};
 pub use policy::{
     AdmitContext, AssessContext, Assessed, Candidate, ComposeContext, GovernancePolicy,

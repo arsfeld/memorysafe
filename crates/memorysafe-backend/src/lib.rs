@@ -37,6 +37,9 @@ pub enum BackendError {
     IdempotencyConflict,
     #[error("query is invalid: {0}")]
     InvalidQuery(String),
+    /// `WriteTransaction::is_valid` rejected the transaction — it both
+    /// inserts and merges, or its scope-bearing fields disagree. `Backend::apply`
+    /// returns this having written nothing.
     #[error("transaction is invalid: {0}")]
     InvalidTransaction(String),
     #[error("vector uses embedder {got}, scope uses {expected}")]
@@ -131,6 +134,18 @@ pub trait Backend: Send + Sync {
 
     /// Persists `txn.audit` under the id it already carries and returns that
     /// id as `AppliedWrite::audit_id` — see the echo rule on this trait.
+    ///
+    /// **`apply` must reject a transaction `WriteTransaction::is_valid`
+    /// rejects, with [`BackendError::InvalidTransaction`], having written
+    /// nothing.** Validation is not optional and not advisory: `is_valid`
+    /// exists because `scope`, the upserted item's own scope and
+    /// `audit.scope` are three independently-settable public fields that a
+    /// real backend reads for three different rows, so a transaction that
+    /// disagrees with itself files a row, its vector and its audit trail under
+    /// three different subjects. Rejecting *after* writing part of it is the
+    /// same defect with an error attached.
+    /// `conformance::atomicity::an_invalid_transaction_is_rejected_and_writes_nothing`
+    /// enforces both halves.
     async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError>;
 
     /// Writes the recall's audit row **and**, in the same transaction, updates
@@ -182,16 +197,21 @@ pub trait Backend: Send + Sync {
     /// list is descending, "after" names a *position* in that returned
     /// order, not a point in time: the next page is restricted to
     /// `id < after` (strictly smaller), not `id > after` — the temporal
-    /// reading would instead re-request rows already returned. Neither
-    /// draft `Backend::audit` implementation wires up `after` yet, so this
-    /// doc comment is the only place the direction is pinned down.
+    /// reading would instead re-request rows already returned.
+    /// `conformance::lifecycle::audit_pages_by_the_after_cursor_without_repeating_a_row`
+    /// enforces this: it pages a four-row log at `limit: 2` and asserts
+    /// strict descent, disjoint pages, a complete walk, and termination on a
+    /// short page.
     ///
     /// `filter.since` and `filter.until` are both **inclusive** bounds: a
-    /// record timestamped exactly at either edge matches. The conformance
-    /// suite's window test deliberately places both bounds off every
-    /// record's timestamp, so it cannot tell an inclusive backend from an
-    /// exclusive one — this doc comment is the only place the choice is
-    /// pinned down.
+    /// record timestamped exactly at either edge matches.
+    /// `conformance::lifecycle::audit_since_and_until_include_a_record_on_the_boundary`
+    /// enforces this, by placing each bound exactly on the timestamp of the
+    /// record that must be the corresponding extreme of the result.
+    /// `audit_filter_narrows_by_event_and_time` still places its own bounds
+    /// off every record's timestamp, on purpose: it tests the window without
+    /// depending on the inclusivity choice, so the two tests fail for
+    /// different reasons.
     ///
     /// **Truncation is detectable from the page size, so there is no
     /// `truncated` flag.** An implementation must return exactly
@@ -207,9 +227,11 @@ pub trait Backend: Send + Sync {
     /// `AuditFilter`: `limit` defaults to 100, so a compliance query built
     /// from `AuditFilter::default()` stops at 100 rows. It still does — but
     /// the caller can now tell, because a full page means "ask again", not
-    /// "that was everything". Note that `filter.after` appears in no
-    /// conformance test: the cursor is entirely untested, so this doc comment
-    /// is the only thing pinning down both its direction and this rule.
+    /// "that was everything".
+    /// `conformance::lifecycle::audit_returns_min_of_the_limit_and_the_rows_that_remain`
+    /// pins both arguments of the `min` in one test — a filter matching fewer
+    /// rows than the limit returns all of them, and one matching more
+    /// truncates to exactly the limit.
     async fn audit(
         &self,
         scope: &Scope,
@@ -306,6 +328,59 @@ pub trait Backend: Send + Sync {
     /// cross-backend drift `list` and `audit` each had to have pinned down
     /// after the fact.
     ///
+    /// That order now has an executable referent — [`AggregateKey`]'s
+    /// hand-written `Ord`, which encodes exactly this sequence and
+    /// deliberately not the struct's field order — and a conformance test,
+    /// `conformance::lifecycle::audit_aggregates_page_in_the_documented_order`.
+    ///
+    /// **The event sorts by its serialised name — `AuditEvent::as_str` — and
+    /// never by a stored ordinal.** `AuditEvent` has no `Ord` on purpose: a
+    /// derive would give declaration order, where `rejected` is second and
+    /// `exported` sixth, against an alphabetical tenth and second. This is not
+    /// a dialect split like the two below; it divides any two backends that
+    /// store the event differently, and storing an enum as an integer is an
+    /// established pattern in this codebase (`SensitivityLevel::ordinal`), so
+    /// a backend author following the local convention lands on the wrong
+    /// order by doing the idiomatic thing.
+    /// Two hazards it exists to catch, neither visible from this paragraph
+    /// alone: `None` before every `Some` is SQLite's default NULL ordering and
+    /// the **opposite** of Postgres's, which needs an explicit `NULLS FIRST`;
+    /// and `to_string()` is `name@version` as one string, so a numerically
+    /// compared version column puts `baseline@9` before `baseline@10` where
+    /// this order puts `baseline@10` first.
+    ///
+    /// **Two `Some`s compare by *byte* order** — `COLLATE "C"` / `ucs_basic`
+    /// in Postgres terms, SQLite's `BINARY` default — and this is **forced,
+    /// not preferred**. [`AggregateKey`]'s `Ord` compares `PolicyId` through
+    /// Rust's `String: Ord`, which is lexicographic over UTF-8 bytes, and
+    /// `conformance::lifecycle::audit_aggregates_page_in_the_documented_order`
+    /// measures a backend against that `Ord`. A backend whose SQL sorts under
+    /// any other collation therefore disagrees with the type the suite
+    /// compares it to. It is not a stylistic call and must not be relaxed to
+    /// match a customer's expected sort order.
+    ///
+    /// Saying only "compare by `to_string()`" leaves the comparison to
+    /// whatever the storage engine does with text, and the two engines do
+    /// different things: Postgres's `text` uses the database collation, which
+    /// is locale-aware by default. `B@1` sorts before `a@1` under byte order
+    /// (`0x42` < `0x61`) and after it under every locale collation; the
+    /// conformance sweep carries that exact pair.
+    ///
+    /// **Why `PolicyId` is the only key on this trait needing the clause**, and
+    /// it is not because the others are validated. `ItemId` and `AuditId` are
+    /// fixed-length `[0-9A-Z]` ULIDs — no case variation, no punctuation — so
+    /// they are genuinely collation-stable. `TenantId` is not: `validate_component`
+    /// permits `-`, `_` and `.`, and glibc collations reweight punctuation
+    /// rather than comparing it positionally, so `a-b` before `ab` in byte
+    /// order becomes `ab` before `a-b` under `en_US.UTF-8`. `TenantId` is safe
+    /// here **by unreachability, not by validation**: `audit_aggregates` takes
+    /// the tenant as a parameter, so every row in a result set shares it and
+    /// the trailing tiebreaker never discriminates between two of them. A SQL
+    /// implementation of the four-column comparison still wants `COLLATE "C"`
+    /// on *both* text columns; pinning only `policy` looks complete and is
+    /// not, and no test can catch the difference because the comparison it
+    /// would have to exercise never fires.
+    ///
     /// **The cursor.** `filter.after`, when set, continues a previous page:
     /// the next page is restricted to keys strictly greater than it in the
     /// order above. `AggregateKey` is a value comparable without existing —
@@ -315,6 +390,10 @@ pub trait Backend: Send + Sync {
     /// `AuditRetention::aggregate`, whereas a row-id cursor would name
     /// nothing once its row was gone and would make the log look exhausted
     /// for a reason unrelated to the caller's query.
+    /// `conformance::lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row`
+    /// enforces that, with a cursor placed between two stored rows and named
+    /// by no row at all — a case no paging sweep can generate, since every
+    /// cursor a sweep produces came from a row the backend just returned.
     ///
     /// **Truncation is detectable from the page size, exactly as `audit`
     /// documents — there is no `truncated` flag.** An implementation must
@@ -337,10 +416,17 @@ pub trait Backend: Send + Sync {
     /// backends exporting the same tenant with a different (or absent)
     /// order produce byte-different artifacts for identical data, so
     /// checksums do not match and a customer verifying a migration cannot.
-    /// `export_import_round_trips_exactly` never inspects the export stream
-    /// itself — it compares `list` output after re-sorting both sides by
-    /// `ItemId`, so no conformance test observes the stream's order at all —
-    /// this doc comment is the only thing pinning it down.
+    /// `export_import_round_trips_exactly` still does not observe the stream —
+    /// it compares `list` output after re-sorting both sides by `ItemId` —
+    /// but `conformance::lifecycle::export_orders_the_stream_by_kind_then_by_id`
+    /// now walks the records themselves, over a corpus whose insertion order
+    /// deliberately disagrees with its id order so that a backend emitting
+    /// rows in storage order fails.
+    ///
+    /// `sel`'s optional `subject` and `namespace` must narrow the result;
+    /// `conformance::lifecycle::export_narrows_to_the_selectors_subject_and_namespace`
+    /// enforces that, asserting both that the matching records are present and
+    /// that the others are absent.
     async fn export(&self, sel: &ScopeSelector) -> Result<ExportStream, BackendError>;
 
     /// Imports `stream` into `destination`. The tenant is a parameter, not a

@@ -526,20 +526,16 @@ pub async fn list_tie_break_is_total_over_identical_timestamps<F: BackendFactory
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
 
-    // Five ULIDs sharing a prefix and differing only in the final character,
-    // so their ascending order is `...FA0 < ...FA1 < ... < ...FA4` by
-    // inspection. `fixtures::tests::the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending`
-    // checks that premise in a test that actually runs today.
-    let ascending: Vec<ItemId> = [
-        "01ARZ3NDEKTSV4RRFFQ69G5FA0",
-        "01ARZ3NDEKTSV4RRFFQ69G5FA1",
-        "01ARZ3NDEKTSV4RRFFQ69G5FA2",
-        "01ARZ3NDEKTSV4RRFFQ69G5FA3",
-        "01ARZ3NDEKTSV4RRFFQ69G5FA4",
-    ]
-    .iter()
-    .map(|s| ItemId::parse(s).unwrap())
-    .collect();
+    // `fx::ITEM_ORDER_ULIDS`: five ULIDs sharing a prefix and differing only in
+    // the final character, so their ascending order is `...FA0 < ...FA1 < ...
+    // < ...FA4` by inspection.
+    // `fixtures::tests::the_literal_ulids_the_ordering_tests_use_parse_and_sort_ascending`
+    // checks that premise against the same constant, in a test that actually
+    // runs today.
+    let ascending: Vec<ItemId> = fx::ITEM_ORDER_ULIDS
+        .iter()
+        .map(|s| ItemId::parse(s).unwrap())
+        .collect();
 
     // Inserted in a deliberately non-ascending order. A backend that applies
     // no tie-break returns its natural row order, which for most storage

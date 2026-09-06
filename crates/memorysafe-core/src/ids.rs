@@ -75,6 +75,50 @@ scope_component!(TenantId, "tenant");
 scope_component!(SubjectId, "subject");
 scope_component!(Namespace, "namespace");
 
+/// The reserved scope component naming a purged subject's residue.
+///
+/// A subject spans namespaces but an `AuditRecord` carries exactly one
+/// `Scope`, so the `SubjectPurged` row has to be filed under some namespace.
+/// When the subject owned no items there is no namespace to file it under,
+/// and this is the name used instead. A leading underscore is deliberate and
+/// legal: `validate_component` rejects a leading `.` (to rule out `.` and
+/// `..` as filenames) but permits `_`, so this parses as a `Namespace` — and
+/// it must, or the fallback could not be constructed at all.
+///
+/// **This constant does not enforce the reservation, and core cannot.**
+/// `Namespace::new(PURGED_COMPONENT)` succeeds, exactly as
+/// `Namespace::new(ADMIN_COMPONENT)` will. Rejecting the name as *caller*
+/// input is an authorisation decision, and "caller" is a concept that does
+/// not exist below the adapters: everything reaching this engine in Plan 1 is
+/// trusted in-process code.
+///
+/// **What enforces it, named rather than gestured at:** Plan 3's adapter
+/// deliverable — `docs/superpowers/plans/2026-09-05-adapters-and-shadow.md`,
+/// Task 1 ("Core — the reserved admin scope; `memorysafe-auth`"), whose
+/// Global Constraints already state that a caller-supplied **subject or
+/// namespace** equal to `_admin` is rejected before the scope reaches the
+/// engine. `_purged` belongs in that same check, on the same two component
+/// kinds. A reader can go to that task and see whether it covers `_purged`
+/// alongside `_admin`; a deferral that named no referent could never be found
+/// unfulfilled.
+///
+/// **Why deferring is acceptable here is not the reason it is acceptable for
+/// `_admin`**, and the difference matters enough to write down. `_admin`
+/// guards an *authorisation* risk that only exists at the adapter, so the
+/// adapter is the only meaningful place to check it. `_purged` guards a
+/// *collision* risk that is live in Plan 1: a legitimate, trusted caller can
+/// innocently name a namespace `_purged` today, after which their ordinary
+/// audit rows sit alongside purge records. That is tolerable only because the
+/// collision is recoverable — a `SubjectPurged` row and an `Admitted` row in
+/// a namespace literally called `_purged` remain distinguishable by
+/// `AuditRecord::event`, so a compliance query is more awkward but never
+/// wrong. A queryability wart, not a correctness failure. If that ever stops
+/// being true, the deferral stops being licensed.
+///
+/// The `SubjectPurged` fallback that consumes this is the engine's
+/// `purge_scope` helper (Plan 1, Task 33).
+pub const PURGED_COMPONENT: &str = "_purged";
+
 // **Signature change here is not local**, for the same reason as
 // `scope_component!` above: `ulid_id!` generates `new() -> Self`,
 // `parse(&str) -> Result<Self, CoreError>` and `as_str(&self) -> &str` for
@@ -207,6 +251,38 @@ mod tests {
         assert!(TenantId::new("acme").is_ok());
         assert!(SubjectId::new("User42").is_err());
         assert!(Namespace::new("CodingAgent").is_err());
+    }
+
+    /// `PURGED_COMPONENT` is a stored word, not an internal one: it is written
+    /// into the `scope.namespace` of every `SubjectPurged` audit row for a
+    /// subject that owned no items, and those rows outlive the subject. A
+    /// compliance query that looks for the purge record of an erased subject
+    /// searches for this literal, so changing it orphans every row already
+    /// written under the old spelling — the data cannot be migrated, because
+    /// the subject it belonged to is gone by construction.
+    ///
+    /// **Vacuous if** rewritten to `assert_eq!(PURGED_COMPONENT, PURGED_COMPONENT)`
+    /// or to any comparison against the constant itself; the literal on the
+    /// right is the whole test.
+    #[test]
+    fn the_purged_component_literal_is_frozen_and_is_a_legal_component() {
+        assert_eq!(
+            PURGED_COMPONENT, "_purged",
+            "PURGED_COMPONENT is written into stored audit rows; changing its \
+             spelling orphans every row already filed under the old one"
+        );
+        // Legal in core by construction — the reservation is enforced above
+        // this crate (see the constant's doc comment), so `Namespace::new`
+        // must accept it here.
+        assert!(
+            Namespace::new(PURGED_COMPONENT).is_ok(),
+            "a leading underscore must stay legal, or the fallback namespace \
+             cannot be built at all"
+        );
+        assert!(
+            SubjectId::new(PURGED_COMPONENT).is_ok(),
+            "core does not reject the reserved word; an adapter does"
+        );
     }
 
     #[test]

@@ -86,6 +86,140 @@ pub async fn a_failed_transaction_leaves_no_trace<F: BackendFactory>(factory: &F
     );
 }
 
+/// A transaction `WriteTransaction::is_valid` rejects must be rejected by the
+/// backend too, **and must leave the corpus exactly as it was**.
+///
+/// **The implementation this rejects:** one that never calls
+/// `txn.is_valid()` and treats the transaction's parts as independent
+/// options — `if let Some(w) = txn.upsert { insert }`, then
+/// `if let Some(m) = txn.merge { rewrite }`, then `for id in txn.evictions
+/// { delete }`. That is the shape of a straightforward `apply`, and nothing
+/// in this suite has ever handed it a transaction where those parts
+/// contradict each other: `is_valid` is exercised only by
+/// `memorysafe-backend`'s own unit tests, which call it directly and never
+/// go through the trait. Such a backend inserts the new item *and* rewrites
+/// the merge target *and* performs the evictions, then reports success.
+///
+/// Both halves are load-bearing. A backend that validates, returns
+/// `InvalidTransaction`, and has already written half the transaction passes
+/// a rejection-only assertion — so the corpus is compared against a baseline
+/// read immediately before the failed call, on all three of the axes the
+/// transaction touches: the item that must not appear, the merge target's
+/// body that must not change, and the eviction that must not happen.
+///
+/// **The violation chosen is `upsert` and `merge` set together**, out of the
+/// three `is_valid` rejects, because it is unambiguous: a transaction cannot
+/// both introduce a new item and fold content into an existing one, under any
+/// reading. The two scope-disagreement cases are equally invalid but describe
+/// a *cross-scope write*, and asserting "nothing was written" for those means
+/// asserting it in two scopes, which weakens the assertion into a search.
+///
+/// **The merge target exists.** If it did not, a backend could reject with
+/// `MergeTargetMissing` — a rejection for a reason that has nothing to do
+/// with validity — and the test would certify a backend that never validates
+/// anything. Seeding it also gives the "nothing changed" half something to
+/// observe: a body that must still read as it did.
+///
+/// **Vacuous if** the corpus is empty when the invalid transaction is
+/// submitted (there is then nothing for a non-validating backend to damage,
+/// and every "unchanged" assertion holds trivially), or if the merge target
+/// is a fresh `ItemId::new()` (see above), or if the transaction is softened
+/// until `is_valid()` accepts it — at which point `apply` may legitimately
+/// succeed and `unwrap_err` panics rather than the test passing. The fixture
+/// therefore seeds two items, asserts the baseline is non-empty *before* the
+/// failed call, and asserts `!txn.is_valid()` locally so the premise is
+/// checked rather than assumed.
+pub async fn an_invalid_transaction_is_rejected_and_writes_nothing<F: BackendFactory>(factory: &F) {
+    use crate::write::MergeWrite;
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // The merge target and a second item for the invalid transaction to try
+    // to evict. Both must survive untouched.
+    let target = fx::item(&scope, "the merge target");
+    let bystander = fx::item(&scope, "not part of any of this");
+    for item in [target.clone(), bystander.clone()] {
+        backend
+            .apply(fx::admit_txn(&scope, item, None))
+            .await
+            .unwrap();
+    }
+
+    let before = backend.list(&scope, &Page::default()).await.unwrap();
+    assert_eq!(
+        before.len(),
+        2,
+        "the corpus must exist before a 'nothing changed' comparison means anything"
+    );
+    let audit_before = backend
+        .audit(&scope, &AuditFilter::default())
+        .await
+        .unwrap()
+        .len();
+
+    // Upsert and merge together — `WriteTransaction::is_valid` rejects this
+    // outright — plus an eviction, so a backend that applies the parts
+    // independently damages the corpus in three distinguishable ways.
+    let newcomer = fx::item(&scope, "must never be written");
+    let mut txn = fx::admit_txn(&scope, newcomer.clone(), None);
+    txn.merge = Some(MergeWrite {
+        target: target.id.clone(),
+        body: "a body the merge target must never acquire".into(),
+        tags: vec![],
+        attrs: Default::default(),
+        vector: None,
+        byte_size: 41,
+    });
+    txn.evictions = vec![bystander.id.clone()];
+    assert!(
+        !txn.is_valid(),
+        "the premise of this test: the transaction it submits must be one \
+         `WriteTransaction::is_valid` rejects"
+    );
+
+    let err = backend.apply(txn).await.unwrap_err();
+    assert!(
+        matches!(err, BackendError::InvalidTransaction(_)),
+        "an invalid transaction must be refused as invalid, not applied and \
+         not refused for some incidental reason: got {err:?}"
+    );
+
+    // Nothing was written: no new item, no rewritten body, no eviction, no
+    // audit row.
+    assert!(
+        backend.get(&scope, &newcomer.id).await.unwrap().is_none(),
+        "a rejected transaction still inserted its item"
+    );
+    let survivor = backend
+        .get(&scope, &target.id)
+        .await
+        .unwrap()
+        .expect("a rejected transaction deleted the merge target");
+    assert_eq!(
+        survivor.body, target.body,
+        "a rejected transaction still applied its merge"
+    );
+    assert!(
+        backend.get(&scope, &bystander.id).await.unwrap().is_some(),
+        "a rejected transaction still applied its evictions"
+    );
+    let after = backend.list(&scope, &Page::default()).await.unwrap();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the corpus changed size across a rejected transaction"
+    );
+    assert_eq!(
+        backend
+            .audit(&scope, &AuditFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        audit_before,
+        "a rejected transaction still wrote its audit row"
+    );
+}
+
 /// Invariant 4 from the spec, at the backend level.
 pub async fn every_mutation_writes_exactly_one_audit_record<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
