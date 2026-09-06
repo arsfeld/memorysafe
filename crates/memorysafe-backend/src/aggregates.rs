@@ -6,9 +6,43 @@
 //! plan mentioned the concept.
 //!
 //! **What is in this module and what is not.** The contract: the key, the
-//! histogram edges, and the read method on `Backend`. The storage table is
-//! Task 19, the increments are Tasks 20 and 23, and retention enforcement is
-//! Task 36. None of those belong here.
+//! histogram edges, the write rule below, and the read method on `Backend`.
+//! The storage table, the increments themselves and retention enforcement are
+//! the SQLite and engine tasks' — the schema task creates the table, every
+//! task that writes an audit row increments, and the retention task expires
+//! rows on `AuditRetention::aggregate`. None of those belong here.
+//!
+//! # The write rule, and its atomicity requirement
+//!
+//! **Every audit row a backend writes increments exactly one aggregate row, in
+//! the same transaction that writes the audit row.** Every path: admissions,
+//! merges, evictions, recalls, the `SubjectPurged` record a purge inserts, and
+//! audit rows arriving through `import`. `AggregateKey::policy` is an `Option`
+//! precisely because most event classes carry no policy, so a rule that
+//! aggregated only policy-driven events would make `None` unreachable in
+//! stored data.
+//!
+//! **And the increment must be atomic against concurrent writers — "same
+//! transaction" is not sufficient and this is the part that is easy to miss.**
+//! An implementation that reads the row, adds one, and writes it back is
+//! correct only if concurrent increments of the same key cannot interleave.
+//! Under a per-tenant write lock they cannot; under a database default like
+//! READ COMMITTED they can, and the second write silently overwrites the
+//! first's count. Use an atomic upsert (`count = count + 1` evaluated by the
+//! database), or a row lock, or serialise the writers — but choose, and say
+//! which in the backend.
+//!
+//! **Why this is stated here rather than left to the same care capacity
+//! accounting gets.** Capacity has a conformance test for exactly this
+//! (`capacity::concurrent_admits_do_not_double_count`) and aggregates do not,
+//! and the asymmetry is deliberate rather than an omission: capacity drift is
+//! **reconcilable** — `used_items` and `used_bytes` can be recomputed from the
+//! `items` table at any time. An aggregate undercount is not. These rows are
+//! designed to outlive the detail rows they summarise, so after a cascading
+//! purge or a retention sweep there is nothing left to recount from. **The loss
+//! is permanent, in the one artifact built to be permanent**, which is why the
+//! requirement is a contract sentence binding backends nobody has written yet
+//! rather than a test that would bind only the ones that remembered.
 //!
 //! # The key: tenant + policy version + event class + day bucket
 //!
@@ -195,29 +229,54 @@ impl Ord for AggregateKey {
     /// declaration order, in which `rejected` is second and `exported` sixth
     /// while the documented order sorts them tenth and second.
     ///
-    /// `policy` compares as `Option<String>` of `PolicyId::to_string()`, which
-    /// gives both halves of the documented rule at once: `Option`'s own
-    /// ordering puts `None` before every `Some`, and two `Some`s compare by
-    /// `name@version` as a single string. That last part is not cosmetic — a
-    /// backend comparing a name column and a numerically-typed version column
-    /// pairwise puts `baseline@9` before `baseline@10`, where the documented
-    /// string order puts `baseline@10` first.
+    /// `policy` compares as `Option<(&str, &str)>` — `None` before every
+    /// `Some`, then `name`, then `version` — and **not** by
+    /// `PolicyId::to_string()`, which is what this comparison used to do.
     ///
-    /// `String`'s `Ord` is **byte** order, and that is what forces
-    /// `Backend::audit_aggregates` to mandate `COLLATE "C"` rather than the
-    /// database's default collation: the conformance sweep compares a backend
-    /// against this function, so a backend sorting under any other collation
-    /// disagrees with the type it is being measured by. `PolicyId::new`
-    /// validates neither field, so case and punctuation both reach this
-    /// comparison — `B@1` precedes `a@1` here and would follow it under any
-    /// locale-aware collation.
+    /// **Why the render was abandoned.** `Display` is `{name}@{version}` and
+    /// `PolicyId` constrains neither field, so `PolicyId::new("a@b", "c")` and
+    /// `PolicyId::new("a", "b@c")` both render `"a@b@c"`. Ordering by the
+    /// render returned `Equal` for two keys that `==` says are different,
+    /// which breaks `Ord`'s agreement with `Eq` — the same defect the trailing
+    /// `tenant` component exists to avoid, one component to the left. Comparing
+    /// the pair instead is injective over `PolicyId` by construction: the pair
+    /// *is* the type, so two keys compare `Equal` exactly when they are equal.
+    /// A tie-break appended after the render would have closed the symptom
+    /// while leaving the documented rule (`to_string()`) as something an
+    /// implementer could implement faithfully and still get a different order.
     ///
-    /// The trailing `tenant` comparison has the same exposure and no test can
-    /// reach it: `TenantId` permits `-`, `_` and `.`, which glibc collations
-    /// reweight rather than compare positionally, but `audit_aggregates` takes
-    /// the tenant as a parameter so every row in one result set shares it. A
-    /// SQL implementation still wants `COLLATE "C"` on both text columns —
-    /// pinning only `policy` looks complete and is not.
+    /// It costs nothing on the cases anyone cares about: `baseline@10` still
+    /// precedes `baseline@9` (versions compare as text, so `"10" < "9"`), and
+    /// `B@1` still precedes `a@1`. What changes is only the pairs the render
+    /// could not separate, and pairs whose names differ around a character
+    /// below `@`.
+    ///
+    /// **Nothing else depends on the rendered form being the sort key**
+    /// (checked before the change): `PolicyId::to_string()` is written into the
+    /// audit detail table's `policy` column and into a shadow-diff report, both
+    /// of which store or display it, and no query anywhere orders by it. The
+    /// aggregate table keys on the two parts, so the pair that renders alike
+    /// occupies two rows rather than colliding into one — the render collision
+    /// was only ever an ordering ambiguity here, never a lost count, and this
+    /// removes the ambiguity instead of tie-breaking around it.
+    ///
+    /// `str`'s `Ord` is **byte** order, and that is what forces
+    /// `Backend::audit_aggregates` to mandate an explicit byte collation
+    /// rather than a database default: the conformance sweep compares a
+    /// backend against this function, so a backend sorting under any other
+    /// collation disagrees with the type it is being measured by.
+    ///
+    /// The trailing `tenant` comparison has the same collation exposure, and
+    /// **no conformance test can reach it**: `TenantId` permits `-`, `_` and
+    /// `.`, which a locale collation may reweight rather than compare
+    /// positionally, but `audit_aggregates` takes the tenant as a parameter, so
+    /// every row in one result set shares it and the comparison never fires
+    /// against a backend. `tests::ordering_by_tenant_is_last_so_it_never_perturbs_a_single_tenant_page`
+    /// does reach it, by comparing two keys directly — which is the only place
+    /// it can be reached at all, and why that test exists. A SQL implementation
+    /// still wants the explicit collation on **every** text column of the key —
+    /// `policy_name`, `policy_version` and `tenant` — since pinning one looks
+    /// complete and is not.
     ///
     /// `tenant` is compared **last**, after the three documented components.
     /// It takes no part in the documented order because `audit_aggregates` is
@@ -231,8 +290,13 @@ impl Ord for AggregateKey {
             .then_with(|| {
                 self.policy
                     .as_ref()
-                    .map(PolicyId::to_string)
-                    .cmp(&other.policy.as_ref().map(PolicyId::to_string))
+                    .map(|p| (p.name.as_str(), p.version.as_str()))
+                    .cmp(
+                        &other
+                            .policy
+                            .as_ref()
+                            .map(|p| (p.name.as_str(), p.version.as_str())),
+                    )
             })
             .then_with(|| self.event.as_str().cmp(other.event.as_str()))
             .then_with(|| self.tenant.as_str().cmp(other.tenant.as_str()))
@@ -526,10 +590,10 @@ mod tests {
              opposite of Postgres's default NULL ordering for ASC"
         );
 
-        // Two `Some`s compare by `to_string()`, which is `name@version` as one
-        // string. The pair below is the case that inverts under a version
-        // column compared numerically: "baseline@10" < "baseline@9" as text,
-        // 9 < 10 as numbers.
+        // Two `Some`s compare by name and then by version, each as text. The
+        // pair below is the case that inverts under a version column compared
+        // numerically: names tie, then "10" < "9" as text while 9 < 10 as
+        // numbers.
         let v10 = key(
             5,
             Some(PolicyId::new("baseline", "10")),
@@ -542,10 +606,36 @@ mod tests {
         );
         assert!(
             v10 < v9,
-            "two Some policies compare as name@version strings, so \
-             baseline@10 precedes baseline@9 — a numerically compared version \
-             column reverses this and no other assertion in this crate would \
-             notice"
+            "two Some policies compare by name and then by version, each as \
+             text, so baseline@10 precedes baseline@9 — a numerically compared \
+             version column reverses this and no other assertion in this crate \
+             would notice"
+        );
+
+        // Two `PolicyId`s that render the same string still compare as
+        // different keys. `Display` is `{name}@{version}` and neither field is
+        // constrained, so ("a@b", "c") and ("a", "b@c") both render "a@b@c" —
+        // ordering by the render returned `Equal` for keys that `==` calls
+        // different, which is the `Ord`/`Eq` inconsistency the pair comparison
+        // removes at the root. Read from the rule: name first, and "a" is a
+        // prefix of "a@b", so the shorter name sorts first.
+        let split_late = key(5, Some(PolicyId::new("a", "b@c")), AuditEvent::Admitted);
+        let split_early = key(5, Some(PolicyId::new("a@b", "c")), AuditEvent::Admitted);
+        assert_eq!(
+            split_late.policy.as_ref().unwrap().to_string(),
+            split_early.policy.as_ref().unwrap().to_string(),
+            "the premise: these two render identically, or the case under test \
+             does not exist"
+        );
+        assert_ne!(
+            split_late, split_early,
+            "they are nonetheless different keys"
+        );
+        assert!(
+            split_late < split_early,
+            "policies compare by name then version, so ('a', 'b@c') precedes \
+             ('a@b', 'c'). Comparing the rendered string returns Equal here and \
+             makes Ord disagree with Eq"
         );
 
         // And the comparison is over *bytes*, not a locale collation.
@@ -597,14 +687,14 @@ mod tests {
                 forgotten,
                 rejected,
                 policy_less,
-                // then the policied rows, by `name@version` as one string:
-                // "a@1" < "baseline@10" < "baseline@9".
+                // then the policied rows, by name and then version:
+                // "a" < "baseline", and within it "10" < "9" as text.
                 with_policy,
                 v10,
                 v9,
             ],
             "the full documented order: day, then policy (None first, then \
-             name@version), then the event's serialised name"
+             name, then version), then the event's serialised name"
         );
     }
 

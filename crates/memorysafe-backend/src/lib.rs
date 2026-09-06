@@ -100,9 +100,13 @@ pub trait Backend: Send + Sync {
     /// Populates `ScoredCandidate::last_accessed_at` and `access_count` from
     /// each item's stored access statistics — the values `record_recall`
     /// maintains. An item never recalled comes back as `(None, 0)`, never
-    /// `(Some(created_at), 0)`; see `ScoredCandidate::last_accessed_at` for
-    /// why the two must stay distinguishable and why no fixture in this suite
-    /// could tell them apart if they were not.
+    /// `(Some(created_at), 0)`; see `ScoredCandidate::last_accessed_at` for why
+    /// the two must stay distinguishable.
+    /// `conformance::retrieval::recall_updates_access_statistics` enforces it,
+    /// and enforces it on the `Option` rather than on the timestamp: `fx::item`
+    /// pins `created_at` to `UNIX_EPOCH`, so a backend seeding
+    /// `last_accessed_at` from `created_at` produces a *value* no fixture here
+    /// can distinguish from a real one — `is_none()` is what separates them.
     async fn retrieve_candidates(
         &self,
         scope: &Scope,
@@ -320,66 +324,95 @@ pub trait Backend: Send + Sync {
     /// the audit detail table destroys the one artifact that was designed to
     /// outlive the detail.
     ///
-    /// **Ordering.** Rows are ordered ascending by the full key — `day`, then
-    /// `policy` (`None` sorts before every `Some`, and two `Some`s compare by
-    /// `to_string()`), then the event's serialised snake_case name — so
-    /// resumption via `after` is over a total order, not merely a mostly-total
-    /// one. Stating the order costs nothing now and stops the same
-    /// cross-backend drift `list` and `audit` each had to have pinned down
-    /// after the fact.
+    /// **Ordering.** Rows are ordered ascending by the full key, which is
+    /// **five comparisons in this order** — enumerated in full rather than
+    /// summarised, because "the full key" previously named three of them and a
+    /// Postgres implementer building from this paragraph would have produced a
+    /// different total order:
     ///
-    /// That order now has an executable referent — [`AggregateKey`]'s
-    /// hand-written `Ord`, which encodes exactly this sequence and
-    /// deliberately not the struct's field order — and a conformance test,
+    /// 1. `day`, ascending.
+    /// 2. `policy`, with `None` before every `Some`.
+    /// 3. the policy's `name`.
+    /// 4. the policy's `version`.
+    /// 5. the event's serialised snake_case name.
+    ///
+    /// and then `tenant` as a sixth, which never discriminates in practice —
+    /// `audit_aggregates` takes the tenant as a parameter, so every row in one
+    /// result set shares it — but is part of the comparison because [`AggregateKey`]'s
+    /// `Ord` must agree with its `Eq`, and two keys differing only in tenant
+    /// are not equal. It is listed so an implementer reading this paragraph
+    /// and an implementer reading `AggregateKey::cmp` write the same code.
+    ///
+    /// **Name and version compare separately, not as `name@version`.** The
+    /// render is `Display`'s job and it is not injective: `PolicyId` constrains
+    /// neither field, so `("a@b", "c")` and `("a", "b@c")` both render
+    /// `"a@b@c"`. An ordering built on the render returns `Equal` for two keys
+    /// `==` calls different — and a backend storing the policy as one rendered
+    /// column does worse than misorder them, it **merges their counts into one
+    /// aggregate row**. Store and compare the two parts.
+    ///
+    /// Stating the order costs nothing now and stops the same cross-backend
+    /// drift `list` and `audit` each had to have pinned down after the fact.
+    /// It has an executable referent — [`AggregateKey`]'s hand-written `Ord`,
+    /// which encodes exactly this sequence and deliberately not the struct's
+    /// field order — and a conformance test,
     /// `conformance::lifecycle::audit_aggregates_page_in_the_documented_order`.
     ///
     /// **The event sorts by its serialised name — `AuditEvent::as_str` — and
     /// never by a stored ordinal.** `AuditEvent` has no `Ord` on purpose: a
     /// derive would give declaration order, where `rejected` is second and
-    /// `exported` sixth, against an alphabetical tenth and second. This is not
-    /// a dialect split like the two below; it divides any two backends that
-    /// store the event differently, and storing an enum as an integer is an
-    /// established pattern in this codebase (`SensitivityLevel::ordinal`), so
-    /// a backend author following the local convention lands on the wrong
-    /// order by doing the idiomatic thing.
-    /// Two hazards it exists to catch, neither visible from this paragraph
-    /// alone: `None` before every `Some` is SQLite's default NULL ordering and
-    /// the **opposite** of Postgres's, which needs an explicit `NULLS FIRST`;
-    /// and `to_string()` is `name@version` as one string, so a numerically
-    /// compared version column puts `baseline@9` before `baseline@10` where
-    /// this order puts `baseline@10` first.
+    /// `exported` sixth, against an alphabetical tenth and second. This one is
+    /// not a dialect split: it divides any two backends that store the event
+    /// differently, and storing an enum as an integer is an established
+    /// pattern in this codebase (`SensitivityLevel::ordinal`), so a backend
+    /// author following the local convention lands on the wrong order by doing
+    /// the idiomatic thing.
     ///
-    /// **Two `Some`s compare by *byte* order** — `COLLATE "C"` / `ucs_basic`
-    /// in Postgres terms, SQLite's `BINARY` default — and this is **forced,
-    /// not preferred**. [`AggregateKey`]'s `Ord` compares `PolicyId` through
-    /// Rust's `String: Ord`, which is lexicographic over UTF-8 bytes, and
-    /// `conformance::lifecycle::audit_aggregates_page_in_the_documented_order`
-    /// measures a backend against that `Ord`. A backend whose SQL sorts under
-    /// any other collation therefore disagrees with the type the suite
-    /// compares it to. It is not a stylistic call and must not be relaxed to
-    /// match a customer's expected sort order.
+    /// # Collation and null placement are stated, never defaulted
     ///
-    /// Saying only "compare by `to_string()`" leaves the comparison to
-    /// whatever the storage engine does with text, and the two engines do
-    /// different things: Postgres's `text` uses the database collation, which
-    /// is locale-aware by default. `B@1` sorts before `a@1` under byte order
-    /// (`0x42` < `0x61`) and after it under every locale collation; the
-    /// conformance sweep carries that exact pair.
+    /// **Every ordering over a text column must state its collation
+    /// explicitly; every ordering over a nullable column must state null
+    /// placement explicitly. Neither may rely on a dialect default.** This
+    /// binds every backend, not only the one whose defaults happen to
+    /// disagree — a rule written as "dialect X defaults the wrong way" rests on
+    /// a remembered default, and if the recollection is wrong it is wrong in
+    /// both directions at once.
     ///
-    /// **Why `PolicyId` is the only key on this trait needing the clause**, and
-    /// it is not because the others are validated. `ItemId` and `AuditId` are
-    /// fixed-length `[0-9A-Z]` ULIDs — no case variation, no punctuation — so
-    /// they are genuinely collation-stable. `TenantId` is not: `validate_component`
-    /// permits `-`, `_` and `.`, and glibc collations reweight punctuation
-    /// rather than comparing it positionally, so `a-b` before `ab` in byte
-    /// order becomes `ab` before `a-b` under `en_US.UTF-8`. `TenantId` is safe
-    /// here **by unreachability, not by validation**: `audit_aggregates` takes
-    /// the tenant as a parameter, so every row in a result set shares it and
-    /// the trailing tiebreaker never discriminates between two of them. A SQL
-    /// implementation of the four-column comparison still wants `COLLATE "C"`
-    /// on *both* text columns; pinning only `policy` looks complete and is
-    /// not, and no test can catch the difference because the comparison it
-    /// would have to exercise never fires.
+    /// The rule is deliberately **semantic, not syntactic**: each dialect
+    /// supplies its own spelling, and this trait does not know them. Byte order
+    /// is the required semantics for text here, because [`AggregateKey`]'s `Ord`
+    /// compares through Rust's `str: Ord` and the conformance sweep measures a
+    /// backend against that `Ord` — so a backend sorting under any other
+    /// collation disagrees with the type it is being compared to. It is forced,
+    /// not preferred, and must not be relaxed to match a customer's expected
+    /// sort order.
+    ///
+    /// The columns this reaches, for the key above: the policy's name, the
+    /// policy's version, the event name, and the tenant — every text component,
+    /// not only the ones a test can currently reach. The nullable one is the
+    /// policy, whose `None` must sort before every `Some`.
+    ///
+    /// **Each backend must carry a test named
+    /// `ordering_sql_states_collation_and_null_placement`**, asserting that the
+    /// SQL it builds for this ordering states both. Two things about that test,
+    /// both of which stop it being read as more than it is:
+    ///
+    /// - **It checks a different property from the conformance sweep, not a
+    ///   better one.** The sweep checks the resulting *order*; a backend
+    ///   relying on a default that happens to agree produces the right order
+    ///   and passes. This checks *explicitness*, which is what survives a
+    ///   deployment moving to a different locale or a different engine.
+    /// - **The canonical name is the propagation check; the test's content is
+    ///   the enforcement check.** Grepping the name across backend crates
+    ///   answers "did this backend write one", which is why the name is fixed
+    ///   rather than left to judgement. It does not answer "does it assert
+    ///   anything" — an empty function satisfies the grep. Do not read a clean
+    ///   grep as a clean audit.
+    ///
+    /// The test must derive the SQL from whatever builds the query rather than
+    /// asserting against a copied literal: a literal is a second copy of the
+    /// query and drifts from it, which is the objection that produced
+    /// `AggregateKey`'s `Ord` in the first place.
     ///
     /// **The cursor.** `filter.after`, when set, continues a previous page:
     /// the next page is restricted to keys strictly greater than it in the

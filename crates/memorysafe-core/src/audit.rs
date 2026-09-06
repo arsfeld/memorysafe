@@ -69,8 +69,23 @@ impl AuditEvent {
     }
 
     /// Every variant, for exhaustive iteration in tests and for a backend that
-    /// needs to enumerate the event space. Adding a variant without adding it
-    /// here is caught by `tests::every_audit_event_name_matches_its_serde_form`.
+    /// needs to enumerate the event space.
+    ///
+    /// **Nothing forces a new variant into this array, and the test below does
+    /// not.** A twelfth variant leaves `ALL` as `[AuditEvent; 11]` holding
+    /// eleven entries, so `every_audit_event_name_matches_its_serde_form`'s
+    /// length assertion passes and its loop never sees the new variant. What
+    /// *is* guarded is the **name**: `as_str`'s match has no wildcard arm, so a
+    /// new variant fails to compile there until it is given one. The
+    /// declaration order of the two is the whole difference — an exhaustive
+    /// match is checked by the compiler, an array literal is not.
+    ///
+    /// The hazard is latent rather than live: `ALL` is referenced nowhere in
+    /// this workspace but its own test. A macro generating the enum, `as_str`
+    /// and `ALL` from one variant list would close it, and is the shape to
+    /// reach for if `ALL` ever acquires a real caller — a `const fn` index with
+    /// an exhaustive match does not, since a new variant simply takes the next
+    /// index, and `std::mem::variant_count` is nightly.
     pub const ALL: [AuditEvent; 11] = [
         AuditEvent::Admitted,
         AuditEvent::Rejected,
@@ -304,11 +319,14 @@ mod tests {
         // something: serde's output is a stored wire format, so a drift here
         // would rename a storage key silently.
         //
-        // Vacuous if `ALL` is ever shortened — a variant left out of it is a
-        // variant this loop never checks — so the length is asserted against
-        // the count the array type fixes, and `as_str`'s match has no wildcard
-        // arm, which makes a new variant a compile error there rather than a
-        // silent omission here.
+        // Vacuous for any variant missing from `ALL` — this loop only sees
+        // what the array holds, and the length assertion below compares 11
+        // against an `[AuditEvent; 11]`, which is a tautology and catches
+        // nothing. It is kept because it makes the number visible at the point
+        // of use, not because it guards anything. The real guard is one level
+        // over: `as_str`'s match has no wildcard arm, so a new variant is a
+        // compile error there. See `ALL`'s own doc, which used to claim this
+        // test was the guard and no longer does.
         assert_eq!(AuditEvent::ALL.len(), 11);
         for event in AuditEvent::ALL {
             assert_eq!(

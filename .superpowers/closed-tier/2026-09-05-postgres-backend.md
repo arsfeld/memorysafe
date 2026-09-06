@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 47-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
+**Goal:** Build `memorysafe-backend-postgres` — the commercial scaling-tier backend — so that it passes Plan 1's frozen 50-test conformance suite unmodified, under both supported tenant layouts, with tenant isolation enforced by PostgreSQL row-level security rather than by application `WHERE` clauses.
 
 **Architecture:** A second Cargo workspace, in its own closed repository, with the open-source repository vendored as a git submodule at `vendor/memorysafe` and consumed through path dependencies. One crate, `memorysafe-backend-postgres`, implements the `Backend` trait frozen at the end of Plan 1 Task 24. Every operation runs inside a transaction that first sets a transaction-local `memorysafe.tenant_id` GUC and `search_path`; the pool's connections run as a non-superuser role, so the RLS policy — not the query text — is what makes cross-tenant reads return nothing. Vector search generates candidates through a pgvector HNSW index and then reranks them exactly in Rust with `QuantizedVector::dot`, the same function the SQLite backend scores with, so both backends order identically.
 
@@ -97,7 +97,7 @@ pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) where F::B: '
 
 Fixtures live in `memorysafe_backend::conformance::fx`: `embedder()` (a `DeterministicEmbedder` at **dim 256**, embedder id `deterministic-256`), `item`, `item_with`, `item_at`, `item_with_id`, `vector_for`, `admit_txn`, `admit_txn_embedded`, `evict_txn`, `evict_txn_at`.
 
-### The 47 conformance tests
+### The 50 conformance tests
 
 The authoritative list is `run_conformance_suite`'s own `run!` in
 `crates/memorysafe-backend/src/conformance/mod.rs`; this table is transcribed
@@ -106,11 +106,11 @@ against that list. Recount, do not adjust by a difference.
 
 | Group | Tests |
 |---|---|
-| `isolation` (4) | `tenants_are_isolated`, `subjects_are_isolated`, `namespaces_are_separated`, `audit_is_scoped` |
+| `isolation` (5) | `tenants_are_isolated`, `subjects_are_isolated`, `namespaces_are_separated`, `audit_is_scoped`, `retrieval_never_crosses_a_scope_boundary` |
 | `atomicity` (6) | `admit_evict_and_audit_commit_together`, `a_failed_transaction_leaves_no_trace`, `an_invalid_transaction_is_rejected_and_writes_nothing`, `every_mutation_writes_exactly_one_audit_record`, `idempotent_writes_replay_the_original_outcome`, `idempotency_conflict_on_different_payload` |
 | `retrieval` (13) | `sensitivity_ceiling_is_enforced_in_the_query`, `tag_and_kind_filters_narrow_results`, `vector_search_ranks_by_similarity`, `keyword_search_finds_exact_terms`, `keyword_search_escapes_user_input`, `hybrid_returns_both_signal_sources`, `list_pages_are_disjoint_and_complete`, `list_orders_oldest_first_by_created_at`, `list_tie_break_is_total_over_identical_timestamps`, `pending_embedding_items_are_excluded_when_asked`, `cross_model_vectors_are_rejected`, `neighbours_break_ties_before_truncating_at_k`, `recall_updates_access_statistics` |
 | `capacity` (4) | `capacity_accounting_tracks_items_and_bytes`, `eviction_releases_capacity`, `concurrent_admits_do_not_double_count`, `scope_stats_reflect_the_corpus` |
-| `lifecycle` (20) | `audit_filter_narrows_by_event_and_time`, `audit_returns_min_of_the_limit_and_the_rows_that_remain`, `audit_pages_by_the_after_cursor_without_repeating_a_row`, `audit_since_and_until_include_a_record_on_the_boundary`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `purge_subject_preserves_audit_when_asked`, `purge_subject_persists_the_record_it_was_given`, `apply_persists_the_audit_id_it_was_given`, `record_recall_persists_the_audit_id_it_was_given`, `import_preserves_every_audit_id`, `export_narrows_to_the_selectors_subject_and_namespace`, `export_orders_the_stream_by_kind_then_by_id`, `export_import_round_trips_exactly`, `import_is_idempotent`, `import_rejects_a_later_record_whose_tenant_disagrees`, `import_rejects_a_foreign_audit_record_even_when_every_item_agrees`, `audit_aggregates_survive_a_cascading_purge`, `audit_aggregates_page_in_the_documented_order`, `audit_aggregates_resume_from_a_cursor_that_names_no_stored_row` |
+| `lifecycle` (22) | `audit_filter_narrows_by_event_and_time`, `audit_returns_min_of_the_limit_and_the_rows_that_remain`, `audit_pages_by_the_after_cursor_without_repeating_a_row`, `audit_since_and_until_include_a_record_on_the_boundary`, `purge_subject_removes_everything_for_that_subject`, `purge_subject_leaves_other_subjects_intact`, `purge_subject_preserves_audit_when_asked`, `purge_subject_persists_the_record_it_was_given`, `apply_persists_the_audit_id_it_was_given`, `record_recall_persists_the_audit_id_it_was_given`, `import_preserves_every_audit_id`, `export_narrows_to_the_selectors_subject_and_namespace`, `export_orders_the_stream_by_kind_then_by_id`, `export_import_round_trips_exactly`, `import_is_idempotent`, `import_rejects_a_later_record_whose_tenant_disagrees`, `import_rejects_a_foreign_audit_record_even_when_every_item_agrees`, `audit_aggregates_survive_a_cascading_purge`, `audit_aggregates_page_in_the_documented_order`, `audit_aggregates_resume_from_a_cursor_that_names_no_stored_row`, `audit_aggregates_narrow_by_day_window_and_policy`, `every_audit_writing_path_increments_the_aggregates` |
 
 **`pagination_is_stable` no longer exists.** It was renamed to
 `list_pages_are_disjoint_and_complete` — what it actually proves. It sorts and
@@ -143,7 +143,7 @@ repo actually put it before Task 7 and import from there; this plan writes
 - A replayed idempotent write returns `AppliedWrite { replayed: true, .. }` with the **original** `item_id`.
 - `import` skips items that already exist rather than duplicating or overwriting them, and counts them in `items_skipped_existing`.
 - `purge_subject` must leave `report.audit_rows_removed + report.audit_rows_preserved` equal to the number of audit rows the subject had.
-- **`audit_aggregates` rows must survive `purge_subject`.** The `audit_aggregates` table is keyed by policy version, event class and day bucket, with **no subject and no namespace column** — see `memorysafe_backend::aggregates` for the whole argument. Do not give it a foreign key to `audit`, do not include it in the subject sweep, and do not add a subject or namespace column for query convenience: `lifecycle::audit_aggregates_survive_a_cascading_purge` fails on the first, and the module doc explains why the third is the one that matters. Every audit row written increments the matching aggregate in the same transaction.
+- **`audit_aggregates` rows must survive `purge_subject`.** The `audit_aggregates` table is keyed by the policy's name and version, the event class and the day bucket, with **no subject and no namespace column** — see `memorysafe_backend::aggregates` for the whole argument. Do not give it a foreign key to `audit`, do not include it in the subject sweep, and do not add a subject or namespace column for query convenience: `lifecycle::audit_aggregates_survive_a_cascading_purge` fails on the first, and the module doc explains why the third is the one that matters. Every audit row written increments the matching aggregate in the same transaction.
 - **`retrieve_candidates` and `neighbours` populate `ScoredCandidate::last_accessed_at` and `access_count`** from the `items.last_access`/`items.access_count` columns the DDL already declares — a row never recalled reads back `(None, 0)`, never `(created_at, 0)`. `record_recall` increments both for every item its `AuditRecord::items` references, in the same transaction as the audit row.
 - **`import` takes the destination tenant** and compares it against every record — items and audit rows alike. A disagreement rejects the whole import; nothing is retargeted and no audit scope is rewritten. There is deliberately no separate "may not span tenants" check and no rejection of a header-only stream.
 
@@ -369,6 +369,61 @@ CREATE TABLE idempotency (
   PRIMARY KEY (tenant_id, key)
 ) PARTITION BY HASH (tenant_id);
 
+CREATE TABLE audit_aggregates (
+  tenant_id      TEXT NOT NULL,
+  -- The policy is two columns, never the rendered `name@version`. `PolicyId`'s
+  -- Display is not injective — ("a@b","c") and ("a","b@c") both render
+  -- "a@b@c" — so a rendered key column merges two distinct policies' counts
+  -- into one row, in the artifact designed to outlive the detail rows.
+  -- `lifecycle::audit_aggregates_page_in_the_documented_order` carries that
+  -- pair. The `audit.policy` column above *is* the rendered form; it is a
+  -- display convenience, nothing keys on it, and the aggregate key must not be
+  -- derived from it.
+  policy_name    TEXT,                 -- NULL together with policy_version
+  policy_version TEXT,
+  event          TEXT NOT NULL,        -- AuditEvent::as_str(), never an ordinal
+  day            BIGINT NOT NULL,      -- whole UTC days, aggregates::day_bucket
+  count          BIGINT NOT NULL,
+  value_histogram     JSONB NOT NULL,
+  fragility_histogram JSONB NOT NULL,
+  histogram_version   INTEGER NOT NULL,
+  -- The two policy columns are NULL together or set together. Without this a
+  -- row like ('x', NULL, 'admitted', 1) is representable, falls inside the
+  -- policied partial index — whose predicate tests only `policy_name` — and
+  -- `aggregates::query`'s `(Some(n), Some(v)) => Some(..), _ => None` would
+  -- silently relabel it as policy-less: a wrong aggregate that looks
+  -- well-formed. The invariant was a comment; this makes it a constraint.
+  CHECK ((policy_name IS NULL) = (policy_version IS NULL))
+) PARTITION BY HASH (tenant_id);
+-- No subject column and no namespace column: that absence is what lets these
+-- rows legitimately outlive `purge_subject`, and it is the single most
+-- important property of this table. Do not add one for query convenience.
+--
+-- Uniqueness in two partial indexes rather than one primary key over the
+-- nullable tuple: a unique index treats NULLs as distinct, so a single index
+-- would let two policy-less rows with the same event and day both insert — and
+-- policy-less rows are the majority of the key space. Splitting on nullability
+-- enforces it without inventing a sentinel policy string, which
+-- `AggregateKey::policy`'s doc rules out.
+CREATE UNIQUE INDEX idx_aggregates_key_policied
+  ON audit_aggregates (tenant_id, policy_name, policy_version, event, day)
+  WHERE policy_name IS NOT NULL;
+CREATE UNIQUE INDEX idx_aggregates_key_policy_less
+  ON audit_aggregates (tenant_id, event, day)
+  WHERE policy_name IS NULL;
+-- The read path's ordering index, in `Backend::audit_aggregates`' documented
+-- key order. Collation stated on every text column rather than left to the
+-- database default, per the mandate on that method: `COLLATE "C"` is
+-- Postgres's spelling of byte order. Null placement is stated in the query's
+-- ORDER BY rather than here.
+CREATE INDEX idx_aggregates_order ON audit_aggregates (
+  tenant_id,
+  day,
+  policy_name    COLLATE "C",
+  policy_version COLLATE "C",
+  event          COLLATE "C"
+);
+
 -- Not tenant-scoped, not partitioned, no RLS: it holds the schema version.
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ```
@@ -435,7 +490,7 @@ The pool connects with whatever credentials `PgConfig::url` carries — typicall
 | 10 | Hard filters and keyword search | Hostile input cannot become an operator |
 | 11 | Hybrid retrieval | Retrieval conformance passes |
 | 12 | Capacity locking, merge, idempotency | Atomicity and capacity conformance pass |
-| 13 | Purge and portable export/import | The full 47-test suite passes |
+| 13 | Purge and portable export/import | The full 50-test suite passes |
 | 14 | `SchemaPerTenant` layout | The full suite passes under both layouts |
 | 15 | Cross-backend parity | SQLite and Postgres rank identically |
 | 16 | Schema-version guard and operator docs | Refuses a database from a newer version |
@@ -1441,7 +1496,8 @@ pub const SCHEMA_VERSION: i64 = 1;
 
 /// Tables that hold tenant data and therefore carry an RLS policy. `meta` is
 /// deliberately absent: it holds the schema version and belongs to no tenant.
-pub const TENANT_TABLES: [&str; 5] = ["items", "vectors", "capacity", "audit", "idempotency"];
+pub const TENANT_TABLES: [&str; 6] =
+    ["items", "vectors", "capacity", "audit", "idempotency", "audit_aggregates"];
 
 /// Schema names reach SQL as interpolated text, because neither `CREATE
 /// SCHEMA` nor `search_path` accepts a bind parameter. This is the check that
@@ -1593,6 +1649,18 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
            ON vectors (tenant_id, subject, namespace, embedder, dim)".into(),
         "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw
            ON vectors USING hnsw (embedding vector_ip_ops)".into(),
+        // Two partial unique indexes on the aggregates, plus the ordering
+        // index — see the DDL above for why one index over the nullable tuple
+        // does not enforce uniqueness, and why the collation is stated.
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregates_key_policied
+           ON audit_aggregates (tenant_id, policy_name, policy_version, event, day)
+           WHERE policy_name IS NOT NULL".into(),
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregates_key_policy_less
+           ON audit_aggregates (tenant_id, event, day)
+           WHERE policy_name IS NULL".into(),
+        "CREATE INDEX IF NOT EXISTS idx_aggregates_order
+           ON audit_aggregates (tenant_id, day, policy_name COLLATE \"C\",
+                                policy_version COLLATE \"C\", event COLLATE \"C\")".into(),
         // Two indexes for two query shapes; see the DDL above for why the
         // `at`-leading one cannot serve `ORDER BY id DESC` or the
         // `AuditFilter::after` cursor.
@@ -2291,8 +2359,14 @@ use time::OffsetDateTime;
 
 /// `AuditEvent` is stored as its serde snake_case name so the column is
 /// readable in `psql` and filterable without a join table.
-fn event_str(e: AuditEvent) -> String {
-    serde_json::to_string(&e).unwrap_or_default().trim_matches('"').to_string()
+// `AuditEvent::as_str` is the one referent for this string — the serde form,
+// the stored value, and the key `AggregateKey` sorts by. This used to be a
+// serde round-trip with `.unwrap_or_default()`, which on a serialisation
+// failure would have written an **empty event string** into the audit table
+// rather than failing; and being a second encoder, it could drift from the one
+// the ordering compares.
+fn event_str(e: AuditEvent) -> &'static str {
+    e.as_str()
 }
 
 fn event_from(s: &str) -> Result<AuditEvent, BackendError> {
@@ -2363,7 +2437,7 @@ pub async fn query(
     let events: Option<Vec<String>> = if filter.events.is_empty() {
         None
     } else {
-        Some(filter.events.iter().map(|e| event_str(*e)).collect())
+        Some(filter.events.iter().map(|e| event_str(*e).to_string()).collect())
     };
 
     // Ordered by id, descending (newest first) — see `AuditFilter::after`'s
@@ -2405,7 +2479,7 @@ pub async fn query(
     .await
     .pg()?;
 
-    let mut out: Vec<AuditRecord> = rows.iter().map(row_to_record).collect::<Result<_, _>>()?;
+    let out: Vec<AuditRecord> = rows.iter().map(row_to_record).collect::<Result<_, _>>()?;
     // `AuditFilter::item` is filtered in the `WHERE` clause above, not here.
     // Filtering in Rust after `LIMIT` would let a page come back shorter than
     // `min(filter.limit, rows still matching)`, which `Backend::audit`
@@ -2421,6 +2495,17 @@ pub async fn query(
     // against `AuditRecord::items: Vec<ItemRef>` — a **membership** test, which
     // Postgres expresses natively. The shape made it feel unpushable; it never
     // was.
+    //
+    // **What is settled and what is not.** Settled: the predicate belongs in
+    // SQL, and over-fetch-and-loop is rejected. Not settled: the containment
+    // operator below and its index implications. It was written without a
+    // Postgres to run it against — no `psql` and no database were available to
+    // whoever added it — so treat `@>` against `jsonb_build_array(...)` as a
+    // sketch of the right shape, not a verified query. Whoever implements this
+    // should confirm the operator, decide whether a GIN index on `items` or an
+    // expression index on the extracted ids is the right support, and say which
+    // in the task. The ruling constrains the shape; it does not constrain that
+    // choice.
     Ok(out)
 }
 ```
@@ -2565,6 +2650,25 @@ impl Backend for PostgresBackend {
         Ok(ImportReport::default())
     }
 
+    // Placeholder here; the real read lands with `purge`, `export` and
+    // `import`. Three lifecycle conformance tests fail against this stub —
+    // `audit_aggregates_survive_a_cascading_purge`,
+    // `audit_aggregates_page_in_the_documented_order` and
+    // `audit_aggregates_narrow_by_day_window_and_policy`. When implementing it:
+    // order by `day`, then `policy_name`, then `policy_version`, then `event`,
+    // each text column with an explicit `COLLATE "C"` and policy-less rows
+    // placed first by an explicit `(policy_name IS NULL) DESC` rather than by
+    // Postgres's default; page **ascending** with `after` selecting keys
+    // **strictly greater**, which is the opposite direction from
+    // `Backend::audit` next door; and return exactly
+    // `min(limit, rows still matching after the cursor)`. Write the row
+    // comparison out longhand rather than as a row-value `(a,b,c,d) > (w,x,y,z)`:
+    // the row-value form yields NULL when any component is NULL, and the policy
+    // columns are NULL for most event classes, so rows would silently vanish and
+    // the short page would read as exhaustion. The crate must also carry
+    // `ordering_sql_states_collation_and_null_placement`, asserting over the
+    // SQL the query builder returns rather than a copied literal — see the
+    // mandate on `Backend::audit_aggregates`.
     async fn audit_aggregates(&self, _tenant: &TenantId, _filter: &AuditAggregateFilter)
         -> Result<Vec<AuditAggregate>, BackendError> {
         Ok(vec![])
@@ -4233,7 +4337,7 @@ Add `pub mod capacity;` and `use sqlx::Row;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-backend-postgres`
-Expected: PASS — 27 conformance tests (everything but the 20 lifecycle ones) plus the unit tests, all ok.
+Expected: PASS — 28 conformance tests (everything but the 22 lifecycle ones) plus the unit tests, all ok.
 
 - [ ] **Step 5: Commit**
 
@@ -4254,9 +4358,9 @@ git commit -m "feat(pg): row-locked capacity accounting, merge, and idempotent w
 
 **Interfaces:**
 - Consumes: everything in the crate.
-- Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and the single `run_conformance_suite` entry point.
+- Produces: `aggregates::increment`, `aggregates::query`, `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, `audit_aggregates`, and the single `run_conformance_suite` entry point.
 
-**Milestone: the complete 47-test suite passes under `SharedPartitioned`.**
+**Milestone: the complete 50-test suite passes under `SharedPartitioned`** — which requires the aggregate write and read this task adds, not only the purge and portability work. Three lifecycle tests depend on them and the stub they replace returns `Ok(vec![])`; the milestone was stated before the aggregates existed anywhere in this document and could not have been met.
 
 **Why vectors are deleted explicitly when the cascade would do it.** `PurgeReport` counts what was removed, and a cascade reports nothing. Deleting vectors first makes the count exact and leaves the item delete with nothing to cascade to.
 
@@ -4573,7 +4677,13 @@ pub async fn import(
 }
 ```
 
-Replace the last three placeholders in `lib.rs`:
+`crates/memorysafe-backend-postgres/src/aggregates.rs` — both halves, write and read. Plan 1's items-and-audit task carries the SQLite sketch for `increment` and its portability task carries `query`; the shapes transfer, the dialect does not. Three things this document must get right that the SQLite one states in the same places:
+
+- **Every audit row increments**, in the transaction that writes it — `apply`, `record_recall`, the purge's `SubjectPurged` row, and rows arriving through `import`. See the write rule in `memorysafe_backend::aggregates`.
+- **The increment must be atomic against concurrent writers.** Postgres has no per-tenant write lock, so a read-modify-write under READ COMMITTED loses updates. Use `ON CONFLICT ... DO UPDATE SET count = audit_aggregates.count + 1` and let the database evaluate it, against the partial unique index the key falls in.
+- **The read states collation and null placement explicitly** — `COLLATE "C"` on every text column of the key, `(policy_name IS NULL) DESC` and `(policy_version IS NULL) DESC` in the `ORDER BY` — and pages **ascending** with `after` selecting keys strictly greater, the opposite of `Backend::audit`. This crate must carry `ordering_sql_states_collation_and_null_placement`, asserting over the SQL its query builder returns rather than a copied literal.
+
+Replace the last four placeholders in `lib.rs`:
 
 ```rust
     async fn purge_subject(
@@ -4649,7 +4759,7 @@ git commit -m "feat(pg): subject purge and portable export/import; full conforma
 - Consumes: `ddl::statements` (already branches on layout), `ensure_ready` (already lazy).
 - Produces: an advisory lock around `ensure_schema`, and a second full conformance run.
 
-**Milestone: the full 47-test suite passes under both layouts.**
+**Milestone: the full 50-test suite passes under both layouts.**
 
 **Most of this layout already exists** — `ddl::statements` omits the partitioning clause and the partition tables, and `ensure_ready` creates a tenant's schema on first use. Two things are missing, and both are the kind of bug that only appears under load.
 
@@ -5335,7 +5445,7 @@ git commit -m "feat(pg): refuse an incompatible schema or vector width at connec
 
 - `cargo test --workspace --all-features` is green, both with Docker (container harness) and against `MEMORYSAFE_TEST_DATABASE_URL` (external server). CI runs both.
 - `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --all -- --check` are clean.
-- `PostgresBackend` passes all **47** conformance tests **unmodified**, under `SharedPartitioned` and under `SchemaPerTenant`.
+- `PostgresBackend` passes all **50** conformance tests **unmodified**, under `SharedPartitioned` and under `SchemaPerTenant`.
 - The isolation tests prove the guarantee is structural: a query with no `tenant_id` predicate returns one tenant's rows, a connection with no tenant context reads nothing and writes nothing, a cross-tenant write is refused by `WITH CHECK`, and partitions cannot be read directly.
 - Vector relevance is bit-identical to the SQLite backend's, and hard filters select the same rows on both.
 - An export produced by the SQLite backend imports into Postgres and reproduces the corpus, vectors included.

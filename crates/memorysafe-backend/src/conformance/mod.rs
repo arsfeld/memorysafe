@@ -9,6 +9,8 @@ pub mod capacity;
 pub mod fixtures;
 pub mod isolation;
 pub mod lifecycle;
+#[cfg(test)]
+mod null;
 pub mod retrieval;
 
 pub use fixtures as fx;
@@ -78,6 +80,7 @@ where
         isolation::subjects_are_isolated,
         isolation::namespaces_are_separated,
         isolation::audit_is_scoped,
+        isolation::retrieval_never_crosses_a_scope_boundary,
         atomicity::admit_evict_and_audit_commit_together,
         atomicity::a_failed_transaction_leaves_no_trace,
         atomicity::an_invalid_transaction_is_rejected_and_writes_nothing,
@@ -121,5 +124,7 @@ where
         lifecycle::audit_aggregates_survive_a_cascading_purge,
         lifecycle::audit_aggregates_page_in_the_documented_order,
         lifecycle::audit_aggregates_resume_from_a_cursor_that_names_no_stored_row,
+        lifecycle::audit_aggregates_narrow_by_day_window_and_policy,
+        lifecycle::every_audit_writing_path_increments_the_aggregates,
     );
 }

@@ -91,10 +91,13 @@ pub struct ScoredCandidate {
     /// for high-fragility *or long-unaccessed* items — a feature that exists
     /// to resurface what is never recalled. Defaulting to `created_at` makes
     /// an old item recalled yesterday look identical to one never recalled at
-    /// all, which is precisely backwards. It would also be undetectable in
-    /// this workspace's own tests: `fx::item` pins `created_at` to
-    /// `UNIX_EPOCH`, so in every conformance fixture `Some(created_at)` and
-    /// "never accessed" would be the same value.
+    /// all, which is precisely backwards. And the wrong default is invisible to
+    /// any assertion on the *timestamp*: `fx::item` pins `created_at` to
+    /// `UNIX_EPOCH`, so in every conformance fixture a seeded
+    /// `Some(created_at)` carries the same instant a real one would. What
+    /// separates them is the `Option` itself, which is why
+    /// `conformance::retrieval::recall_updates_access_statistics` asserts
+    /// `is_none()` before the recall rather than comparing times.
     ///
     /// These two fields live here and on `MaintenanceCandidate`, and
     /// deliberately **not** on `MemoryItem`: that type is serialised into

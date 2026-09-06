@@ -1512,7 +1512,8 @@ pub async fn export_narrows_to_the_selectors_subject_and_namespace<F: BackendFac
         .collect();
     assert!(
         exported_audit.contains(&audit_ids[0]),
-        "include_audit: true dropped the audit row of the very scope the          selector names — narrowing must exclude other scopes, not everything"
+        "include_audit: true dropped the audit row of the very scope the \
+         selector names — narrowing must exclude other scopes, not everything"
     );
     for (i, label) in [
         (1usize, "the same subject's other namespace"),
@@ -1521,7 +1522,9 @@ pub async fn export_narrows_to_the_selectors_subject_and_namespace<F: BackendFac
     ] {
         assert!(
             !exported_audit.contains(&audit_ids[i]),
-            "the export of one scope carried an audit row from {label}:              `ScopeSelector` narrowed the items and not the audit rows, which              is a cross-subject disclosure in the export path"
+            "the export of one scope carried an audit row from {label}: \
+             `ScopeSelector` narrowed the items and not the audit rows, which \
+             is a cross-subject disclosure in the export path"
         );
     }
     assert_eq!(
@@ -2059,14 +2062,19 @@ pub async fn export_orders_the_stream_by_kind_then_by_id<F: BackendFactory>(fact
     );
 }
 
-/// Eight aggregate rows spanning two days, both policy states, four `Some`
+/// Ten aggregate rows spanning two days, both policy states, six `Some`
 /// policies and two event classes — the corpus both aggregate-cursor tests
 /// page over. Returns the tenant it wrote into.
 ///
-/// Two of the four policies exist for the version hazard (`baseline@10` before
-/// `baseline@9` as text, the reverse as numbers) and two for the collation
-/// hazard (`B@1` before `a@1` as bytes, the reverse under any locale-aware
-/// collation).
+/// Two of the six policies exist for the version hazard (`baseline@10` before
+/// `baseline@9` as text, the reverse as numbers), two for the collation hazard
+/// (`B@1` before `a@1` as bytes, the reverse under any locale-aware
+/// collation), and two for the render collision: `("a@b", "c")` and
+/// `("a", "b@c")` are different policies that `Display` renders identically as
+/// `"a@b@c"`. A backend keying its aggregate table on the rendered string
+/// cannot tell them apart at all and merges their counts into one row, which
+/// the corpus size assertion catches deterministically rather than as a
+/// coin-flip ordering failure.
 ///
 /// Aggregates are produced by the write path, not by an API of their own: each
 /// `apply` writes one audit row and increments the aggregate keyed by that
@@ -2090,14 +2098,23 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
     let v10 = PolicyId::new("baseline", "10");
     let v9 = PolicyId::new("baseline", "9");
     // `PolicyId::new` validates neither field, so an uppercase name is a legal
-    // policy — and this is the pair on which SQLite's default TEXT collation
-    // (BINARY, i.e. bytes) and Postgres's (locale-aware) disagree with
-    // certainty rather than by locale. Validation would not have helped:
+    // policy — and this is the pair that separates byte order from any
+    // locale-aware collation with certainty rather than by locale: `B` is 0x42
+    // and `a` is 0x61, while every locale orders them the other way.
+    //
+    // (*Which engine defaults to which is recollection, unverified here — no
+    // database was available. The assertion below does not depend on it: it
+    // asserts byte order, which the trait mandates explicitly, so it is right
+    // whatever the defaults turn out to be.*) Validation would not have helped:
     // `validate_component` permits `-`, `_` and `.`, and glibc collations
     // reweight punctuation, so a validated component is not collation-stable
     // either.
     let upper_b = PolicyId::new("B", "1");
     let lower_a = PolicyId::new("a", "1");
+    // Same render, different policies. `Display` is `{name}@{version}` and
+    // neither field is constrained, so both of these are `"a@b@c"`.
+    let split_early = PolicyId::new("a@b", "c");
+    let split_late = PolicyId::new("a", "b@c");
 
     // (day 0, None, Admitted)
     let a = fx::item_at(&scope, "day zero, no policy", day0);
@@ -2128,6 +2145,28 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
     let f = fx::item_at(&scope, "day zero, lowercase policy", day0);
     let mut txn = fx::admit_txn(&scope, f, None);
     txn.audit = txn.audit.clone().with_decision(decision(lower_a));
+    backend.apply(txn).await.unwrap();
+
+    // The render-collision pair: two keys whose policies render identically.
+    // **Their events differ deliberately**, and the two orders disagree because
+    // of it. Correct order compares the policy *parts*, so `("a", "b@c")`
+    // precedes `("a@b", "c")` — `"a"` is a prefix of `"a@b"` — regardless of
+    // event. A backend that stores the parts but orders by the rendered
+    // `policy_name || '@' || policy_version` sees the two tie on day and on
+    // policy, falls through to the event, and puts `admitted` before
+    // `forgotten` — the opposite. With both rows carrying the same event that
+    // backend ties on all three components and emits them in an arbitrary
+    // order, so it would be caught only about half the time; this makes it
+    // every time. (The other wrong implementation — a single rendered key
+    // column — merges them into one row and is caught by the corpus size.)
+    let g = fx::item_at(&scope, "day zero, name carries the separator", day0);
+    let g_id = g.id.clone();
+    let mut txn = fx::admit_txn(&scope, g, None);
+    txn.audit = txn.audit.clone().with_decision(decision(split_early));
+    backend.apply(txn).await.unwrap();
+
+    let mut txn = fx::evict_txn_at(&scope, vec![g_id], day0);
+    txn.audit = txn.audit.clone().with_decision(decision(split_late));
     backend.apply(txn).await.unwrap();
 
     // (day 1, None, Admitted)
@@ -2172,10 +2211,15 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
 ///   the page comes back short — and a short page is defined to *mean* the log
 ///   is exhausted, so the sweep terminates early and silently, on the majority
 ///   of the key space.
-/// - *A numerically compared version column.* Two `Some`s compare by
-///   `PolicyId::to_string()`, i.e. `name@version` as one string, so
-///   `baseline@10` precedes `baseline@9`. A backend storing version as a
-///   number reverses exactly that pair.
+/// - *A numerically compared version column.* Two `Some`s compare by name and
+///   then by version, each as text, so `baseline@10` precedes `baseline@9`. A
+///   backend storing version as a number reverses exactly that pair.
+/// - *A policy key built from the rendered `name@version`.* `Display` is not
+///   injective — `PolicyId` constrains neither field — so `("a@b", "c")` and
+///   `("a", "b@c")` both render `"a@b@c"`. A backend keying its aggregate
+///   table on that string merges two distinct policies' counts into one row,
+///   and one ordering by it returns `Equal` for keys that `==` calls
+///   different. The order is over the two parts, name then version.
 /// - *A locale collation on the policy column.* That comparison is over
 ///   **bytes**, and byte order is forced rather than preferred: this test
 ///   measures a backend against `AggregateKey`'s `Ord`, which compares through
@@ -2203,10 +2247,16 @@ async fn seed_aggregate_corpus<B: Backend>(backend: &B) -> TenantId {
 /// the two `Some` policies sort the same numerically and lexically (the
 /// version hazard is invisible), or if no policy name reaches outside the
 /// range where byte order and locale collation agree (the collation hazard is
-/// invisible). The fixture is eight rows over two days, swept two at a time,
-/// with three policy-less rows, the `baseline@9` / `baseline@10` pair that
-/// inverts under numeric comparison, and the `B@1` / `a@1` pair that inverts
-/// under any locale-aware collation.
+/// invisible), or if no two policies render to the same string (the
+/// collision is invisible, and after the ordering changed to compare name and
+/// version separately nothing else would pin that it did). The fixture is ten
+/// rows over two days, swept two at a time, with three policy-less rows, the
+/// `baseline@9` / `baseline@10` pair that inverts under numeric comparison,
+/// the `B@1` / `a@1` pair that inverts under any locale-aware collation, and
+/// the `("a@b", "c")` / `("a", "b@c")` pair that renders identically — the last
+/// of which carries two different events, so that a backend ordering by the
+/// render breaks the resulting tie on the event and lands the wrong way round
+/// deterministically rather than by coin flip.
 pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(factory: &F) {
     use crate::{AggregateKey, AuditAggregate};
 
@@ -2249,10 +2299,12 @@ pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(fa
 
     assert_eq!(
         swept.len(),
-        8,
-        "the corpus is eight distinct keys and every one must be visited \
-         exactly once; a smaller number means the sweep terminated early, a \
-         larger one means the cursor re-served rows it had already returned"
+        10,
+        "the corpus is ten distinct keys and every one must be visited exactly \
+         once. A smaller number means the sweep terminated early — or that the \
+         two policies rendering as `a@b@c` were keyed on the render and merged \
+         into one row, which is a lost count rather than a paging bug. A larger \
+         one means the cursor re-served rows it had already returned"
     );
     assert!(
         page_size < swept.len(),
@@ -2273,8 +2325,8 @@ pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(fa
     assert_eq!(
         keys, canonical,
         "the pages must arrive in the documented order — ascending by day, \
-         then policy (None before every Some, two Somes by name@version), then \
-         the event's serialised name"
+         then policy (None before every Some, two Somes by name and then \
+         version), then the event's serialised name"
     );
 
     // Read straight from the prose rather than through `Ord`: the earliest day
@@ -2297,17 +2349,47 @@ pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(fa
     assert_eq!(
         keys.iter().filter(|k| k.policy.is_none()).count(),
         3,
-        "three of the six rows carry no policy; if that ever reaches zero this \
-         test stops exercising the ordering hazard it exists for"
+        "three of the corpus's rows carry no policy; if that ever reaches zero \
+         this test stops exercising the ordering hazard it exists for"
     );
     assert_eq!(
         keys.iter()
             .filter(|k| k.day == 0)
             .filter(|k| k.policy.is_some())
             .count(),
-        4,
-        "day zero must hold all four policied rows, or neither the \
-         name@version comparison nor the collation pair is exercised"
+        6,
+        "day zero must hold all six policied rows, or one of the three hazards \
+         — version comparison, collation, or the render collision — is not \
+         exercised at all"
+    );
+
+    // The render collision, asserted by name from the documented rule and not
+    // through `Ord`: policy compares by **name** and then by **version**, as
+    // two components, so `("a", "b@c")` precedes `("a@b", "c")` because `"a"`
+    // is a prefix of `"a@b"`. An ordering built on `Display` cannot separate
+    // these — both render `"a@b@c"` — so it returns `Equal` for keys that are
+    // not equal, and a backend storing the render as its key never has two
+    // rows here to order.
+    let by_parts = |name: &str, version: &str| {
+        keys.iter().position(|k| {
+            k.policy
+                .as_ref()
+                .is_some_and(|p| p.name == name && p.version == version)
+        })
+    };
+    let (late, early) = (by_parts("a", "b@c"), by_parts("a@b", "c"));
+    assert!(
+        late.is_some() && early.is_some(),
+        "both halves of the render-collision pair must be present as separate \
+         rows: a backend that keyed on the rendered policy string merged them"
+    );
+    assert!(
+        late < early,
+        "policy compares by name then version, so ('a', 'b@c') precedes \
+         ('a@b', 'c') — 'a' is a prefix of 'a@b'. A backend ordering by the \
+         rendered `name@version` ties these two, falls through to the event, \
+         and returns them the other way round: their events differ precisely so \
+         that fallback is wrong every time rather than arbitrary"
     );
 
     // The collation pair, asserted by position rather than through `Ord`:
@@ -2353,8 +2435,8 @@ pub async fn audit_aggregates_page_in_the_documented_order<F: BackendFactory>(fa
     );
     assert_eq!(
         whole.iter().map(|a| a.count).sum::<u64>(),
-        8,
-        "eight audit rows, eight distinct keys, one event counted in each"
+        10,
+        "ten audit rows, ten distinct keys, one event counted in each"
     );
 }
 
@@ -2405,14 +2487,14 @@ pub async fn audit_aggregates_resume_from_a_cursor_that_names_no_stored_row<F: B
         .unwrap();
     assert_eq!(
         all.len(),
-        8,
+        10,
         "the corpus must exist before it can be resumed into"
     );
 
     // Day 0, policy `nonexistent@1.0.0`: no such row was ever written, and it
-    // sorts above every policy day zero holds ("B@1", "a@1", "baseline@10",
-    // "baseline@9" — all below "nonexistent@..." in byte order), so this
-    // coordinate sits after all five of day zero's rows and before all three
+    // sorts above every policy day zero holds — the names are "B", "a",
+    // "a@b" and "baseline", all below "nonexistent" in byte order — so this
+    // coordinate sits after all seven of day zero's rows and before all three
     // of day one's.
     let phantom = AggregateKey {
         tenant: tenant.clone(),
@@ -2465,5 +2547,364 @@ pub async fn audit_aggregates_resume_from_a_cursor_that_names_no_stored_row<F: B
         expected,
         "resuming must return exactly the rows strictly greater than the \
          cursor, in the documented order"
+    );
+}
+
+/// `AuditAggregateFilter`'s day window and its `policy` narrowing both narrow.
+///
+/// **Why this was missing.** `AuditAggregateFilter`'s doc says it "mirrors
+/// `AuditFilter`'s shape ... so there is one idiom for a bounded, resumable
+/// read across this trait rather than two", and `AuditFilter`'s `since`/`until`
+/// *are* covered — by `audit_filter_narrows_by_event_and_time`. The mirror
+/// carried the shape across and not the coverage: every
+/// `AuditAggregateFilter` literal in this suite set only `after` and `limit`,
+/// so a backend that ignored the day bounds and the policy narrowing and
+/// returned the whole set passed. A claim of structural similarity transfers
+/// structure, not tests, and a coverage check that reads the sentence sees a
+/// tested sibling and moves on.
+///
+/// **The implementations this rejects:**
+///
+/// - *Day bounds ignored.* Returns all seven rows where the window admits two.
+/// - *Day bounds treated as exclusive.* `since` and `until` are documented as
+///   **inclusive**, in whole-UTC-day units. The window here is `[1, 1]` — a
+///   single day, both bounds landing exactly on it — so an exclusive backend
+///   returns nothing at all. This is a deliberate departure from
+///   `audit_filter_narrows_by_event_and_time`, which places its bounds *off*
+///   every record's timestamp precisely so it does not depend on the
+///   inclusivity choice. That is right for a test of the window; it leaves the
+///   choice itself unpinned, and days are integers, so there is no "between two
+///   values" position available here that would still select a subset. Pinning
+///   it is therefore both possible and necessary, and this is where it happens.
+/// - *`policy` narrowing ignored.* Returns the policy-less rows too.
+/// - *`policy` matched on name alone.* The corpus holds `alpha@1` and
+///   `alpha@2`; a backend comparing only `policy_name` returns both where the
+///   filter names one.
+///
+/// **Vacuity:** a filter test whose expected set is everything cannot fail, so
+/// each of the three queries below selects a strict subset — two of seven, three
+/// of seven, one of seven — and each asserts presence *and* absence. Rows sit
+/// outside the window on both sides, so a backend clamping only one bound is
+/// caught; and the excluded policies include both a different name and the same
+/// name at a different version.
+pub async fn audit_aggregates_narrow_by_day_window_and_policy<F: BackendFactory>(factory: &F) {
+    use crate::AggregateKey;
+    use memorysafe_core::{Decision, PolicyId, Reason, ReasonCode};
+
+    let backend = factory.create().await;
+    let tenant = TenantId::new("t").unwrap();
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    let alpha1 = PolicyId::new("alpha", "1");
+    let alpha2 = PolicyId::new("alpha", "2");
+    let beta = PolicyId::new("beta", "1");
+    let decision = |policy: PolicyId| {
+        Decision::retain(
+            policy,
+            Reason::new(ReasonCode::HighValue, "seeded", Default::default()),
+        )
+    };
+
+    // Seven rows over three days: day 0 and day 2 sit outside the window on
+    // either side, and `alpha@1` appears on all three days so the policy
+    // narrowing is not a disguised day filter.
+    let rows: [(i64, Option<PolicyId>); 7] = [
+        (0, None),
+        (0, Some(alpha1.clone())),
+        (1, None),
+        (1, Some(alpha1.clone())),
+        (2, Some(alpha1.clone())),
+        (2, Some(alpha2.clone())),
+        (2, Some(beta.clone())),
+    ];
+    for (day, policy) in &rows {
+        let at = OffsetDateTime::UNIX_EPOCH + Duration::days(*day);
+        let item = fx::item_at(&scope, &format!("day {day} under {policy:?}"), at);
+        let mut txn = fx::admit_txn(&scope, item, None);
+        if let Some(p) = policy {
+            txn.audit = txn.audit.clone().with_decision(decision(p.clone()));
+        }
+        backend.apply(txn).await.unwrap();
+    }
+
+    let read = |filter: AuditAggregateFilter| {
+        let tenant = tenant.clone();
+        let backend = &backend;
+        async move {
+            backend
+                .audit_aggregates(&tenant, &filter)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|a| a.key)
+                .collect::<Vec<AggregateKey>>()
+        }
+    };
+
+    let everything = read(AuditAggregateFilter {
+        limit: 100,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        everything.len(),
+        7,
+        "the corpus must exist before any narrowing means anything, and each of \
+         the seven rows must be its own key"
+    );
+
+    // The window is a single day, with both bounds exactly on it. Days are
+    // integers: there is no position between two of them, so this pins
+    // inclusivity rather than avoiding it.
+    let windowed = read(AuditAggregateFilter {
+        since: Some(1),
+        until: Some(1),
+        limit: 100,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        windowed.len(),
+        2,
+        "day one holds two rows. Seven means the day bounds were ignored; zero \
+         means they were applied exclusively, and `since`/`until` are documented \
+         as inclusive"
+    );
+    assert!(
+        windowed.iter().all(|k| k.day == 1),
+        "a row outside [1, 1] came back: {windowed:?}"
+    );
+
+    // Policy narrowing across every day, so it cannot be a day filter wearing
+    // a different name.
+    let by_policy = read(AuditAggregateFilter {
+        policy: Some(alpha1.clone()),
+        limit: 100,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        by_policy.len(),
+        3,
+        "alpha@1 appears once on each of the three days"
+    );
+    assert!(
+        by_policy.iter().all(|k| k.policy.as_ref() == Some(&alpha1)),
+        "the policy narrowing let through a row with another policy — or a \
+         policy-less row, which `policy: Some(..)` must exclude: {by_policy:?}"
+    );
+    assert!(
+        !by_policy.iter().any(|k| k.policy.as_ref() == Some(&alpha2)),
+        "alpha@2 came back for a filter naming alpha@1: the narrowing compares \
+         the policy name and ignores the version"
+    );
+
+    // Both together, selecting one row of seven.
+    let both = read(AuditAggregateFilter {
+        since: Some(1),
+        until: Some(1),
+        policy: Some(alpha1.clone()),
+        limit: 100,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        both.len(),
+        1,
+        "the window and the policy narrowing must intersect, not replace one \
+         another"
+    );
+    assert_eq!(both[0].day, 1);
+    assert_eq!(both[0].policy.as_ref(), Some(&alpha1));
+}
+
+/// Every path that writes an audit row increments the aggregates.
+///
+/// **What this exists to survive, and it is a structural failure mode rather
+/// than a coding one.** The aggregate increment is a call that has to appear in
+/// every method that writes an audit row. A later task that *rewrites* one of
+/// those methods — the SQLite plan has one task write a partial `apply` and a
+/// later task replace it with the final form — inherits none of the earlier
+/// block's calls, and nothing notices. That happened: the increment lived in
+/// the partial `apply` and was absent from the final one, so the aggregate
+/// table would never have been written at all, and the failure would have
+/// surfaced two tasks later as three unrelated-looking test failures. Prose
+/// cannot prevent that, because the rewrite does not read the prose. This test
+/// can: it goes red at the task that drops the call.
+///
+/// **The implementation this rejects** is the same one on each path: a method
+/// that writes its audit row and returns. Three of the four sketches in the
+/// SQLite plan had exactly that shape at some point.
+///
+/// **Already covered, and deliberately not repeated here:** `apply` is pinned
+/// by `audit_aggregates_survive_a_cascading_purge`, which asserts three admits
+/// are counted before the purge, and again by
+/// `audit_aggregates_page_in_the_documented_order` and
+/// `audit_aggregates_narrow_by_day_window_and_policy`, whose whole corpora are
+/// written through it and whose counts are asserted exactly. This test covers
+/// the three that nothing else reaches: `record_recall`, `purge_subject`, and
+/// `import`. Adding `apply` here would add an obligation on a second backend
+/// for no discrimination.
+///
+/// **Vacuity.** "The count rose" is satisfied by a backend that increments the
+/// wrong key, or twice, so every assertion pins an **exact** delta rather than
+/// an inequality. It is also satisfied by rows that were already there, so each
+/// path asserts its event's count is zero first — and for the import leg, that
+/// the destination's aggregates are entirely empty before the stream arrives.
+/// The three paths use three different event classes, so a backend that
+/// increments the wrong one fails the path it belongs to as well as the one it
+/// borrowed from.
+pub async fn every_audit_writing_path_increments_the_aggregates<F: BackendFactory>(factory: &F) {
+    use memorysafe_core::ItemRef;
+
+    let backend = factory.create().await;
+    let tenant = TenantId::new("t").unwrap();
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // Total count across every aggregate row carrying `event`. Summed rather
+    // than read from one key, so a backend that splits the same event across
+    // several keys is still measured honestly — the assertion is about the
+    // increment happening, not about which key it landed in.
+    async fn counted<B: Backend>(backend: &B, tenant: &TenantId, event: AuditEvent) -> u64 {
+        backend
+            .audit_aggregates(
+                tenant,
+                &AuditAggregateFilter {
+                    limit: 1000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.key.event == event)
+            .map(|a| a.count)
+            .sum()
+    }
+
+    let item = fx::item(&scope, "a memory to recall and then erase");
+    backend
+        .apply(fx::admit_txn(&scope, item.clone(), None))
+        .await
+        .unwrap();
+
+    // --- record_recall -----------------------------------------------------
+    assert_eq!(
+        counted(&backend, &tenant, AuditEvent::Recalled).await,
+        0,
+        "record_recall: nothing has been recalled yet, so a later 'the count \
+         rose' assertion would be satisfied by a pre-existing row"
+    );
+    backend
+        .record_recall(AuditRecord::new(
+            scope.clone(),
+            AuditEvent::Recalled,
+            vec![ItemRef::from_item(&item)],
+            Actor::system(),
+            OffsetDateTime::UNIX_EPOCH,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        counted(&backend, &tenant, AuditEvent::Recalled).await,
+        1,
+        "record_recall wrote its audit row without incrementing the aggregates. \
+         Every path that writes an audit row increments exactly one aggregate \
+         row, in the same transaction — see the write rule in \
+         `memorysafe_backend::aggregates`"
+    );
+
+    // --- purge_subject -----------------------------------------------------
+    // A subject of its own, so the erasure does not disturb the corpus the
+    // other legs use. Aggregates are tenant-scoped and name no subject, so the
+    // count is visible from here regardless.
+    let doomed_scope = Scope::new("t", "doomed", "n").unwrap();
+    let doomed = SubjectId::new("doomed").unwrap();
+    backend
+        .apply(fx::admit_txn(
+            &doomed_scope,
+            fx::item(&doomed_scope, "erase me"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        counted(&backend, &tenant, AuditEvent::SubjectPurged).await,
+        0,
+        "purge_subject: no purge has run yet"
+    );
+    backend
+        .purge_subject(
+            &tenant,
+            &doomed,
+            PurgeCascade::Cascade,
+            fx::purge_record(&doomed_scope, AuditId::new(), Actor::system()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        counted(&backend, &tenant, AuditEvent::SubjectPurged).await,
+        1,
+        "purge_subject inserted its SubjectPurged record without incrementing \
+         the aggregates. That row's aggregate is the only evidence at tenant \
+         granularity that an erasure happened, once the detail row it \
+         summarises is itself swept by retention"
+    );
+
+    // --- import ------------------------------------------------------------
+    // Its own source and destination: importing into `backend` would collide
+    // on `AuditId`, which is the audit table's key.
+    let source = factory.create().await;
+    let source_scope = Scope::new("t", "s", "n").unwrap();
+    for body in ["first imported memory", "second imported memory"] {
+        source
+            .apply(fx::admit_txn(
+                &source_scope,
+                fx::item(&source_scope, body),
+                None,
+            ))
+            .await
+            .unwrap();
+    }
+    let stream = source
+        .export(&ScopeSelector {
+            tenant: tenant.clone(),
+            subject: None,
+            namespace: None,
+            include_audit: true,
+        })
+        .await
+        .unwrap();
+
+    let destination = factory.create().await;
+    assert_eq!(
+        destination
+            .audit_aggregates(
+                &tenant,
+                &AuditAggregateFilter {
+                    limit: 1000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "import: the destination must hold no aggregates at all before the \
+         stream arrives, or the assertion below measures the wrong thing"
+    );
+    let report = destination.import(&tenant, stream).await.unwrap();
+    assert_eq!(
+        report.audit_imported, 2,
+        "import: the two audit rows must actually have been imported, or the \
+         aggregate assertion below is about a stream that carried nothing"
+    );
+    assert_eq!(
+        counted(&destination, &tenant, AuditEvent::Admitted).await,
+        2,
+        "import wrote its audit rows without incrementing the aggregates. An \
+         ExportStream carries no aggregate records, so a destination that does \
+         not increment holds detail rows with no summary — and loses the \
+         history entirely at its first cascading purge"
     );
 }
