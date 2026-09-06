@@ -315,6 +315,17 @@ mod tests {
     /// one comes back — was considered and rejected: SQLite does not
     /// document an order for an unindexed `LIMIT 1` with no `ORDER BY`, so a
     /// test built on it would be asserting on undefined behaviour.
+    ///
+    /// **`vectors.subject`/`vectors.namespace` are read back directly, with
+    /// raw SQL, rather than only through `search` or `scope_embedder`.**
+    /// Neither reader can see a corrupted write to those two columns:
+    /// `search` joins `vectors` to `items` on `item_id` and filters on
+    /// `items.subject`/`items.namespace` alone, never touching
+    /// `vectors.subject`/`vectors.namespace`, and `scope_embedder`'s
+    /// diagnostic scopes above probe coordinates that a hardcoded or swapped
+    /// column in `insert` would not alias onto. A backend that writes the
+    /// `items` row correctly and hardcodes (or swaps) the `vectors` row's own
+    /// `subject`/`namespace` passes every assertion above unnoticed.
     #[test]
     fn search_and_scope_embedder_are_scoped_by_subject_and_namespace() {
         let c = conn();
@@ -348,10 +359,46 @@ mod tests {
             crate::items::insert(&c, &item).unwrap();
             let q = memorysafe_embed::QuantizedVector::from_embedding(&e.embed(body).unwrap());
             insert(&c, &item.id, scope, &q).unwrap();
+            item.id
         };
         plant(&home, home_body);
-        plant(&subject_neighbour, probe_text);
-        plant(&namespace_neighbour, probe_text);
+        let subject_neighbour_id = plant(&subject_neighbour, probe_text);
+        let namespace_neighbour_id = plant(&namespace_neighbour, probe_text);
+
+        // `vectors.subject`/`vectors.namespace` are the table's *own*
+        // columns, and every check above and below reads through `search`
+        // (which joins `vectors` to `items` on `item_id` and filters on
+        // `items.subject`/`items.namespace` — it never touches
+        // `vectors.subject`/`vectors.namespace` at all) or through
+        // `scope_embedder`, whose diagnostic scopes above probe different
+        // coordinates than the ones a hardcoded or swapped column in
+        // `insert` would alias onto. So a corrupted write here is invisible
+        // to everything above: the `items` row stays correct and `search`
+        // never notices. Read the stored columns back directly, with raw
+        // SQL, for the two neighbours whose subject and namespace each
+        // differ from the common `"s"`/`"n"` pair used everywhere else in
+        // this file — so a literal hardcoded from the wrong scope cannot
+        // coincidentally match either check.
+        let stored_columns = |item_id: &ItemId| -> (String, String) {
+            c.query_row(
+                "SELECT subject, namespace FROM vectors WHERE item_id = ?1",
+                params![item_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            stored_columns(&subject_neighbour_id),
+            ("other-s".to_string(), "n".to_string()),
+            "vectors.subject/vectors.namespace were not the coordinates insert \
+             was given for subject_neighbour"
+        );
+        assert_eq!(
+            stored_columns(&namespace_neighbour_id),
+            ("s".to_string(), "other-n".to_string()),
+            "vectors.subject/vectors.namespace were not the coordinates insert \
+             was given for namespace_neighbour"
+        );
 
         let probe =
             memorysafe_embed::QuantizedVector::from_embedding(&e.embed(probe_text).unwrap());
