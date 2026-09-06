@@ -13152,7 +13152,7 @@ Add `pub mod read;` to `lib.rs`. `RecallRequest`, `ScoredCandidate`, and `Compos
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 61 tests ok.
+Expected: PASS — 78 tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -13572,7 +13572,7 @@ and pass it as `ItemWrite { item, vector }`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 67 tests ok.
+Expected: PASS — 84 tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -13894,7 +13894,7 @@ pub use maintain::{MAINTAIN_BATCH, MaintainCursor, MaintainReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 72 tests ok.
+Expected: PASS — 89 tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -14112,7 +14112,7 @@ Add `pub mod cache;` and `pub use cache::{CacheConfig, EngineCache};` to `lib.rs
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 77 tests ok.
+Expected: PASS — 94 tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -14420,7 +14420,7 @@ Add `pub mod retention;` and
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 82 tests ok.
+Expected: PASS — 99 tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -14732,7 +14732,7 @@ Add `pub mod portability;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 89 tests ok.
+Expected: PASS — 106 tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -15007,7 +15007,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 94 memorysafe-engine tests, 50 backend conformance tests, and the unit and integration suites of all six crates.
+Expected: PASS — the whole workspace green: 5 invariants, 111 memorysafe-engine tests, 50 backend conformance tests, and the unit and integration suites of all six crates.
 
 - [ ] **Step 5: Commit**
 
@@ -15381,7 +15381,7 @@ pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine && cargo test --workspace --all-features`
-Expected: PASS — 101 engine tests ok, whole workspace green.
+Expected: PASS — 118 engine tests ok, whole workspace green.
 
 - [ ] **Step 5: Commit**
 
