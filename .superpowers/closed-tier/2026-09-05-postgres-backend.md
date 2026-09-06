@@ -457,15 +457,19 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ALTER TABLE <t> ENABLE ROW LEVEL SECURITY;
 ALTER TABLE <t> FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON <t>
-  USING      (tenant_id = current_setting('memorysafe.tenant_id', true))
-  WITH CHECK (tenant_id = current_setting('memorysafe.tenant_id', true));
+  USING      (tenant_id = nullif(current_setting('memorysafe.tenant_id', true), ''))
+  WITH CHECK (tenant_id = nullif(current_setting('memorysafe.tenant_id', true), ''));
 ```
 
 for each of `items`, `vectors`, `capacity`, `audit`, `idempotency`.
 
 Three properties this buys, all verified:
 
-1. With the GUC unset, `current_setting(..., true)` is `NULL`, `tenant_id = NULL` is `NULL`, and every row is filtered. Reads return zero rows; writes fail with `new row violates row-level security policy`.
+1. With no tenant claimed, the comparison is `NULL` and every row is filtered. Reads return zero rows; writes fail with `new row violates row-level security policy`.
+
+   **The `nullif` is load-bearing and the obvious spelling is wrong.** A custom GUC that was never declared in `postgresql.conf` does *not* return to unset after a transaction that `set_config`'d it: PostgreSQL 17 resets it to the empty string, a placeholder GUC's reset value, verified directly against a live server. So on any pooled connection that has previously served a tenant, `current_setting('memorysafe.tenant_id', true)` is `Some("")`, not `NULL` — and `tenant_id = ''` is `FALSE`, not `NULL`.
+
+   Every row is still filtered, so the property survives, but **it survives for a reason the plan did not state and did not depend on deliberately**: no stored `tenant_id` can be the empty string, because `memorysafe_core`'s `validate_component` rejects an empty component and `TenantId::new("")` is an error. That is a guarantee in another crate, in the OSS repository, load-bearing for this one's tenant isolation and coupled to it by nothing. `nullif` removes the dependency and restores the stated mechanism: an empty GUC becomes `NULL`, the comparison becomes `NULL`, and the argument above is true as written rather than true by accident.
 2. `WITH CHECK` blocks a connection that has claimed tenant B from writing a row labelled tenant A.
 3. Grants are issued on the **parent tables only**. Access through a partitioned parent is authorised against the parent, so the app role can work normally while a direct `SELECT … FROM items_p0` fails with `permission denied for table items_p0`. Direct partition access is the obvious way around a parent-level policy, and this closes it.
 
@@ -1803,8 +1807,8 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
         out.push(format!("DROP POLICY IF EXISTS tenant_isolation ON {table}"));
         out.push(format!(
             "CREATE POLICY tenant_isolation ON {table}
-               USING      (tenant_id = current_setting('memorysafe.tenant_id', true))
-               WITH CHECK (tenant_id = current_setting('memorysafe.tenant_id', true))"
+               USING      (tenant_id = nullif(current_setting('memorysafe.tenant_id', true), ''))
+               WITH CHECK (tenant_id = nullif(current_setting('memorysafe.tenant_id', true), ''))"
         ));
     }
 
@@ -2022,16 +2026,33 @@ async fn the_tenant_guc_is_transaction_local() {
         tx.commit().await.unwrap();
     }
 
-    // A later borrower of a pooled connection must not inherit it. The pool
-    // is small enough that this reuses the same connection.
+    // A later borrower of a pooled connection must not inherit it.
+    //
+    // TWO THINGS THIS TEST MUST NOT ASSUME, both measured rather than reasoned:
+    //
+    // 1. **It does not reset to unset.** A custom GUC never declared in
+    //    `postgresql.conf` resets to the empty string, not to unset, so
+    //    `current_setting(..., true)` returns `Some("")` here on PostgreSQL 17
+    //    and `assert_eq!(leaked, None)` fails. Compare against the *tenant*,
+    //    which is the property actually at stake.
+    // 2. **The pool does not reliably hand back the same connection.** Eight
+    //    sequential acquisitions at `max_connections = 4` were observed to use
+    //    three distinct backends. A loop that assumes reuse inspects
+    //    connections that never ran the transaction and passes whatever the
+    //    GUC does — so pin the connection instead of looping and hoping.
+    let mut held = backend.app_pool().acquire().await.unwrap();
     for _ in 0..8 {
         let leaked: Option<String> =
-            sqlx::query("SELECT current_setting('memorysafe.tenant_id', true) AS t")
-                .fetch_one(backend.app_pool())
+            sqlx::query("SELECT nullif(current_setting('memorysafe.tenant_id', true), '') AS t")
+                .fetch_one(&mut *held)
                 .await
                 .unwrap()
                 .get("t");
-        assert_eq!(leaked, None, "the tenant GUC leaked out of its transaction");
+        assert_eq!(
+            leaked.as_deref(),
+            None,
+            "the tenant GUC leaked out of its transaction onto a pooled connection"
+        );
     }
 }
 
@@ -2085,9 +2106,11 @@ use sqlx::{Postgres, Transaction};
 ///
 /// * `search_path` puts the tenant's schema first and keeps `public` reachable
 ///   for the `vector` type and the `<#>` operator.
-/// * `memorysafe.tenant_id` is what the RLS policies compare against. Unset,
-///   `current_setting(..., true)` is NULL, every comparison is NULL, and every
-///   row is filtered — so a bug that skips this function fails closed.
+/// * `memorysafe.tenant_id` is what the RLS policies compare against. With no
+///   tenant claimed the policies see NULL — via `nullif(..., '')`, because an
+///   undeclared custom GUC resets to the empty string rather than to unset —
+///   so every comparison is NULL and every row is filtered. A bug that skips
+///   this function fails closed.
 /// * `hnsw.iterative_scan` lets pgvector keep scanning when the scope
 ///   predicate rejects most of what the index returns. Without it a selective
 ///   scope can starve an ANN result set; with it the recall loss is bounded.
