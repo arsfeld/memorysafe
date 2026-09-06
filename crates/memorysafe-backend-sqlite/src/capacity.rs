@@ -14,11 +14,22 @@
 //! rolled-back write does not leave the count adjusted for an item that was
 //! never actually admitted.
 //!
-//! The in-process serialiser is still `TenantManager::with_write`'s
-//! per-tenant mutex — every mutating path goes through it — so
-//! `concurrent_admits_do_not_double_count` is exercising that lock, not a
-//! property of this module's SQL. See the task report for the mutation that
-//! confirms this.
+//! **What actually serialises `concurrent_admits_do_not_double_count`, and
+//! what does not.** Every mutating path still goes through
+//! `TenantManager::with_write`'s per-tenant async mutex, and `apply` must
+//! keep taking it — but that test does not exercise it. Its one tenant stays
+//! under `max_open` for the whole run, so it never produces the two-live-
+//! connections state `with_write`'s lock exists to cover (see
+//! `TenantManager`'s own doc). What actually serialises the 20 concurrent
+//! admits there is `with_conn`'s `Mutex<Connection>`: one pooled connection
+//! for that one tenant, so every call through it — with or without
+//! `with_write`'s lock also held — runs one at a time regardless. Deleting
+//! `with_write`'s per-tenant lock entirely and rerunning the workspace suite
+//! confirms this: `concurrent_admits_do_not_double_count` stays green, and
+//! the only failure is `tenant::tests::writes_to_one_tenant_are_serialized`
+//! — the test built specifically to force the two-connection case by
+//! churning the pool underneath a live write. So `with_write`'s lock has
+//! exactly one test able to fail if it is removed, and it is not this one.
 
 use crate::tenant::SqlResultExt;
 use memorysafe_backend::BackendError;
@@ -256,22 +267,82 @@ mod tests {
         assert_eq!(got.used_bytes, 500, "set_budget disturbed used_bytes");
     }
 
-    /// `adjust` and `state` are scoped by subject and namespace, exactly like
-    /// `items::get`/`items::list` — nothing structural enforces either
-    /// dimension here, since the tenant (the only structural boundary) is the
-    /// file.
+    /// `adjust`'s `UPDATE` is scoped by subject and namespace — and this
+    /// gives every scope its own row and its own nonzero usage *before* the
+    /// write under test, which an earlier version of this test did not: it
+    /// left the neighbour scopes with no capacity row at all, so `state`
+    /// fell through to its `Budget::UNBOUNDED, 0, 0` default regardless of
+    /// whether `adjust`'s `WHERE` clause ran — the tenant file held exactly
+    /// one row (`home`'s), so an `UPDATE` with no `WHERE` at all touches only
+    /// that one row and is indistinguishable from a correctly scoped one.
+    /// Seeding `other_subject`/`other_namespace` with their own established
+    /// values first means an unscoped `UPDATE` would visibly clobber them
+    /// too.
     #[test]
-    fn capacity_is_scoped_by_subject_and_namespace() {
+    fn adjust_is_scoped_by_subject_and_namespace() {
         let conn = db();
         let home = scope("s", "n");
         let other_subject = scope("other-s", "n");
         let other_namespace = scope("s", "other-n");
 
+        adjust(&conn, &other_subject, 7, 700).unwrap();
+        adjust(&conn, &other_namespace, 9, 900).unwrap();
+
         adjust(&conn, &home, 1, 100).unwrap();
 
-        assert_eq!(state(&conn, &other_subject).unwrap().used_items, 0);
-        assert_eq!(state(&conn, &other_namespace).unwrap().used_items, 0);
         assert_eq!(state(&conn, &home).unwrap().used_items, 1);
+        assert_eq!(state(&conn, &home).unwrap().used_bytes, 100);
+        assert_eq!(
+            state(&conn, &other_subject).unwrap().used_items,
+            7,
+            "adjust on `home` moved a different subject's usage"
+        );
+        assert_eq!(
+            state(&conn, &other_namespace).unwrap().used_items,
+            9,
+            "adjust on `home` moved a different namespace's usage"
+        );
+    }
+
+    /// `set_budget`'s `UPDATE` is scoped the same way, and for the same
+    /// reason `adjust`'s test above seeds every scope first: a neighbour
+    /// with no budget of its own cannot tell "correctly scoped" from "the
+    /// tenant file only had one row to begin with" apart.
+    #[test]
+    fn set_budget_is_scoped_by_subject_and_namespace() {
+        let conn = db();
+        let home = scope("s", "n");
+        let other = scope("other-s", "n");
+
+        set_budget(
+            &conn,
+            &other,
+            Budget {
+                max_items: Some(5),
+                max_bytes: Some(500),
+            },
+        )
+        .unwrap();
+        set_budget(
+            &conn,
+            &home,
+            Budget {
+                max_items: Some(10),
+                max_bytes: Some(1000),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state(&conn, &home).unwrap().budget.max_items, Some(10));
+        assert_eq!(state(&conn, &home).unwrap().budget.max_bytes, Some(1000));
+        assert_eq!(
+            state(&conn, &other).unwrap().budget,
+            Budget {
+                max_items: Some(5),
+                max_bytes: Some(500)
+            },
+            "set_budget on `home` overwrote a different subject's budget"
+        );
     }
 
     /// `stats` computes `item_count`, `total_bytes` and `median_item_bytes`
@@ -280,6 +351,17 @@ mod tests {
     /// rather than needing interpolation, and the byte sizes are spaced apart
     /// so an off-by-one in the `OFFSET` reads back a *different* value rather
     /// than one that happens to coincide.
+    ///
+    /// **The bystander is smaller than every in-scope item, not larger.** The
+    /// median query's `ORDER BY byte_size ASC ... OFFSET count/2` finds its
+    /// row by *position* in sorted order, and `count` itself always comes
+    /// from the (separately, correctly scoped) `COUNT(*)` above — so a
+    /// bystander bigger than everything in scope sorts past the offset this
+    /// test reads from and an unscoped median query still happens to land on
+    /// the right row. A bystander smaller than every in-scope item shifts
+    /// every later row's position by one, so an unscoped query reads back a
+    /// *different* value (20, not 30) — that is what actually distinguishes
+    /// a dropped `WHERE` on this specific query from a correctly scoped one.
     #[test]
     fn stats_reports_exact_count_total_and_median() {
         let conn = db();
@@ -289,8 +371,10 @@ mod tests {
         for (i, bytes) in [10i64, 40, 20, 50, 30].into_iter().enumerate() {
             insert_item(&conn, &format!("i{i}"), "s", "n", bytes);
         }
-        // A bystander in a different scope must not be counted.
-        insert_item(&conn, "elsewhere", "other-s", "n", 999);
+        // A bystander in a different scope, smaller than every in-scope item
+        // — see the doc above for why it must be smaller rather than larger
+        // — must not be counted and must not shift the median.
+        insert_item(&conn, "elsewhere", "other-s", "n", 1);
 
         let got = stats(&conn, &s).unwrap();
         assert_eq!(got.item_count, 5);
@@ -298,7 +382,9 @@ mod tests {
         assert_eq!(
             got.median_item_bytes, 30,
             "median must be the middle value of the sorted byte sizes, at \
-             OFFSET count/2"
+             OFFSET count/2 — 30 if the WHERE clause scoped the query to \
+             this subject/namespace, 20 if the smaller out-of-scope row was \
+             allowed to shift the offset"
         );
     }
 

@@ -199,6 +199,16 @@ impl Backend for SqliteBackend {
                 let tx = conn
                     .transaction()
                     .map_err(|e| tenant::storage_error(e, false))?;
+                // Must stay the transaction's first statement, ahead of the
+                // eviction loop below — this is an `INSERT OR IGNORE` (a
+                // write) so a DEFERRED transaction takes its write lock right
+                // here, before the eviction loop's `items::delete` can open
+                // it with a `SELECT` instead. `capacity::adjust` also calls
+                // `ensure_row` internally, so this call is redundant for
+                // *its* correctness — its only job is to go first. See
+                // `crate::aggregates`' module doc for the hazard this
+                // ordering closes and why nothing in this crate's suite can
+                // fail if the order regresses.
                 capacity::ensure_row(&tx, &txn.scope)?;
 
                 let mut delta_items: i64 = 0;
@@ -596,6 +606,81 @@ mod tests {
         );
     }
 
+    /// The companion the capacity-after-merge test above cannot see:
+    /// `items::merge`'s own `UPDATE` writes `items.byte_size`, and that
+    /// column — not the delta `merge` returns — is what a *later* eviction
+    /// reads to compute its own capacity release (`items::delete`). A merge
+    /// that computes the right delta at merge time but persists the
+    /// pre-merge size into that column leaves `capacity.used_bytes` reading
+    /// correctly right up until the item is evicted, at which point too few
+    /// bytes are released and the drift becomes permanent — silent, because
+    /// nothing reads `items.byte_size` again until then.
+    ///
+    /// Round-trips through `apply` end to end (admit, merge to a much larger
+    /// body, evict) so it exercises exactly the column a unit test on
+    /// `items::merge` alone cannot: `MemoryItem::byte_size()` recomputes from
+    /// body/tags/attrs and never reads the stored column, so asserting
+    /// against it — as the test above does, correctly, for the merge-time
+    /// delta — cannot catch a stale column that only misbehaves on the next
+    /// write.
+    #[tokio::test]
+    async fn evicting_a_merged_item_releases_its_post_merge_size_not_its_pre_merge_one() {
+        let b = backend();
+        let s = scope("s", "n");
+
+        let target = fx::item(&s, "short");
+        b.apply(fx::admit_txn(&s, target.clone(), None))
+            .await
+            .unwrap();
+
+        let new_body = "a considerably longer body than the one this item \
+                         started with, so the post-merge charge is \
+                         unambiguously larger than the pre-merge one";
+        let audit = memorysafe_core::AuditRecord::new(
+            s.clone(),
+            AuditEvent::Merged,
+            vec![memorysafe_core::ItemRef::from_item(&target)],
+            Actor::system(),
+            target.created_at,
+        );
+        let mut txn = memorysafe_backend::WriteTransaction::new(s.clone(), audit);
+        txn.merge = Some(memorysafe_backend::write::MergeWrite {
+            target: target.id.clone(),
+            body: new_body.into(),
+            tags: vec![],
+            attrs: Default::default(),
+            vector: None,
+            byte_size: new_body.len() as u64,
+        });
+        b.apply(txn).await.unwrap();
+
+        // Sanity: the merge did grow the item, or the eviction below proves
+        // nothing about which size was released.
+        let merged = b.get(&s, &target.id).await.unwrap().unwrap();
+        assert!(
+            merged.byte_size() > target.byte_size(),
+            "the premise: the merge must grow the item"
+        );
+
+        b.apply(fx::evict_txn(&s, vec![target.id.clone()]))
+            .await
+            .unwrap();
+
+        let after_evict = b.capacity_state(&s).await.unwrap();
+        assert_eq!(
+            after_evict.used_items, 0,
+            "eviction did not release the merged item's slot"
+        );
+        assert_eq!(
+            after_evict.used_bytes, 0,
+            "eviction released the wrong number of bytes: this only returns \
+             to exactly 0 if `items.byte_size` was rewritten to the item's \
+             post-merge size rather than left at its pre-merge value — a \
+             nonzero residue here is exactly the permanent capacity drift a \
+             stale column produces"
+        );
+    }
+
     /// `items::merge`'s lookup is scoped by subject and namespace through
     /// `items::get`, so a merge naming a target that exists but belongs to a
     /// different subject reports `MergeTargetMissing` rather than rewriting
@@ -653,6 +738,13 @@ mod tests {
     /// guards `apply`'s lookup actually binding all three columns rather than
     /// `key` alone, until a conformance test for this is queued before the
     /// freeze.
+    ///
+    /// **Also asserts `audit_id`, not only `item_id`.** Neither conformance
+    /// idempotency test compares `audit_id` at all, so a replay path that
+    /// mints a fresh `AuditId` instead of returning the one actually stored
+    /// — naming an audit row that does not exist, and disagreeing with
+    /// `replayed_outcome`'s own JSON — passes the whole suite. Checked here
+    /// on the same retry that already exists for `item_id`.
     #[tokio::test]
     async fn two_subjects_replaying_the_same_idempotency_key_each_get_their_own_outcome() {
         let b = backend();
@@ -698,6 +790,11 @@ mod tests {
         assert_eq!(
             replayed_a.item_id, applied_a.item_id,
             "subject a's retry replayed the wrong subject's outcome"
+        );
+        assert_eq!(
+            replayed_a.audit_id, applied_a.audit_id,
+            "a replay must return the audit id actually stored, not a \
+             freshly minted one that names no row in the audit table"
         );
     }
 

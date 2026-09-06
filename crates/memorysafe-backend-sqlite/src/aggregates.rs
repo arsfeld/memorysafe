@@ -32,22 +32,52 @@
 //! ahead of that insert in either caller removes the second mechanism and
 //! leaves only the in-process one.
 //!
-//! **What is *not* covered, stated because the reassuring version of this
-//! paragraph was wrong.** `items::delete` opens with a `SELECT byte_size` and
+//! **What used to not be covered on the `apply` path, and is closed now —
+//! stated because the reassuring version of this paragraph was wrong once
+//! already, and a silently stale correction would be worse than the original
+//! mistake.** Before capacity accounting existed, `apply`'s transaction could
+//! open with a read: `items::delete` opens with a `SELECT byte_size` and
 //! returns without writing at all when the row is absent, so on an eviction
-//! the transaction's first statement is a read — and nothing in this crate
+//! the transaction's first statement was a read — and nothing in this crate
 //! sets `TransactionBehavior`, so every transaction is `DEFERRED`. A DEFERRED
 //! transaction that reads first takes a WAL snapshot and upgrades later; if
 //! another connection committed in between, SQLite answers
-//! `SQLITE_BUSY_SNAPSHOT`, for which the busy handler is **not** invoked. So
-//! `busy_timeout` does not wait that case out — the caller must roll back and
-//! retry. Reachable only across processes or across two `SqliteBackend` values
-//! over one root, and only when `txn.evictions` is non-empty. The fix is
-//! `transaction_with_behavior(TransactionBehavior::Immediate)`, which takes
-//! the write lock up front and puts the wait back under `busy_timeout`; it is
-//! queued rather than done here because it is a behaviour change that deserves
-//! a test able to fail, and this claim is reasoned from the SQLite and
-//! rusqlite contracts rather than reproduced under contention.
+//! `SQLITE_BUSY_SNAPSHOT`, for which the busy handler is **not** invoked, so
+//! `busy_timeout` does not wait that case out.
+//!
+//! `apply`'s transaction now opens with `capacity::ensure_row` —
+//! `INSERT OR IGNORE`, a write, even on the path where the row already
+//! exists and the statement changes nothing — placed in `lib.rs` **before**
+//! the eviction loop that used to run first. SQLite decides a DEFERRED
+//! transaction's locking behaviour from its first executed statement, so a
+//! write there takes the reserved lock immediately, the same as
+//! `TransactionBehavior::Immediate` would, and the eviction loop's later
+//! `SELECT` no longer determines how the transaction opened. This closes the
+//! hazard for `apply` specifically. `record_recall`'s transaction was never
+//! exposed to it in the first place — it already opened with `audit::insert`,
+//! itself always a write.
+//!
+//! **The ordering is load-bearing, and nothing in this crate's test suite can
+//! fail if it regresses.** `capacity::adjust` also calls `ensure_row`
+//! internally, so the standalone call `apply` makes first exists *only* to be
+//! the transaction's first statement — deleting it and relying on `adjust`'s
+//! own `ensure_row` (called later, after the eviction loop) compiles, is
+//! functionally identical in every test this crate runs, and reopens exactly
+//! this hazard whenever `txn.evictions` is non-empty. Reaching
+//! `SQLITE_BUSY_SNAPSHOT` needs two live connections racing across processes
+//! (or two `SqliteBackend`s over one root), which nothing in this crate's
+//! single-process suite provokes — the same reason this whole paragraph is
+//! reasoned from the SQLite and rusqlite contracts rather than measured under
+//! contention. Keep `capacity::ensure_row(&tx, &txn.scope)` as `apply`'s first
+//! statement in `lib.rs`, ahead of the eviction loop; do not move it down
+//! "because `adjust` calls it anyway."
+//!
+//! The residual fix, if this is ever to be closed independent of statement
+//! ordering, is `transaction_with_behavior(TransactionBehavior::Immediate)`,
+//! which takes the write lock up front regardless of what the first statement
+//! turns out to be and puts the wait back under `busy_timeout`. Still queued
+//! rather than done here, for the same reason as before: a behaviour change
+//! that deserves a test able to fail it.
 
 use crate::tenant::SqlResultExt;
 use memorysafe_backend::BackendError;

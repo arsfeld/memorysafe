@@ -559,6 +559,28 @@ mod tests {
              new size alone"
         );
         assert!(delta > 0, "the premise: the replacement body is longer");
+
+        // `stored.byte_size()` above is *recomputed* by `MemoryItem::byte_size`
+        // from the row's body/tags/attrs — `MemoryItem` has no `byte_size`
+        // field at all — so it cannot see what `merge`'s own `UPDATE` wrote
+        // into the `items.byte_size` column. Read that column back directly:
+        // `items::delete` charges an eviction from exactly this column, so a
+        // merge that computes the right delta but persists the pre-merge
+        // size here is a capacity leak that only shows up later, when the
+        // item is evicted for less than it is actually costing the budget.
+        let stored_byte_size: i64 = conn
+            .query_row(
+                "SELECT byte_size FROM items WHERE id = ?1",
+                params![existing.id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_byte_size, after,
+            "merge must persist the item's new byte_size, not the pre-merge \
+             one — a later eviction reads this column, not the delta merge \
+             returned"
+        );
     }
 
     /// A merge whose supplied tag already exists on the target must not
