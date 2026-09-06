@@ -126,6 +126,24 @@ predicate: `items.id` is `TEXT PRIMARY KEY` and `get` already refused an out-of-
   Only `sensitivity` has an exactness test; `occurred_after >=` → `>` and
   `occurred_before <=` → `<` both survive.
 
+## One process note, because it cost a near-miss at the freeze
+
+**The highest-risk moment for a retired pattern is inside the fix for a different one.**
+
+The fix for C1 needed to rebuild a `Scope` from stored columns, and its first draft was
+`Scope::new(...).expect("stored scopes are valid")` — the seventh instance of a pattern six
+of which had been removed from this crate an hour earlier, for poisoning a tenant's
+connection mutex on one corrupt row. Caught before commit.
+
+Not carelessness. **A fix is written in the frame of the thing it fixes**, and that frame
+does not include what you were doing before it. The retired pattern is the locally obvious
+way to write the line, and the reason it was retired lives in a different part of the file
+and a different part of your attention.
+
+No construction retires this one — it is a judgment about your own recent history, which is
+the category that cannot be made unrepresentable. The cheap mitigation is a grep of the diff
+for the pattern you most recently removed, before committing a fix for anything else.
+
 ## Elsewhere
 
 - **Every transaction is `DEFERRED`.** `apply` now opens with a write (`capacity::ensure_row`),

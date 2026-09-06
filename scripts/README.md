@@ -91,6 +91,37 @@ artifact's shape changes, not only its content.** Hence the pinned `timeout_mult
 `.cargo/mutants.toml`: on auto, verdicts stop being comparable across any commit that
 changes test structure.
 
+## What a mutation score does NOT measure — the boundary, marked by a Critical
+
+**89.1% was the score on the commit that carried silent data loss in the compliance path.**
+
+The freeze review found that `export(include_audit: true)` dropped every audit row for a
+scope holding no items — exactly what `purge_subject(Preserve)` creates, so a migrated
+tenant lost the only remaining evidence that an erasure happened.
+
+**No mutation run could have found it, and the run at that commit had `portability.rs` fully
+in scope.** Mutation testing perturbs an existing expression and asks whether the tests
+notice. C1 was not a perturbable expression — it was the **wrong choice of data source**,
+deriving the audit scopes from the items just exported. No single-token operator generates
+"read this from a different table". The defect was semantically wrong and syntactically
+invisible.
+
+So: **a mutation score measures test sensitivity to local perturbation, not
+defect-freedom.** Three instruments, three distinct blind spots, and the third is reached by
+neither:
+
+| instrument | finds | blind to |
+|---|---|---|
+| `cargo mutants` | local perturbations the tests miss | wrong source, wrong shape — anything not a token edit |
+| a hypothesis-driven review pass | discriminators, with measured inputs | whatever nobody thought to hypothesise |
+| neither | — | assertions *structurally* unable to observe a field |
+
+The third has a worked example in `docs/known-gaps.md`: the exported vector's `scale`.
+`export_import_round_trips_exactly` compares ranked ids from `neighbours`, and **cosine
+ranking is invariant under per-vector positive scaling** — so that assertion cannot pin
+`scale` however hard it is strengthened. Found by reasoning about what an assertion can
+*see*, which is not a thing either tool does.
+
 ## The denominator nobody had printed
 
 `cargo mutants` finds **187 mutants** in `memorysafe-backend-sqlite` — `lib.rs` 46,
