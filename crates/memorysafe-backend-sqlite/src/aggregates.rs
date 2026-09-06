@@ -21,6 +21,16 @@
 //! tenant file are a normal steady state produced by ordinary LRU eviction, not
 //! only by a race. The read-modify-write below is correct under that lock and
 //! under nothing weaker.
+//!
+//! **That lock is in-process, and it is not the only thing holding this up.**
+//! `with_write`'s mutex lives in one `TenantManager`, so two `SqliteBackend`
+//! values over one root — or a second process — are outside it. They are still
+//! safe, by a second mechanism: both callers of `increment` open their
+//! transaction with a *write* (`items::delete`, `items::insert` or
+//! `audit::insert`), so SQLite's own single-writer WAL lock is already held
+//! before the `SELECT` below runs, with `busy_timeout` from `schema::initialise`
+//! to wait for it. Reordering `increment` ahead of the first write in either
+//! caller would remove that second mechanism and leave only the in-process one.
 
 use crate::tenant::SqlResultExt;
 use memorysafe_backend::BackendError;
@@ -415,6 +425,48 @@ mod tests {
         assert!(
             matches!(err, BackendError::Storage { .. }),
             "expected a storage error, got {err:?}"
+        );
+    }
+
+    /// The `UPDATE`'s `histogram_version = ?8` is the whole mechanism keeping a
+    /// row honest about which `SCORE_HISTOGRAM_EDGES` its counts were bucketed
+    /// with, and nothing else in the crate observes the column: it is not part
+    /// of the key, and the read half does not arrive until the portability
+    /// task. Without this test, deleting the refresh leaves every test in the
+    /// workspace green.
+    #[test]
+    fn an_increment_refreshes_a_row_left_at_a_foreign_histogram_version() {
+        let conn = db();
+        let zeros = serde_json::to_string(&vec![0u64; SCORE_HISTOGRAM_BUCKETS]).unwrap();
+        let foreign = SCORE_HISTOGRAM_VERSION as i64 + 41;
+        conn.execute(
+            "INSERT INTO audit_aggregates
+               (policy_name, policy_version, event, day, count,
+                value_histogram, fragility_histogram, histogram_version)
+             VALUES (NULL, NULL, 'admitted', 0, 0, ?1, ?2, ?3)",
+            params![zeros, zeros, foreign],
+        )
+        .unwrap();
+
+        increment(&conn, &record(AuditEvent::Admitted, 0)).unwrap();
+
+        let (count, version): (i64, i64) = conn
+            .query_row(
+                "SELECT count, histogram_version FROM audit_aggregates
+                  WHERE policy_name IS NULL AND event = 'admitted' AND day = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "the increment must have taken the UPDATE branch, not inserted a \
+             second row — otherwise the version assertion below proves nothing"
+        );
+        assert_eq!(
+            version, SCORE_HISTOGRAM_VERSION as i64,
+            "the row still advertises the edges it was created under while \
+             holding a count bucketed by this build's"
         );
     }
 }

@@ -128,8 +128,8 @@ mod tests {
     use super::*;
     use crate::schema;
     use memorysafe_core::{
-        Actor, ActorKind, AuditEvent, AuditRecord, ItemId, ItemRef, MemoryItem, Protection, Scope,
-        SensitivityLevel, Source, SourceKind,
+        Actor, ActorKind, AuditEvent, AuditRecord, Decision, ItemId, ItemRef, MemoryItem, PolicyId,
+        Protection, Reason, ReasonCode, Scope, SensitivityLevel, Source, SourceKind,
     };
     use time::OffsetDateTime;
 
@@ -172,6 +172,48 @@ mod tests {
             Actor::system(),
             OffsetDateTime::from_unix_timestamp(at).unwrap(),
         )
+    }
+
+    /// The `policy` column has no reader anywhere in this crate — `query`'s
+    /// `SELECT` omits it, and the export that reads it arrives with the
+    /// portability task. Until then this is the only thing in the workspace
+    /// that fails if `insert` binds `None` there or renders the wrong part of
+    /// the `PolicyId`, so it is written against the exact string rather than
+    /// against `Display` re-derived at assertion time.
+    #[test]
+    fn the_policy_column_renders_the_decision_and_is_null_without_one() {
+        let conn = db();
+        let sc = scope("s", "n");
+
+        let mut policied = record(&sc, AuditEvent::Rejected, 1);
+        policied.decision = Some(Decision::reject(
+            PolicyId::new("retention", "3"),
+            Reason::new(ReasonCode::LowValue, "", Default::default()),
+        ));
+        insert(&conn, &policied).unwrap();
+
+        let plain = record(&sc, AuditEvent::Admitted, 2);
+        insert(&conn, &plain).unwrap();
+
+        let policy_of = |id: &AuditId| -> Option<String> {
+            conn.query_row(
+                "SELECT policy FROM audit WHERE id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            policy_of(&policied.id).as_deref(),
+            Some("retention@3"),
+            "the rendered policy is missing or mis-rendered"
+        );
+        assert_eq!(
+            policy_of(&plain.id),
+            None,
+            "a record carrying no decision must leave the column NULL, not an \
+             empty string — NULL is what the export will read as `no policy`"
+        );
     }
 
     /// The echo rule at the storage layer: the row comes back under the id it

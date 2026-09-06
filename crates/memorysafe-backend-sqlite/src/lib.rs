@@ -53,12 +53,13 @@ impl SqliteBackend {
 
 /// **Partial, and deliberately so.** Task 20 implements `get`, `list`,
 /// `audit`, `record_recall` and a first `apply` covering insert, evictions and
-/// the audit row. Vectors and retrieval arrive in Task 21, merge and capacity
-/// in Task 22, idempotency in Task 23, and purge/export/import plus the
-/// aggregate *read* in Task 24. The methods those tasks own return `Ok`
-/// defaults here so the crate compiles and the isolation and atomicity
-/// conformance tests can run at all; each is marked, and none is bound by a
-/// conformance test in this crate's `tests/conformance.rs` yet.
+/// the audit row. Vectors and `neighbours` arrive in Task 21, keyword and
+/// hybrid retrieval in Task 22, merge and capacity and idempotency in
+/// Task 23, and purge/export/import plus the aggregate *read* in Task 24.
+/// The methods those tasks own return `Ok` defaults here so the crate
+/// compiles and the isolation and atomicity conformance tests can run at
+/// all; each is marked, and none is bound by a conformance test in this
+/// crate's `tests/conformance.rs` yet.
 #[async_trait]
 impl Backend for SqliteBackend {
     async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, BackendError> {
@@ -138,6 +139,20 @@ impl Backend for SqliteBackend {
                  fields must agree"
                     .into(),
             ));
+        }
+        // `is_valid()` accepts a merge-only transaction, and this task does not
+        // implement merges — so without this guard `apply` performs the
+        // evictions, writes the audit row, commits, and returns `Ok` for a
+        // request whose merge half it silently discarded. A stub returning a
+        // default is recoverable; reporting success for work not done is not.
+        // The merge task removes this and implements the branch.
+        if txn.merge.is_some() {
+            return Err(BackendError::Storage {
+                message: "merge is not implemented in this build; refusing rather than \
+                          applying the rest of the transaction and reporting success"
+                    .into(),
+                retryable: false,
+            });
         }
         let tenant = txn.scope.tenant.clone();
         self.tenants
@@ -319,6 +334,61 @@ mod tests {
     /// is asserted empty first, so "there is an aggregate row" cannot be
     /// satisfied by a row that was already there — the mistake the pragma case
     /// in `schema.rs` records.
+    /// `WriteTransaction::is_valid` accepts a merge-only transaction, and this
+    /// build implements no merge. The dangerous outcome is not that the merge
+    /// fails — it is that the *rest* of the transaction succeeds and `apply`
+    /// returns `Ok`, so the caller records a merge that never happened while
+    /// the evictions it was bundled with are permanent.
+    #[tokio::test]
+    async fn a_merge_is_refused_whole_rather_than_applied_in_part() {
+        let b = backend();
+        let s = scope("s", "n");
+
+        let victim = fx::item(&s, "collateral");
+        b.apply(fx::admit_txn(&s, victim.clone(), None))
+            .await
+            .unwrap();
+        let before = aggregate_rows(&b, &s.tenant).await;
+
+        // Evictions *and* a merge: without the guard the evictions commit, the
+        // audit row is written, and the merge is silently dropped.
+        let mut txn = fx::evict_txn(&s, vec![victim.id.clone()]);
+        txn.merge = Some(memorysafe_backend::write::MergeWrite {
+            target: victim.id.clone(),
+            body: "merged text".into(),
+            tags: vec![],
+            attrs: Default::default(),
+            vector: None,
+            byte_size: 11,
+        });
+        assert!(
+            txn.is_valid(),
+            "the premise: this transaction is well-formed"
+        );
+
+        let err = b.apply(txn).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BackendError::Storage {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "expected a non-retryable refusal, got {err:?}"
+        );
+        assert!(
+            b.get(&s, &victim.id).await.unwrap().is_some(),
+            "the refusal wrote nothing, so the eviction bundled with the merge \
+             must not have taken effect"
+        );
+        assert_eq!(
+            aggregate_rows(&b, &s.tenant).await,
+            before,
+            "a refused transaction wrote an audit row and an aggregate"
+        );
+    }
+
     #[tokio::test]
     async fn apply_increments_the_aggregates_in_the_same_write() {
         let b = backend();

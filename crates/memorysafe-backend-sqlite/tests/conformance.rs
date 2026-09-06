@@ -17,9 +17,10 @@
 //! absent rather than bound-and-failing:
 //!
 //! - `isolation::retrieval_never_crosses_a_scope_boundary` — reads through
-//!   `retrieve_candidates` and `neighbours`. Task 21.
+//!   *both* `retrieve_candidates` and `neighbours`. Task 21 supplies only
+//!   `neighbours`, so this binds at Task 22, with `retrieve_candidates`.
 //! - `atomicity::a_failed_transaction_leaves_no_trace` — requires a merge and
-//!   `BackendError::MergeTargetMissing`. Task 22.
+//!   `BackendError::MergeTargetMissing`. Task 23.
 //! - `atomicity::idempotent_writes_replay_the_original_outcome` and
 //!   `atomicity::idempotency_conflict_on_different_payload` — require the
 //!   `idempotency` table's read-write path. Task 23.
