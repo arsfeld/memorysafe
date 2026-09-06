@@ -290,6 +290,49 @@ CREATE TABLE idempotency (
   outcome        TEXT NOT NULL,               -- JSON WriteOutcome
   at             INTEGER NOT NULL
 );
+
+CREATE TABLE audit_aggregates (
+  -- The key, and nothing finer. No subject column and no namespace column:
+  -- `memorysafe_backend::aggregates` carries the argument, and
+  -- `lifecycle::audit_aggregates_survive_a_cascading_purge` fails if a purge
+  -- can reach these rows.
+  --
+  -- The policy is two columns because `PolicyId`'s Display is not injective;
+  -- a rendered key column merges distinct policies into one row. See the
+  -- prose below.
+  policy_name    TEXT,                        -- NULL together with policy_version
+  policy_version TEXT,
+  event          TEXT NOT NULL,               -- AuditEvent::as_str(), never an ordinal
+  day            INTEGER NOT NULL,            -- whole UTC days, aggregates::day_bucket
+  count          INTEGER NOT NULL,
+  value_histogram     TEXT NOT NULL,          -- JSON [u64; 10]
+  fragility_histogram TEXT NOT NULL,          -- JSON [u64; 10]
+  histogram_version   INTEGER NOT NULL
+);
+-- Uniqueness in two partial indexes rather than one PRIMARY KEY over the
+-- nullable tuple. A unique index treats NULLs as distinct from each other, so
+-- a single index over (policy_name, policy_version, event, day) would let two
+-- policy-less rows with the same event and day both insert — and policy-less
+-- rows are the majority of the key space, not a corner. Splitting on the
+-- nullability makes the constraint hold in both cases without inventing a
+-- sentinel policy string, which `AggregateKey::policy`'s doc rules out.
+CREATE UNIQUE INDEX idx_aggregates_key_policied
+  ON audit_aggregates(policy_name, policy_version, event, day)
+  WHERE policy_name IS NOT NULL;
+CREATE UNIQUE INDEX idx_aggregates_key_policy_less
+  ON audit_aggregates(event, day)
+  WHERE policy_name IS NULL;
+-- The read path's ordering index, in the documented key order: day first, then
+-- the policy parts, then the event name. Collation is stated on every text
+-- column rather than left to the engine's default, per the mandate on
+-- `Backend::audit_aggregates`; `COLLATE BINARY` is SQLite's spelling of byte
+-- order and Postgres's is `COLLATE "C"`.
+CREATE INDEX idx_aggregates_order ON audit_aggregates(
+  day,
+  policy_name    COLLATE BINARY,
+  policy_version COLLATE BINARY,
+  event          COLLATE BINARY
+);
 ```
 
 ---
@@ -6313,7 +6356,11 @@ git commit -m "feat(backend): conformance tests for audit, purge, and portabilit
 
 **Design:** one database file per tenant, named `<tenant>.db` under the root. `TenantId` validation from Task 2 already forbids `/`, `..`, and control characters, so the name is safe as a path component. Reads run concurrently under WAL; writes for a given tenant are serialized through a per-tenant `tokio::sync::Mutex`, which is what makes the capacity accounting correct.
 
-**This task also creates the `audit_aggregates` table.** Its key is policy name, policy version, event class, and day bucket — and **nothing else**: no subject column, no namespace column. `memorysafe_backend::aggregates` carries the full argument; the short version is that a cascading purge deletes items, vectors, audit, idempotency and capacity all by subject, so a namespace column here would make an aggregate row the sole surviving artifact naming a purged subject's namespace. Store the histogram bucket counts as ten integers plus the `SCORE_HISTOGRAM_VERSION` the row was written under, and do **not** give the table a foreign key to `audit` or include it in `purge::subject`'s sweep — `lifecycle::audit_aggregates_survive_a_cascading_purge` fails if you do. The two columns `items.last_access` and `items.access_count` are also read for the first time from Task 21 onward; they have been declared since this task and unread until now.
+**This task also creates the `audit_aggregates` table** — and the DDL above now contains it, which it did not for several rounds while this paragraph claimed it did. Its key is policy name, policy version, event class, and day bucket — and **nothing else**: no subject column, no namespace column. `memorysafe_backend::aggregates` carries the full argument; the short version is that a cascading purge deletes items, vectors, audit, idempotency and capacity all by subject, so a namespace column here would make an aggregate row the sole surviving artifact naming a purged subject's namespace. Store the histogram bucket counts as ten integers plus the `SCORE_HISTOGRAM_VERSION` the row was written under, and do **not** give the table a foreign key to `audit` or include it in `purge::subject`'s sweep — `lifecycle::audit_aggregates_survive_a_cascading_purge` fails if you do.
+
+**The policy is two columns, not one rendered string, and this is a correctness constraint rather than a layout preference.** `PolicyId`'s `Display` is `{name}@{version}` and neither field is constrained, so `("a@b", "c")` and `("a", "b@c")` both render `"a@b@c"`. A single rendered key column would merge two distinct policies' counts into one row — a lost count, unrecoverable, in the artifact designed to outlive the detail rows. `lifecycle::audit_aggregates_page_in_the_documented_order` carries that exact pair and fails on a merged row. Note that the `audit` detail table's own `policy` column *is* the rendered form: that is a display and filter convenience, nothing keys on it, and nothing in Plan 1 reads it — do not derive the aggregate key from it.
+
+**The ordering index states its collation explicitly on every text column.** `Backend::audit_aggregates` mandates that every ordering over a text column states its collation and every ordering over a nullable column states null placement, neither relying on a dialect default. `COLLATE BINARY` is SQLite's spelling of byte order; Postgres's is `COLLATE "C"`. `policy_name` is nullable and must sort NULL first, which is SQLite's default — state it anyway, with `ORDER BY (policy_name IS NULL) DESC, ...` in the query rather than relying on the default, since the point of the mandate is that a reader can see the choice was made. Task 22's `ordering_sql_states_collation_and_null_placement` is where that is asserted. The two columns `items.last_access` and `items.access_count` are also read for the first time from Task 21 onward; they have been declared since this task and unread until now.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6587,6 +6634,49 @@ CREATE TABLE IF NOT EXISTS idempotency (
   outcome        TEXT NOT NULL,
   at             INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_aggregates (
+  -- The key, and nothing finer. No subject column and no namespace column:
+  -- `memorysafe_backend::aggregates` carries the argument, and
+  -- `lifecycle::audit_aggregates_survive_a_cascading_purge` fails if a purge
+  -- can reach these rows.
+  --
+  -- The policy is two columns because `PolicyId`'s Display is not injective;
+  -- a rendered key column merges distinct policies into one row. See the
+  -- prose below.
+  policy_name    TEXT,                        -- NULL together with policy_version
+  policy_version TEXT,
+  event          TEXT NOT NULL,               -- AuditEvent::as_str(), never an ordinal
+  day            INTEGER NOT NULL,            -- whole UTC days, aggregates::day_bucket
+  count          INTEGER NOT NULL,
+  value_histogram     TEXT NOT NULL,          -- JSON [u64; 10]
+  fragility_histogram TEXT NOT NULL,          -- JSON [u64; 10]
+  histogram_version   INTEGER NOT NULL
+);
+-- Uniqueness in two partial indexes rather than one PRIMARY KEY over the
+-- nullable tuple. A unique index treats NULLs as distinct from each other, so
+-- a single index over (policy_name, policy_version, event, day) would let two
+-- policy-less rows with the same event and day both insert — and policy-less
+-- rows are the majority of the key space, not a corner. Splitting on the
+-- nullability makes the constraint hold in both cases without inventing a
+-- sentinel policy string, which `AggregateKey::policy`'s doc rules out.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregates_key_policied
+  ON audit_aggregates(policy_name, policy_version, event, day)
+  WHERE policy_name IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregates_key_policy_less
+  ON audit_aggregates(event, day)
+  WHERE policy_name IS NULL;
+-- The read path's ordering index, in the documented key order: day first, then
+-- the policy parts, then the event name. Collation is stated on every text
+-- column rather than left to the engine's default, per the mandate on
+-- `Backend::audit_aggregates`; `COLLATE BINARY` is SQLite's spelling of byte
+-- order and Postgres's is `COLLATE "C"`.
+CREATE INDEX IF NOT EXISTS idx_aggregates_order ON audit_aggregates(
+  day,
+  policy_name    COLLATE BINARY,
+  policy_version COLLATE BINARY,
+  event          COLLATE BINARY
+);
 "#;
 
 /// Applies pragmas and DDL. Idempotent — safe on every open.
@@ -6774,7 +6864,7 @@ git commit -m "feat(sqlite): per-tenant database files, schema, and pooled conne
 
 ## Task 20: SQLite — items and audit
 
-**Also increments the aggregates.** Every audit row this task writes updates the matching `audit_aggregates` row in the same transaction — same key, count + 1, and the assessment's `value`/`fragility` bucketed with `memorysafe_backend::aggregates::score_bucket`. Same transaction, not a follow-up write: an aggregate that can diverge from the detail rows it summarises is worse than no aggregate. `record_recall` additionally bumps `items.last_access` and `items.access_count` for every item its `AuditRecord::items` references, in that same transaction — see `Backend::record_recall`.
+**Also increments the aggregates**, through `aggregates::increment` below — a real function, not a described one; the increment was prose for several rounds against a table that did not exist, so the first `apply` would have failed at runtime rather than at the aggregate tests. Every audit row this task writes updates the matching `audit_aggregates` row in the same transaction — same key, count + 1, and the assessment's `value`/`fragility` bucketed with `memorysafe_backend::aggregates::score_bucket`. Same transaction, not a follow-up write: an aggregate that can diverge from the detail rows it summarises is worse than no aggregate. `record_recall` additionally bumps `items.last_access` and `items.access_count` for every item its `AuditRecord::items` references, in that same transaction — see `Backend::record_recall`.
 
 **Files:**
 - Create: `crates/memorysafe-backend-sqlite/src/items.rs`
@@ -6784,7 +6874,7 @@ git commit -m "feat(sqlite): per-tenant database files, schema, and pooled conne
 
 **Interfaces:**
 - Consumes: `TenantManager`, `SqlResultExt`, all core types.
-- Produces: `items::insert(&Connection, &MemoryItem)`, `items::get`, `items::list`, `items::delete`, `items::row_to_item`, `audit::insert`, `audit::query`, and a partial `Backend` impl covering `get`, `list`, `audit`, `record_recall`, plus a first `apply` that handles insert + eviction + audit.
+- Produces: `items::insert(&Connection, &MemoryItem)`, `items::get`, `items::list`, `items::delete`, `items::row_to_item`, `audit::insert`, `audit::query`, `aggregates::increment`, and a partial `Backend` impl covering `get`, `list`, `audit`, `record_recall`, plus a first `apply` that handles insert + eviction + audit.
 
 **Milestone:** the isolation and atomicity conformance tests execute for the first time.
 
@@ -7136,9 +7226,98 @@ pub fn query(conn: &Connection, scope: &Scope, filter: &AuditFilter)
 }
 ```
 
+`crates/memorysafe-backend-sqlite/src/aggregates.rs` — the write half. The read half arrives with `purge`, `export` and `import` in the portability task; both are listed there so neither is forgotten again.
+
+```rust
+use crate::tenant::SqlResultExt;
+use memorysafe_backend::BackendError;
+use memorysafe_backend::aggregates::{SCORE_HISTOGRAM_BUCKETS, SCORE_HISTOGRAM_VERSION, day_bucket, score_bucket};
+use memorysafe_core::AuditRecord;
+use rusqlite::{Connection, params};
+
+/// Counts one audit row into its aggregate, creating the row on first sight.
+///
+/// The key comes from the record itself: the decision's policy **as two
+/// fields**, the event's `as_str()`, and `day_bucket(record.at)`. Not from the
+/// `audit` table's rendered `policy` column — that column is a display
+/// convenience and `PolicyId`'s `Display` is not injective, so keying on it
+/// merges distinct policies into one row.
+///
+/// `sum(histogram) <= count`, never `==`: only rows carrying an `Assessment`
+/// land in a bucket, while `count` counts every row matching the key. See
+/// `AuditAggregate`.
+pub fn increment(conn: &Connection, record: &AuditRecord) -> Result<(), BackendError> {
+    let (name, version) = match record.decision.as_ref().map(|d| &d.policy) {
+        Some(p) => (Some(p.name.as_str()), Some(p.version.as_str())),
+        None => (None, None),
+    };
+    let event = record.event.as_str();
+    let day = day_bucket(record.at);
+
+    // `IS`, not `=`: the policy columns are NULL for the majority of event
+    // classes, and `= NULL` is never true. This is the same NULL-distinctness
+    // that forced two partial unique indexes in the schema.
+    let existing: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT count, value_histogram, fragility_histogram FROM audit_aggregates
+             WHERE policy_name IS ?1 AND policy_version IS ?2 AND event = ?3 AND day = ?4",
+            params![name, version, event, day],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .sql()?;
+
+    let mut value: Vec<u64> = vec![0; SCORE_HISTOGRAM_BUCKETS];
+    let mut fragility: Vec<u64> = vec![0; SCORE_HISTOGRAM_BUCKETS];
+    let mut count = 0i64;
+    if let Some((c, v, f)) = existing {
+        count = c;
+        value = serde_json::from_str(&v).map_err(|e| BackendError::Storage {
+            message: format!("aggregate histogram is not readable: {e}"),
+            retryable: false,
+        })?;
+        fragility = serde_json::from_str(&f).map_err(|e| BackendError::Storage {
+            message: format!("aggregate histogram is not readable: {e}"),
+            retryable: false,
+        })?;
+    }
+    count += 1;
+    if let Some(a) = &record.assessment {
+        value[score_bucket(a.value)] += 1;
+        fragility[score_bucket(a.fragility)] += 1;
+    }
+
+    conn.execute(
+        "INSERT INTO audit_aggregates
+             (policy_name, policy_version, event, day, count,
+              value_histogram, fragility_histogram, histogram_version)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT DO UPDATE SET
+             count = excluded.count,
+             value_histogram = excluded.value_histogram,
+             fragility_histogram = excluded.fragility_histogram",
+        params![
+            name,
+            version,
+            event,
+            day,
+            count,
+            serde_json::to_string(&value).expect("a Vec<u64> serialises"),
+            serde_json::to_string(&fragility).expect("a Vec<u64> serialises"),
+            SCORE_HISTOGRAM_VERSION as i64,
+        ],
+    )
+    .sql()?;
+    Ok(())
+}
+```
+
+`rusqlite::OptionalExtension` is needed for `.optional()`.
+
 Add a first `Backend` impl in `crates/memorysafe-backend-sqlite/src/lib.rs`. `apply` at this stage handles insert, evictions, and audit inside one transaction; vectors, merge, capacity, and idempotency arrive in Tasks 21–23. Every other method returns `Ok` defaults so the crate compiles and the isolation tests can run:
 
 ```rust
+pub mod aggregates;
 pub mod audit;
 pub mod items;
 
@@ -7210,6 +7389,10 @@ impl Backend for SqliteBackend {
                 }
 
                 let audit_id = audit::insert(&tx, &txn.audit)?;
+                // Same transaction as the audit row, never a follow-up write:
+                // an aggregate that can diverge from the detail rows it
+                // summarises is worse than no aggregate.
+                aggregates::increment(&tx, &txn.audit)?;
                 tx.commit().map_err(|e| tenant::storage_error(e, false))?;
 
                 Ok(AppliedWrite {
@@ -7250,6 +7433,12 @@ impl Backend for SqliteBackend {
         -> Result<ImportReport, BackendError> {
         Ok(ImportReport::default())
     }
+    // Stubbed here and replaced in the portability task, alongside
+    // `purge_subject`, `export` and `import`. Three conformance tests depend on
+    // the real read — `audit_aggregates_survive_a_cascading_purge`,
+    // `audit_aggregates_page_in_the_documented_order` and
+    // `audit_aggregates_narrow_by_day_window_and_policy` — and this stub
+    // satisfies none of them.
     async fn audit_aggregates(&self, _t: &TenantId, _f: &AuditAggregateFilter)
         -> Result<Vec<AuditAggregate>, BackendError> {
         Ok(vec![])
@@ -8409,7 +8598,7 @@ git commit -m "feat(sqlite): locked capacity accounting, merge, and idempotent w
 
 **Interfaces:**
 - Consumes: everything in the crate.
-- Produces: `purge::subject`, `portability::export`, `portability::import`, real `Backend::purge_subject`, `export`, `import`, and a single `full_conformance_suite` test.
+- Produces: `purge::subject`, `portability::export`, `portability::import`, `aggregates::query`, real `Backend::purge_subject`, `export`, `import`, `audit_aggregates`, and a single `full_conformance_suite` test.
 
 **Milestone: the complete 39-test conformance suite passes.** From here the suite is frozen — Plan 2's Postgres backend must pass it unmodified.
 
@@ -8464,7 +8653,8 @@ use rusqlite::{Connection, params};
 /// caller's `SubjectPurged` record — is inserted either way, after the
 /// deletes and inside this same transaction. See `Backend::purge_subject` for
 /// why the order and the single transaction are both load-bearing. Note the
-/// `audit_aggregates` table is absent from every statement below, deliberately:
+/// `audit_aggregates` table — which the schema task now actually creates — is
+/// absent from every statement below, deliberately:
 /// `lifecycle::audit_aggregates_survive_a_cascading_purge` fails the moment it
 /// joins the sweep.
 pub fn subject(
@@ -8717,9 +8907,168 @@ pub fn import(
 }
 ```
 
-Replace the last three placeholders in `lib.rs`:
+Add the aggregate **read** to `crates/memorysafe-backend-sqlite/src/aggregates.rs`,
+beside the `increment` the items-and-audit task wrote. It was stubbed
+`Ok(vec![])` there and three lifecycle conformance tests fail against the stub:
+`audit_aggregates_survive_a_cascading_purge` (which asserts three admits are
+counted **before** the purge), `audit_aggregates_page_in_the_documented_order`
+and `audit_aggregates_narrow_by_day_window_and_policy`.
 
 ```rust
+use memorysafe_backend::{AggregateKey, AuditAggregate, AuditAggregateFilter};
+use memorysafe_core::{AuditEvent, PolicyId, TenantId};
+
+/// One page of aggregates for `tenant`, matching `filter`.
+///
+/// **The ordering is the four-component key in `Backend::audit_aggregates`'s
+/// order**: `day`, then the policy's `name`, then its `version`, then the
+/// event's serialised name. Not the struct's field order, and not by
+/// `PolicyId::to_string()` — the render is not injective, which is why the
+/// policy is two columns here. `tenant` is the fifth component of
+/// `AggregateKey`'s `Ord` and is omitted from the SQL deliberately: it is a
+/// parameter of this query, so every row shares it.
+///
+/// **Collation and null placement are stated, not defaulted**, per the mandate
+/// on `Backend::audit_aggregates`. `COLLATE BINARY` is SQLite's spelling of
+/// byte order; `(policy_name IS NULL) DESC` puts policy-less rows first
+/// without relying on SQLite's NULL ordering being what we remember it to be.
+///
+/// **The cursor runs the opposite way from `Backend::audit`'s, and this is the
+/// most likely thing to get wrong here.** `audit` pages **descending** and its
+/// `after` selects ids **strictly less** than the cursor. This method pages
+/// **ascending** and `after` selects keys **strictly greater**. An implementer
+/// who copies the shape from `audit::query` next door gets a cursor that
+/// compiles, returns rows, and pages backwards through the log.
+///
+/// The comparison is a lexicographic row comparison over four components, so
+/// it is written out longhand rather than as SQL's `(a,b,c,d) > (w,x,y,z)`:
+/// the row-value form evaluates to NULL when any component is NULL, and the
+/// policy columns are NULL for the majority of event classes, so the row would
+/// be dropped and the page would come back short — which
+/// `AuditAggregateFilter::limit` defines as meaning the log is exhausted.
+/// Silent early termination on most of the key space is worse than a visible
+/// duplicate.
+///
+/// Returns exactly `min(filter.limit, rows still matching after the cursor)`,
+/// the same rule `Backend::audit` carries.
+pub fn query(
+    conn: &Connection,
+    tenant: &TenantId,
+    filter: &AuditAggregateFilter,
+) -> Result<Vec<AuditAggregate>, BackendError> {
+    // The cursor, decomposed. `after_present` is bound separately so the
+    // predicate can be switched off without a second SQL string.
+    let (a_day, a_name, a_version, a_event) = match &filter.after {
+        Some(k) => (
+            Some(k.day),
+            k.policy.as_ref().map(|p| p.name.clone()),
+            k.policy.as_ref().map(|p| p.version.clone()),
+            Some(k.event.as_str().to_string()),
+        ),
+        None => (None, None, None, None),
+    };
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT policy_name, policy_version, event, day, count,
+                    value_histogram, fragility_histogram, histogram_version
+             FROM audit_aggregates
+             WHERE (?1 IS NULL OR day >= ?1)
+               AND (?2 IS NULL OR day <= ?2)
+               AND (?3 IS NULL OR (policy_name IS ?3 AND policy_version IS ?4))
+               AND (?5 IS NULL OR (
+                     day > ?5
+                  OR (day = ?5 AND (policy_name IS NOT NULL) > (?6 IS NOT NULL))
+                  OR (day = ?5 AND (policy_name IS NULL) = (?6 IS NULL)
+                      AND coalesce(policy_name, '') COLLATE BINARY
+                        > coalesce(?6, '') COLLATE BINARY)
+                  OR (day = ?5 AND policy_name IS ?6
+                      AND coalesce(policy_version, '') COLLATE BINARY
+                        > coalesce(?7, '') COLLATE BINARY)
+                  OR (day = ?5 AND policy_name IS ?6 AND policy_version IS ?7
+                      AND event COLLATE BINARY > ?8 COLLATE BINARY)))
+             ORDER BY day ASC,
+                      (policy_name IS NULL) DESC,
+                      policy_name    COLLATE BINARY ASC,
+                      policy_version COLLATE BINARY ASC,
+                      event          COLLATE BINARY ASC
+             LIMIT ?9",
+        )
+        .sql()?;
+
+    let rows = stmt
+        .query_map(
+            params![
+                filter.since,
+                filter.until,
+                filter.policy.as_ref().map(|p| p.name.clone()),
+                filter.policy.as_ref().map(|p| p.version.clone()),
+                a_day,
+                a_name,
+                a_version,
+                a_event,
+                filter.limit as i64,
+            ],
+            |r| {
+                let name: Option<String> = r.get(0)?;
+                let version: Option<String> = r.get(1)?;
+                let event: String = r.get(2)?;
+                Ok((name, version, event, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?, r.get::<_, String>(6)?, r.get::<_, i64>(7)?))
+            },
+        )
+        .sql()?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (name, version, event, day, count, value, fragility, version_tag) = row.sql()?;
+        out.push(AuditAggregate {
+            key: AggregateKey {
+                tenant: tenant.clone(),
+                policy: match (name, version) {
+                    (Some(n), Some(v)) => Some(PolicyId::new(&n, &v)),
+                    _ => None,
+                },
+                event: event_from_str(&event)?,
+                day,
+            },
+            count: count as u64,
+            value_histogram: histogram_from_json(&value)?,
+            fragility_histogram: histogram_from_json(&fragility)?,
+            histogram_version: version_tag as u32,
+        });
+    }
+    Ok(out)
+}
+```
+
+`event_from_str` is the inverse of `AuditEvent::as_str`, and belongs beside it
+in `crates/memorysafe-backend-sqlite/src/audit.rs` if that file already has
+one — do not write a second. `histogram_from_json` parses the stored JSON into
+`[u64; SCORE_HISTOGRAM_BUCKETS]` and rejects a wrong length rather than
+padding: a histogram of the wrong width means the row was written under
+different `SCORE_HISTOGRAM_EDGES` than this build has, which
+`histogram_version` exists to make detectable.
+
+**The `ordering_sql_states_collation_and_null_placement` test the trait
+requires goes in this crate**, asserting over the string `query` builds rather
+than a copied literal — a literal is a second copy and drifts. Since the SQL
+above is a `const`-shaped string inside the function, lift it to a
+`pub(crate) const AGGREGATE_ORDER_SQL: &str` and have both the query and the
+test read that.
+
+Replace the last four placeholders in `lib.rs`:
+
+```rust
+    async fn audit_aggregates(&self, tenant: &TenantId, filter: &AuditAggregateFilter)
+        -> Result<Vec<AuditAggregate>, BackendError>
+    {
+        let (tenant, filter) = (tenant.clone(), filter.clone());
+        self.tenants
+            .with_conn(&tenant.clone(), move |c| aggregates::query(c, &tenant, &filter))
+            .await
+    }
+
     async fn purge_subject(&self, tenant: &TenantId, subject: &SubjectId,
         cascade: PurgeCascade, audit: AuditRecord)
         -> Result<PurgeReport, BackendError>

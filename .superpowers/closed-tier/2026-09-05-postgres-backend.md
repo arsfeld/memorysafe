@@ -143,7 +143,7 @@ repo actually put it before Task 7 and import from there; this plan writes
 - A replayed idempotent write returns `AppliedWrite { replayed: true, .. }` with the **original** `item_id`.
 - `import` skips items that already exist rather than duplicating or overwriting them, and counts them in `items_skipped_existing`.
 - `purge_subject` must leave `report.audit_rows_removed + report.audit_rows_preserved` equal to the number of audit rows the subject had.
-- **`audit_aggregates` rows must survive `purge_subject`.** The `audit_aggregates` table is keyed by policy version, event class and day bucket, with **no subject and no namespace column** — see `memorysafe_backend::aggregates` for the whole argument. Do not give it a foreign key to `audit`, do not include it in the subject sweep, and do not add a subject or namespace column for query convenience: `lifecycle::audit_aggregates_survive_a_cascading_purge` fails on the first, and the module doc explains why the third is the one that matters. Every audit row written increments the matching aggregate in the same transaction.
+- **`audit_aggregates` rows must survive `purge_subject`.** The `audit_aggregates` table is keyed by the policy's name and version, the event class and the day bucket, with **no subject and no namespace column** — see `memorysafe_backend::aggregates` for the whole argument. Do not give it a foreign key to `audit`, do not include it in the subject sweep, and do not add a subject or namespace column for query convenience: `lifecycle::audit_aggregates_survive_a_cascading_purge` fails on the first, and the module doc explains why the third is the one that matters. Every audit row written increments the matching aggregate in the same transaction.
 - **`retrieve_candidates` and `neighbours` populate `ScoredCandidate::last_accessed_at` and `access_count`** from the `items.last_access`/`items.access_count` columns the DDL already declares — a row never recalled reads back `(None, 0)`, never `(created_at, 0)`. `record_recall` increments both for every item its `AuditRecord::items` references, in the same transaction as the audit row.
 - **`import` takes the destination tenant** and compares it against every record — items and audit rows alike. A disagreement rejects the whole import; nothing is retargeted and no audit scope is rewritten. There is deliberately no separate "may not span tenants" check and no rejection of a header-only stream.
 
@@ -368,6 +368,54 @@ CREATE TABLE idempotency (
   at             BIGINT NOT NULL,
   PRIMARY KEY (tenant_id, key)
 ) PARTITION BY HASH (tenant_id);
+
+CREATE TABLE audit_aggregates (
+  tenant_id      TEXT NOT NULL,
+  -- The policy is two columns, never the rendered `name@version`. `PolicyId`'s
+  -- Display is not injective — ("a@b","c") and ("a","b@c") both render
+  -- "a@b@c" — so a rendered key column merges two distinct policies' counts
+  -- into one row, in the artifact designed to outlive the detail rows.
+  -- `lifecycle::audit_aggregates_page_in_the_documented_order` carries that
+  -- pair. The `audit.policy` column above *is* the rendered form; it is a
+  -- display convenience, nothing keys on it, and the aggregate key must not be
+  -- derived from it.
+  policy_name    TEXT,                 -- NULL together with policy_version
+  policy_version TEXT,
+  event          TEXT NOT NULL,        -- AuditEvent::as_str(), never an ordinal
+  day            BIGINT NOT NULL,      -- whole UTC days, aggregates::day_bucket
+  count          BIGINT NOT NULL,
+  value_histogram     JSONB NOT NULL,
+  fragility_histogram JSONB NOT NULL,
+  histogram_version   INTEGER NOT NULL
+) PARTITION BY HASH (tenant_id);
+-- No subject column and no namespace column: that absence is what lets these
+-- rows legitimately outlive `purge_subject`, and it is the single most
+-- important property of this table. Do not add one for query convenience.
+--
+-- Uniqueness in two partial indexes rather than one primary key over the
+-- nullable tuple: a unique index treats NULLs as distinct, so a single index
+-- would let two policy-less rows with the same event and day both insert — and
+-- policy-less rows are the majority of the key space. Splitting on nullability
+-- enforces it without inventing a sentinel policy string, which
+-- `AggregateKey::policy`'s doc rules out.
+CREATE UNIQUE INDEX idx_aggregates_key_policied
+  ON audit_aggregates (tenant_id, policy_name, policy_version, event, day)
+  WHERE policy_name IS NOT NULL;
+CREATE UNIQUE INDEX idx_aggregates_key_policy_less
+  ON audit_aggregates (tenant_id, event, day)
+  WHERE policy_name IS NULL;
+-- The read path's ordering index, in `Backend::audit_aggregates`' documented
+-- key order. Collation stated on every text column rather than left to the
+-- database default, per the mandate on that method: `COLLATE "C"` is
+-- Postgres's spelling of byte order. Null placement is stated in the query's
+-- ORDER BY rather than here.
+CREATE INDEX idx_aggregates_order ON audit_aggregates (
+  tenant_id,
+  day,
+  policy_name    COLLATE "C",
+  policy_version COLLATE "C",
+  event          COLLATE "C"
+);
 
 -- Not tenant-scoped, not partitioned, no RLS: it holds the schema version.
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1441,7 +1489,8 @@ pub const SCHEMA_VERSION: i64 = 1;
 
 /// Tables that hold tenant data and therefore carry an RLS policy. `meta` is
 /// deliberately absent: it holds the schema version and belongs to no tenant.
-pub const TENANT_TABLES: [&str; 5] = ["items", "vectors", "capacity", "audit", "idempotency"];
+pub const TENANT_TABLES: [&str; 6] =
+    ["items", "vectors", "capacity", "audit", "idempotency", "audit_aggregates"];
 
 /// Schema names reach SQL as interpolated text, because neither `CREATE
 /// SCHEMA` nor `search_path` accepts a bind parameter. This is the check that
@@ -1593,6 +1642,18 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
            ON vectors (tenant_id, subject, namespace, embedder, dim)".into(),
         "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw
            ON vectors USING hnsw (embedding vector_ip_ops)".into(),
+        // Two partial unique indexes on the aggregates, plus the ordering
+        // index — see the DDL above for why one index over the nullable tuple
+        // does not enforce uniqueness, and why the collation is stated.
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregates_key_policied
+           ON audit_aggregates (tenant_id, policy_name, policy_version, event, day)
+           WHERE policy_name IS NOT NULL".into(),
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregates_key_policy_less
+           ON audit_aggregates (tenant_id, event, day)
+           WHERE policy_name IS NULL".into(),
+        "CREATE INDEX IF NOT EXISTS idx_aggregates_order
+           ON audit_aggregates (tenant_id, day, policy_name COLLATE \"C\",
+                                policy_version COLLATE \"C\", event COLLATE \"C\")".into(),
         // Two indexes for two query shapes; see the DDL above for why the
         // `at`-leading one cannot serve `ORDER BY id DESC` or the
         // `AuditFilter::after` cursor.
@@ -2291,8 +2352,14 @@ use time::OffsetDateTime;
 
 /// `AuditEvent` is stored as its serde snake_case name so the column is
 /// readable in `psql` and filterable without a join table.
-fn event_str(e: AuditEvent) -> String {
-    serde_json::to_string(&e).unwrap_or_default().trim_matches('"').to_string()
+// `AuditEvent::as_str` is the one referent for this string — the serde form,
+// the stored value, and the key `AggregateKey` sorts by. This used to be a
+// serde round-trip with `.unwrap_or_default()`, which on a serialisation
+// failure would have written an **empty event string** into the audit table
+// rather than failing; and being a second encoder, it could drift from the one
+// the ordering compares.
+fn event_str(e: AuditEvent) -> &'static str {
+    e.as_str()
 }
 
 fn event_from(s: &str) -> Result<AuditEvent, BackendError> {
@@ -2405,7 +2472,7 @@ pub async fn query(
     .await
     .pg()?;
 
-    let mut out: Vec<AuditRecord> = rows.iter().map(row_to_record).collect::<Result<_, _>>()?;
+    let out: Vec<AuditRecord> = rows.iter().map(row_to_record).collect::<Result<_, _>>()?;
     // `AuditFilter::item` is filtered in the `WHERE` clause above, not here.
     // Filtering in Rust after `LIMIT` would let a page come back shorter than
     // `min(filter.limit, rows still matching)`, which `Backend::audit`
@@ -2421,6 +2488,17 @@ pub async fn query(
     // against `AuditRecord::items: Vec<ItemRef>` — a **membership** test, which
     // Postgres expresses natively. The shape made it feel unpushable; it never
     // was.
+    //
+    // **What is settled and what is not.** Settled: the predicate belongs in
+    // SQL, and over-fetch-and-loop is rejected. Not settled: the containment
+    // operator below and its index implications. It was written without a
+    // Postgres to run it against — no `psql` and no database were available to
+    // whoever added it — so treat `@>` against `jsonb_build_array(...)` as a
+    // sketch of the right shape, not a verified query. Whoever implements this
+    // should confirm the operator, decide whether a GIN index on `items` or an
+    // expression index on the extracted ids is the right support, and say which
+    // in the task. The ruling constrains the shape; it does not constrain that
+    // choice.
     Ok(out)
 }
 ```
@@ -2565,6 +2643,25 @@ impl Backend for PostgresBackend {
         Ok(ImportReport::default())
     }
 
+    // Placeholder here; the real read lands with `purge`, `export` and
+    // `import`. Three lifecycle conformance tests fail against this stub —
+    // `audit_aggregates_survive_a_cascading_purge`,
+    // `audit_aggregates_page_in_the_documented_order` and
+    // `audit_aggregates_narrow_by_day_window_and_policy`. When implementing it:
+    // order by `day`, then `policy_name`, then `policy_version`, then `event`,
+    // each text column with an explicit `COLLATE "C"` and policy-less rows
+    // placed first by an explicit `(policy_name IS NULL) DESC` rather than by
+    // Postgres's default; page **ascending** with `after` selecting keys
+    // **strictly greater**, which is the opposite direction from
+    // `Backend::audit` next door; and return exactly
+    // `min(limit, rows still matching after the cursor)`. Write the row
+    // comparison out longhand rather than as a row-value `(a,b,c,d) > (w,x,y,z)`:
+    // the row-value form yields NULL when any component is NULL, and the policy
+    // columns are NULL for most event classes, so rows would silently vanish and
+    // the short page would read as exhaustion. The crate must also carry
+    // `ordering_sql_states_collation_and_null_placement`, asserting over the
+    // SQL the query builder returns rather than a copied literal — see the
+    // mandate on `Backend::audit_aggregates`.
     async fn audit_aggregates(&self, _tenant: &TenantId, _filter: &AuditAggregateFilter)
         -> Result<Vec<AuditAggregate>, BackendError> {
         Ok(vec![])
