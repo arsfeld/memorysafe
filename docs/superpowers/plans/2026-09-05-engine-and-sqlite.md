@@ -7621,7 +7621,8 @@ mod tests {
         let hits = search(&c, &scope, &probe, 2).unwrap();
 
         assert_eq!(hits.len(), 2, "k was not honoured");
-        assert!(hits[0].1 >= hits[1].1, "results not sorted descending");
+        // `.2` is the score; `.1` is `AccessStats`, which has no ordering.
+        assert!(hits[0].2 >= hits[1].2, "results not sorted descending");
         assert_eq!(hits[0].0.body, "alpha one");
     }
 
