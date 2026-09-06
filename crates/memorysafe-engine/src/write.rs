@@ -1,0 +1,317 @@
+use crate::error::EngineError;
+use crate::outcome::WriteOutcome;
+use crate::validate::{self, FailureStance, PolicyFailure};
+use crate::{Engine, gather};
+use memorysafe_backend::{ItemWrite, MergeWrite, WriteTransaction};
+use memorysafe_core::{
+    Action, Actor, ActorKind, AssessContext, Assessed, AuditEvent, AuditRecord, Candidate, ItemId,
+    ItemRef, MemoryItem, Reason, ReasonCode, Scope, SensitivityLevel, Source, SourceKind, features,
+};
+use memorysafe_embed::QuantizedVector;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use time::{Duration, OffsetDateTime};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RememberRequest {
+    pub scope: Scope,
+    pub body: String,
+    pub kind: String,
+    pub source: Source,
+    pub occurred_at: Option<OffsetDateTime>,
+    pub tags: Vec<String>,
+    pub attrs: BTreeMap<String, Value>,
+    pub sensitivity_hint: Option<SensitivityLevel>,
+    pub ttl: Option<Duration>,
+    pub idempotency_key: Option<String>,
+    pub actor: Actor,
+}
+
+impl RememberRequest {
+    pub fn new(scope: Scope, body: &str) -> Self {
+        Self {
+            scope,
+            body: body.to_string(),
+            kind: "fact".into(),
+            source: Source {
+                kind: SourceKind::Agent,
+                id: None,
+            },
+            occurred_at: None,
+            tags: vec![],
+            attrs: BTreeMap::new(),
+            sensitivity_hint: None,
+            ttl: None,
+            idempotency_key: None,
+            actor: Actor {
+                kind: ActorKind::Agent,
+                id: None,
+            },
+        }
+    }
+}
+
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
+impl Engine {
+    pub async fn remember(&self, req: RememberRequest) -> Result<WriteOutcome, EngineError> {
+        if req.body.trim().is_empty() {
+            return Err(EngineError::Validation("body must not be empty".into()));
+        }
+        if req.body.len() > MAX_BODY_BYTES {
+            return Err(EngineError::Validation(format!(
+                "body exceeds {MAX_BODY_BYTES} bytes"
+            )));
+        }
+
+        // Embed. A missing or failed model must never cost a user their memory.
+        let embedding = self.embedder.embed(&req.body).ok();
+        let pending_embedding = embedding.is_none();
+
+        let candidate = Candidate {
+            body: req.body.clone(),
+            kind: req.kind.clone(),
+            tags: req.tags.clone(),
+            attrs: req.attrs.clone(),
+            sensitivity_hint: req.sensitivity_hint,
+            embedding: embedding.clone(),
+            // Same function `MemoryItem::byte_size` uses. A smaller estimate
+            // here would let every admitted item overrun the budget by the
+            // difference between what was checked and what is stored.
+            byte_size: MemoryItem::charge(
+                &req.body,
+                &req.kind,
+                &req.tags,
+                &req.attrs,
+                req.source.id.as_deref(),
+                req.scope.subject.as_str(),
+                req.scope.namespace.as_str(),
+            ),
+        };
+
+        // One I/O pass gathers everything the policy is allowed to see.
+        let ctx = gather::assess_context(
+            self.backend.as_ref(),
+            &req.scope,
+            embedding.as_ref(),
+            self.neighbour_k,
+        )
+        .await?;
+
+        let assessment = self.run_assess(&candidate, &ctx)?;
+
+        let admit_ctx = gather::admit_context(
+            self.backend.as_ref(),
+            &req.scope,
+            &ctx,
+            self.eviction_candidates,
+        )
+        .await?;
+
+        let assessed = Assessed {
+            candidate: &candidate,
+            assessment: &assessment,
+        };
+        let decision = self.run_admit(&assessed, &admit_ctx)?;
+
+        // Nothing a policy returns is applied until it passes validation.
+        if let Err(invalid) = validate::decision(&decision, &admit_ctx) {
+            return self
+                .handle_invalid_decision(invalid, &req, &assessment)
+                .await;
+        }
+
+        // Added requirement (Task 33 provenance, see the crate's task report):
+        // `AdmitContext` carries no set of existing items, so `validate::decision`
+        // has nothing to check `Action::Merge { into, .. }` against — the engine
+        // is the first place with a backend in hand to ask. A single scoped
+        // `Backend::get` answers both "does it exist" and "is it in this
+        // request's scope" at once, since `get` is itself scope-filtered.
+        let merge_target = match &decision.action {
+            Action::Merge { into, .. } => self.backend.get(&req.scope, into).await?,
+            _ => None,
+        };
+        if let Err(invalid) = validate::merge_target(&decision.action, merge_target.as_ref()) {
+            return self
+                .handle_invalid_decision(invalid, &req, &assessment)
+                .await;
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let vector = embedding.as_ref().map(QuantizedVector::from_embedding);
+
+        let (item, merge) = match &decision.action {
+            Action::Reject => (None, None),
+            Action::Retain { protection } => {
+                let item = MemoryItem {
+                    id: ItemId::new(),
+                    scope: req.scope.clone(),
+                    body: req.body.clone(),
+                    kind: req.kind.clone(),
+                    source: req.source.clone(),
+                    occurred_at: req.occurred_at,
+                    created_at: now,
+                    tags: req.tags.clone(),
+                    attrs: req.attrs.clone(),
+                    // Applied by the ENGINE, not trusted from the policy. A
+                    // closed scorer that forgot to call `raised_by` would
+                    // silently downgrade a caller's declared `Restricted` to
+                    // its own detector's level, and the item would then satisfy
+                    // a lower `sensitivity_ceiling` — the leak the read path
+                    // exists to prevent, caused by an omission in the closed
+                    // crate.
+                    sensitivity: assessment.sensitivity.level.raised_by(req.sensitivity_hint),
+                    ttl: req.ttl,
+                    protection: *protection,
+                    pending_embedding,
+                };
+                (Some(item), None)
+            }
+            Action::Merge { into, .. } => (
+                None,
+                Some(MergeWrite {
+                    target: into.clone(),
+                    body: req.body.clone(),
+                    tags: req.tags.clone(),
+                    attrs: req.attrs.clone(),
+                    vector: vector.clone(),
+                    byte_size: req.body.len() as u64,
+                }),
+            ),
+        };
+
+        let event = match &decision.action {
+            Action::Retain { .. } => AuditEvent::Admitted,
+            Action::Merge { .. } => AuditEvent::Merged,
+            Action::Reject => AuditEvent::Rejected,
+        };
+
+        let refs: Vec<ItemRef> = item
+            .as_ref()
+            .map(|i| vec![ItemRef::from_item(i)])
+            .unwrap_or_default();
+        // `now`, already sampled above for `created_at`, not a second clock
+        // read — the item and its own audit row must agree on when this
+        // happened.
+        let audit = AuditRecord::new(req.scope.clone(), event, refs, req.actor.clone(), now)
+            .with_assessment(assessment.clone())
+            .with_decision(decision.clone());
+
+        let mut txn = WriteTransaction::new(req.scope.clone(), audit);
+        txn.evictions = decision.evictions.iter().map(|e| e.item.clone()).collect();
+        txn.idempotency_key = req.idempotency_key.clone();
+        txn.payload_digest = req
+            .idempotency_key
+            .as_ref()
+            .map(|_| blake3::hash(req.body.as_bytes()).to_hex().to_string());
+        if let Some(i) = item {
+            txn.upsert = Some(ItemWrite { item: i, vector });
+        }
+        txn.merge = merge;
+
+        let applied = self.backend.apply(txn).await?;
+
+        Ok(WriteOutcome {
+            item_id: applied.item_id.clone(),
+            action: decision.action.clone(),
+            reasons: decision.reasons.clone(),
+            merged_into: match &decision.action {
+                Action::Merge { into, .. } => Some(into.clone()),
+                _ => None,
+            },
+            evicted: applied.evicted,
+            audit_id: applied.audit_id,
+        })
+    }
+
+    async fn handle_invalid_decision(
+        &self,
+        invalid: validate::Invalid,
+        req: &RememberRequest,
+        assessment: &memorysafe_core::Assessment,
+    ) -> Result<WriteOutcome, EngineError> {
+        let reason = Reason::new(
+            ReasonCode::PolicyInvalid,
+            &format!("policy returned an unusable decision: {invalid}"),
+            features! {},
+        );
+        let audit = AuditRecord::new(
+            req.scope.clone(),
+            AuditEvent::Rejected,
+            vec![],
+            req.actor.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .with_assessment(assessment.clone());
+
+        let txn = WriteTransaction::new(req.scope.clone(), audit);
+        let applied = self.backend.apply(txn).await?;
+
+        match self.stance {
+            FailureStance::FailClosed => Err(EngineError::PolicyRefused(invalid.to_string())),
+            FailureStance::FailSafe => Ok(WriteOutcome {
+                item_id: None,
+                action: Action::Reject,
+                reasons: vec![reason],
+                merged_into: None,
+                evicted: vec![],
+                audit_id: applied.audit_id,
+            }),
+        }
+    }
+
+    fn run_assess(
+        &self,
+        cand: &Candidate,
+        ctx: &AssessContext,
+    ) -> Result<memorysafe_core::Assessment, EngineError> {
+        let policy = self.policy.clone();
+        let (c, x) = (cand.clone(), ctx.clone());
+        // `Arc<dyn GovernancePolicy>` is not `RefUnwindSafe` — the compiler
+        // cannot see into a closed-source policy to know it holds no interior
+        // mutability, so it will not infer the closure `UnwindSafe` on its
+        // own. `AssertUnwindSafe` is the standard escape hatch: this call
+        // never hands the policy a `&mut` to anything shared, so a panic here
+        // leaves no half-mutated state for the caller to observe.
+        match validate::call_policy(std::panic::AssertUnwindSafe(move || policy.assess(&c, &x))) {
+            Ok(a) => Ok(a),
+            Err(e) => self.policy_fallback(e, || self.fallback_policy.assess(cand, ctx)),
+        }
+    }
+
+    fn run_admit(
+        &self,
+        assessed: &Assessed,
+        ctx: &memorysafe_core::AdmitContext,
+    ) -> Result<memorysafe_core::Decision, EngineError> {
+        let policy = self.policy.clone();
+        let (c, a, x) = (
+            assessed.candidate.clone(),
+            assessed.assessment.clone(),
+            ctx.clone(),
+        );
+        let call = std::panic::AssertUnwindSafe(move || {
+            let assessed = Assessed {
+                candidate: &c,
+                assessment: &a,
+            };
+            policy.admit(&assessed, &x)
+        });
+        match validate::call_policy(call) {
+            Ok(d) => Ok(d),
+            Err(e) => self.policy_fallback(e, || self.fallback_policy.admit(assessed, ctx)),
+        }
+    }
+
+    fn policy_fallback<T, F>(&self, failure: PolicyFailure, fallback: F) -> Result<T, EngineError>
+    where
+        F: FnOnce() -> Result<T, memorysafe_core::PolicyError>,
+    {
+        match self.stance {
+            FailureStance::FailClosed => Err(EngineError::PolicyRefused(failure.to_string())),
+            FailureStance::FailSafe => {
+                fallback().map_err(|e| EngineError::PolicyRefused(e.to_string()))
+            }
+        }
+    }
+}

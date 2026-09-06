@@ -25,6 +25,8 @@ pub enum Invalid {
     UnofferedItem { item: ItemId },
     #[error("working set reports {reported} tokens but its items sum to {actual}")]
     TokenAccountingWrong { reported: u32, actual: u32 },
+    #[error("decision merges into {item}, which does not exist in the request's scope")]
+    MergeTargetMissing { item: ItemId },
 }
 
 #[derive(Debug, Error)]
@@ -61,6 +63,27 @@ pub fn decision(d: &Decision, ctx: &AdmitContext) -> Result<(), Invalid> {
         return Err(Invalid::NoReason);
     }
 
+    Ok(())
+}
+
+/// `Action::Merge { into, .. }` names a target `AdmitContext` has nothing to
+/// check it against — no set of existing items is carried there, structurally
+/// (see Task 33's provenance note: Task 32's brief claimed `validate::decision`
+/// would check this and it cannot). The caller looks the id up in the
+/// request's scope and hands the result here; `None` means either the id does
+/// not exist at all, or it exists outside the scope this write is addressed
+/// to — `Backend::get` is itself scope-filtered, so a single lookup answers
+/// both questions at once. A policy naming a nonexistent or out-of-scope
+/// merge target is a policy bug, not a silently dropped write.
+pub fn merge_target(
+    action: &Action,
+    target: Option<&memorysafe_core::MemoryItem>,
+) -> Result<(), Invalid> {
+    if let Action::Merge { into, .. } = action
+        && target.is_none()
+    {
+        return Err(Invalid::MergeTargetMissing { item: into.clone() });
+    }
     Ok(())
 }
 
@@ -588,5 +611,59 @@ mod tests {
         // green.
         let result: Result<u32, PolicyFailure> = call_policy(|| Ok(7));
         assert_eq!(result.unwrap(), 7);
+    }
+
+    // `merge_target`: `AdmitContext` carries no set of existing items to check
+    // `Action::Merge { into, .. }` against, so the caller looks the target up
+    // and hands the result in. These tests pin that the check fires only for
+    // `Merge`, that a missing target is refused with the *actual* target id
+    // (not just the variant), and that a resolved target is accepted.
+
+    #[test]
+    fn a_merge_decision_whose_target_exists_is_accepted() {
+        let target = item("the existing memory");
+        let d = Decision {
+            subject: None,
+            action: Action::Merge {
+                into: target.id.clone(),
+                strategy: MergeStrategy::AppendAndUnion,
+            },
+            evictions: vec![],
+            reasons: vec![reason()],
+            policy: PolicyId::new("baseline", "0.1.0"),
+        };
+        assert!(merge_target(&d.action, Some(&target)).is_ok());
+    }
+
+    #[test]
+    fn a_merge_decision_whose_target_does_not_exist_is_refused() {
+        let missing_id = ItemId::new();
+        let action = Action::Merge {
+            into: missing_id.clone(),
+            strategy: MergeStrategy::AppendAndUnion,
+        };
+        assert_eq!(
+            merge_target(&action, None),
+            Err(Invalid::MergeTargetMissing { item: missing_id }),
+            "the payload must name the missing target, not just the variant"
+        );
+    }
+
+    #[test]
+    fn a_retain_decision_is_accepted_regardless_of_any_target() {
+        // The check must fire only for `Action::Merge`. A mutant that dropped
+        // the `if let Action::Merge` guard and required a target
+        // unconditionally would refuse this legitimate `Retain` decision,
+        // which never has a merge target to look up.
+        let action = Action::Retain {
+            protection: Protection::Normal,
+        };
+        assert!(merge_target(&action, None).is_ok());
+    }
+
+    #[test]
+    fn a_reject_decision_is_accepted_regardless_of_any_target() {
+        // Same guard, the other non-merge variant.
+        assert!(merge_target(&Action::Reject, None).is_ok());
     }
 }
