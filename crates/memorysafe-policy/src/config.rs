@@ -20,6 +20,12 @@ pub struct BaselineConfig {
     pub merge_threshold: f32,
     /// Neighbours below this are not reported as near-duplicates.
     pub near_duplicate_floor: f32,
+    /// `admit::decide`: fragility at or above this earns a retained item a
+    /// protection window rather than `Protection::Normal`.
+    pub fragile_threshold: f32,
+    /// `admit::decide`: length, in whole days, of the protection window a
+    /// fragile item is granted.
+    pub protection_window_days: i64,
     /// Fraction of the recall budget reserved for replay of fragile or
     /// long-unaccessed items.
     pub replay_quota: f32,
@@ -73,6 +79,8 @@ impl Default for BaselineConfig {
             duplicate_threshold: 0.98,
             merge_threshold: 0.93,
             near_duplicate_floor: 0.30,
+            fragile_threshold: 0.85,
+            protection_window_days: 30,
             replay_quota: 0.20,
             mmr_lambda: 0.70,
             value_half_life_days: 90.0,

@@ -4,7 +4,9 @@
 //! earns its keep with learned scorers and cross-tenant calibration, not by
 //! this one being bad.
 
+pub mod admit;
 pub mod config;
+pub mod eviction;
 pub mod fragility;
 pub mod redundancy;
 pub mod sensitivity;
@@ -71,9 +73,8 @@ impl GovernancePolicy for BaselinePolicy {
         })
     }
 
-    // Implemented in Tasks 27-29.
-    fn admit(&self, _assessed: &Assessed, _ctx: &AdmitContext) -> Result<Decision, PolicyError> {
-        unimplemented!("Task 27")
+    fn admit(&self, assessed: &Assessed, ctx: &AdmitContext) -> Result<Decision, PolicyError> {
+        Ok(admit::decide(assessed, ctx, &self.config, self.policy_id()))
     }
     fn compose(
         &self,
