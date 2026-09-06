@@ -414,13 +414,27 @@ CREATE UNIQUE INDEX idx_aggregates_key_policy_less
 -- The read path's ordering index, in `Backend::audit_aggregates`' documented
 -- key order. Collation stated on every text column rather than left to the
 -- database default, per the mandate on that method: `COLLATE "C"` is
--- Postgres's spelling of byte order. Null placement is stated in the query's
--- ORDER BY rather than here.
+-- Postgres's spelling of byte order.
+--
+-- **Null placement is stated HERE as well as in the query, and it has to be.**
+-- In Postgres a btree index's null ordering is part of the index, and `ASC`
+-- defaults to `NULLS LAST`. An index declared without `NULLS FIRST` cannot
+-- serve `ORDER BY ... ASC NULLS FIRST` however the query is written — the
+-- planner falls back to a full sort. So the two must agree, and an earlier
+-- version of this comment said the opposite ("null placement is stated in the
+-- query's ORDER BY rather than here"), which would have produced exactly that
+-- sort while satisfying the mandate's letter.
+--
+-- Plan 1 hit the same trap from the other direction: `(policy_name IS NULL)
+-- DESC` also satisfies the mandate and is also unservable, because it is an
+-- expression rather than a column. Its measurement (`EXPLAIN QUERY PLAN`
+-- showing `USE TEMP B-TREE FOR ORDER BY`) is why both documents now name the
+-- form rather than only the requirement.
 CREATE INDEX idx_aggregates_order ON audit_aggregates (
   tenant_id,
   day,
-  policy_name    COLLATE "C",
-  policy_version COLLATE "C",
+  policy_name    COLLATE "C" ASC NULLS FIRST,
+  policy_version COLLATE "C" ASC NULLS FIRST,
   event          COLLATE "C"
 );
 
@@ -1676,9 +1690,14 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregates_key_policy_less
            ON audit_aggregates (tenant_id, event, day)
            WHERE policy_name IS NULL".into(),
+        // `NULLS FIRST` on both nullable columns is load-bearing, not decorative:
+        // without it this index cannot serve the read's `ASC NULLS FIRST`
+        // ordering and the planner sorts. Must match the DDL above exactly.
         "CREATE INDEX IF NOT EXISTS idx_aggregates_order
-           ON audit_aggregates (tenant_id, day, policy_name COLLATE \"C\",
-                                policy_version COLLATE \"C\", event COLLATE \"C\")".into(),
+           ON audit_aggregates (tenant_id, day,
+                                policy_name COLLATE \"C\" ASC NULLS FIRST,
+                                policy_version COLLATE \"C\" ASC NULLS FIRST,
+                                event COLLATE \"C\")".into(),
         // Two indexes for two query shapes; see the DDL above for why the
         // `at`-leading one cannot serve `ORDER BY id DESC` or the
         // `AuditFilter::after` cursor.
@@ -4699,7 +4718,7 @@ pub async fn import(
 
 - **Every audit row increments**, in the transaction that writes it — `apply`, `record_recall`, the purge's `SubjectPurged` row, and rows arriving through `import`. See the write rule in `memorysafe_backend::aggregates`.
 - **The increment must be atomic against concurrent writers.** Postgres has no per-tenant write lock, so a read-modify-write under READ COMMITTED loses updates. Use `ON CONFLICT ... DO UPDATE SET count = audit_aggregates.count + 1` and let the database evaluate it, against the partial unique index the key falls in.
-- **The read states collation and null placement explicitly** — `COLLATE "C"` on every text column of the key, `(policy_name IS NULL) DESC` and `(policy_version IS NULL) DESC` in the `ORDER BY` — and pages **ascending** with `after` selecting keys strictly greater, the opposite of `Backend::audit`. This crate must carry `ordering_sql_states_collation_and_null_placement`, asserting over the SQL its query builder returns rather than a copied literal.
+- **The read states collation and null placement explicitly, in the form the index can serve** — `COLLATE "C"` on every text column of the key, and `ASC NULLS FIRST` on `policy_name` and `policy_version`. **Not `(policy_name IS NULL) DESC`.** That expression form satisfies the mandate and is unservable by any column index, so the planner sorts the whole scope; Plan 1 measured it (`EXPLAIN QUERY PLAN` → `USE TEMP B-TREE FOR ORDER BY`) and now prescribes `ASC NULLS FIRST` for the same reason. **And `idx_aggregates_order` must itself declare `NULLS FIRST` on both nullable columns** — in Postgres the index carries its own null ordering and `ASC` defaults to `NULLS LAST`, so a query and an index that disagree produce the sort the explicit ordering was meant to avoid. The read pages **ascending** with `after` selecting keys strictly greater, the opposite of `Backend::audit`. This crate must carry `ordering_sql_states_collation_and_null_placement`, asserting over the SQL its query builder returns rather than a copied literal.
 
 Replace the last four placeholders in `lib.rs`:
 
