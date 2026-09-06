@@ -11,6 +11,7 @@ pub mod eviction;
 pub mod fragility;
 pub mod redundancy;
 pub mod sensitivity;
+pub mod similarity;
 pub mod value;
 
 #[cfg(test)]
