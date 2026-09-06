@@ -15,31 +15,54 @@ use memorysafe_core::{
 };
 use time::Duration;
 
-/// Cheap textual proxy for "these two say the same thing", used by MMR. The
-/// backend's vectors are not carried through to the policy, so similarity is
-/// computed over token overlap instead — crude, but it reliably catches the
+/// Cheap textual proxy for "how much of THIS CANDIDATE's own content is
+/// already covered by an already-selected item", used by MMR as a
+/// dissimilarity PENALTY (`max_sim` at the call sites below). The backend's
+/// vectors are not carried through to the policy, so this proxy works over
+/// token sets instead of embeddings — crude, but it reliably catches the
 /// case MMR exists for: near-paraphrases crowding out distinct facts.
+///
+/// **Directional, not symmetric.** `overlap(a, b)` is `|A ∩ B| / |A|`, where
+/// `A` is the SET of `a`'s distinct lower-cased, whitespace-split tokens and
+/// `B` is `b`'s — the fraction of `a`'s OWN content also present in `b`, not
+/// a symmetric "how alike are these two texts". This is deliberate for the
+/// one call shape this function is used in: `overlap(&candidate.item.body,
+/// &selected.item.body)`, where the question is "what fraction of THIS
+/// CANDIDATE is already covered by what has been selected".
+///
+/// A symmetric measure gets this backwards. Consider a candidate that
+/// EXTENDS an already-selected item (adds new information not already
+/// present) versus one that is entirely CONTAINED IN it (adds nothing new):
+/// Jaccard (`|A∩B|/|A∪B|`) scores both at `0.50` in the case where one set is
+/// exactly double the other — treating "adds nothing" as no more similar
+/// than "adds something", which is precisely the distinction this penalty
+/// exists to make. `|A∩B|/|A|` gets both directions right: the extending
+/// candidate scores `0.50` (its own new tokens count against its own
+/// denominator, pulling the ratio down), the contained candidate scores
+/// `1.00` (all of it is already covered, so it should be penalised fully).
+///
+/// **A gap this leaves deliberately**: a candidate covered by the SELECTED
+/// SET taken together, but by no single already-selected item, is not
+/// detected. The caller (`working_set`'s MMR fill) takes a `max` over
+/// pairwise `overlap` calls against each selected item individually, and
+/// `max` over pairwise comparisons cannot see a union that only emerges
+/// across several of them. This is canonical MMR's own property — it is
+/// defined pairwise against the selected set — not a defect introduced here.
 fn overlap(a: &str, b: &str) -> f32 {
-    let toks =
-        |s: &str| -> Vec<String> { s.split_whitespace().map(|t| t.to_lowercase()).collect() };
+    let toks = |s: &str| -> std::collections::HashSet<String> {
+        s.split_whitespace().map(|t| t.to_lowercase()).collect()
+    };
     let (ta, tb) = (toks(a), toks(b));
-    if ta.is_empty() || tb.is_empty() {
+    // Only `ta` (the candidate, `A`) needs an emptiness guard: `ta.is_empty()`
+    // risks dividing `0 / 0` (NaN). `tb` empty needs no special case —
+    // `ta.intersection(&tb)` is empty whenever `tb` is, regardless of `ta`'s
+    // contents, so `0 / ta.len()` already reads as the correct `0.0` on its
+    // own.
+    if ta.is_empty() {
         return 0.0;
     }
-    let shared = ta.iter().filter(|t| tb.contains(t)).count();
-    // Clamped to `[0.0, 1.0]`: `shared` counts token OCCURRENCES in `a`
-    // against `b`'s membership (a multiset count, not a distinct-token/set
-    // intersection), so a token repeated within `a` more times than the
-    // denominator can push the raw ratio above 1.0 — e.g. `overlap("the the
-    // the", "the cat")` is `3 / 2 = 1.5` without this clamp. A distinct-token
-    // count would also bound this at 1.0 and is arguably the more faithful
-    // "similarity", but it changes the numeric result for every
-    // already-pinned fixture in this module's tests (several assert an exact
-    // value), whereas this clamp changes nothing for any value that was
-    // already in range. Fixing "unbounded" does not require also fixing
-    // "counts occurrences, not distinct tokens" — that is a separate, larger
-    // change this task did not ask for.
-    (shared as f32 / ta.len().min(tb.len()) as f32).min(1.0)
+    let shared = ta.intersection(&tb).count();
+    shared as f32 / ta.len() as f32
 }
 
 fn fits(req: &RecallRequest, tokens: u32, items: usize) -> bool {
@@ -469,16 +492,21 @@ mod tests {
         );
         // NOT `DiversityCut`: this candidate has zero overlap with the
         // selected seed, so `max_sim` is `0.0`, which is not above
-        // `diversity_cut_similarity` (`0.5`) — its reason is `HighValue`. The
-        // `DiversityCut`/`HighValue` boundary itself is covered by
-        // `mmr_reason_is_diversity_cut_only_strictly_above_the_half_similarity_threshold`;
-        // this assertion previously read
-        // `ws.items[1].reason.code == ReasonCode::DiversityCut || bodies.len() == 2`,
-        // which is vacuous — the second disjunct is guaranteed by the
-        // preceding `bodies` assertions and the request's 2-item budget, so
-        // it passed regardless of the (actually false) first disjunct and
-        // misdescribed which reason code this path produces.
-        assert_eq!(ws.items.len(), 2);
+        // `cfg.diversity_cut_similarity` (default `0.5`) — its reason is
+        // `HighValue`. The `DiversityCut`/`HighValue` boundary itself is
+        // covered by
+        // `mmr_reason_is_diversity_cut_only_strictly_above_the_half_similarity_threshold`.
+        // This assertion previously read `assert_eq!(ws.items.len(), 2)`,
+        // which is ALSO vacuous, just a different vacuous assertion in the
+        // same slot: `fits` already bounds `items <= max_items == 2`, and
+        // the two `bodies[0]`/`bodies[1]` index assertions above already
+        // panic if the length were under 2 — so nothing left this assertion
+        // capable of failing. Asserting the actual reason code is the
+        // falsifiable claim: mutating the `> cfg.diversity_cut_similarity`
+        // comparison at the MMR reason site to `<` would flip this exact
+        // case (`max_sim == 0.0`) to `DiversityCut`, and this assertion
+        // would catch it.
+        assert_eq!(ws.items[1].reason.code, ReasonCode::HighValue);
     }
 
     #[test]
@@ -587,44 +615,147 @@ mod tests {
     }
 
     #[test]
-    fn overlap_treats_either_side_being_empty_as_zero_not_only_both() {
-        // Rejects: the empty-body guard's `||` weakened to `&&`, which only
-        // short-circuits when BOTH bodies are empty. With `&&` broken, one
-        // side empty falls through to `0 / 0`, i.e. NaN, not 0.0 — and
+    fn overlap_treats_an_empty_candidate_as_zero_and_an_empty_selected_item_needs_no_guard() {
+        // Rejects: removing or inverting the `ta.is_empty()` guard. Without
+        // it, an empty candidate (`a`) divides `0 / 0` (NaN), and
         // `assert_eq!(_, 0.0)` fails against NaN (NaN != anything, including
-        // itself), so this is not a case the assertion could pass by luck.
-        // Vacuous if both sides were empty at once, which cannot distinguish
-        // `||` from `&&` — both fixtures below have exactly one side empty.
+        // itself), so the first assertion is not a case that could pass by
+        // luck.
+        // The second assertion pins a structural fact about `|A ∩ B| / |A|`
+        // rather than testing a guard-removal mutation: an empty SELECTED
+        // item (`b`) needs no special case at all — `ta.intersection(&tb)`
+        // is empty whenever `tb` is, so `0 / ta.len()` already reads as the
+        // correct `0.0` without a guard. (This is why the function's guard
+        // checks only `ta.is_empty()`, not `ta.is_empty() || tb.is_empty()`
+        // as an earlier, symmetric version of this formula needed.)
         assert_eq!(overlap("", "cats and dogs"), 0.0);
         assert_eq!(overlap("cats and dogs", ""), 0.0);
     }
 
     #[test]
     fn overlap_divides_the_shared_count_rather_than_taking_a_remainder() {
-        // Rejects: the ratio's `/` weakened to `%`. `shared / ta.len().min(tb.len())`
-        // and `shared % ta.len().min(tb.len())` agree whenever `shared` is 0
-        // (both 0.0) or would exactly divide, so both operands here are
-        // chosen so the two operators diverge: 1 shared token out of a
-        // 2-token minimum gives 0.5 under division and 1.0 under remainder.
-        // Vacuous if `shared` were 0 or a multiple of the denominator —
-        // pinned by the arithmetic in the comment, not by inspection alone.
-        assert_eq!(overlap("a b c d", "a x"), 0.5);
+        // Rejects: the ratio's `/` weakened to `%`. `shared / ta.len()` and
+        // `shared % ta.len()` agree whenever `shared` is 0 or a multiple of
+        // `ta.len()`, so this fixture is chosen so they diverge: the
+        // candidate `"a b c d"` has 4 distinct tokens, exactly 1 of which
+        // ("a") is also in `"a x"`, giving `1 / 4 = 0.25` under division and
+        // `1 % 4 = 1.0` under remainder.
+        // Vacuous if `shared` were 0 or a multiple of `ta.len()` — pinned by
+        // the arithmetic in the comment, not by inspection alone.
+        assert_eq!(overlap("a b c d", "a x"), 0.25);
     }
 
     #[test]
-    fn overlap_is_clamped_to_one_when_a_repeated_token_would_exceed_it() {
-        // Rejects: the missing `.min(1.0)` clamp on the final ratio.
-        // `shared` counts token OCCURRENCES in `a` against `b`'s membership,
-        // not distinct shared tokens, so a token repeated within `a` more
-        // times than `b`'s (shorter) token count pushes the raw ratio above
-        // 1.0: "the" appears three times in `a` and matches `b`'s single
-        // "the", giving `shared = 3` against `min(3, 2) = 2`, i.e. `1.5`
-        // before clamping.
-        // Vacuous if `shared <= ta.len().min(tb.len())` in the fixture, which
-        // is the ordinary (already-in-range) case every other `overlap` test
-        // in this module exercises — this is the one fixture in the module
-        // that forces the numerator past the denominator.
+    fn overlap_of_a_single_token_repeated_many_times_is_not_inflated_by_the_repeats() {
+        // Rejects: tokenizing into a `Vec` (multiset) rather than a
+        // `HashSet` for either side — with a multiset, "the" would be
+        // counted three times in `a`, and a numerator/denominator mismatch
+        // (multiset count over distinct count, or vice versa) could push the
+        // ratio away from `1.0` in either direction.
+        // The correct value is `1.0` for a real reason, not a clamp on an
+        // otherwise-unbounded ratio (see `overlap`'s own doc comment for why
+        // that historical fix was replaced by this directional formula):
+        // `a`'s only DISTINCT content is the single token "the", which is
+        // fully present in `b` — the candidate is entirely CONTAINED IN the
+        // selected item, adding nothing new, which is exactly the case this
+        // penalty should score at its maximum.
+        // Vacuous if `a` had no repeated token to deduplicate — this fixture
+        // exists specifically to exercise `HashSet` deduplication, not any
+        // particular size relationship between `a` and `b`.
         assert_eq!(overlap("the the the", "the cat"), 1.0);
+    }
+
+    #[test]
+    fn overlap_penalises_a_contained_candidate_fully_and_an_extending_one_only_partially() {
+        // The motivating case for `|A ∩ B| / |A|` over a symmetric measure
+        // like Jaccard (`|A ∩ B| / |A ∪ B|`): a candidate that ADDS
+        // information to what is already selected must be penalised less
+        // than one that adds NOTHING, and a symmetric measure cannot tell
+        // the two apart. `long` (6 distinct tokens) is exactly `short`'s 3
+        // tokens plus 3 new ones, so `short` ⊆ `long`.
+        //
+        // Rejects: a symmetric similarity measure standing in for this
+        // directional one. Jaccard scores BOTH directions at
+        // `3 / 6 = 0.50` here (the union is `long` either way, since one set
+        // contains the other) — it cannot distinguish "this candidate is a
+        // strict extension, so partially penalise it" from "this candidate
+        // is a strict subset, so fully penalise it", which is exactly the
+        // distinction this function exists to make.
+        // Vacuous if the two directions produced the same number regardless
+        // of formula — pinned by asserting both directions to DIFFERENT
+        // values (`0.5` and `1.0`), not merely that each is in range.
+        let short = "the cat sat";
+        let long = "the cat sat plus more words";
+
+        // `long` as the candidate, `short` as what's already selected:
+        // `long` EXTENDS `short` with new information ("plus", "more",
+        // "words") — only half its own content is already covered.
+        assert_eq!(overlap(long, short), 0.5);
+
+        // `short` as the candidate, `long` as what's already selected:
+        // `short` is entirely CONTAINED IN `long` — nothing new, fully
+        // covered, maximally penalised.
+        assert_eq!(overlap(short, long), 1.0);
+    }
+
+    #[test]
+    fn max_over_selected_understates_coverage_split_across_several_selected_items() {
+        // Characterizes a REGRESSION this file's directional `|A∩B|/|A|` fix
+        // introduces, pinned here deliberately rather than left to a report
+        // comment nobody re-reads. Three facts, because two invite the wrong
+        // repair:
+        //
+        // 1. THE VALUE IS WRONG. `"alpha beta"` as a candidate is entirely
+        //    covered by the selected set TAKEN TOGETHER — "alpha" is in the
+        //    first selected item, "beta" is in the second — so the true
+        //    penalty is `1.0` (it adds nothing new). The code computes
+        //    `0.5`, asserted below as what it actually does today, not as
+        //    the correct answer.
+        // 2. IT IS NEWLY WRONG. The previous formula (`shared / min(|a|,
+        //    |b|)`, uncapped multiset count) gave `1 / min(2, 1) = 1.0`
+        //    against EACH selected item here individually, so `max` over
+        //    them was already `1.0` — the old code got this specific case
+        //    right.
+        // 3. THE OLD ANSWER IS NOT RECOVERABLE BY REVERTING. Fact 2 alone
+        //    invites reverting to the old formula; that would be wrong. The
+        //    old formula's `1.0` here was not earned — it came from `min`
+        //    SATURATING to `1.0` across the entire subset-relation class,
+        //    where it was mostly wrong the OTHER direction: candidate
+        //    `"alpha beta gamma delta epsilon"` (5 tokens) against a
+        //    selected item containing only `"alpha"` also saturated to
+        //    `1 / min(5, 1) = 1.0` under the old formula, when the true
+        //    coverage is `0.2` (one of five tokens). Reverting `min` would
+        //    trade this one accidentally-correct split-coverage case for
+        //    every extending candidate this round's fix was written to
+        //    correct (see
+        //    `overlap_penalises_a_contained_candidate_fully_and_an_extending_one_only_partially`
+        //    above).
+        //
+        // The actual fix for split coverage is a UNION-based measure —
+        // `|A ∩ (B1 ∪ B2 ∪ …)| / |A|` computed once against everything
+        // selected, rather than `max` over pairwise `|A ∩ Bi| / |A|` calls —
+        // and it is deferred to its own task, not attempted here: it
+        // changes what the audit-visible `"max_similarity_to_selected"`
+        // evidence key means, it re-derives `max_sim`'s contribution to the
+        // MMR score itself (so `mmr_lambda` would need re-calibration), and
+        // it changes the distribution `diversity_cut_similarity` is
+        // compared against. Four moving parts, none in this round's scope.
+        //
+        // This is canonical MMR's own limitation (`max` over pairwise
+        // comparisons cannot see a union — see `overlap`'s own doc comment),
+        // not specific to this formula; the directional fix just changed
+        // WHICH inputs happen to expose it.
+        let candidate_body = "alpha beta";
+        let selected_1 = "alpha";
+        let selected_2 = "beta";
+        assert_eq!(overlap(candidate_body, selected_1), 0.5);
+        assert_eq!(overlap(candidate_body, selected_2), 0.5);
+        let max_sim = overlap(candidate_body, selected_1).max(overlap(candidate_body, selected_2));
+        assert_eq!(
+            max_sim, 0.5,
+            "known-wrong: truth is 1.0 (wholly covered by the selected set \
+             together); tracked here, not fixed — see the comment above"
+        );
     }
 
     #[test]
@@ -808,14 +939,16 @@ mod tests {
 
     #[test]
     fn mmr_reason_is_diversity_cut_only_strictly_above_the_half_similarity_threshold() {
-        // Isolates the `> 0.5` in the MMR fill's reason choice. Rejects: `>`
-        // replaced with `==` or `>=` (both would misclassify the exact-0.5
-        // case below as `DiversityCut`) or with `<` (would misclassify the
-        // 0.8 case below as `HighValue`).
+        // Isolates the `> cfg.diversity_cut_similarity` comparison in the MMR
+        // fill's reason choice. Rejects: `>` replaced with `==` or `>=`
+        // (both would misclassify the exact-threshold case below as
+        // `DiversityCut`) or with `<` (would misclassify the
+        // well-above-threshold case below as `HighValue`).
         // Vacuous if the two fixtures' `overlap` values were not pinned
-        // exactly at 0.8 and 0.5 — both are asserted directly before the
-        // reason-code check, so a fixture drift fails loudly here rather
-        // than silently changing which branch is exercised.
+        // exactly at 0.8 (above the default 0.5 threshold) and 0.5 (exactly
+        // at it) — both are asserted directly before the reason-code check,
+        // so a fixture drift fails loudly here rather than silently changing
+        // which branch is exercised.
         let cfg = BaselineConfig::default();
 
         let seed_a = candidate("one two three four five", 0.99);
@@ -844,6 +977,36 @@ mod tests {
             ws_b.items[1].reason.code,
             ReasonCode::HighValue,
             "exactly 0.5 must not count as diversity-cut; the threshold is strict"
+        );
+    }
+
+    #[test]
+    fn diversity_cut_similarity_is_configurable() {
+        // F3-style config-wiring test (see `admit.rs`/`value.rs`): a
+        // non-default config value, shown to change the observed behaviour —
+        // proving the field is actually read, not merely decorative
+        // alongside a still-hardcoded literal that happens to match the
+        // default.
+        let cfg = BaselineConfig {
+            diversity_cut_similarity: 0.2,
+            ..BaselineConfig::default()
+        };
+        let seed = candidate("one two three four five six seven eight nine ten", 0.99);
+        let contested = candidate("one two three alpha beta gamma delta epsilon zeta eta", 0.5);
+        // 0.3 is below the crate default (0.5) but above this config's 0.2.
+        assert_eq!(overlap(&contested.item.body, &seed.item.body), 0.3);
+
+        let mut cands = vec![seed, contested];
+        for c in &mut cands {
+            c.fragility = Score::ZERO;
+            c.item.created_at = ctx().now;
+        }
+        let ws = working_set(&req(RecallMode::WorkingSet, 2), &cands, &ctx(), &cfg);
+        assert_eq!(ws.items.len(), 2);
+        assert_eq!(
+            ws.items[1].reason.code,
+            ReasonCode::DiversityCut,
+            "similarity above the CONFIGURED threshold must be tagged DiversityCut"
         );
     }
 
@@ -896,12 +1059,14 @@ mod tests {
 
     #[test]
     fn replay_due_high_fragility_alone_is_sufficient_when_recently_accessed() {
-        // Isolates the `fragility >= 0.8` disjunct: fragility 0.9 clears it
-        // on its own, and `last_accessed_at` is pinned to yesterday so the
-        // second disjunct (`stale && fragility >= 0.5`) is false regardless
-        // of fragility. Rejects: a fragility threshold that has drifted
-        // (e.g. requires `>= 1.0`), which would make this candidate false
-        // and the assertion below fail.
+        // Isolates the `fragility >= cfg.replay_fragile_threshold` (default
+        // 0.8) disjunct: fragility 0.9 clears it on its own, and
+        // `last_accessed_at` is pinned to yesterday so the second disjunct
+        // (`stale && fragility >= cfg.replay_stale_fragile_threshold`,
+        // default 0.5) is false regardless of fragility. Rejects: a
+        // fragility threshold that has drifted (e.g. requires `>= 1.0`),
+        // which would make this candidate false and the assertion below
+        // fail.
         // Vacuous if the item were also stale — the guard assertion makes
         // that fixture error loud instead of silently passing for the wrong
         // reason.
@@ -922,17 +1087,20 @@ mod tests {
 
     #[test]
     fn replay_due_staleness_alone_decides_when_fragility_is_between_the_thresholds() {
-        // Isolates the `stale && fragility >= 0.5` disjunct: fragility 0.6
-        // sits strictly between 0.5 and 0.8, so the first disjunct is false
-        // for both candidates below and only staleness can move the answer.
+        // Isolates the `stale && fragility >= cfg.replay_stale_fragile_threshold`
+        // (default 0.5) disjunct: fragility 0.6 sits strictly between the
+        // default 0.5 and 0.8 thresholds, so the first disjunct
+        // (`fragility >= cfg.replay_fragile_threshold`) is false for both
+        // candidates below and only staleness can move the answer.
         // Also the discriminating pair the brief's mandated test's name
         // implies but its own body cannot check (see the note on that test).
         // Rejects: a `replay_due` that ignores `replay_stale_days`, measures
         // staleness from the wrong timestamp, or has a dead staleness path —
         // any of those make the "stale" case below false, or the "fresh"
         // case true, and the assertions fail.
-        // Vacuous if fragility were >= 0.8 (first disjunct alone decides,
-        // twice hit by this crate already) or < 0.5 (second disjunct's own
+        // Vacuous if fragility were >= cfg.replay_fragile_threshold (first
+        // disjunct alone decides, twice hit by this crate already) or below
+        // cfg.replay_stale_fragile_threshold (second disjunct's own
         // fragility guard already false) — pinned by the guard assertions.
         let cfg = BaselineConfig::default();
         let c = ctx();
@@ -987,6 +1155,54 @@ mod tests {
     }
 
     #[test]
+    fn replay_fragile_threshold_is_configurable() {
+        // F3-style config-wiring test: a non-default config value, shown to
+        // change the observed behaviour of `replay_due`'s first disjunct.
+        let cfg = BaselineConfig {
+            replay_fragile_threshold: 0.3,
+            ..BaselineConfig::default()
+        };
+        let c = ctx();
+        // 0.5 is below the crate default (0.8) but above this config's 0.3.
+        // Fresh and recently accessed, so the second disjunct
+        // (`stale && fragility >= replay_stale_fragile_threshold`) is false
+        // regardless of fragility — only the first disjunct can explain a
+        // `true` result here.
+        let mut fresh_and_moderately_fragile = candidate("fresh but moderately fragile", 0.5);
+        fresh_and_moderately_fragile.fragility = Score::clamped(0.5);
+        fresh_and_moderately_fragile.item.created_at = c.now;
+        fresh_and_moderately_fragile.last_accessed_at = Some(c.now);
+        assert!(
+            replay_due(&fresh_and_moderately_fragile, &c, &cfg),
+            "fragility above the CONFIGURED replay threshold must be replay-due even when fresh"
+        );
+    }
+
+    #[test]
+    fn replay_stale_fragile_threshold_is_configurable() {
+        // F3-style config-wiring test: a non-default config value, shown to
+        // change the observed behaviour of `replay_due`'s second disjunct.
+        let cfg = BaselineConfig {
+            replay_stale_fragile_threshold: 0.2,
+            ..BaselineConfig::default()
+        };
+        let c = ctx();
+        // 0.35 is below the crate default (0.5) but above this config's
+        // 0.2, and also below `replay_fragile_threshold`'s default (0.8) —
+        // the guard below pins that the first disjunct cannot independently
+        // explain the result.
+        let mut stale_and_mildly_fragile = candidate("old and mildly fragile", 0.5);
+        stale_and_mildly_fragile.fragility = Score::clamped(0.35);
+        stale_and_mildly_fragile.item.created_at = OffsetDateTime::UNIX_EPOCH;
+        assert!(stale_and_mildly_fragile.fragility.get() < cfg.replay_fragile_threshold);
+        assert!(
+            replay_due(&stale_and_mildly_fragile, &c, &cfg),
+            "fragility above the CONFIGURED stale threshold, with staleness \
+             corroborating, must be replay-due"
+        );
+    }
+
+    #[test]
     fn a_zero_replay_quota_reserves_no_slots_even_for_a_maximally_fragile_stale_item() {
         // Isolates the `replay_slots = floor(slot_budget * replay_quota)`
         // arithmetic from `replay_due` itself: the stale item here is exactly
@@ -1020,6 +1236,44 @@ mod tests {
             !ws.items
                 .iter()
                 .any(|s| s.reason.code == ReasonCode::ReplayDue)
+        );
+    }
+
+    #[test]
+    fn many_replay_due_candidates_against_a_tight_item_budget_exercise_the_replay_slots_tripwire() {
+        // Exercises the precondition the `debug_assert!` at the
+        // `replay_slots` derivation guards (see that call site's comment).
+        // The `debug_assert!` cannot fire against the CURRENT, correct
+        // derivation under any input — `.min(slot_budget)` makes
+        // `replay_slots <= slot_budget` true by construction — but the
+        // fixture here is shaped so that a plausible regression (basing the
+        // reservation on `candidates.len()` instead of `slot_budget`,
+        // without also keeping the `.min` cap) would make this exact test
+        // panic on `debug_assert!(replay_slots <= slot_budget)`, rather than
+        // requiring a hand-written probe to discover it, which is what the
+        // original round needed: 100 replay-due candidates against a 5-item
+        // budget makes `candidates.len() * replay_quota` (100 * 0.2 = 20)
+        // wildly exceed `max_items` (5), where every other test in this
+        // module has few enough candidates, or a loose enough budget, for
+        // that gap not to arise.
+        // Rejects: nothing under the current, correct code — this is a
+        // regression-tripwire fixture, not a fixture with a distinguishable
+        // pass/fail outcome under the code as it stands today.
+        // Vacuous under a release build with debug assertions compiled out;
+        // that limitation is inherent to `debug_assert!` and is unrelated to
+        // this fixture's shape.
+        let cfg = BaselineConfig::default();
+        let mut cands: Vec<_> = (0..100)
+            .map(|i| candidate(&format!("stale fact {i}"), 0.5 - i as f32 * 0.001))
+            .collect();
+        for c in &mut cands {
+            c.fragility = Score::ONE;
+            c.item.created_at = OffsetDateTime::UNIX_EPOCH;
+        }
+        let ws = working_set(&req(RecallMode::WorkingSet, 5), &cands, &ctx(), &cfg);
+        assert!(
+            ws.items.len() <= 5,
+            "must never exceed the requested item budget"
         );
     }
 
