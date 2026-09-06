@@ -1,0 +1,82 @@
+# cargo-mutants configuration.
+#
+# Run:  cargo mutants            (uses this file automatically)
+#
+# ---------------------------------------------------------------------------
+# WHY THE TIMEOUT IS PINNED AND NOT LEFT ON AUTO
+# ---------------------------------------------------------------------------
+# cargo-mutants derives its per-mutant timeout from the baseline test run. That
+# makes a verdict a function of the HARNESS as well as the code, and this
+# project has already been bitten by it:
+#
+#   at e7525a6   baseline test 1s   auto timeout 20s   headroom 20x
+#   at 2d5701c   baseline test 4s   auto timeout 22s   headroom 5.5x
+#
+# Nothing about the mutated code changed. What changed is that the portability
+# task collapsed 28 individually-bound conformance tests into one call to
+# `run_conformance_suite`, whose `run!` macro awaits each test INLINE — so 50
+# tests that had been running in parallel within the binary now run serially.
+# Two mutants flipped from MISSED to TIMEOUT on that alone.
+#
+# A TIMEOUT IS NOT A KILL. It is an unresolved verdict, which is why
+# cargo-mutants reports it separately. Left on auto, verdicts stop being
+# comparable across any commit that changes test structure, and an allowlist
+# keyed to drifting verdicts is worse than no allowlist.
+timeout_multiplier = 15.0
+build_timeout_multiplier = 10.0
+
+# ---------------------------------------------------------------------------
+# THE ALLOWLIST IS A DOCUMENT, NOT A PERMISSION
+# ---------------------------------------------------------------------------
+# Every entry below states WHY the mutant cannot be caught and HOW to test the
+# thing it masks. An entry that only says "expected survivor" records that a
+# mutant is permitted and loses the one fact that makes the enforcement point
+# testable at all.
+#
+# Gate on this list, never on a percentage. Genuine defence in depth is
+# unfalsifiable while the first line works, so the score has a permanent
+# ceiling below 100% for good reasons; a percentage gate either fails forever
+# or gets ratcheted down until it means nothing.
+#
+# NOTE: these are not yet wired as exclusions. They are recorded here first
+# because the justification is the artifact worth having, and a `--exclude-re`
+# added before the reasoning is written is how an allowlist becomes a
+# permission.
+#
+# --- masked by a working first line -----------------------------------------
+#
+# retrieve::passes -> true, and its four boundary mutants.
+#   `filter_sql` enforces all six HardFilters dimensions in SQL; `passes`
+#   re-checks them in Rust. Against a CORRECT filter_sql, passes never rejects
+#   anything and deleting it is unobservable. Against an INCORRECT one it is
+#   the only thing between a widened predicate and a leak — measured:
+#   `i.sensitivity <= ?N + 1` passed the entire suite with passes present and
+#   failed `sensitivity_ceiling_is_enforced_in_the_query` the moment it was
+#   disabled.
+#   TO MUTATION-TEST filter_sql: disable `passes` first. With it enabled these
+#   cannot fail. That is the procedure, and it is the reason this entry exists.
+#
+# vectors::delete -> Ok(())
+#   `schema.rs`'s vectors DDL is `REFERENCES items(id) ON DELETE CASCADE`, so
+#   the row goes when the item does. The explicit delete is defence against a
+#   future schema that drops the cascade.
+#   TO TEST: assert on the vectors table directly after an eviction, not
+#   through any read path that joins items.
+#
+# --- equivalent under reachable states --------------------------------------
+#
+# Backend::neighbours, `||` -> `&&` in the cross-model guard.
+#   The guard is `stored != embedder || dim != embedding.dim`. The test
+#   embedder's id is `format!("deterministic-{dim}")`, so the id ENCODES the
+#   dim and the two operands are perfectly correlated for every test using it.
+#   Separating them needs a vectors row whose embedder and dim disagree, and
+#   `vectors::insert` writes both from one QuantizedVector — the backend cannot
+#   produce that state.
+#   This one is an instance of the mechanism that hides survivors: a fixture
+#   that varies two axes together makes every condition over those axes
+#   untestable.
+#
+# items::merge, scope predicate dropped from the UPDATE.
+#   `items.id` is TEXT PRIMARY KEY, so `WHERE id = ?1` matches at most one row
+#   in the file, and merge's own `get` has already refused an out-of-scope
+#   target. No input distinguishes it. The predicate stays as defence.
