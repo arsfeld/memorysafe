@@ -80,6 +80,28 @@
 //!    assert the boundary there. Defence in depth needs testing in depth, or
 //!    the depth is only ever exercised by accident.
 //!
+//!    **Which doubled rules are dangerous, and which are merely redundant.**
+//!    This backend has two. The `HardFilters` rule is enforced in
+//!    `retrieve::filter_sql` and again in `retrieve::passes`; the
+//!    embedder-and-dim rule is enforced in `vectors::search`'s `WHERE` and
+//!    again by the `scope_embedder` guard in `Backend::neighbours`. Only the
+//!    first hides anything, and the discriminator is the test rather than the
+//!    code:
+//!
+//!    - `retrieval::cross_model_vectors_are_rejected` deliberately accepts
+//!      **either** `EmbedderMismatch` **or** an empty result. Both layers
+//!      produce an accepted outcome, so removing either shows up as a
+//!      surviving mutant and nothing is concealed.
+//!    - `retrieval::sensitivity_ceiling_is_enforced_in_the_query` asserts an
+//!      **exact count**, and `passes` restores exactly that count. The backstop
+//!      repairs the asserted outcome.
+//!
+//!    So: **a second enforcement layer is dangerous precisely when it can
+//!    restore the specific thing the test asserts.** Where the test admits a
+//!    range of acceptable outcomes, redundancy is visible and harmless; where
+//!    it pins one, redundancy is a blindfold. That is the question to ask of
+//!    any rule enforced twice, and it is cheaper than auditing both layers.
+//!
 //! [`isolation::retrieval_never_crosses_a_scope_boundary`](super::isolation::retrieval_never_crosses_a_scope_boundary)
 //! implements all three and says so in its own comments. It is the shape to
 //! copy for any scope or filter test.
