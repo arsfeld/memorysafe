@@ -149,4 +149,47 @@ mod tests {
         let s = scope();
         assert!(evict_txn(&s, vec![ItemId::new()]).is_valid());
     }
+
+    // Task 16 introduces three transaction shapes `is_valid()` has never
+    // seen exercised: an admit that also carries evictions, a merge-only
+    // transaction, and one carrying idempotency fields. Each is built the
+    // same way the atomicity conformance tests build it, so a scope or
+    // shape bug here would otherwise stay invisible until Task 20 runs a
+    // real backend against them.
+
+    #[test]
+    fn a_transaction_carrying_evictions_is_valid() {
+        let s = scope();
+        let mut txn = admit_txn(&s, item(&s, "the new memory"), None);
+        txn.evictions = vec![ItemId::new()];
+        assert!(txn.is_valid());
+    }
+
+    #[test]
+    fn a_merge_only_transaction_is_valid() {
+        use crate::write::MergeWrite;
+
+        let s = scope();
+        let mut txn = admit_txn(&s, item(&s, "doomed"), None);
+        txn.upsert = None;
+        txn.merge = Some(MergeWrite {
+            target: ItemId::new(),
+            body: "merged body".into(),
+            tags: vec![],
+            attrs: Default::default(),
+            vector: None,
+            byte_size: 11,
+        });
+        assert!(txn.is_valid());
+    }
+
+    #[test]
+    fn a_transaction_with_an_idempotency_key_and_payload_digest_is_valid() {
+        let s = scope();
+        let i = item(&s, "written once");
+        let mut txn = admit_txn(&s, i.clone(), None);
+        txn.idempotency_key = Some("key-1".into());
+        txn.payload_digest = Some(i.digest());
+        assert!(txn.is_valid());
+    }
 }

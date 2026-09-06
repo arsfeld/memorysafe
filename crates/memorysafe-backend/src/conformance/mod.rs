@@ -4,6 +4,7 @@
 //! SQLite and Postgres drift within a month and the `Backend` trait becomes a
 //! lie. Backends call `run_conformance_suite` from their own integration test.
 
+pub mod atomicity;
 pub mod fixtures;
 pub mod isolation;
 
@@ -36,5 +37,10 @@ pub async fn run_conformance_suite<F: BackendFactory>(factory: &F) {
         isolation::subjects_are_isolated,
         isolation::namespaces_are_separated,
         isolation::audit_is_scoped,
+        atomicity::admit_evict_and_audit_commit_together,
+        atomicity::a_failed_transaction_leaves_no_trace,
+        atomicity::every_mutation_writes_exactly_one_audit_record,
+        atomicity::idempotent_writes_replay_the_original_outcome,
+        atomicity::idempotency_conflict_on_different_payload,
     );
 }
