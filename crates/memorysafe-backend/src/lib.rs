@@ -100,9 +100,13 @@ pub trait Backend: Send + Sync {
     /// Populates `ScoredCandidate::last_accessed_at` and `access_count` from
     /// each item's stored access statistics — the values `record_recall`
     /// maintains. An item never recalled comes back as `(None, 0)`, never
-    /// `(Some(created_at), 0)`; see `ScoredCandidate::last_accessed_at` for
-    /// why the two must stay distinguishable and why no fixture in this suite
-    /// could tell them apart if they were not.
+    /// `(Some(created_at), 0)`; see `ScoredCandidate::last_accessed_at` for why
+    /// the two must stay distinguishable.
+    /// `conformance::retrieval::recall_updates_access_statistics` enforces it,
+    /// and enforces it on the `Option` rather than on the timestamp: `fx::item`
+    /// pins `created_at` to `UNIX_EPOCH`, so a backend seeding
+    /// `last_accessed_at` from `created_at` produces a *value* no fixture here
+    /// can distinguish from a real one — `is_none()` is what separates them.
     async fn retrieve_candidates(
         &self,
         scope: &Scope,
