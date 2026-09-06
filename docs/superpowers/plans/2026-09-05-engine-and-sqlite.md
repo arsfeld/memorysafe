@@ -4079,6 +4079,14 @@ pub struct AppliedWrite {
     pub replayed_outcome: Option<String>,
 }
 
+/// `audit_rows_removed + audit_rows_preserved` accounts for every audit row
+/// that existed for the subject *before* the purge ran — not for any row
+/// the purge itself may add. `AuditEvent::SubjectPurged` exists, so a
+/// conformant backend may write its own audit row recording the purge; that
+/// row did not exist to be removed or preserved and is not counted in
+/// either field. (Note: this docstring was added in Task 18's review pass,
+/// once `lifecycle`'s purge tests existed to motivate it — it applies from
+/// Task 14 onward regardless.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PurgeReport {
     pub items_removed: u64,
@@ -4530,8 +4538,20 @@ pub use fixtures as fx;
 use crate::Backend;
 use std::future::Future;
 
-/// Hands out a pristine backend per test. SQLite returns one rooted in a fresh
-/// `TempDir`; Postgres will return one rooted in a fresh schema.
+/// Hands out a pristine backend per `create()` call, not per test. SQLite
+/// returns one rooted in a fresh `TempDir`; Postgres will return one rooted
+/// in a fresh schema.
+///
+/// Most tests call `create()` once, but `lifecycle::export_import_round_trips_exactly`
+/// and `lifecycle::import_is_idempotent` each hold a source and a target
+/// backend simultaneously and require them to be mutually invisible — a
+/// factory that memoized one instance per test would hand both calls the
+/// same backend, and the target would already contain the source's rows
+/// before import ever ran. For Postgres this means two schemas alive at
+/// once, not one schema reused across a test's two `create()` calls.
+/// (Note: this docstring was corrected in Task 18's review pass, once
+/// `lifecycle` existed to name the two-backend requirement — it applies
+/// from Task 15 onward regardless.)
 pub trait BackendFactory: Send + Sync {
     type B: Backend;
     fn create(&self) -> impl Future<Output = Self::B> + Send;
@@ -5572,7 +5592,7 @@ use time::{Duration, OffsetDateTime};
 /// `since`/`until` time window, and `limit` — including the newest-first
 /// ordering `limit` depends on.
 ///
-/// An earlier draft of this test had three compounding defects, fixed here:
+/// An earlier draft of this test had defects, fixed here:
 ///
 /// 1. **The time bound was never exercised**, despite the test's name —
 ///    `since`/`until` sat unused. Fixed by querying a `since`/`until` window
@@ -5581,10 +5601,10 @@ use time::{Duration, OffsetDateTime};
 /// 2. **Every record shared one timestamp.** `fx::item`/`fx::evict_txn` both
 ///    pin `UNIX_EPOCH`, so any ordering assertion over `at` held for *any*
 ///    order, including oldest-first. Fixed by giving each of the four
-///    records its own timestamp, ten whole seconds apart — `at` stores
-///    whole seconds (see `AuditFilter::after`'s doc on why a time cursor
-///    can't separate same-second rows), so anything finer would not survive
-///    a real round trip through storage.
+///    records its own timestamp — `at` stores whole seconds (see
+///    `AuditFilter::after`'s doc on why a time cursor can't separate
+///    same-second rows), so anything finer would not survive a real round
+///    trip through storage.
 /// 3. **The ordering assertion compared `at`**, the one field
 ///    `memorysafe_core::AuditFilter` documents as unable to provide a total
 ///    order: rows are ordered by `AuditId` instead, because "`at` is whole
@@ -5593,15 +5613,26 @@ use time::{Duration, OffsetDateTime};
 ///    identity instead: the two rows returned under `limit: 2` must be the
 ///    two most recently *written* rows, newest first — checked against the
 ///    `AuditId`s the writes themselves returned, not against `at`.
+/// 4. **The eviction's `at` was the newest of the four**, so ordering by
+///    `at` and ordering by `AuditId` (write order) agreed by construction —
+///    the test could not tell the two conventions apart, and would have
+///    certified a backend that (wrongly) orders by `at`. Fixed by placing
+///    the eviction's business timestamp *between* the second and third
+///    admit's rather than after all of them, so the two orderings
+///    genuinely disagree and only the documented one (`AuditId`) is
+///    asserted as correct.
 pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
 
-    // Four records, ten whole seconds apart: three admits, then an eviction.
+    // Three admits at t0/t1/t2, ten seconds apart. The eviction's business
+    // timestamp (`t_evict`) sits between t1 and t2 rather than after
+    // everything, so it is not simultaneously "newest by `at`" and "newest
+    // by write order" — see point 4 above.
     let t0 = OffsetDateTime::UNIX_EPOCH;
     let t1 = t0 + Duration::seconds(10);
     let t2 = t0 + Duration::seconds(20);
-    let t3 = t0 + Duration::seconds(30);
+    let t_evict = t0 + Duration::seconds(15);
 
     let mut audit_ids = Vec::new();
     for (i, at) in [t0, t1, t2].into_iter().enumerate() {
@@ -5620,7 +5651,7 @@ pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: 
     // admitted at `t0` — the oldest one.
     let items = backend.list(&scope, &Page::default()).await.unwrap();
     let evicted = backend
-        .apply(fx::evict_txn_at(&scope, vec![items[0].id.clone()], t3))
+        .apply(fx::evict_txn_at(&scope, vec![items[0].id.clone()], t_evict))
         .await
         .unwrap();
     audit_ids.push(evicted.audit_id);
@@ -5650,13 +5681,14 @@ pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: 
         .unwrap();
     assert_eq!(forgets.len(), 1);
 
-    // Time filter: a window strictly between the second and third admit's
-    // timestamps (5s..25s) admits exactly those two rows and excludes both
-    // the first admit (0s) and the eviction (30s) — a strict subset (2 of
-    // 4), so a backend that ignores the filter and returns everything, or
-    // one that returns nothing, both fail. The bounds are chosen off any
-    // record's exact timestamp so the test does not depend on whether
-    // `since`/`until` are inclusive or exclusive at the edges.
+    // Time filter: a window strictly between the first admit's timestamp
+    // and the third's (5s..25s) admits the second admit (10s), the
+    // eviction (15s), and the third admit (20s), and excludes only the
+    // first admit (0s) — a strict subset (3 of 4), so a backend that
+    // ignores the filter and returns everything, or one that returns
+    // nothing, both fail. The bounds are chosen off any record's exact
+    // timestamp so the test does not depend on whether `since`/`until` are
+    // inclusive or exclusive at the edges.
     let since = t0 + Duration::seconds(5);
     let until = t0 + Duration::seconds(25);
     let windowed = backend
@@ -5672,7 +5704,7 @@ pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: 
         .unwrap();
     assert_eq!(
         windowed.len(),
-        2,
+        3,
         "since/until must select a strict subset of the four rows, not all or none"
     );
     assert!(
@@ -5680,17 +5712,26 @@ pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: 
         "a row outside [since, until] leaked through the time filter"
     );
     let windowed_ids: BTreeSet<_> = windowed.iter().map(|r| r.id.clone()).collect();
-    let expected_ids: BTreeSet<_> = [audit_ids[1].clone(), audit_ids[2].clone()]
-        .into_iter()
-        .collect();
+    let expected_ids: BTreeSet<_> = [
+        audit_ids[1].clone(),
+        audit_ids[3].clone(),
+        audit_ids[2].clone(),
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(
         windowed_ids, expected_ids,
         "since/until returned the wrong rows"
     );
 
-    // Ordering: `limit: 2` must return the two most recently *written* rows,
-    // newest first. Checked by identity (the `AuditId`s the writes
-    // themselves returned), not by `at` — see point 3 above.
+    // Ordering: `limit: 2` must return the two most recently *written*
+    // rows, newest first — by `AuditId` (write/insertion order), not by
+    // the business `at` field. The eviction's `at` (15s) is earlier than
+    // the third admit's (20s), so a backend that (wrongly) orders by `at`
+    // would return [third admit, eviction] here; the documented ordering
+    // by `AuditId` returns [eviction, third admit], since the eviction was
+    // written after the third admit regardless of the business timestamp
+    // it carries.
     let limited = backend
         .audit(
             &scope,
@@ -5706,7 +5747,7 @@ pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: 
     assert_eq!(
         limited_ids,
         vec![audit_ids[3].clone(), audit_ids[2].clone()],
-        "audit must come back newest first: the eviction, then the third admit"
+        "audit must come back newest first by write order (AuditId), not by the business `at` field: the eviction, then the third admit"
     );
 }
 
@@ -5730,6 +5771,15 @@ pub async fn purge_subject_removes_everything_for_that_subject<F: BackendFactory
         }
     }
 
+    // Baseline: tie the purge report's own numbers to observed state. Every
+    // check below the purge is satisfied by a backend that stored nothing
+    // at all unless this baseline proves the corpus existed first.
+    assert_eq!(
+        backend.list(&a, &Page::default()).await.unwrap().len(),
+        3,
+        "the corpus must exist before the purge for the purge report to mean anything"
+    );
+
     let report = backend.purge_subject(&tenant, &subject).await.unwrap();
     assert_eq!(report.items_removed, 6);
     assert_eq!(report.vectors_removed, 6);
@@ -5737,10 +5787,13 @@ pub async fn purge_subject_removes_everything_for_that_subject<F: BackendFactory
     assert!(backend.list(&a, &Page::default()).await.unwrap().is_empty());
     assert!(backend.list(&b, &Page::default()).await.unwrap().is_empty());
     assert_eq!(backend.capacity_state(&a).await.unwrap().used_items, 0);
+    assert_eq!(backend.capacity_state(&b).await.unwrap().used_items, 0);
     assert_eq!(
         report.audit_rows_removed + report.audit_rows_preserved,
         6,
-        "every audit row must be accounted for as removed or preserved"
+        "every pre-existing audit row must be accounted for as removed or preserved \
+         (a backend's own SubjectPurged audit row, if it writes one, did not exist \
+         before the purge and is not counted in this total)"
     );
 }
 
@@ -5753,8 +5806,9 @@ pub async fn purge_subject_leaves_other_subjects_intact<F: BackendFactory>(facto
         .apply(fx::admit_txn(&doomed, fx::item(&doomed, "goes away"), None))
         .await
         .unwrap();
+    let keeper_item = fx::item(&keeper, "stays");
     backend
-        .apply(fx::admit_txn(&keeper, fx::item(&keeper, "stays"), None))
+        .apply(fx::admit_txn(&keeper, keeper_item.clone(), None))
         .await
         .unwrap();
 
@@ -5773,9 +5827,21 @@ pub async fn purge_subject_leaves_other_subjects_intact<F: BackendFactory>(facto
             .unwrap()
             .is_empty()
     );
+    let keeper_items = backend.list(&keeper, &Page::default()).await.unwrap();
+    assert_eq!(keeper_items.len(), 1);
     assert_eq!(
-        backend.list(&keeper, &Page::default()).await.unwrap().len(),
-        1
+        keeper_items[0].id, keeper_item.id,
+        "purge left the keeper with a different item than the one it admitted"
+    );
+    // A purge scoped as `DELETE FROM capacity WHERE tenant = ?` (plausible,
+    // since purge's own arguments are tenant + subject) would correctly
+    // scope the item delete but silently zero an unrelated subject's
+    // capacity accounting. Nothing else in this suite purges, so only this
+    // test can catch it.
+    assert_eq!(
+        backend.capacity_state(&keeper).await.unwrap().used_items,
+        1,
+        "purging one subject zeroed an unrelated subject's capacity accounting"
     );
     assert_eq!(
         backend
@@ -5788,27 +5854,55 @@ pub async fn purge_subject_leaves_other_subjects_intact<F: BackendFactory>(facto
     );
 }
 
-/// Invariant 5 from the spec: export then import reproduces the corpus exactly.
+/// Invariant 5 from the spec: export then import reproduces the corpus
+/// exactly.
+///
+/// The three items are built to each carry a different set of
+/// `MemoryItem`'s fields away from their shared defaults, not just
+/// `kind`/`tags`/`sensitivity`: one carries `Protection::Pinned`, one an
+/// `occurred_at`, a `ttl`, and an `attrs` entry, and one
+/// `pending_embedding: true` with a non-`Internal` sensitivity. A round
+/// trip that silently dropped or re-derived any of these on import, rather
+/// than actually persisting and restoring them, is caught by the
+/// full-`MemoryItem` equality below. This still cannot catch a field the
+/// backend never persists at all — `before` and `after` are both read back
+/// through the same backend, via `list()` — but it converts every
+/// plausible import-side re-derivation from invisible to caught.
 pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
     let source = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();
 
-    for (body, kind, tags) in [
-        ("first memory about cats", "fact", vec!["work"]),
-        (
-            "second memory about dogs",
-            "preference",
-            vec!["home", "pets"],
-        ),
-        ("third memory about zstandard", "procedure", vec![]),
-    ] {
-        let item = fx::item_with(
-            &scope,
-            body,
-            kind,
-            &tags,
-            memorysafe_core::SensitivityLevel::Internal,
-        );
+    let mut cats = fx::item_with(
+        &scope,
+        "first memory about cats",
+        "fact",
+        &["work"],
+        memorysafe_core::SensitivityLevel::Internal,
+    );
+    cats.protection = memorysafe_core::Protection::Pinned;
+
+    let mut dogs = fx::item_with(
+        &scope,
+        "second memory about dogs",
+        "preference",
+        &["home", "pets"],
+        memorysafe_core::SensitivityLevel::Internal,
+    );
+    dogs.occurred_at = Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(1));
+    dogs.ttl = Some(Duration::days(30));
+    dogs.attrs
+        .insert("confidence".to_string(), serde_json::json!(0.75));
+
+    let mut zstd = fx::item_with(
+        &scope,
+        "third memory about zstandard",
+        "procedure",
+        &[],
+        memorysafe_core::SensitivityLevel::Restricted,
+    );
+    zstd.pending_embedding = true;
+
+    for item in [cats, dogs, zstd] {
         source
             .apply(fx::admit_txn_embedded(&scope, item))
             .await
@@ -5827,6 +5921,11 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
     let report = target.import(exported.clone()).await.unwrap();
     assert_eq!(report.items_imported, 3);
     assert_eq!(report.vectors_imported, 3);
+    assert_eq!(
+        report.audit_imported, 3,
+        "include_audit: true must actually export and import the audit rows, \
+         not just set the flag"
+    );
 
     let mut before = source
         .list(
@@ -5848,6 +5947,11 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
         )
         .await
         .unwrap();
+    assert_eq!(
+        before.len(),
+        3,
+        "the source corpus must exist before comparing it to the imported copy"
+    );
     before.sort_by(|a, b| a.id.cmp(&b.id));
     after.sort_by(|a, b| a.id.cmp(&b.id));
     assert_eq!(
@@ -5860,6 +5964,12 @@ pub async fn export_import_round_trips_exactly<F: BackendFactory>(factory: &F) {
     let probe = fx::embedder().embed("cats").unwrap();
     let src_hits = source.neighbours(&scope, &probe, 3).await.unwrap();
     let tgt_hits = target.neighbours(&scope, &probe, 3).await.unwrap();
+    assert_eq!(
+        src_hits.len(),
+        3,
+        "the source itself must have ranked vectors before comparing rankings \
+         across the round trip — otherwise empty-vs-empty would pass"
+    );
     let ids = |v: &[memorysafe_core::ScoredCandidate]| {
         v.iter().map(|c| c.item.id.clone()).collect::<Vec<_>>()
     };
@@ -5893,10 +6003,22 @@ pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
     let target = factory.create().await;
     let first = target.import(exported.clone()).await.unwrap();
     assert_eq!(first.items_imported, 1);
+    assert!(
+        target
+            .audit(&scope, &AuditFilter::default())
+            .await
+            .unwrap()
+            .is_empty(),
+        "include_audit: false must not import any audit rows"
+    );
 
     let second = target.import(exported).await.unwrap();
     assert_eq!(second.items_imported, 0);
     assert_eq!(second.items_skipped_existing, 1);
+    assert_eq!(
+        second.vectors_imported, 0,
+        "a skipped item's vector must not be re-inserted either"
+    );
     assert_eq!(
         target.list(&scope, &Page::default()).await.unwrap().len(),
         1
@@ -5904,11 +6026,25 @@ pub async fn import_is_idempotent<F: BackendFactory>(factory: &F) {
 }
 ```
 
-**Three defects fixed in `audit_filter_narrows_by_event_and_time` above, relative to an earlier draft** (found during Task 18's implementation, before this test ever ran against a real backend):
+**Defects fixed in the code above, relative to earlier drafts, across two rounds** (both found during Task 18's implementation and review, before any of these tests ever ran against a real backend):
 
-1. **The time bound was never exercised**, despite the test's name — `AuditFilter::since`/`until` sat unused. Fixed by querying a `since`/`until` window that returns a genuine strict subset of the four audit rows (2 of 4): not all of them, and not none.
-2. **Every record shared one timestamp.** `fx::item`/`fx::evict_txn` both pin `UNIX_EPOCH`, so an ordering assertion over `at` held for *any* order, including oldest-first. Fixed by giving each of the four records (three admits, one eviction) its own timestamp, ten whole seconds apart — `at` stores whole seconds, so anything finer would not survive a real round trip through storage. The three admits use `fx::item_at` (Task 17); the eviction uses a new `fx::evict_txn_at` (added to Task 15's fixtures block below, mirroring `item`/`item_at` — `evict_txn` itself is untouched so Task 16's tests are unaffected).
+*First round, in `audit_filter_narrows_by_event_and_time`:*
+
+1. **The time bound was never exercised**, despite the test's name — `AuditFilter::since`/`until` sat unused. Fixed by querying a `since`/`until` window that returns a genuine strict subset of the four audit rows: not all of them, and not none.
+2. **Every record shared one timestamp.** `fx::item`/`fx::evict_txn` both pin `UNIX_EPOCH`, so an ordering assertion over `at` held for *any* order, including oldest-first. Fixed by giving each of the four records (three admits, one eviction) its own timestamp — `at` stores whole seconds, so anything finer would not survive a real round trip through storage. The three admits use `fx::item_at` (Task 17); the eviction uses a new `fx::evict_txn_at` (added to Task 15's fixtures block below, mirroring `item`/`item_at` — `evict_txn` itself is untouched so Task 16's tests are unaffected).
 3. **The ordering assertion compared `at`**, the one field `memorysafe_core::AuditFilter` documents as unable to provide a total order (rows are ordered by `AuditId` instead, because "`at` is whole seconds and cannot separate rows written in the same second, so a time-based cursor would repeat or skip them"). Fixed by asserting identity instead: the two rows returned under `limit: 2` are checked against the `AuditId`s the writes themselves returned (`AppliedWrite::audit_id`), not against `at`.
+
+*Second round (review "Fix Round 1"), across all five tests — the suite is frozen after Task 24, so these were folded in now rather than left for later:*
+
+4. **The eviction's `at` was the newest of the four**, so ordering by `at` and ordering by `AuditId` (write order) agreed by construction and the test could not tell the two conventions apart. Fixed by moving the eviction's business timestamp to *between* the second and third admit's (15s, not 30s) rather than after all of them, so the two orderings genuinely disagree; the time window's expected row count changed from 2 to 3 as a consequence (the eviction now falls inside `[5s, 25s]` too).
+5. **The round-trip corpus could not detect a lost field for six of `MemoryItem`'s thirteen** (`occurred_at`, `attrs`, `ttl`, `protection`, `pending_embedding`, and uniform `sensitivity`) — all three items varied only `kind`/`tags`/`sensitivity` via `fx::item_with`, at values that were `fx::item`'s own defaults. Fixed by giving one item `Protection::Pinned`, one an `occurred_at` + `ttl` + an `attrs` entry, and one `pending_embedding: true` with a non-`Internal` sensitivity — all fields are `pub`, so no new fixture was needed. This still cannot catch a field the backend never persists at all, since both sides are read back through the same backend via `list()`; it converts every plausible import-side re-derivation from invisible to caught.
+6. **`include_audit: true` was set and its effect was never verified anywhere in the frozen suite.** Added `assert_eq!(report.audit_imported, 3)` after import in `export_import_round_trips_exactly`, and an assertion that the `include_audit: false` path (`import_is_idempotent`) leaves the target's audit empty.
+7. **`purge_subject_leaves_other_subjects_intact` omitted the capacity mirror its own sibling asserts.** Added `capacity_state(&keeper).used_items == 1`, plus reading back the surviving item's id (not just the list's length) to confirm the keeper's own item, not some other row, is what survived.
+8. **The purge report's accounting assertion pinned an undocumented convention with an unactionable message.** `AuditEvent::SubjectPurged` exists, so a conformant backend may write its own purge-audit row and legitimately report 7 instead of 6. Clarified the assertion message and added a doc comment on `PurgeReport` (Task 14's block) stating the convention: the count is of audit rows that existed *before* the purge.
+9. **`BackendFactory`'s docstring said "per test"** but `export_import_round_trips_exactly` and `import_is_idempotent` each hold a source and target simultaneously and require them mutually invisible — a factory memoized per test would make the target already contain the source's rows. Corrected the docstring (Task 15's block) to "per call," with the reason.
+10. **No pre-purge baseline in `purge_subject_removes_everything_for_that_subject`.** Every post-purge check was satisfiable by a backend that stored nothing. Added `assert_eq!(list(&a).len(), 3)` before the purge.
+11. **The vector-survival check was satisfiable by empty-vs-empty.** Added `assert_eq!(src_hits.len(), 3)` and `assert_eq!(before.len(), 3)` before the respective structural comparisons.
+12. **Two unchecked adjacent counters**: `capacity_state(&b)` after the purge in `purge_subject_removes_everything_for_that_subject` (only `&a` was checked), and `second.vectors_imported` in `import_is_idempotent` (a backend that skips the item but re-inserts its vector would have passed).
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -6746,10 +6882,12 @@ pub fn query(conn: &Connection, scope: &Scope, filter: &AuditFilter)
         args.push(Box::new(until.unix_timestamp()));
         sql.push_str(&format!(" AND at <= ?{}", args.len()));
     }
-    // Newest first; id breaks ties so ordering is total even at one-second
-    // resolution.
+    // Ordered by id, descending (newest first) — see `AuditFilter::after`'s
+    // doc comment in memorysafe-core: `at` is whole seconds and cannot
+    // separate rows written in the same second, so `id` alone is the total
+    // order, not a tie-break on `at`.
     args.push(Box::new(filter.limit as i64));
-    sql.push_str(&format!(" ORDER BY at DESC, id DESC LIMIT ?{}", args.len()));
+    sql.push_str(&format!(" ORDER BY id DESC LIMIT ?{}", args.len()));
 
     let tenant = scope.tenant.as_str().to_string();
     let mut stmt = conn.prepare(&sql).sql()?;
@@ -8387,6 +8525,63 @@ mod tests {
     }
 
     #[test]
+    fn density_at_the_corpus_mean_scores_exactly_one_half() {
+        // 0.5 is the calibration anchor downstream policy code reads
+        // directly (compose's fixed 0.5/0.8 thresholds mean "at least as
+        // sparse as typical" / "much sparser than typical"): a neighbourhood
+        // exactly as dense as the corpus's own mean similarity must land
+        // exactly at the midpoint — for any baseline, not by coincidence at
+        // one particular value.
+        let baseline = 0.42;
+        // A single neighbour at exactly the baseline: local_density = b / 1
+        // = b with no averaging rounding, so this is exact by construction
+        // rather than exact by coincidence (three neighbours all at 0.5
+        // would also land exactly on 0.5, but only because 1.5 / 3 happens
+        // to divide evenly).
+        let at_baseline = [candidate("a", baseline)];
+        assert_eq!(score(&at_baseline, &stats(baseline)).get(), 0.5);
+    }
+
+    #[test]
+    fn a_neighbour_identical_to_the_item_scores_exactly_zero() {
+        // local_density == 1.0 is the other calibration anchor: an exact
+        // duplicate neighbour is never fragile, however diffuse or tight the
+        // rest of the corpus is.
+        let identical = [candidate("a", 1.0)];
+        assert_eq!(score(&identical, &stats(0.3)).get(), 0.0);
+    }
+
+    #[test]
+    fn sparser_than_typical_scores_above_half_denser_scores_below() {
+        // The gradient either side of the 0.5 anchor: strictly sparser than
+        // corpus-typical must land strictly above 0.5, and strictly denser
+        // strictly below. This is the function's contract independent of
+        // what any particular caller currently computes as `local_density`
+        // — it must hold for every caller, including ones that only ever
+        // produce values on one side of the anchor today.
+        let baseline = 0.5;
+        let sparser = [candidate("a", 0.2)];
+        let denser = [candidate("a", 0.8)];
+        assert!(score(&sparser, &stats(baseline)).get() > 0.5);
+        assert!(score(&denser, &stats(baseline)).get() < 0.5);
+    }
+
+    #[test]
+    fn an_isolated_item_reaches_maximum_fragility_even_in_a_diffuse_corpus() {
+        // Regression guard: a shared-denominator rescale (normalising the
+        // sparser-than-typical side by the *upward* room, `1.0 - baseline`,
+        // instead of its own downward room) caps the reachable ceiling below
+        // 1.0 at any baseline under 0.5 — an item with literally no similar
+        // neighbours could never be judged maximally fragile in a diffuse
+        // corpus, no matter how isolated it actually is. At baseline 0.2 that
+        // broken shape returns 0.625; the correct shape must still reach the
+        // true ceiling.
+        let baseline = 0.2;
+        let no_similar_neighbours = [candidate("a", 0.0)];
+        assert_eq!(score(&no_similar_neighbours, &stats(baseline)).get(), 1.0);
+    }
+
+    #[test]
     fn fragility_is_calibrated_against_the_corpus_not_an_absolute() {
         // The same neighbours mean different things in a tight corpus versus
         // a diffuse one.
@@ -8398,6 +8593,14 @@ mod tests {
             "0.6 similarity is unusual in a tight corpus and ordinary in a diffuse one"
         );
     }
+
+    // The tests above state this function's contract. Its arithmetic is
+    // additionally pinned by mutation-killer tests not reproduced here —
+    // `the_sparser_branch_is_linear_between_the_baseline_and_zero`,
+    // `the_denser_branch_is_linear_between_the_baseline_and_one`,
+    // `typical_density_at_the_lower_extreme_scores_one_half_without_dividing_by_zero`,
+    // and `typical_density_at_the_upper_extreme_scores_one_half_without_dividing_by_zero`
+    // — see `crates/memorysafe-policy/src/fragility.rs`.
 }
 ```
 
@@ -8450,7 +8653,9 @@ pub enum Verdict {
 /// documented in the spec; tenants may override them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BaselineConfig {
-    /// At or above this, reject the write as an exact duplicate.
+    /// At or above this, the write is rejected. The verdict is decided by
+    /// cosine similarity, not content-digest identity, so two items at the
+    /// threshold can have different digests.
     pub duplicate_threshold: f32,
     /// At or above this (but below `duplicate_threshold`), merge.
     pub merge_threshold: f32,
@@ -8530,7 +8735,7 @@ pub fn assess(
 `crates/memorysafe-policy/src/fragility.rs`:
 
 ```rust
-use memorysafe_core::{Score, ScopeStats, ScoredCandidate};
+use memorysafe_core::{ScopeStats, Score, ScoredCandidate};
 
 /// How costly this memory would be to lose.
 ///
@@ -8542,6 +8747,32 @@ use memorysafe_core::{Score, ScopeStats, ScoredCandidate};
 /// absolute — 0.6 similarity is unusual in a tightly clustered corpus and
 /// unremarkable in a diffuse one. This is the "rare class" notion from the
 /// continual-learning lineage, expressed in embedding space.
+///
+/// `0.5` means corpus-typical density: a neighbourhood exactly as dense as
+/// `stats.mean_neighbour_similarity` scores exactly `0.5`. Each side of that
+/// midpoint is normalised by its OWN room, not by a shared denominator —
+/// sparser-than-typical by the room below the baseline (`baseline` itself),
+/// denser-than-typical by the room above it (`1.0 - baseline`). That keeps
+/// both `0.0` and `1.0` reachable at every baseline: normalising both sides
+/// by the same (upward) room would shrink the reachable ceiling as the
+/// baseline moves down — an item with literally no similar neighbours could
+/// then never reach maximum fragility in a diffuse corpus — so a fixed
+/// downstream threshold like "`>= 0.8` = much sparser than typical" would
+/// mean different things, or be unreachable outright, in different corpora.
+/// Do not fold the two branches back into one symmetric-looking expression;
+/// that shared-denominator shape was the actual defect this one fixes.
+///
+/// Downstream policy code reads the `0.5` midpoint and higher thresholds
+/// directly, so this mapping is this function's contract, not an
+/// implementation detail.
+///
+/// **Precondition:** `stats.mean_neighbour_similarity` must already be a
+/// meaningful corpus-level baseline in the sense of `ScopeStats`'s own doc
+/// comment on that field — this function reads it as-is and cannot verify
+/// that on its own, since `stats` and `neighbours` are independent parameters
+/// with no enforced relationship between them. Supplying it unmet (in
+/// particular, the field's `0.0`/`Default` "no data" value while
+/// `item_count < 2`) is a caller error, not a case this function detects.
 pub fn score(neighbours: &[ScoredCandidate], stats: &ScopeStats) -> Score {
     if neighbours.is_empty() {
         return Score::ONE;
@@ -8552,13 +8783,34 @@ pub fn score(neighbours: &[ScoredCandidate], stats: &ScopeStats) -> Score {
     let mut sims: Vec<f32> = neighbours.iter().map(|n| n.relevance).collect();
     sims.sort_by(|a, b| b.total_cmp(a));
     let k = sims.len().min(3);
-    let local_density: f32 = sims[..k].iter().sum::<f32>() / k as f32;
+    // Cosine can be negative; clamping alongside `baseline` below is what
+    // makes each branch's division safe BY CONSTRUCTION rather than by an
+    // epsilon floor (see the branch comments). This discards no real signal:
+    // neighbours anti-correlated with the item are exactly the "as sparse as
+    // it gets" case, which should map to `local_density = 0.0` regardless of
+    // how negative the raw cosine got.
+    let local_density: f32 = (sims[..k].iter().sum::<f32>() / k as f32).clamp(0.0, 1.0);
 
     let baseline = stats.mean_neighbour_similarity.clamp(0.0, 1.0);
-    // How much sparser than typical this neighbourhood is, normalised by the
-    // headroom above the corpus mean.
-    let headroom = (1.0 - baseline).max(1e-3);
-    let relative_sparsity = ((baseline - local_density) / headroom + 1.0) / 2.0;
+
+    // Each side of the `0.5` (corpus-typical) midpoint is normalised by its
+    // OWN room — see the doc comment above for why.
+    let relative_sparsity = if local_density < baseline {
+        // Sparser than typical, normalised by the room below the baseline.
+        // Reachable only when `baseline > 0` (`local_density >= 0` and
+        // `local_density < baseline`), so this division is never by zero.
+        0.5 + 0.5 * (baseline - local_density) / baseline
+    } else if local_density > baseline {
+        // Denser than typical, normalised by the room above it. Reachable
+        // only when `baseline < 1` (`local_density <= 1` and
+        // `local_density > baseline`), so this division is never by zero.
+        0.5 - 0.5 * (local_density - baseline) / (1.0 - baseline)
+    } else {
+        // Exactly typical. Kept as its own case rather than falling into
+        // either branch above: `local_density == baseline` at the extremes
+        // (both `0.0` or both `1.0`) would otherwise divide by zero there.
+        0.5
+    };
 
     Score::clamped(relative_sparsity)
 }
@@ -9066,7 +9318,7 @@ git commit -m "feat(policy): value scoring and pattern-based sensitivity detecti
 - Consumes: `Assessed`, `AdmitContext`, `BaselineConfig`, `Verdict`.
 - Produces: `admit::decide(&Assessed, &AdmitContext, &BaselineConfig, PolicyId) -> Decision`, and `GovernancePolicy::admit` on `BaselinePolicy`.
 
-**The rules, in order.** An exact duplicate is rejected. A near-duplicate is merged into its closest neighbour. Otherwise the item is retained — and if capacity is tight, evictions are selected ascending by `value × (1 − fragility)` until there is room. A candidate that is both highly fragile and highly sensitive gets `Protected` plus a `SensitivityConflict` reason, so the conflict is visible in the audit trail rather than silently resolved. If nothing is evictable and there is no room, the write is rejected with `BudgetExhausted` — never by silently exceeding the budget.
+**The rules, in order.** At or above `duplicate_threshold` the write is rejected. At or above `merge_threshold` it is merged into its closest neighbour. Otherwise the item is retained — and if capacity is tight, evictions are selected ascending by `value × (1 − fragility)` until there is room. A candidate that is both highly fragile and highly sensitive gets `Protected` plus a `SensitivityConflict` reason, so the conflict is visible in the audit trail rather than silently resolved. If nothing is evictable and there is no room, the write is rejected with `BudgetExhausted` — never by silently exceeding the budget.
 
 - [ ] **Step 1: Write the failing test**
 

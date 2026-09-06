@@ -16,8 +16,17 @@ pub use fixtures as fx;
 use crate::Backend;
 use std::future::Future;
 
-/// Hands out a pristine backend per test. SQLite returns one rooted in a fresh
-/// `TempDir`; Postgres will return one rooted in a fresh schema.
+/// Hands out a pristine backend per `create()` call, not per test. SQLite
+/// returns one rooted in a fresh `TempDir`; Postgres will return one rooted
+/// in a fresh schema.
+///
+/// Most tests call `create()` once, but `lifecycle::export_import_round_trips_exactly`
+/// and `lifecycle::import_is_idempotent` each hold a source and a target
+/// backend simultaneously and require them to be mutually invisible — a
+/// factory that memoized one instance per test would hand both calls the
+/// same backend, and the target would already contain the source's rows
+/// before import ever ran. For Postgres this means two schemas alive at
+/// once, not one schema reused across a test's two `create()` calls.
 pub trait BackendFactory: Send + Sync {
     type B: Backend;
     fn create(&self) -> impl Future<Output = Self::B> + Send;

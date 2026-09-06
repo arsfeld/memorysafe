@@ -27,7 +27,7 @@ Every task's requirements implicitly include this section.
 - **Tenant isolation is enforced by RLS, not by `WHERE` clauses.** Every query still carries its `tenant_id` predicate for the planner's benefit, but the load-bearing guarantee is the policy. A test that removes the predicate must still return zero rows.
 - **The runtime pool never holds superuser rights.** Connections `SET ROLE` to a `NOSUPERUSER NOBYPASSRLS` role on checkout. Superusers and `BYPASSRLS` roles ignore RLS entirely, so a pool that connects as `postgres` would silently have no isolation at all.
 - **Every operation runs inside a transaction,** including reads. The tenant GUC is set with `set_config(..., is_local => true)` so it cannot leak to the next borrower of a pooled connection.
-- **Timestamps are stored as `BIGINT` Unix seconds,** not `timestamptz`. `MemoryItem::created_at` serialises through `time::serde::timestamp` (whole seconds), so a backend that preserved sub-second precision would fail `export_import_round_trips_exactly` — the exported item would not equal the stored one.
+- **Timestamps are stored as `BIGINT` Unix seconds,** not `timestamptz`. `MemoryItem::created_at` serialises through `time::serde::timestamp` (whole seconds) — but the frozen corpus never exercises this: every item `export_import_round_trips_exactly` admits has `created_at = UNIX_EPOCH` exactly (see `fx::item`), with no sub-second component to lose, so that test cannot by itself distinguish a backend that preserves sub-second precision from one that truncates it. `BIGINT` is still the right choice: it matches what the wire format already discards, and it avoids storing precision the export/import API can never round-trip.
 - **Ids are `TEXT`,** holding the 26-character Crockford base32 ULID, exactly as in SQLite.
 - **Policies are pure and the backend performs no scoring.** `ItemWrite` arrives with its vector already quantised; this crate never embeds.
 - **Audit rows never contain item bodies** — only ids, content digests, and feature numbers.
@@ -116,7 +116,7 @@ repo actually put it before Task 7 and import from there; this plan writes
 
 - `HardFilters::default().sensitivity_ceiling` is `Internal`, not `Restricted`. Fail closed.
 - `list` orders by `id ASC`. ULIDs are lexicographically time-ordered, which is what makes pagination stable under concurrent inserts.
-- `audit` orders newest first: `at DESC, id DESC`.
+- `audit` orders newest first: `id DESC` (see `AuditFilter::after`'s doc comment in `memorysafe-core` — `at` is whole seconds and cannot separate rows written in the same second, so `id` alone is the total order).
 - Relevance fusion when both signals are present is `0.7 * vector + 0.3 * keyword`; when only one is present it is that one. Ties break by `item.id` ascending so ordering is total.
 - Keyword scores are squashed into `(0, 1]` as `r / (1 + r)` before fusion.
 - `retrieve_candidates` over-fetches `limit * 4` from each source before fusing, then truncates to `limit`.
@@ -323,7 +323,7 @@ CREATE TABLE audit (
   policy     TEXT,
   PRIMARY KEY (tenant_id, id)
 ) PARTITION BY HASH (tenant_id);
-CREATE INDEX idx_audit_scope_at ON audit (tenant_id, subject, namespace, at DESC, id DESC);
+CREATE INDEX idx_audit_scope_at ON audit (tenant_id, subject, namespace, id DESC);
 
 CREATE TABLE idempotency (
   tenant_id      TEXT NOT NULL,
@@ -1561,7 +1561,7 @@ pub fn statements(config: &PgConfig, schema: &str) -> Vec<String> {
         "CREATE INDEX IF NOT EXISTS idx_vectors_hnsw
            ON vectors USING hnsw (embedding vector_ip_ops)".into(),
         "CREATE INDEX IF NOT EXISTS idx_audit_scope_at
-           ON audit (tenant_id, subject, namespace, at DESC, id DESC)".into(),
+           ON audit (tenant_id, subject, namespace, id DESC)".into(),
     ]);
 
     for table in TENANT_TABLES {
@@ -2328,8 +2328,11 @@ pub async fn query(
         Some(filter.events.iter().map(|e| event_str(*e)).collect())
     };
 
-    // Newest first; id breaks ties so ordering is total at one-second
-    // resolution.
+    // Ordered by id, descending (newest first) — see `AuditFilter::after`'s
+    // doc comment in memorysafe-core: `at` is whole seconds and cannot
+    // separate rows written in the same second, so `id` alone is the total
+    // order, not a tie-break on `at`. `since`/`until` are inclusive, hence
+    // `>=`/`<=` rather than `>`/`<`.
     let rows = sqlx::query(
         "SELECT tenant_id, id, at, subject, namespace, event, items, assessment,
                 decision, actor
@@ -2338,7 +2341,7 @@ pub async fn query(
            AND ($4::text[] IS NULL OR event = ANY($4))
            AND ($5::bigint IS NULL OR at >= $5)
            AND ($6::bigint IS NULL OR at <= $6)
-         ORDER BY at DESC, id DESC
+         ORDER BY id DESC
          LIMIT $7",
     )
     .bind(scope.tenant.as_str())
