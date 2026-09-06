@@ -7,12 +7,29 @@
 //! engine applies; nothing in this file touches a backend, chooses a
 //! transaction boundary, or decides when the next page runs.
 //!
-//! **At most one decision names any item.** The engine applies decisions
-//! independently, so two naming one row — a release and a re-grant, a merge
-//! and an eviction — would leave the outcome to whichever it happened to
-//! apply last. Each step below therefore skips anything an earlier step has
-//! already spoken for, and this module's last test asserts the invariant end
-//! to end over a fixture that produces all four shapes at once.
+//! **Two guarantees about how decisions overlap.** The engine applies them
+//! independently, so both matter to anyone writing that side:
+//!
+//! * **At most one decision has any given item as its `subject`.** Each step
+//!   below skips what earlier steps have already spoken for. Without it the
+//!   engine could receive a release and a re-grant for one row, or a merge and
+//!   an eviction, and the result would be whichever it happened to apply last.
+//! * **No decision names a row that another decision removes.** A merge's
+//!   `into` is always a survivor — never an item this run expires, reclaims or
+//!   absorbs — or the engine would write merged content into something it is
+//!   deleting in the same transaction.
+//!
+//! **What is deliberately allowed, and what a flatter "one decision names any
+//! item" would wrongly forbid:** an item may be the `subject` of one decision
+//! and the `into` of another's merge. Returning a row to `Protection::Normal`
+//! and writing an absorbed near-duplicate's content into it are two coherent
+//! instructions about one row, and the engine carries out both;
+//! `an_item_released_from_protection_is_not_also_absorbed_in_the_same_run`
+//! asserts exactly that pairing as the wanted outcome. The subject guarantee
+//! is about `subject`, not about every mention.
+//!
+//! `every_decision_names_one_subject_a_policy_and_never_a_row_the_run_removes`
+//! asserts both, over a fixture that produces all four decision shapes at once.
 //!
 //! **What one page can and cannot see.** `ctx.batch` is a slice of the
 //! namespace, so an item's page-mates undercount its real neighbourhood. Two
@@ -339,12 +356,22 @@ fn protection_releases(
 /// reason: `ReplaceBody` would discard the target's body, which on this path
 /// is a stored row's content rather than a candidate that never existed.
 ///
-/// Two items may not be merged if the absorbed side is not removable
-/// (`Protection::is_evictable` — a pin, or a window still running), or if
-/// either side is already the subject of a decision this run. An item takes
-/// part in at most ONE merge per run: a chain of them would have the engine
-/// writing merged content into a row the same run deletes. What is left over
-/// is picked up by the next run.
+/// **The two sides are held to different bars, on purpose.**
+///
+/// The ABSORBED side is being deleted, so it must be removable
+/// (`Protection::is_evictable` — not pinned, no window still running) and must
+/// not already be the `subject` of a decision this run.
+///
+/// The TARGET only has to be a survivor: nothing this run expires, reclaims or
+/// absorbs. It MAY already be the subject of a decision. An item released from
+/// an elapsed protection window is a legitimate merge target, because setting a
+/// row's protection and writing merged content into it are two instructions the
+/// engine can carry out together — see
+/// `an_item_released_from_protection_is_not_also_absorbed_in_the_same_run`.
+///
+/// An item takes part in at most ONE merge per run, on either side: a chain
+/// would have the engine writing merged content into a row the same run
+/// deletes. What is left over is picked up by the next run.
 fn consolidations(
     ctx: &MaintainContext,
     cfg: &BaselineConfig,
@@ -1172,14 +1199,27 @@ mod tests {
 
     #[test]
     fn the_item_already_covered_by_the_other_is_the_one_absorbed() {
-        // The direction rule, and the reason it is not "absorb the newer":
-        // `contained`'s tokens are a strict subset of `extending`'s, so
-        // absorbing it loses nothing, while absorbing `extending` would lose
-        // four tokens of real content. `contained` is deliberately the OLDER
-        // of the two, so an age-only rule gives the opposite answer and this
-        // fixture tells the two apart.
+        // The direction rule at the DEFAULT threshold, where only one of the
+        // two directions clears it: `contained`'s tokens are a strict subset
+        // of `extending`'s, so absorbing it loses nothing, while absorbing
+        // `extending` would drop four tokens of real content.
         //   overlap(contained, extending) = 5/5 = 1.00  >= 0.93
         //   overlap(extending, contained) = 5/9 = 0.556  <  0.93
+        //
+        // **This fixture does not discriminate the sort key**, and an earlier
+        // version of this comment claimed it did — on the grounds that
+        // `contained` is the older of the two, so an age-first rule would
+        // supposedly pick the other. It would not: the reverse direction
+        // fails the threshold guard, so an age-first ranking skips it and
+        // reaches this same merge through the fallback. The claim was false
+        // and the test passed under the rule it named as rejected.
+        //
+        // What this fixture DOES reject: dropping the threshold guard (which
+        // would absorb `extending` on its 0.556 and lose content), and
+        // absorbing a fixed side irrespective of content. The sort key itself
+        // is tested by
+        // `the_more_covered_side_is_absorbed_even_when_age_would_pick_the_other`,
+        // which is the only fixture here with both directions above the bar.
         let mut contained = item("postgres runs on port 5432");
         contained.created_at = now() - Duration::days(200);
         let mut extending = item("postgres runs on port 5432 in the staging cluster");
@@ -1204,6 +1244,63 @@ mod tests {
         assert_eq!(
             evidence(reason(&ds[0], ReasonCode::HighRedundancy), "similarity"),
             1.0
+        );
+    }
+
+    #[test]
+    fn the_more_covered_side_is_absorbed_even_when_age_would_pick_the_other() {
+        // The only fixture in this file where coverage and age give DIFFERENT
+        // answers, and so the only one that tests consolidation's PRIMARY sort
+        // key at all. Every other consolidation fixture here is either a
+        // coverage tie (age decides, correctly) or has just one direction
+        // above the threshold (the guard decides, and the sort is unobservable
+        // behind it) — so all of them pass an implementation that ranks by age
+        // alone, which is the opposite of what this module's doc says it does.
+        //
+        // `merge_threshold: 0.5` is what puts BOTH directions above the bar
+        // and makes the sort observable:
+        //   overlap("a b c d", "a b c d e f g h") = 4/4 = 1.00  >= 0.5
+        //   overlap("a b c d e f g h", "a b c d") = 4/8 = 0.50  >= 0.5
+        // `contained` is the OLDER of the two, and the age tie-break prefers
+        // to absorb the NEWER, so the two rules disagree here:
+        //   coverage-first -> absorbs `contained` (1.00 beats 0.50)
+        //   age-first      -> absorbs `extending` (newer, and its 0.50 clears
+        //                     the threshold, so the guard does not save it)
+        // Confirmed by swapping the sort to the age key alone: this test
+        // fails and no other test in the workspace does.
+        let cfg = BaselineConfig {
+            merge_threshold: 0.5,
+            ..BaselineConfig::default()
+        };
+        let mut contained = item("a b c d");
+        contained.created_at = now() - Duration::days(200);
+        let mut extending = item("a b c d e f g h");
+        extending.created_at = now() - Duration::days(100);
+        let (contained_id, extending_id) = (contained.id.clone(), extending.id.clone());
+
+        let ds = decisions(
+            &ctx_with_stats(vec![contained, extending], 2, None, stats(0.4)),
+            &cfg,
+            pid(),
+        );
+
+        assert_eq!(ds.len(), 1, "expected exactly one merge: {ds:?}");
+        assert_eq!(
+            ds[0].subject.as_ref(),
+            Some(&contained_id),
+            "the item that adds nothing must be absorbed, not whichever is newer"
+        );
+        assert_eq!(
+            ds[0].action,
+            Action::Merge {
+                into: extending_id,
+                strategy: MergeStrategy::AppendAndUnion,
+            }
+        );
+        assert_eq!(
+            evidence(reason(&ds[0], ReasonCode::HighRedundancy), "similarity"),
+            1.0,
+            "the recorded similarity must be the absorbed side's own coverage"
         );
     }
 
@@ -1540,7 +1637,7 @@ mod tests {
     // ------------------------------------------------------------- shape --
 
     #[test]
-    fn every_maintenance_decision_names_its_subject_and_its_policy() {
+    fn every_decision_names_one_subject_a_policy_and_never_a_row_the_run_removes() {
         // `Decision::subject`'s own doc: "`maintain` MUST set it: a
         // maintenance decision with no subject names nobody, so
         // `Action::Retain { protection }` returned from `maintain` ... would
@@ -1603,7 +1700,34 @@ mod tests {
         assert_eq!(
             subjects.len(),
             before_dedup,
-            "two decisions name one row: {ds:?}"
+            "two decisions have one row as their subject: {ds:?}"
         );
+
+        // The module's second guarantee: nothing this run removes is named by
+        // another decision. A merge's `into` has to be a survivor, or the
+        // engine writes merged content into a row it is deleting in the same
+        // transaction. Removals are the evicted items (TTL and capacity) plus
+        // the subject of every merge, which the engine deletes once absorbed.
+        let removed: Vec<&ItemId> = ds
+            .iter()
+            .flat_map(|d| d.evictions.iter().map(|e| &e.item))
+            .chain(
+                ds.iter()
+                    .filter(|d| matches!(d.action, Action::Merge { .. }))
+                    .filter_map(|d| d.subject.as_ref()),
+            )
+            .collect();
+        assert!(
+            !removed.is_empty(),
+            "fixture removes nothing, so the check below is vacuous: {ds:?}"
+        );
+        for d in &ds {
+            if let Action::Merge { into, .. } = &d.action {
+                assert!(
+                    !removed.contains(&into),
+                    "a merge names a row this run removes: {d:?}"
+                );
+            }
+        }
     }
 }
