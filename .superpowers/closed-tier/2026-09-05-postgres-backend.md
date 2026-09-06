@@ -2798,12 +2798,27 @@ use session::tenant_txn;
 ///   see because it answers "may this row exist here" and never "is this the
 ///   right table" — likewise requires a query running *outside* `tenant_txn`.
 ///
-/// Both hold only while this invariant does. It holds today: of the fourteen
-/// methods, five are implemented and all five open with `tenant_txn`; the
-/// other nine are stubs. **Each of those nine is an opportunity to break it**,
-/// and nothing in the type system objects — `pool_for_isolation_tests` is
-/// `pub` because `tests/isolation.rs` is an integration test and cannot see a
-/// narrower visibility.
+/// Both hold only while this invariant does, and **be precise about where it
+/// currently holds, because the imprecise version is vacuous.** In *this
+/// document's* listing, five of the fourteen methods are written and all five
+/// open with `tenant_txn`. In the implementing crate there is **no
+/// `impl Backend for PostgresBackend` at all yet** — so "every method opens
+/// with `tenant_txn`" is quantified over an empty set there, true the way any
+/// statement about no elements is true.
+///
+/// That distinction is the whole point of writing this down. A reader who
+/// checks the crate and finds no violations has confirmed nothing; the first
+/// method written is the first thing that could violate it, and there is no
+/// type-system objection to a method that queries the pool directly.
+/// `pool_for_isolation_tests` is `pub` because `tests/isolation.rs` is an
+/// integration test and neither `pub(crate)` nor `#[cfg(test)]` reaches it.
+///
+/// **The rename is a stopgap; the mechanism is `#[cfg(feature = "test-support")]`.**
+/// `pub` and *reachable by an embedder* are separable: behind a feature the
+/// method does not exist in a default build, so no downstream crate can call
+/// it, while `cargo test --features test-support` still compiles the
+/// integration tests. Prefer that. The rename only makes a misuse *look*
+/// wrong; the feature gate makes it not compile.
 ///
 /// So a new method that touches the database without opening a `tenant_txn` is
 /// not a style deviation: it falsifies a freeze ruling and upgrades a
