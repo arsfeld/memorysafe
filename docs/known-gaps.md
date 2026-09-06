@@ -36,9 +36,55 @@ it a requirement for every future backend.
 4. **`retrieve_candidates`' relevance tie-break** and **`neighbours`' access statistics** —
    both covered crate-locally only.
 
+## From the freeze review — six the frozen suite cannot see
+
+Each has a **measured distinguishing input**, so none is an equivalent mutant. Ranked; the
+first two are cross-backend compatibility properties, which is the single class this suite
+exists to protect.
+
+1. **`import` never checks `Header`'s `format_version`, and the suite cannot tell.** Both
+   halves are unpinned — presence *and* version. Every conformance import receives a header
+   built with the current `FORMAT_VERSION`, so a backend that ignores the field passes.
+   `FORMAT_VERSION`'s own doc calls it the mechanism against "a SQLite export that Postgres
+   refuses"; that mechanism is currently unenforced by the contract.
+2. **The exported vector's `scale` is unchecked.** Forcing every `scale` to a constant
+   survives. `QuantizedVector::dot` multiplies by both operands' scales, so a constant
+   destroys relative weighting between vectors with different `max_abs` — but
+   `export_import_round_trips_exactly` compares only the ranked *ids* from `neighbours`, and
+   **cosine ranking is invariant under per-vector positive scaling**, so a ranking assertion
+   structurally cannot pin it. `embedder` and `dim` are pinned; `scale` is the one field of
+   `ExportVector` not reconstructible from the bytes and the one nothing checks.
+3. **`import` does no capacity accounting, and nothing notices.** Removing it entirely
+   survives. Measured: 3 items import as `used_items=3, used_bytes=287`; without the
+   accounting, 0/0. `capacity::adjust` is delta-based and never self-heals, so a migrated
+   tenant's budget stays permanently under-counted and unenforced. Four capacity conformance
+   tests exist; none reaches `import`.
+4. **`ImportReport::items_imported` and `vectors_imported` are interchangeable.** Every
+   conformance import feeds a corpus where the two are equal; the one stream with unequal
+   counts asserts only `audit_imported`. Same shape as `PurgeReport`'s own swap survivor —
+   two report types, one blind spot.
+5. **No conformance test reads any of `AuditAggregate`'s histogram fields.** Swapping
+   `value_histogram` and `fragility_histogram` on read survives, as does taking
+   `histogram_version` from a neighbouring column. The suite never sets an `Assessment`, so
+   both histograms are all-zeros there — empty-set vacuity again. `histogram_version` exists
+   specifically to make a `SCORE_HISTOGRAM_EDGES` change detectable.
+6. **`AuditAggregateFilter::since` and `until` are interchangeable.** The only test that
+   sets them uses `since: Some(1), until: Some(1)` — a degenerate window where the two
+   orders are equivalent. Chosen deliberately to pin *inclusivity*; the side effect is that
+   the parameter assignment is unpinned. `since: Some(0), until: Some(2)` gives 7 rows
+   against 0.
+
+**And the deserialiser fix is crate-local only.** The three arms are killed by a test in
+`portability`, not by the suite: `human` deleted and `Protected{until}` shifted both still
+survive a conformance-only run. A future backend dropping either passes the frozen suite.
+
 ## Surviving mutants, four kinds
 
 Run `cargo mutants`; the baseline and the timeout caveat are in `scripts/README.md`.
+
+**Closed after the freeze review** — `export` dropping audit for item-less scopes
+(Critical), and all four transactions now opening `Immediate` rather than relying on the
+position of one call.
 
 **Closed since the freeze** — `items.rs`'s `"session"`/`"tool"`/`"pinned"` arms (the enum
 readers now error rather than falling back, so there is no fallback value for a fixture to
