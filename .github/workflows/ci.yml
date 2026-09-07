@@ -14,6 +14,15 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features --workspace
+  invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: The five correctness invariants
+        run: cargo test -p memorysafe-engine --test invariants --release
+        env:
+          PROPTEST_CASES: 64
   purity:
     runs-on: ubuntu-latest
     steps:

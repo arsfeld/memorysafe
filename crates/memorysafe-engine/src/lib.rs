@@ -126,4 +126,23 @@ impl Engine {
     pub async fn set_budget(&self, scope: &Scope, budget: Budget) -> Result<(), EngineError> {
         Ok(self.backend.set_budget(scope, budget).await?)
     }
+
+    /// A namespace's budget and what it has used, read through to the backend.
+    ///
+    /// Deliberately a straight read-through with no caching. `CacheConfig`
+    /// caches `ScopeStats`, never `CapacityState`, and even that stats cache
+    /// is currently unreachable from any read path — `gather::assess_context`,
+    /// `read::recall` and `maintain` all call `Backend::scope_stats` directly,
+    /// and the only callers of `EngineCache::stats`/`put_stats` in the
+    /// workspace are that module's own tests. So there is no cached capacity
+    /// figure anywhere to go stale, and none should be introduced here: this
+    /// is the accessor `capacity_is_never_exceeded` (`tests/invariants.rs`)
+    /// cross-checks the stored item count against, and a cached answer would
+    /// turn that cross-check into a comparison of the accounting with itself.
+    pub async fn capacity_state(
+        &self,
+        scope: &Scope,
+    ) -> Result<memorysafe_core::CapacityState, EngineError> {
+        Ok(self.backend.capacity_state(scope).await?)
+    }
 }
