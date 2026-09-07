@@ -54,7 +54,7 @@ future reader can tell which decisions were load-bearing and which were preferen
 | D5 | **Open core.** Engine crates and adapters stay public under Apache-2.0; Postgres backend, control plane, and infrastructure are closed | An auditable governance policy is a sales asset for a product sold on privacy. The moat is the hosted service, not the scoring algorithm. |
 | D6 | **Self-serve signup, GitHub OAuth only, no billing** | Developer audience already has GitHub. No password store means no recovery, verification, or reset surface to build or secure. |
 | D7 | Tenants are **per GitHub user and per GitHub org** (both), derived from **numeric** GitHub ids | Personal tenants keep evaluation friction near zero; org tenants match how businesses buy. Numeric ids because logins are renameable and reusable. |
-| D8 | Hosting is a **single VPS running k3s**, self-hosted Postgres in-cluster. Provider: **Hetzner CX33**, ~$10.45/mo (§13) | One bill. Self-hosting pins PostgreSQL 17 + pgvector 0.8.6, exactly the versions Plan 2 was validated against. |
+| D8 | Hosting is a **single VPS running k3s**, self-hosted Postgres in-cluster. Host: **repurpose the existing OVH box `can-1`**, subject to the preconditions in §13.0; fallback is Hetzner CX33 at ~$10.45/mo | One bill, and zero marginal cost on hardware already paid for. Self-hosting pins PostgreSQL 17 + pgvector 0.8.6, exactly the versions Plan 2 was validated against. |
 | D9 | **k3s over Docker Compose** | Compose → Kubernetes is a rewrite; k3s → multi-node or managed Kubernetes is incremental. Also gives CronJob, Job, probes, and rolling deploys as primitives. |
 | D10 | **No PITR, no replica, no EU residency requirement** — but a **nightly logical backup is mandatory** | Deferred deliberately for cost. A backup is not optional: the product *is* customer memory, and it is not reconstructible from any other source. |
 
@@ -384,11 +384,12 @@ New tests the hosted layer requires:
 
 1. Land Plan 3 (adapters) and Plan 2 (Postgres backend, with the corrected test count).
 2. Stand up `memorysafe-cloud`: submodule, composition root, control plane, key persistence.
-3. Provision the VPS; install k3s with `--secrets-encryption`.
-4. Apply manifests; run `bootstrap` Job; deploy one replica.
-5. **Rehearse a restore from the nightly dump.** Gate: no client is onboarded before this passes.
-6. Onboard design partners through self-serve signup.
-7. Add a second replica when a client's uptime depends on it — a config change, not a project.
+3. **Audit `can-1` against §13.0** — RAM, disk, root access, existing workloads, architecture, DNS. Decide repurpose-or-fallback on the evidence before any deployment work targets it.
+4. Install k3s with `--secrets-encryption`.
+5. Apply manifests; run `bootstrap` Job; deploy one replica.
+6. **Rehearse a restore from the nightly dump.** Gate: no client is onboarded before this passes.
+7. Onboard design partners through self-serve signup.
+8. Add a second replica when a client's uptime depends on it — a config change, not a project.
 
 ---
 
@@ -409,8 +410,36 @@ New tests the hosted layer requires:
 
 ## 13. Provider selection
 
-**Decision: Hetzner Cloud CX33 — 4 vCPU x86, 8 GB RAM, 80 GB NVMe, 20 TB traffic, at
-€8.49/mo plus the €0.50 mandatory IPv4 surcharge = €8.99/mo (~$10.45).**
+**Decision: repurpose the existing OVH host `can-1`.** Marginal hosting cost is zero — the box is
+already paid for — which beats every option in the comparison below. The comparison is retained
+because it establishes the replacement cost if `can-1` proves unsuitable, and because it is the
+benchmark for what a purpose-provisioned box would cost.
+
+**Fallback, and the benchmark: Hetzner Cloud CX33** — 4 vCPU x86, 8 GB RAM, 80 GB NVMe, 20 TB
+traffic, at €8.49/mo plus the €0.50 mandatory IPv4 surcharge = €8.99/mo (~$10.45).
+
+### 13.0 Preconditions on `can-1`
+
+`can-1`'s specification was not available when this document was written, so these are gates on
+the rollout (§11), not assumptions. Each has a defined outcome if it fails.
+
+| Check | Requirement | If it fails |
+|---|---|---|
+| RAM | ≥ 4 GB free after existing workloads (§8.4). 8 GB gives comfortable headroom for HNSW builds | Adopt the `halfvec` amendment (§13.1) to halve index memory, or move to the CX33 fallback |
+| Disk | ≥ 40 GB free, SSD/NVMe. Postgres on spinning disk is not acceptable for this workload | CX33 fallback |
+| Root access | Full root: k3s installation, and a Postgres container with superuser (§8.1) | Disqualifying — CX33 fallback |
+| Existing workloads | Either none, or ones that tolerate co-tenancy with k3s | See below |
+| Public IPv4 + DNS | A record for the service hostname, ports 80/443 reachable for Let's Encrypt | Resolve before deploy; Traefik cannot issue a certificate otherwise |
+
+**On co-tenancy.** If `can-1` currently runs something else, note that §8.4's fourth constraint
+gets worse, not merely unchanged: the app, the database, *and* an unrelated workload now share
+fate on one box, and a memory spike during an HNSW index build can take down a neighbour that has
+nothing to do with MemorySafe. Set memory and CPU limits on the k3s workloads, and treat "what
+else runs here" as a documented fact rather than something rediscovered during an incident.
+
+**On the ARM/x86 question.** If `can-1` is one of OVH's ARM offerings, the Rust binary must be
+built for `aarch64` and `pgvector/pgvector:pg17` pulled for arm64. Both are available; it is a
+build-configuration item, not a blocker. Confirm the architecture before the first image build.
 
 Options that satisfy all three hard requirements in §8.1 — own Postgres container with
 superuser, ≥ 4 GB RAM, one bill:
