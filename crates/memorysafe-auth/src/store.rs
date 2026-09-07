@@ -1,6 +1,8 @@
 use crate::AuthError;
 use crate::key::{ApiKeyRecord, hash_presented, parse_presented};
-use memorysafe_core::{ADMIN_COMPONENT, Actor, ActorKind, PURGED_COMPONENT, Scope, TenantId};
+use memorysafe_core::{
+    ADMIN_COMPONENT, Actor, ActorKind, Namespace, PURGED_COMPONENT, Scope, SubjectId, TenantId,
+};
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
 
@@ -76,23 +78,38 @@ impl ApiKeyStore {
 
         Ok(Authenticated {
             tenant: record.tenant.clone(),
+            subject: record.subject.clone(),
+            default_namespace: record.default_namespace.clone(),
             key_id: record.id.clone(),
         })
     }
 }
 
-/// Proof that a caller is one specific tenant. The only way to obtain one is
-/// `ApiKeyStore::authenticate`, so a handler that holds one cannot have skipped
-/// the check.
+/// Proof that a caller is one specific tenant *and* one specific subject.
+/// The only way to obtain one is `ApiKeyStore::authenticate`, so a handler
+/// that holds one cannot have skipped the check.
 #[derive(Debug, Clone)]
 pub struct Authenticated {
     tenant: TenantId,
+    subject: SubjectId,
+    default_namespace: Option<Namespace>,
     key_id: String,
 }
 
 impl Authenticated {
     pub fn tenant(&self) -> &TenantId {
         &self.tenant
+    }
+
+    /// The subject this credential acts as. Fixed when the key was minted.
+    pub fn subject(&self) -> &SubjectId {
+        &self.subject
+    }
+
+    /// The namespace to use when a request declares none. `None` means the
+    /// caller should fall back to `FALLBACK_NAMESPACE`.
+    pub fn default_namespace(&self) -> Option<&Namespace> {
+        self.default_namespace.as_ref()
     }
 
     pub fn key_id(&self) -> &str {
@@ -119,23 +136,21 @@ impl Authenticated {
     }
 
     /// The constructor of a `Scope` for any adapter path that authenticates
-    /// an API key. The tenant is taken from the credential and never from
-    /// the request, so a scope that crosses tenants is unrepresentable
-    /// rather than merely rejected.
+    /// an API key. Tenant *and subject* come from the credential; only the
+    /// namespace comes from the request. A scope that crosses tenants or
+    /// impersonates another subject is unrepresentable here rather than
+    /// merely rejected.
     ///
-    /// Not the only site a `Scope` is built in the network adapters, so do
-    /// not assume routing a caller-supplied subject/namespace through this
-    /// method is the only way scope construction gets guarded: MCP's stdio
-    /// transport (`memorysafe-mcp`'s `ScopeSource::Stdio` arm) builds one
-    /// directly, because there is no API key to authenticate on that path at
-    /// all — the tenant (and there, the subject too) is the server's own
-    /// configuration, fixed when the process starts, the way a CLI process
-    /// already runs as a fixed OS user. That site is safe for the same
-    /// reason this one is: tenant comes from a value the caller never
-    /// supplies, never from request input, on either path.
-    pub fn scope(&self, subject: &str, namespace: &str) -> Result<Scope, AuthError> {
-        check_reserved(Some(subject), Some(namespace))?;
-        Ok(Scope::new(self.tenant.as_str(), subject, namespace)?)
+    /// The namespace is checked because it is caller input. The *subject* is
+    /// checked because `ApiKeyStore::new` takes records on trust, so a
+    /// hand-edited record carrying a reserved subject reaches here.
+    pub fn scope(&self, namespace: &str) -> Result<Scope, AuthError> {
+        check_reserved(Some(self.subject.as_str()), Some(namespace))?;
+        Ok(Scope::new(
+            self.tenant.as_str(),
+            self.subject.as_str(),
+            namespace,
+        )?)
     }
 }
 
@@ -143,12 +158,54 @@ impl Authenticated {
 mod tests {
     use super::*;
     use crate::key::generate;
-    use memorysafe_core::{ActorKind, TenantId};
+    use memorysafe_core::{ActorKind, SubjectId, TenantId};
 
     fn store_with(label: &str) -> (ApiKeyStore, String, TenantId) {
         let tenant = TenantId::new("acme").unwrap();
-        let g = generate(tenant.clone(), label).unwrap();
+        let subject = SubjectId::new("user-42").unwrap();
+        let g = generate(tenant.clone(), subject, label).unwrap();
         (ApiKeyStore::new(vec![g.record]), g.secret, tenant)
+    }
+
+    #[test]
+    fn an_authenticated_key_reports_the_subject_it_was_minted_for() {
+        let (store, secret, tenant) = store_with("ci");
+        let auth = store.authenticate(&secret).expect("authenticate");
+        assert_eq!(auth.tenant(), &tenant);
+        assert_eq!(auth.subject().as_str(), "user-42");
+        assert_eq!(auth.default_namespace(), None);
+    }
+
+    #[test]
+    fn scope_takes_the_namespace_and_nothing_else_from_the_caller() {
+        // The signature is the enforcement. There is no subject parameter to
+        // pass, so no adapter can route request input into the subject position.
+        let (store, secret, _) = store_with("ci");
+        let auth = store.authenticate(&secret).unwrap();
+
+        let scope = auth.scope("coding-agent").expect("in-tenant scope");
+        assert_eq!(scope.tenant.as_str(), "acme");
+        assert_eq!(scope.subject.as_str(), "user-42");
+        assert_eq!(scope.namespace.as_str(), "coding-agent");
+    }
+
+    #[test]
+    fn scope_still_refuses_a_reserved_namespace() {
+        let (store, secret, _) = store_with("ci");
+        let auth = store.authenticate(&secret).unwrap();
+
+        assert!(matches!(
+            auth.scope(ADMIN_COMPONENT),
+            Err(AuthError::Reserved {
+                component: "_admin"
+            })
+        ));
+        assert!(matches!(
+            auth.scope(PURGED_COMPONENT),
+            Err(AuthError::Reserved {
+                component: "_purged"
+            })
+        ));
     }
 
     #[test]
@@ -180,7 +237,12 @@ mod tests {
     #[test]
     fn an_unknown_id_is_rejected_with_the_same_error_as_a_wrong_secret() {
         let (store, _, _) = store_with("ci");
-        let other = generate(TenantId::new("acme").unwrap(), "elsewhere").unwrap();
+        let other = generate(
+            TenantId::new("acme").unwrap(),
+            SubjectId::new("user-42").unwrap(),
+            "elsewhere",
+        )
+        .unwrap();
         assert!(matches!(
             store.authenticate(&other.secret),
             Err(AuthError::Unknown)
@@ -190,7 +252,7 @@ mod tests {
     #[test]
     fn a_disabled_key_does_not_authenticate() {
         let tenant = TenantId::new("acme").unwrap();
-        let g = generate(tenant, "revoked").unwrap();
+        let g = generate(tenant, SubjectId::new("user-42").unwrap(), "revoked").unwrap();
         let mut record = g.record;
         record.disabled = true;
         let store = ApiKeyStore::new(vec![record]);
@@ -220,15 +282,13 @@ mod tests {
         let (store, secret, _) = store_with("ci");
         let auth = store.authenticate(&secret).unwrap();
 
-        let scope = auth
-            .scope("user-42", "coding-agent")
-            .expect("in-tenant scope");
+        let scope = auth.scope("coding-agent").expect("in-tenant scope");
         assert_eq!(scope.tenant.as_str(), "acme");
         assert_eq!(scope.subject.as_str(), "user-42");
     }
 
     #[test]
-    fn the_reserved_component_is_refused_in_either_position() {
+    fn the_reserved_component_is_refused_as_a_namespace() {
         // Task 2 writes tenant-level audit rows under `_admin`. A caller that
         // could name that scope could read another tenant's policy history —
         // or forge rows that look like the engine wrote them.
@@ -243,14 +303,10 @@ mod tests {
         let (store, secret, _) = store_with("ci");
         let auth = store.authenticate(&secret).unwrap();
 
+        // The subject position no longer exists: key minting rejects it in
+        // `a_key_may_not_be_minted_for_a_reserved_subject` in key.rs.
         assert!(matches!(
-            auth.scope(memorysafe_core::ADMIN_COMPONENT, "agent"),
-            Err(AuthError::Reserved {
-                component: "_admin"
-            })
-        ));
-        assert!(matches!(
-            auth.scope("user-42", memorysafe_core::ADMIN_COMPONENT),
+            auth.scope(memorysafe_core::ADMIN_COMPONENT),
             Err(AuthError::Reserved {
                 component: "_admin"
             })
@@ -258,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn purged_is_refused_in_either_position() {
+    fn purged_is_refused_as_a_namespace() {
         // `_purged` is where the engine files a purged subject's `SubjectPurged`
         // residue when the subject owned no items (memorysafe-core's
         // `PURGED_COMPONENT` doc). A caller who names an ordinary subject or
@@ -270,20 +326,13 @@ mod tests {
         let auth = store.authenticate(&secret).unwrap();
 
         // Pin the returned `component` to "_purged", not just the variant --
-        // see the comment on `the_reserved_component_is_refused_in_either_position`
+        // see the comment on `the_reserved_component_is_refused_as_a_namespace`
         // for why `Err(AuthError::Reserved { .. })` alone is not enough.
+        // The subject position no longer exists: key minting rejects it in
+        // `a_key_may_not_be_minted_for_a_reserved_subject` in key.rs.
         assert!(
             matches!(
-                auth.scope("_purged", "agent"),
-                Err(AuthError::Reserved {
-                    component: "_purged"
-                })
-            ),
-            "'_purged' as subject was accepted, or reported the wrong component"
-        );
-        assert!(
-            matches!(
-                auth.scope("user-42", "_purged"),
+                auth.scope("_purged"),
                 Err(AuthError::Reserved {
                     component: "_purged"
                 })
@@ -320,11 +369,8 @@ mod tests {
     fn an_invalid_component_surfaces_as_a_scope_error_not_a_panic() {
         let (store, secret, _) = store_with("ci");
         let auth = store.authenticate(&secret).unwrap();
-        assert!(matches!(
-            auth.scope("User-42", "agent"),
-            Err(AuthError::Scope(_))
-        ));
-        assert!(matches!(auth.scope("", "agent"), Err(AuthError::Scope(_))));
+        assert!(matches!(auth.scope("Agent-Caps"), Err(AuthError::Scope(_))));
+        assert!(matches!(auth.scope(""), Err(AuthError::Scope(_))));
     }
 
     #[test]
