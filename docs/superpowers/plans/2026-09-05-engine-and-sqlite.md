@@ -14748,7 +14748,7 @@ Add `pub mod portability;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 139 tests ok (124 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan. Re-propagated again: the 2026-09-06 byte-reclaim ruling batch — `protect`'s missing `pending_embedding` on an embedder failure, the fabricated eviction-evidence scrub, an explicit doc comment on `recall`'s fail-closed stance, and a ULID-ordering flake sweep — added 4 tests, carrying a further +4 into every later count in this plan.)
+Expected: PASS — 142 tests ok (124 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan. Re-propagated again: the 2026-09-06 byte-reclaim ruling batch — `protect`'s missing `pending_embedding` on an embedder failure, the fabricated eviction-evidence scrub, an explicit doc comment on `recall`'s fail-closed stance, and a ULID-ordering flake sweep — added 4 tests, carrying a further +4 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -15023,7 +15023,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 144 memorysafe-engine tests (129 planned + the 9 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan. Re-propagated again: the 2026-09-06 byte-reclaim ruling batch — `protect`'s missing `pending_embedding` on an embedder failure, the fabricated eviction-evidence scrub, an explicit doc comment on `recall`'s fail-closed stance, and a ULID-ordering flake sweep — added 4 tests, carrying a further +4 into every later count in this plan.)
+Expected: PASS — the whole workspace green: 5 invariants, 147 memorysafe-engine tests (129 planned + the 9 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan. Re-propagated again: the 2026-09-06 byte-reclaim ruling batch — `protect`'s missing `pending_embedding` on an embedder failure, the fabricated eviction-evidence scrub, an explicit doc comment on `recall`'s fail-closed stance, and a ULID-ordering flake sweep — added 4 tests, carrying a further +4 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -15397,7 +15397,7 @@ pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine && cargo test --workspace --all-features`
-Expected: PASS — 151 engine tests ok (136 planned + the 9 propagated from Task 35's mutation-testing closures), whole workspace green. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan. Re-propagated again: the 2026-09-06 byte-reclaim ruling batch — `protect`'s missing `pending_embedding` on an embedder failure, the fabricated eviction-evidence scrub, an explicit doc comment on `recall`'s fail-closed stance, and a ULID-ordering flake sweep — added 4 tests, carrying a further +4 into every later count in this plan.)
+Expected: PASS — 154 engine tests ok (136 planned + the 9 propagated from Task 35's mutation-testing closures), whole workspace green. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan. Re-propagated again: the 2026-09-06 byte-reclaim ruling batch — `protect`'s missing `pending_embedding` on an embedder failure, the fabricated eviction-evidence scrub, an explicit doc comment on `recall`'s fail-closed stance, and a ULID-ordering flake sweep — added 4 tests, carrying a further +4 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
