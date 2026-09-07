@@ -1457,15 +1457,34 @@ mod tests {
     /// them to the referenced item's scope. What a divergent row costs, in
     /// descending sharpness:
     ///
-    /// 1. **Divergence cannot self-heal.** `vectors::insert` is an upsert
-    ///    whose conflict clause is `ON CONFLICT(item_id) DO UPDATE SET
-    ///    embedder=…, dim=…, scale=…, q=…`. `subject` and `namespace` are not
-    ///    in that `SET` list, so every subsequent re-embed preserves the
-    ///    divergence.
+    /// 1. **The upsert cannot heal it. Exactly one path can.**
+    ///    `vectors::insert` is an upsert whose conflict clause is
+    ///    `ON CONFLICT(item_id) DO UPDATE SET embedder=…, dim=…, scale=…,
+    ///    q=…`. `subject` and `namespace` are not in that `SET` list, so an
+    ///    insert that **hits** the conflict leaves the divergence exactly
+    ///    where it was. That is the merge path: `items::merge` is an
+    ///    `UPDATE`, the item row survives, no `ON DELETE CASCADE` fires, and
+    ///    the re-embed lands on the existing vector row — so **a merge
+    ///    preserves divergence.**
+    ///
+    ///    A re-embedding pass does not. `Engine::reembed` in
+    ///    `memorysafe-engine`'s `reembed.rs` — the shared body of
+    ///    `Engine::backfill_embeddings` and `Engine::reembed_scope` — cannot
+    ///    `UPDATE` an item at all, because `items::insert` is a plain
+    ///    `INSERT` with no conflict clause and re-inserting a live id would
+    ///    violate the primary key. So it names the item in `txn.evictions`
+    ///    alongside its `upsert`, and that eviction is **required, not
+    ///    gratuitous**: `apply` runs the eviction loop *before* the upsert
+    ///    branch, `items::delete` removes the item row, and the
+    ///    `ON DELETE CASCADE` above takes the vector row with it. The
+    ///    upsert's `vectors::insert` therefore hits **no** conflict and
+    ///    writes `subject`/`namespace` fresh from the item's own scope.
+    ///    **Re-embedding heals Direction-2 divergence**; nothing else does.
     /// 2. **The scoped `vectors::delete` silently no-ops on such a row** — it
     ///    matches on `item_id AND subject AND namespace`. With (1): a merge
-    ///    that drops an embedding leaves a stale vector row that no later
-    ///    insert corrects and no scoped delete removes.
+    ///    that drops an embedding leaves a stale vector row that no *merge's*
+    ///    later insert corrects and no scoped delete removes — until a
+    ///    re-embedding pass over that scope replaces the row wholesale.
     /// 3. **`vectors::scope_embedder` mis-attributes.** It reads `SELECT
     ///    embedder, dim FROM vectors WHERE subject=?1 AND namespace=?2 LIMIT
     ///    1`, so a row leaked into scope T makes T report an embedder and
@@ -1478,8 +1497,9 @@ mod tests {
     /// 5. **`vectors::search` is unaffected**, because it never reads these
     ///    columns. No recall leak, no sensitivity-ceiling consequence.
     ///
-    /// **The honest bound.** Nothing structurally prevents divergence, the
-    /// upsert cannot heal it, and a one-line mutation produces it — but **no
+    /// **The honest bound.** Nothing structurally prevents divergence, no
+    /// upsert heals it (only the delete-and-reinsert in `Engine::reembed`
+    /// does, per (1)), and a one-line mutation produces it — but **no
     /// current engine path produces one**, because every `vectors::insert`
     /// call site passes the item's own scope. It is foreclosed **by
     /// convention, not by construction**, and this test is what makes the
