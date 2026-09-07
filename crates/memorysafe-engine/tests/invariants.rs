@@ -273,7 +273,7 @@ proptest! {
                 // assertion checked nothing.
                 prop_assert!(
                     level == SensitivityLevel::Public || !ws.items.is_empty(),
-                    "the premise: a {:?} ceiling in {:?} mode returned nothing, so the \
+                    "the premise: ceiling {:?} in {:?} mode returned nothing, so the \
                      leak check below never ran",
                     level, mode
                 );
