@@ -201,16 +201,28 @@ mod tests {
         // Task 2 writes tenant-level audit rows under `_admin`. A caller that
         // could name that scope could read another tenant's policy history —
         // or forge rows that look like the engine wrote them.
+        //
+        // Pin the returned `component` to the literal, not just the variant:
+        // `Err(AuthError::Reserved { .. })` alone is satisfied by a `scope`
+        // that always reports "_admin" regardless of which reserved word
+        // actually matched -- a caller rejected for "_purged" would then be
+        // told "'_admin' is reserved". That degree of freedom does not exist
+        // in the old single-word check; the `RESERVED_COMPONENTS` slice
+        // introduced it, so the test has to close it.
         let (store, secret, _) = store_with("ci");
         let auth = store.authenticate(&secret).unwrap();
 
         assert!(matches!(
             auth.scope(memorysafe_core::ADMIN_COMPONENT, "agent"),
-            Err(AuthError::Reserved { .. })
+            Err(AuthError::Reserved {
+                component: "_admin"
+            })
         ));
         assert!(matches!(
             auth.scope("user-42", memorysafe_core::ADMIN_COMPONENT),
-            Err(AuthError::Reserved { .. })
+            Err(AuthError::Reserved {
+                component: "_admin"
+            })
         ));
     }
 
@@ -226,19 +238,26 @@ mod tests {
         let (store, secret, _) = store_with("ci");
         let auth = store.authenticate(&secret).unwrap();
 
+        // Pin the returned `component` to "_purged", not just the variant --
+        // see the comment on `the_reserved_component_is_refused_in_either_position`
+        // for why `Err(AuthError::Reserved { .. })` alone is not enough.
         assert!(
             matches!(
                 auth.scope("_purged", "agent"),
-                Err(AuthError::Reserved { .. })
+                Err(AuthError::Reserved {
+                    component: "_purged"
+                })
             ),
-            "'_purged' as subject was accepted"
+            "'_purged' as subject was accepted, or reported the wrong component"
         );
         assert!(
             matches!(
                 auth.scope("user-42", "_purged"),
-                Err(AuthError::Reserved { .. })
+                Err(AuthError::Reserved {
+                    component: "_purged"
+                })
             ),
-            "'_purged' as namespace was accepted"
+            "'_purged' as namespace was accepted, or reported the wrong component"
         );
     }
 
