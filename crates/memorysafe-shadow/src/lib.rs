@@ -13,12 +13,9 @@ pub mod run;
 pub mod scenario;
 pub mod trace;
 
-// `diff` and `replay` are filled in by Tasks 16 and 17; this task leaves
-// them as empty modules (see their own doc comments), so nothing is
-// re-exported from either here yet — the plan's own lib.rs sketch for this
-// task re-exported `DecisionChange`/`TraceDiff`/`diff` from a module it also
-// says to leave empty, which cannot resolve. Left for whichever of those
-// tasks actually defines those items to add its own `pub use`.
+// `replay` is filled in by Task 17; this task leaves it as an empty module
+// (see its own doc comment), so nothing is re-exported from it yet.
+pub use diff::{DecisionChange, TraceDiff, diff};
 pub use run::run;
 pub use scenario::{Scenario, ScenarioWrite, Unreplayable};
 pub use trace::{Trace, TracedAction, TracedDecision, TracedProtection};

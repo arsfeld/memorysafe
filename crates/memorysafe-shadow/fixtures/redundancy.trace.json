@@ -1,0 +1,67 @@
+{
+  "scenario": "redundancy",
+  "policy": {
+    "name": "baseline",
+    "version": "0.1.0"
+  },
+  "decisions": [
+    {
+      "seq": 0,
+      "scope": {
+        "tenant": "acme",
+        "subject": "user-42",
+        "namespace": "agent"
+      },
+      "body_digest": "6a871b982f8ba7f366c63848f2d7d332ef6972c95bcc4f54da89cda861f9bde1",
+      "action": {
+        "kind": "retain",
+        "protection": {
+          "kind": "protected",
+          "window_seconds": 2592000
+        }
+      },
+      "reason_codes": [
+        "protected_fragile"
+      ],
+      "evicted": 0,
+      "sensitivity": "internal"
+    },
+    {
+      "seq": 1,
+      "scope": {
+        "tenant": "acme",
+        "subject": "user-42",
+        "namespace": "agent"
+      },
+      "body_digest": "6a871b982f8ba7f366c63848f2d7d332ef6972c95bcc4f54da89cda861f9bde1",
+      "action": {
+        "kind": "reject"
+      },
+      "reason_codes": [
+        "near_duplicate"
+      ],
+      "evicted": 0,
+      "sensitivity": null
+    },
+    {
+      "seq": 2,
+      "scope": {
+        "tenant": "acme",
+        "subject": "user-42",
+        "namespace": "agent"
+      },
+      "body_digest": "bf8e55f47a7a0e8adf2f12e3e49c51ff166b2e6fab38e0d2eb4e4e06cd15846f",
+      "action": {
+        "kind": "retain",
+        "protection": {
+          "kind": "normal"
+        }
+      },
+      "reason_codes": [
+        "novel_content"
+      ],
+      "evicted": 0,
+      "sensitivity": "internal"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "capacity",
+  "embedder_dim": 256,
+  "budgets": [
+    [ { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      { "max_items": 2, "max_bytes": null } ]
+  ],
+  "writes": [
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the release train departs on Thursdays", "kind": "fact", "tags": [] },
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the incident review template lives in the engineering wiki", "kind": "procedure", "tags": [] },
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the finance team closes the books on the fifth working day", "kind": "fact", "tags": [] },
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the office coffee machine is descaled every fortnight", "kind": "fact", "tags": [] },
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the staging cluster is rebuilt from scratch every night", "kind": "fact", "tags": [] }
+  ],
+  "unreplayable": []
+}

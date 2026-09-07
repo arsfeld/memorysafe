@@ -1,0 +1,11 @@
+{
+  "name": "sensitivity",
+  "embedder_dim": 256,
+  "budgets": [],
+  "writes": [
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the deployment api key is sk-abc123def456ghi789jkl012mno345",
+      "kind": "fact", "tags": [], "sensitivity_hint": "public" }
+  ],
+  "unreplayable": []
+}
