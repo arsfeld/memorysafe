@@ -136,6 +136,20 @@ impl From<CoreError> for ApiError {
     }
 }
 
+/// `memorysafe_core::parse_protection` is the one decision table for turning a
+/// caller's `(level, until)` pair into a `Protection` — see that function's
+/// own doc for why: the table was hand-copied three times across this plan's
+/// text before a line of it was written, and had already drifted between the
+/// copies. Every `ProtectionParseError` names the caller's own mistake (an
+/// unknown level, a missing or extraneous `until`, an out-of-range
+/// timestamp), never a server fault, so every variant maps to `Validation`
+/// uniformly rather than needing its own arm.
+impl From<memorysafe_core::ProtectionParseError> for ApiError {
+    fn from(e: memorysafe_core::ProtectionParseError) -> Self {
+        ApiError::Validation(e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

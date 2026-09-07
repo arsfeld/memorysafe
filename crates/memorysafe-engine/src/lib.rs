@@ -30,7 +30,7 @@ pub use write::RememberRequest;
 use memorysafe_backend::{Backend, ImportReport, Page, ScopeSelector, WriteTransaction};
 use memorysafe_core::{
     Action, Actor, AuditEvent, AuditFilter, AuditId, AuditRecord, Budget, Decision,
-    GovernancePolicy, MemoryItem, PolicyId, Reason, ReasonCode, Scope, TenantId, features,
+    GovernancePolicy, ItemId, MemoryItem, PolicyId, Reason, ReasonCode, Scope, TenantId, features,
 };
 use memorysafe_embed::Embedder;
 use memorysafe_policy::{BaselineConfig, BaselinePolicy};
@@ -384,6 +384,15 @@ impl Engine {
 
     pub async fn review(&self, scope: &Scope, page: &Page) -> Result<Vec<MemoryItem>, EngineError> {
         Ok(self.backend.list(scope, page).await?)
+    }
+
+    /// A single memory by id, scope-filtered like every other read. `None`
+    /// means either the id does not exist or it exists outside `scope` — the
+    /// two are indistinguishable here, and adapters must not treat them
+    /// differently, or a caller could learn that an id is "real, just not
+    /// theirs" by probing another tenant's or subject's ids.
+    pub async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, EngineError> {
+        Ok(self.backend.get(scope, id).await?)
     }
 
     pub async fn audit(

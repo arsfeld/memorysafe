@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod memories;
 pub mod query;
 pub mod scope;
 
@@ -17,7 +18,7 @@ use crate::auth::Auth;
 use axum::Json;
 use axum::Router;
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use memorysafe_auth::ApiKeyStore;
 use memorysafe_engine::Engine;
 use std::sync::Arc;
@@ -33,6 +34,17 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/whoami", get(whoami))
+        .route("/v1/recall", post(memories::recall))
+        .route(
+            "/v1/memories",
+            post(memories::remember).get(memories::review),
+        )
+        .route(
+            "/v1/memories/{id}",
+            get(memories::get_one).delete(memories::delete_one),
+        )
+        .route("/v1/memories/{id}/protect", post(memories::protect))
+        .route("/v1/forget", post(memories::forget))
         // ADD EVERY NEW `.route(...)` ABOVE THIS LINE, NEVER BELOW IT.
         //
         // `Router::fallback` only covers an unmatched *path*. A matched path
