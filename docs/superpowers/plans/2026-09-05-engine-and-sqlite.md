@@ -14759,10 +14759,14 @@ git commit -m "feat(engine): portable ndjson export/import plus a human-readable
 
 ---
 
-## Task 40: The five correctness invariants
+## Task 40: The five correctness invariants (plus a sixth, ruled in during execution)
 
 **Files:**
 - Create: `crates/memorysafe-engine/tests/invariants.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs` (the `capacity_state` accessor, Step 3)
+- Modify: `crates/memorysafe-backend-sqlite/src/lib.rs` (the sixth invariant, Step 3b --
+  it CANNOT live in the engine crate; see that step for why)
+- Modify: `docs/known-gaps.md` (Step 3b corrects a stale claim there)
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
@@ -15003,7 +15007,7 @@ Add the missing read-through accessor to `crates/memorysafe-engine/src/lib.rs`:
 
 Any invariant that then fails is a real defect, not a test problem. The two most likely, and their fixes:
 
-- **Capacity exceeded.** `Engine::remember` offers eviction candidates only when `capacity.budget.is_bounded()` (Task 33, `gather::admit_context`). Confirm the budget is read fresh per write rather than cached — `CacheConfig` caches `ScopeStats`, never `CapacityState`, and that distinction is load-bearing.
+- **Capacity exceeded.** `Engine::remember` offers eviction candidates only when `capacity.budget.is_bounded()` (Task 33, `gather::admit_context`). Confirm the budget is read fresh per write rather than cached. **Correction, verified on this branch before dispatch:** this sentence originally warned that `CacheConfig` caches `ScopeStats` but never `CapacityState`. That distinction is real but currently INERT — nothing on the read path reads the stats cache. `gather.rs:36`, `read.rs:98` and `maintain.rs:84` all call `backend.scope_stats()` directly, and the only callers of `EngineCache::stats()`/`put_stats()` in the whole workspace are that crate's own tests (`cache.rs:40-41` says so in its own doc comment). So there is no stale-cache risk to chase here. If `capacity_is_never_exceeded` reports drift, the cause is in the SQLite accounting or in the admission path, NOT in a stale cached stat. Do not transcribe the original warning as a live concern.
 - **Audit count mismatch.** A rejected write must still write exactly one audit record. Confirm the `Action::Reject` branch in `remember` builds a `WriteTransaction` with no `upsert` and no `merge` but still passes its audit record through `backend.apply`.
 
 Add the invariants job to `.github/workflows/ci.yml`:
@@ -15019,6 +15023,97 @@ Add the invariants job to `.github/workflows/ci.yml`:
         env:
           PROPTEST_CASES: 64
 ```
+
+- [ ] **Step 3b: The sixth invariant — vector/item scope consistency**
+
+Ruled in during execution, after the five above were written. It is a real gap in the
+five: nothing in Invariants 1-5 can observe the `vectors` table at all.
+
+**It does NOT go in `crates/memorysafe-engine/tests/invariants.rs`.** Neither direction is
+observable from the engine's public API, and this was verified on this branch before
+dispatch, not assumed:
+
+- The `Backend` trait exposes no vector-observation surface whatsoever. Its methods are
+  `retrieve_candidates`, `neighbours`, `capacity_state`, `scope_stats`, `apply`,
+  `record_recall`, `get`, `list`, `audit`, `purge_subject`, `audit_aggregates`, `export`,
+  `import`, `set_budget`. None returns a vector row or a count of them.
+- `SqliteBackend`'s only public non-trait methods are `open`, `with_max_open` and
+  `forget_tenant`.
+- `vectors::search` cannot substitute, and the reason is already written down in
+  `vector_rows_for_item`'s doc comment in `crates/memorysafe-backend-sqlite/src/lib.rs`:
+  search joins `vectors` to `items` on `item_id` and filters on the **item's** scope, so it
+  reports zero for a vector row whose own scope columns diverged exactly as readily as for
+  one that was genuinely deleted. An instrument that reports absence for two different
+  reasons cannot distinguish them.
+
+So it goes in the **existing `mod tests` in `crates/memorysafe-backend-sqlite/src/lib.rs`**,
+as a plain `#[tokio::test]`. That crate has `tokio` with the `macros` feature as a *main*
+dependency, so `#[tokio::test]` works with no manifest change. It has **no** `proptest`
+dev-dependency: do not add one, and do not write this as a property test. A handful of
+explicit cases plus the two mutations below is the right shape here.
+
+Reuse the existing `vector_rows_for_item(b, scope, id)` helper in that module for the
+per-item direction. Direction 2 needs one new unjoined aggregate read in the same style
+(`b.tenants.with_conn(...)`).
+
+**DIRECTION 1 — no live item is without a vector row, UNLESS it is marked
+`pending_embedding`.** `MemoryItem::pending_embedding` is a public field, and
+`RetrievalFilter::exclude_pending_embedding` (`memorysafe-backend/src/query.rs:48`) is what
+keeps such items out of vector retrieval. CONSEQUENCE, to be stated in the test's doc
+comment: this invariant is only as trustworthy as `pending_embedding` itself. That flag is
+the invariant's own escape hatch — if it were set spuriously, the invariant would pass
+while the corpus silently lost vector coverage. Task 41 owns the backfill that drains it.
+
+**DIRECTION 2 — every vector row's `subject`/`namespace` agree with the scope of the item
+it references.** This is the one with teeth, and the schema is why: `vectors.item_id` is
+`TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE`, but `subject` and `namespace`
+are plain `TEXT NOT NULL` columns with **nothing** tying them to the referenced item's
+scope.
+
+Consequences of a divergent row, verified against the code, in descending sharpness —
+put these in the doc comment, and do not inflate them:
+
+1. **Divergence cannot self-heal.** `vectors::insert` is an upsert whose conflict clause is
+   `ON CONFLICT(item_id) DO UPDATE SET embedder=..., dim=..., scale=..., q=...`.
+   `subject` and `namespace` are **not in that SET list**, so every subsequent re-embed
+   preserves the divergence.
+2. **The scoped `vectors::delete` silently no-ops on such a row** — it matches on
+   `item_id AND subject AND namespace`. Combined with (1): a merge that drops an embedding
+   leaves a stale vector row that no later insert corrects and no scoped delete removes.
+3. **`vectors::scope_embedder` mis-attributes.** It reads `SELECT embedder, dim FROM vectors
+   WHERE subject=?1 AND namespace=?2 LIMIT 1` — a row leaked into scope T makes T report an
+   embedder and dimension it has no items for.
+4. **`PurgeReport::vectors_removed` under-counts.** `purge::subject` deletes vectors by
+   `vectors.subject` first, but then deletes items by `items.subject`, and the FK cascade
+   takes the divergent row with it. **The data IS still erased** — the count is wrong, the
+   erasure is not. Do not claim a right-to-erasure consequence here; there isn't one.
+5. **`vectors::search` is unaffected**, because it never reads these columns. There is no
+   recall leak and no sensitivity-ceiling consequence.
+
+**DO NOT assert "no orphan vector rows"** (a vector row whose `item_id` matches no item).
+The FK cascade gives that for free and it is already pinned by
+`schema::tests::initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector`.
+Asserting it here would test SQLite, not this code.
+
+**HONEST BOUND — keep this in the doc comment, in these terms.** Nothing structurally
+prevents divergence, the upsert cannot heal it, and a one-line mutation produces it — but
+**no current engine path produces one**, because every `vectors::insert` call site passes
+the item's own scope. It is foreclosed **by convention, not by construction**. State it
+that way, or a later reader will call the invariant speculative and delete it.
+
+**Correct the stale claim in `docs/known-gaps.md`.** Its "Elsewhere" section says the
+`vectors` table's duplicated scope columns have "exactly one reader, `scope_embedder`".
+That is now wrong in two ways: the newly-scoped `vectors::delete` reads both columns, and
+`purge.rs`'s `DELETE FROM vectors WHERE subject = ?1` reads `subject`. Update the entry to
+name all three readers and to note that this test now pins the property. Cite the entry by
+its symbol and description. **Use no commit hashes anywhere** — a repo-wide history
+rewrite orphaned every pre-rewrite SHA in this repository, so a hex reference in a comment
+is a dead pointer.
+
+**Mutation-test both directions** (Global Constraint). At minimum: delete the scope columns
+from `vectors::insert`'s parameter list so they take a wrong-but-valid value (wrong-value
+class), and remove the `pending_embedding` guard from Direction 1's assertion (absence
+class). Report survivors.
 
 - [ ] **Step 4: Run test to verify it passes**
 
