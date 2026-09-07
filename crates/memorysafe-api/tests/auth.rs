@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use memorysafe_auth::{ApiKeyStore, generate};
 use memorysafe_core::TenantId;
 use serde_json::json;
-use support::{get, harness, send};
+use support::{get, harness, post, send};
 
 #[tokio::test]
 async fn health_needs_no_credential() {
@@ -88,6 +88,26 @@ async fn the_bearer_scheme_is_accepted_case_insensitively() {
         );
         assert_eq!(reply.body["tenant"], "acme");
     }
+
+    // The scheme boundary: `strip_bearer` requires exactly one space after
+    // the scheme (`split_once(' ')`), matching `memorysafe-mcp`'s own test
+    // (`http_accepts_the_bearer_scheme_case_insensitively`). Without this, a
+    // regression to `strip_prefix("Bearer")` (no trailing space) combined
+    // with the existing `.map(str::trim)` would accept `Bearer<key>` as a
+    // valid credential and pass every other test in this file.
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/whoami")
+        .header("authorization", format!("Bearer{}", h.key))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let reply = send(&h.app, request).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNAUTHORIZED,
+        "a missing space after the scheme must still be refused: {}",
+        reply.text
+    );
 }
 
 #[tokio::test]
@@ -128,4 +148,34 @@ async fn an_unknown_route_is_404_with_a_problem_body() {
     let h = harness();
     let reply = send(&h.app, get("/v1/nope", Some(&h.key))).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    // Not just the status: axum's own default fallback also answers a bare
+    // 404 with an empty body, so asserting status alone cannot tell "our
+    // `not_found` handler ran" from "no fallback is wired up at all" —
+    // deleting `.fallback(not_found)` from `router()` would still pass a
+    // status-only assertion. `not_found`'s whole reason to exist (its own
+    // doc comment: "a client parsing `Problem` on every failure would choke
+    // on the one failure it did not cause") goes untested without this.
+    assert_eq!(reply.body["error"], "not_found");
+    assert!(reply.body["message"].is_string());
+    assert_eq!(reply.body["retryable"], json!(false));
+}
+
+#[tokio::test]
+async fn a_matched_path_with_the_wrong_method_is_405_with_a_problem_body() {
+    // `Router::fallback` (which `an_unknown_route_is_404...` pins) only
+    // covers an unmatched *path*. `/v1/health` exists and only answers GET,
+    // so POSTing it is the other half of "axum can answer a 4xx before any
+    // handler of ours runs": without `.method_not_allowed_fallback(...)`,
+    // axum's own default is an empty-bodied 405 that bypasses `Problem`.
+    let h = harness();
+    let reply = send(&h.app, post("/v1/health", None, json!({}))).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "{}",
+        reply.text
+    );
+    assert_eq!(reply.body["error"], "method_not_allowed");
+    assert!(reply.body["message"].is_string());
+    assert_eq!(reply.body["retryable"], json!(false));
 }

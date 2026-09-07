@@ -16,6 +16,7 @@ pub use scope::ScopeParams;
 use crate::auth::Auth;
 use axum::Json;
 use axum::Router;
+use axum::http::StatusCode;
 use axum::routing::get;
 use memorysafe_auth::ApiKeyStore;
 use memorysafe_engine::Engine;
@@ -33,6 +34,21 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/whoami", get(whoami))
         .fallback(not_found)
+        // `Router::fallback` only covers an unmatched *path*. A matched path
+        // called with the wrong method (e.g. `POST /v1/health`) never reaches
+        // `fallback` — axum's `MethodRouter` answers that itself, by default
+        // an empty-bodied 405, bypassing the `Problem` envelope every other
+        // failure on this API returns. Nearly invisible today with two GET
+        // routes; Tasks 8-10 add POST/PUT/DELETE, where a wrong-method call
+        // becomes a real, everyday client mistake.
+        .method_not_allowed_fallback(method_not_allowed)
+        // `TraceLayer::new_for_http()`'s default span (`DefaultMakeSpan::new()`)
+        // does NOT include headers (`include_headers: false`), so the
+        // `Authorization` header — and any presented API key — is never
+        // recorded. Left at the default deliberately; do not add
+        // `.make_span_with(DefaultMakeSpan::new().include_headers(true))`
+        // without a redaction step, or every presented key ends up in the
+        // trace log.
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -58,4 +74,21 @@ async fn whoami(auth: Auth) -> Json<serde_json::Value> {
 /// cause.
 async fn not_found() -> ApiError {
     ApiError::NotFound("no such route".into())
+}
+
+/// A matched path called with a method it doesn't support. Not built through
+/// `ApiError`: 405 is a routing artifact axum's `MethodRouter` produces
+/// before any handler runs, not one of §9's engine/auth-driven error kinds
+/// (`Validation`/`Auth`/`NotFound`/`Conflict`/`Backend`/`PolicyRefused`), so
+/// it has no slot in that table. Still answers the same `Problem` shape every
+/// other failure on this API does, for the same reason `not_found` does.
+async fn method_not_allowed() -> (StatusCode, Json<Problem>) {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(Problem {
+            error: "method_not_allowed",
+            message: "method not allowed on this route".into(),
+            retryable: false,
+        }),
+    )
 }
