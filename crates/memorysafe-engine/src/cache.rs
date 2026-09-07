@@ -58,23 +58,24 @@ impl Default for CacheConfig {
 /// signature change, not a two-line wiring edit.
 ///
 /// **What leaving it unwired costs today: nothing, for a single-instance,
-/// sole-writer deployment.** Invalidation is wired into all six
+/// sole-writer deployment.** Invalidation is wired into all seven
 /// `Backend::apply`/`Backend::purge_subject` call sites in this engine
 /// (`remember`, `forget`, `protect`, `purge_subject`, `maintain`'s
-/// decision-application write, and `apply_merge` — see each one's own call
-/// to `invalidate_scope`). Since every corpus change this engine can make
-/// goes through one of those six surfaces, and each invalidates before the
-/// write it guards can be observed, `Backend::scope_stats` read directly (as
-/// every caller does today) can never be stale relative to *this engine's
+/// decision-application write, `apply_merge`, and `reembed` — see each
+/// one's own call to `invalidate_scope`). Since every corpus change this
+/// engine can make goes through one of those seven surfaces, and each
+/// invalidates before the write it guards can be observed,
+/// `Backend::scope_stats` read directly (as every caller does today) can
+/// never be stale relative to *this engine's
 /// own writes* — there is no window for `stats_ttl` to matter yet. The
 /// exposure a read-through would start bounding is external to any single
 /// `Engine`: a second engine instance, or a writer outside this engine
 /// entirely, changing the same backend's data through a path that calls
-/// none of the six surfaces above. Wiring `stats()`/`put_stats()` into a
+/// none of the seven surfaces above. Wiring `stats()`/`put_stats()` into a
 /// read path would only turn that unbounded exposure into one bounded by
 /// `stats_ttl` (30 seconds by default) — and that bound would come *entirely*
-/// from those six surfaces staying wired. **Unwiring `invalidate_scope` from
-/// any one of them would silently widen this bound back toward unbounded,
+/// from those seven surfaces staying wired. **Unwiring `invalidate_scope`
+/// from any one of them would silently widen this bound back toward unbounded,
 /// with no test able to catch the regression until the stats cache actually
 /// has a reader to make it observable.**
 pub struct EngineCache {

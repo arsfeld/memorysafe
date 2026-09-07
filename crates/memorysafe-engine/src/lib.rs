@@ -10,6 +10,7 @@ pub mod mutate;
 pub mod outcome;
 pub mod portability;
 pub mod read;
+pub mod reembed;
 pub mod retention;
 pub mod validate;
 pub mod write;
@@ -19,6 +20,7 @@ pub use error::EngineError;
 pub use maintain::{MAINTAIN_BATCH, MaintainCursor, MaintainReport};
 pub use mutate::ForgetSelector;
 pub use outcome::{ForgetOutcome, PurgeOutcome, WriteOutcome};
+pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 pub use retention::{AuditRetention, PurgeCascade, RetentionProfile, RetentionSpan};
 pub use validate::FailureStance;
 pub use write::RememberRequest;
@@ -134,9 +136,10 @@ impl Engine {
     /// is currently unreachable from any read path — `gather::assess_context`,
     /// `read::recall` and `maintain` all call `Backend::scope_stats` directly,
     /// and the only callers of `EngineCache::stats`/`put_stats` anywhere in
-    /// the workspace are this crate's own test modules in `mutate.rs` and
-    /// `maintain.rs` (`cache.rs` itself has no `#[cfg(test)]` module at all,
-    /// so do not go looking there). So there is no cached capacity
+    /// the workspace are this crate's own test modules in `mutate.rs`,
+    /// `maintain.rs` and `reembed.rs` (`cache.rs` itself has no
+    /// `#[cfg(test)]` module at all, so do not go looking there). So there is
+    /// no cached capacity
     /// figure anywhere to go stale, and none should be introduced here: this
     /// is the accessor `capacity_is_never_exceeded` (`tests/invariants.rs`)
     /// cross-checks the stored item count against, and a cached answer would
