@@ -13910,7 +13910,7 @@ pub use maintain::{MAINTAIN_BATCH, MaintainCursor, MaintainReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 98 tests ok (89 planned + the 9 propagated from Task 35's mutation-testing closures).
+Expected: PASS — 104 tests ok (95 planned + the 9 propagated from Task 35's mutation-testing closures). Task 36's own executor found the brief's mandated five insufficient — the merge arm required by the brief's prose (see "The requirement is restated here" above) needed its own coverage across both `MergeStrategy` arms and its three defensive guards (pinning, self-merge, missing target) plus the tag/attr union and re-embed step, six tests beyond the five mandated.
 
 - [ ] **Step 5: Commit**
 
@@ -14128,7 +14128,7 @@ Add `pub mod cache;` and `pub use cache::{CacheConfig, EngineCache};` to `lib.rs
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 103 tests ok (94 planned + the 9 propagated from Task 35's mutation-testing closures).
+Expected: PASS — 109 tests ok (100 planned + the 9 propagated from Task 35's mutation-testing closures).
 
 - [ ] **Step 5: Commit**
 
@@ -14436,7 +14436,7 @@ Add `pub mod retention;` and
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 108 tests ok (99 planned + the 9 propagated from Task 35's mutation-testing closures).
+Expected: PASS — 114 tests ok (105 planned + the 9 propagated from Task 35's mutation-testing closures).
 
 - [ ] **Step 5: Commit**
 
@@ -14748,7 +14748,7 @@ Add `pub mod portability;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 115 tests ok (106 planned + the 9 propagated from Task 35's mutation-testing closures).
+Expected: PASS — 121 tests ok (112 planned + the 9 propagated from Task 35's mutation-testing closures).
 
 - [ ] **Step 5: Commit**
 
@@ -15023,7 +15023,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 120 memorysafe-engine tests (111 planned + the 9 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates.
+Expected: PASS — the whole workspace green: 5 invariants, 126 memorysafe-engine tests (117 planned + the 9 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates.
 
 - [ ] **Step 5: Commit**
 
@@ -15397,7 +15397,7 @@ pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine && cargo test --workspace --all-features`
-Expected: PASS — 127 engine tests ok (118 planned + the 9 propagated from Task 35's mutation-testing closures), whole workspace green.
+Expected: PASS — 133 engine tests ok (124 planned + the 9 propagated from Task 35's mutation-testing closures), whole workspace green.
 
 - [ ] **Step 5: Commit**
 

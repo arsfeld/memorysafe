@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod gather;
+pub mod maintain;
 pub mod mutate;
 pub mod outcome;
 pub mod read;
@@ -11,6 +12,7 @@ pub mod validate;
 pub mod write;
 
 pub use error::EngineError;
+pub use maintain::{MAINTAIN_BATCH, MaintainCursor, MaintainReport};
 pub use mutate::ForgetSelector;
 pub use outcome::{ForgetOutcome, PurgeOutcome, WriteOutcome};
 pub use validate::FailureStance;
