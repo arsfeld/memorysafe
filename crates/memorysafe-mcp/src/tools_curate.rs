@@ -27,7 +27,7 @@ impl MemorySafeServer {
     /// List what is stored and why.
     #[tool(
         name = "memory_review",
-        description = "List the memories stored in this scope with the governance reason each one is there for. Use this to show a person what the agent remembers about them."
+        description = "List the memories stored in this scope with the governance reason each one is there for. Use this to show a person what the agent remembers about them. The reason is only available for decisions made within the recent audit window; an older item is still listed but reports reason_code and reason_detail as null rather than a guessed reason."
     )]
     async fn memory_review(
         &self,
@@ -93,7 +93,17 @@ impl MemorySafeServer {
                 })
                 .collect(),
             offset: page.offset,
-            limit: page.limit,
+            // Not `page.limit`: the backend clamps to `Page::effective_limit()`
+            // before running the query (`MAX_PAGE_LIMIT`), and this echo is
+            // the only exhaustion signal a caller has — `AuditFilter::limit`'s
+            // doc states the same convention for audit paging: no `truncated`
+            // flag, `returned.len() < limit` is the sole exhaustion test. An
+            // echo of the raw, unclamped request would make a caller asking
+            // for more than the ceiling see fewer items than the (wrong)
+            // limit it was told, and wrongly conclude the scope was
+            // exhausted — silently hiding part of what is stored, which is
+            // exactly what this tool exists to prevent.
+            limit: page.effective_limit(),
         }))
     }
 

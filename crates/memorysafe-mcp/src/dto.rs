@@ -298,6 +298,22 @@ pub struct RecallParams {
     pub namespace: Option<String>,
 }
 
+/// **`memory_review` carries no `sensitivity_ceiling`, unlike `RecallParams`
+/// above — deliberately, not an oversight. Do not add one.**
+///
+/// `RecallParams::sensitivity_ceiling` fails closed because recall is the
+/// *retrieval* surface: its results feed straight into an agent's working
+/// set, so a caller that forgets to widen the ceiling should get the
+/// conservative default rather than an accidental over-disclosure. Review is
+/// the *disclosure* surface — the design spec (§618) defines `memory_review`
+/// as the tool that turns "reviewable rather than invisible" into something
+/// an agent can show the person the memories are about. A ceiling that hid a
+/// subject's own `restricted`/`sensitive` memories from a review of what is
+/// stored about them would defeat that purpose outright: the two surfaces
+/// have opposite failure modes on purpose, not by accident, and a future
+/// implementer (the HTTP or CLI review endpoint, most likely) porting
+/// recall's fail-closed ceiling onto review would silently break the
+/// disclosure guarantee this tool exists to provide.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReviewParams {
     pub limit: Option<usize>,

@@ -2,6 +2,7 @@ mod support;
 
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
+use std::collections::HashSet;
 use support::{args, connect, engine};
 
 fn structured(result: &rmcp::model::CallToolResult) -> &serde_json::Value {
@@ -101,6 +102,24 @@ async fn review_pages() {
         .await;
     }
 
+    let first = client
+        .call_tool(
+            CallToolRequestParams::new("memory_review")
+                .with_arguments(args(json!({ "limit": 2, "offset": 0 }))),
+        )
+        .await
+        .unwrap();
+    let first_value = structured(&first);
+    assert_eq!(first_value["offset"], json!(0));
+    assert_eq!(first_value["limit"], json!(2));
+    let first_ids: HashSet<String> = first_value["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(first_ids.len(), 2, "premise: the first page has two items");
+
     let page = client
         .call_tool(
             CallToolRequestParams::new("memory_review")
@@ -108,7 +127,51 @@ async fn review_pages() {
         )
         .await
         .unwrap();
-    assert_eq!(structured(&page)["items"].as_array().unwrap().len(), 2);
+    let page_value = structured(&page);
+    // Pins the response's own offset/limit echo, not just the item count —
+    // a hard-coded `offset: 0` in the adapter would still return two items
+    // here (there are five in the scope) and still pass a count-only check.
+    assert_eq!(page_value["offset"], json!(2));
+    assert_eq!(page_value["limit"], json!(2));
+    let page_items = page_value["items"].as_array().unwrap();
+    assert_eq!(page_items.len(), 2);
+    let page_ids: HashSet<String> = page_items
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        first_ids.is_disjoint(&page_ids),
+        "offset must move the page, not just shrink it: {first_ids:?} vs {page_ids:?}"
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_echoes_the_clamped_limit_not_the_requested_one() {
+    // The backend clamps `Page::limit` to `MAX_PAGE_LIMIT` before running the
+    // query (`Page::effective_limit`), and this workspace's own paging
+    // convention (`AuditFilter::limit`'s doc) makes `returned.len() < limit`
+    // the SOLE exhaustion signal — there is deliberately no `truncated` flag.
+    // If the echoed `limit` were the raw, unclamped request, a client paging
+    // with a large limit would see fewer items than that limit and wrongly
+    // conclude the scope was exhausted, silently hiding the rest of what is
+    // stored — precisely what `memory_review` exists to make visible.
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
+    remember(&client, "one memory in a very large requested page", "bulk").await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("memory_review")
+                .with_arguments(args(json!({ "limit": 5000 }))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        structured(&result)["limit"],
+        json!(memorysafe_backend::MAX_PAGE_LIMIT),
+        "the echoed limit must be the backend's clamped ceiling, not the raw request"
+    );
     client.cancel().await.unwrap();
 }
 
@@ -157,6 +220,21 @@ async fn forgetting_by_tag_removes_only_the_tagged_memories() {
     assert_eq!(
         structured(&result)["forgotten"].as_array().unwrap().len(),
         2
+    );
+
+    // The count alone does not prove the RIGHT two were forgotten — a
+    // defect that deletes any two of the three items would also report two.
+    // Confirm the untagged item specifically survived.
+    let review = client
+        .call_tool(CallToolRequestParams::new("memory_review").with_arguments(args(json!({}))))
+        .await
+        .unwrap();
+    let items = structured(&review)["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "exactly the untagged item should remain");
+    assert_eq!(
+        items[0]["body"],
+        json!("beta note about the kitchen"),
+        "the tag filter must remove only 'work'-tagged memories, leaving 'home' untouched"
     );
     client.cancel().await.unwrap();
 }
