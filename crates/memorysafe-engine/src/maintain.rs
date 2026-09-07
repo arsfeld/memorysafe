@@ -112,12 +112,21 @@ impl Engine {
 
         for d in &decisions {
             for e in &d.evictions {
-                // The engine enforces pinning even if a policy forgets.
-                let pinned = ctx
-                    .batch
-                    .iter()
-                    .any(|c| c.item.id == e.item && c.item.protection == Protection::Pinned);
-                if !pinned {
+                // Looked up in THIS batch, not trusted as a bare id — the same
+                // discipline the merge arm below applies, and for the same
+                // reason. One `Arc<dyn GovernancePolicy>` serves every scope
+                // this engine handles; without this check a policy that
+                // retains an id it saw while deciding for scope A can hand
+                // that same id back as an "eviction" while deciding for scope
+                // B, and `items::delete` being scope-filtered only saves the
+                // ROW — `vectors::delete` carries no scope predicate at all
+                // and would silently strip scope A's vector regardless. The
+                // engine enforces pinning, and now membership, even if a
+                // policy forgets.
+                let Some(candidate) = ctx.batch.iter().find(|c| c.item.id == e.item) else {
+                    continue;
+                };
+                if candidate.item.protection != Protection::Pinned {
                     to_forget.push(e.item.clone());
                 }
             }
@@ -179,8 +188,15 @@ impl Engine {
             self.backend.apply(txn).await?;
         }
 
-        // Advance past what survived; forgotten rows have shifted the window.
-        let next_offset = offset + scanned.saturating_sub(forgotten);
+        // Advance past what survived; forgotten rows AND consolidated
+        // (merged-away) rows have both shifted the window. `Backend::list` is
+        // a total order over the whole scope, so every row deleted from
+        // inside the scanned window — whether by eviction or by a merge's own
+        // `txn.evictions` on the absorbed item — moves everything after it
+        // one position earlier. Accounting for `forgotten` alone left
+        // `consolidated` rows uncounted, overshooting the next offset by
+        // exactly that many and silently skipping that many items forever.
+        let next_offset = offset + scanned.saturating_sub(forgotten + consolidated);
         let next_cursor = if is_final_batch {
             None
         } else {

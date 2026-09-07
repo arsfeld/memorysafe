@@ -4,7 +4,7 @@ use memorysafe_embed::DeterministicEmbedder;
 use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
 use memorysafe_policy::BaselinePolicy;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use time::Duration;
 
 fn engine() -> Engine {
@@ -649,5 +649,318 @@ async fn maintenance_merge_reembeds_the_targets_content() {
         spy.calls() > calls_before_maintain,
         "the merge must re-embed the merged content rather than leaving the \
          target's vector stale"
+    );
+}
+
+// --- Fix round 1: the cursor must account for consolidated rows, not just
+// forgotten ones -------------------------------------------------------
+//
+// `Backend::list` is a total order (`ORDER BY created_at ASC, id ASC`), so
+// deleting ANY row from inside the scanned window shifts the offsets of
+// everything after it — whether that row was removed by an eviction or by a
+// merge's own absorbed-item eviction. `maintenance_resumes_from_its_cursor`
+// above cannot catch a cursor bug caused by merges: it runs under
+// `BaselinePolicy`, which never emits a merge, so paging and merging have
+// never been exercised together before this test.
+
+/// Forces exactly one merge on the FIRST page only (an `AtomicBool` latch),
+/// merging the batch's second item into its first. Every other decision is
+/// `BaselinePolicy`'s own, delegated through.
+struct ForcesOneMergeOnFirstPage {
+    baseline: BaselinePolicy,
+    merged_once: AtomicBool,
+}
+
+impl memorysafe_core::GovernancePolicy for ForcesOneMergeOnFirstPage {
+    fn id(&self) -> memorysafe_core::PolicyId {
+        memorysafe_core::PolicyId::new("test-forces-one-merge-on-first-page", "0.0.1")
+    }
+
+    fn assess(
+        &self,
+        cand: &memorysafe_core::Candidate,
+        ctx: &memorysafe_core::AssessContext,
+    ) -> Result<memorysafe_core::Assessment, memorysafe_core::PolicyError> {
+        self.baseline.assess(cand, ctx)
+    }
+
+    fn admit(
+        &self,
+        assessed: &memorysafe_core::Assessed,
+        ctx: &memorysafe_core::AdmitContext,
+    ) -> Result<memorysafe_core::Decision, memorysafe_core::PolicyError> {
+        self.baseline.admit(assessed, ctx)
+    }
+
+    fn compose(
+        &self,
+        _req: &memorysafe_core::RecallRequest,
+        _candidates: &[memorysafe_core::ScoredCandidate],
+        _ctx: &memorysafe_core::ComposeContext,
+    ) -> Result<memorysafe_core::WorkingSet, memorysafe_core::PolicyError> {
+        unimplemented!("maintain tests never call compose")
+    }
+
+    fn maintain(
+        &self,
+        ctx: &memorysafe_core::MaintainContext,
+    ) -> Result<Vec<memorysafe_core::Decision>, memorysafe_core::PolicyError> {
+        // `swap` returns the PRIOR value: only the call that finds it still
+        // `false` gets to force the merge, and it is the only one that ever
+        // will — later calls (the second page) see `true` and fall through
+        // to an empty decision list.
+        if !self.merged_once.swap(true, Ordering::SeqCst) && ctx.batch.len() >= 2 {
+            let into = &ctx.batch[0].item;
+            let absorbed = &ctx.batch[1].item;
+            return Ok(vec![memorysafe_core::Decision {
+                subject: Some(absorbed.id.clone()),
+                action: memorysafe_core::Action::Merge {
+                    into: into.id.clone(),
+                    strategy: memorysafe_core::MergeStrategy::AppendAndUnion,
+                },
+                evictions: vec![],
+                reasons: vec![memorysafe_core::Reason::new(
+                    memorysafe_core::ReasonCode::HighRedundancy,
+                    "forced merge for the cursor-arithmetic test",
+                    memorysafe_core::features! {},
+                )],
+                policy: self.id(),
+            }]);
+        }
+        Ok(vec![])
+    }
+}
+
+/// The direct regression test for Fix 1. Seeds 205 items (more than one
+/// `MAINTAIN_BATCH` page), forces exactly one merge within the first page,
+/// and pins the exact arithmetic: without accounting for `consolidated`, the
+/// second page starts one position too late and permanently skips the item
+/// that shifted into the gap the merge left behind.
+#[tokio::test]
+async fn maintenance_resumes_correctly_when_a_merge_lands_on_a_page_boundary() {
+    let e = engine_with(ForcesOneMergeOnFirstPage {
+        baseline: BaselinePolicy::default(),
+        merged_once: AtomicBool::new(false),
+    });
+
+    const TOTAL: usize = 205;
+    for i in 0..TOTAL {
+        let mut r = RememberRequest::new(scope(), &format!("memory number {i} on subject {i}"));
+        r.idempotency_key = Some(format!("seed-{i}"));
+        e.remember(r).await.unwrap();
+    }
+    let full_page = memorysafe_backend::Page {
+        offset: 0,
+        limit: TOTAL + 10,
+    };
+    assert_eq!(
+        e.review(&scope(), &full_page).await.unwrap().len(),
+        TOTAL,
+        "the premise needs all items admitted as distinct rows, none merged at write time"
+    );
+
+    let first = e.maintain(&scope(), None).await.unwrap();
+    assert_eq!(first.scanned, memorysafe_engine::MAINTAIN_BATCH);
+    assert_eq!(first.forgotten, 0);
+    assert_eq!(first.consolidated, 1, "the forced merge must be applied");
+    let cursor = first
+        .next_cursor
+        .expect("205 items over a 200-item batch must page");
+    assert_eq!(
+        cursor.offset, 199,
+        "one row was removed from inside the scanned window (by the merge, \
+         not an eviction), so the next offset must be scanned - forgotten - \
+         consolidated = 200 - 0 - 1 = 199, not 200"
+    );
+
+    let second = e.maintain(&scope(), Some(cursor)).await.unwrap();
+    assert_eq!(
+        second.scanned, 5,
+        "205 total minus 1 merged away minus the 199 already advanced past \
+         leaves exactly 5 unscanned rows; a cursor that overshot by the \
+         consolidated count would scan only 4 and permanently skip one"
+    );
+    assert!(
+        second.next_cursor.is_none(),
+        "the second page must be final"
+    );
+    assert_eq!(second.consolidated, 0);
+
+    let survivors = e.review(&scope(), &full_page).await.unwrap();
+    assert_eq!(
+        survivors.len(),
+        TOTAL - 1,
+        "exactly one item (the absorbed side of the forced merge) is gone"
+    );
+    // The item that would be silently skipped under the bug is the one
+    // immediately after the merge's absorbed item in creation order —
+    // "memory number 200" survives the merge (it is neither side of it) and
+    // must still be reachable after paging completes.
+    assert!(
+        survivors
+            .iter()
+            .any(|i| i.body == "memory number 200 on subject 200"),
+        "an item past the page boundary must not be silently skipped"
+    );
+}
+
+// --- Fix round 1: the mandated eviction loop must not evict an id it never
+// offered, the same discipline the merge arm already has ------------------
+//
+// `Engine`'s policy is one `Arc<dyn GovernancePolicy>` shared across every
+// scope it maintains. Before this fix, an id absent from `ctx.batch` was
+// treated as "not pinned" and forwarded to `txn.evictions` anyway;
+// `items::delete` is scope-filtered so the victim's ROW survives, but
+// `vectors::delete` carries no scope predicate at all and runs
+// unconditionally — so a policy that remembers an id from scope A's batch
+// and names it as an eviction while deciding for scope B silently strips
+// scope A's vector row.
+
+/// Reuses `SpyEmbedder` so a keyword-blind recall query can only succeed
+/// through a surviving vector row — the same reachability technique
+/// `maintenance_merge_reembeds_the_targets_content` and
+/// `protect_embedder_reach.rs` use, applied here to prove a vector was NOT
+/// destroyed rather than that one WAS created.
+struct EvictsAForeignScopesId {
+    baseline: BaselinePolicy,
+    foreign_victim: memorysafe_core::ItemId,
+}
+
+impl memorysafe_core::GovernancePolicy for EvictsAForeignScopesId {
+    fn id(&self) -> memorysafe_core::PolicyId {
+        memorysafe_core::PolicyId::new("test-evicts-a-foreign-scopes-id", "0.0.1")
+    }
+
+    fn assess(
+        &self,
+        cand: &memorysafe_core::Candidate,
+        ctx: &memorysafe_core::AssessContext,
+    ) -> Result<memorysafe_core::Assessment, memorysafe_core::PolicyError> {
+        self.baseline.assess(cand, ctx)
+    }
+
+    fn admit(
+        &self,
+        assessed: &memorysafe_core::Assessed,
+        ctx: &memorysafe_core::AdmitContext,
+    ) -> Result<memorysafe_core::Decision, memorysafe_core::PolicyError> {
+        self.baseline.admit(assessed, ctx)
+    }
+
+    fn compose(
+        &self,
+        _req: &memorysafe_core::RecallRequest,
+        _candidates: &[memorysafe_core::ScoredCandidate],
+        _ctx: &memorysafe_core::ComposeContext,
+    ) -> Result<memorysafe_core::WorkingSet, memorysafe_core::PolicyError> {
+        unimplemented!("maintain tests never call compose")
+    }
+
+    fn maintain(
+        &self,
+        _ctx: &memorysafe_core::MaintainContext,
+    ) -> Result<Vec<memorysafe_core::Decision>, memorysafe_core::PolicyError> {
+        // A rogue (or simply buggy, cross-scope-caching) policy: it names an
+        // id it remembers from a DIFFERENT scope's batch as an eviction here,
+        // regardless of what this call's own `ctx.batch` actually contains.
+        Ok(vec![memorysafe_core::Decision {
+            subject: None,
+            action: memorysafe_core::Action::Reject,
+            evictions: vec![memorysafe_core::Eviction {
+                item: self.foreign_victim.clone(),
+                reason: memorysafe_core::Reason::new(
+                    memorysafe_core::ReasonCode::CapacityPressure,
+                    "rogue cross-scope eviction",
+                    memorysafe_core::features! {},
+                ),
+            }],
+            reasons: vec![],
+            policy: self.id(),
+        }])
+    }
+}
+
+fn recall_req(query: &str, scope: Scope) -> memorysafe_core::RecallRequest {
+    memorysafe_core::RecallRequest {
+        scope,
+        query: Some(query.into()),
+        tags_any: vec![],
+        kinds: vec![],
+        occurred_after: None,
+        occurred_before: None,
+        mode: memorysafe_core::RecallMode::WorkingSet,
+        budget: memorysafe_core::RecallBudget {
+            max_tokens: Some(4000),
+            max_items: Some(5),
+        },
+        sensitivity_ceiling: memorysafe_core::SensitivityLevel::Restricted,
+    }
+}
+
+#[tokio::test]
+async fn maintenance_does_not_evict_an_id_outside_its_own_scopes_batch() {
+    let victim_scope = Scope::new("acme", "victim-subject", "agent").unwrap();
+    let attacker_scope = Scope::new("acme", "attacker-subject", "agent").unwrap();
+
+    let dir = tempfile::tempdir().expect("tempdir").keep();
+    let spy = Arc::new(SpyEmbedder::new(8));
+
+    // Seed the victim's item first, under a plain baseline engine sharing
+    // the spy embedder (so its vector row is the spy's kind, matching what
+    // the reachability check below needs).
+    let seed = Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.clone())),
+        spy.clone(),
+        Arc::new(BaselinePolicy::default()),
+    ));
+    let victim_id = seed
+        .remember(RememberRequest::new(
+            victim_scope.clone(),
+            "zzyyxx111 wwvvuu222 ttssrr333",
+        ))
+        .await
+        .unwrap()
+        .item_id
+        .unwrap();
+
+    // A rogue policy now drives maintenance for a DIFFERENT scope in the
+    // same tenant, naming the victim's id as an eviction.
+    let e = Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir)),
+        spy,
+        Arc::new(EvictsAForeignScopesId {
+            baseline: BaselinePolicy::default(),
+            foreign_victim: victim_id.clone(),
+        }),
+    ));
+    // The attacker's own scope needs at least one item, or `Engine::maintain`
+    // short-circuits on an empty batch before ever calling the policy.
+    e.remember(RememberRequest::new(
+        attacker_scope.clone(),
+        "an unrelated item in the attacking scope",
+    ))
+    .await
+    .unwrap();
+
+    let report = e.maintain(&attacker_scope, None).await.unwrap();
+    assert_eq!(
+        report.forgotten, 0,
+        "the foreign id must not be counted as forgotten by this scope's report"
+    );
+
+    // The row survives regardless (`items::delete` is scope-filtered) — the
+    // real question is the vector.
+    let still_present = e.review(&victim_scope, &Default::default()).await.unwrap();
+    assert_eq!(still_present.len(), 1, "the victim's row must survive");
+
+    let ws = e
+        .recall(recall_req("aabbcc444 ddeeff555 gghhii666", victim_scope))
+        .await
+        .unwrap();
+    assert!(
+        !ws.items.is_empty(),
+        "the victim shares no keyword with the query, so it can only be \
+         found through the vector arm — a surviving row with a stripped \
+         vector would recall empty here"
     );
 }
