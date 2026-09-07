@@ -13572,7 +13572,7 @@ and pass it as `ItemWrite { item, vector }`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 84 tests ok.
+Expected: PASS — 93 tests ok.
 
 **Re-propagated after Task 35 landed 93, not 84.** Mutation testing found
 fourteen genuine survivors this brief's own literal tests never reached; a
