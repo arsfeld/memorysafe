@@ -1,0 +1,31 @@
+[package]
+name = "memorysafe-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MCP server for the MemorySafe governed-memory engine"
+
+[dependencies]
+memorysafe-auth.workspace = true
+memorysafe-core.workspace = true
+memorysafe-engine.workspace = true
+anyhow.workspace = true
+http.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros", "io-std"] }
+
+[dev-dependencies]
+memorysafe-backend-sqlite.workspace = true
+memorysafe-embed.workspace = true
+memorysafe-policy.workspace = true
+rmcp = { workspace = true, features = ["client"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+
+[lints]
+workspace = true
