@@ -138,9 +138,32 @@ impl Engine {
             .unwrap_or(self.default_retention)
     }
 
-    /// A snapshot of everything `tenant` has configured, falling back to the
-    /// engine's defaults for anything it has not overridden. Returned by
-    /// value so a caller never holds the registries' locks.
+    /// A snapshot of everything `tenant` has configured. Returned by value so
+    /// a caller never holds the registries' locks.
+    ///
+    /// **`retention` genuinely falls back to the engine's default**
+    /// (`retention_for`, which reads `self.default_retention`) — the two can
+    /// never disagree.
+    ///
+    /// **`policy_config` does not, and the two accessors below can disagree
+    /// under a custom policy.** With no override on record, this falls back
+    /// to `BaselineConfig::default()` — a hardcoded literal, not
+    /// `self.default_policy`'s own configuration — because `default_policy`
+    /// is an opaque `Arc<dyn GovernancePolicy>` with no way to ask it for the
+    /// `BaselineConfig` it was built from (and, for anything other than
+    /// `BaselinePolicy`, no `BaselineConfig` to ask for at all: this whole
+    /// struct is a fiction under a custom policy). So `tenant_settings(t)`
+    /// and `policy_for(t)` agree only when the engine happens to have been
+    /// constructed with `EngineConfig { policy: Arc::new(BaselinePolicy::default()), .. }`.
+    /// A deployment built with a tuned `BaselinePolicy::new(cfg)` as its
+    /// engine-wide default gets `policy_for(t)` returning that tuned policy
+    /// while `tenant_settings(t).policy_config` reports stock defaults for
+    /// any tenant with no override of its own — the two disagree about what
+    /// actually governs the tenant's writes until something calls
+    /// `set_tenant_policy_config` for it. There is no fix available at this
+    /// layer: closing the gap needs `EngineConfig`/`GovernancePolicy` to
+    /// expose a policy's own configuration, which is out of this method's
+    /// reach.
     pub fn tenant_settings(&self, tenant: &TenantId) -> TenantSettings {
         let policy_config = self
             .policies
@@ -176,6 +199,14 @@ impl Engine {
         let policy: Arc<dyn GovernancePolicy> = Arc::new(BaselinePolicy::new(cfg.clone()));
         let after = policy.id();
 
+        // The `detail` string alone only says *that* the policy changed, not
+        // *to what* — `BaselinePolicy::id()` is `"baseline"`@`BASELINE_VERSION`
+        // unconditionally, so it does not vary with `cfg` and `before`/`after`
+        // above are textually identical for every `BaselinePolicy` transition.
+        // The incoming thresholds go into `evidence` instead, which the
+        // constraint that audit rows carry "ids, content digests, and feature
+        // numbers" exists to allow: an operator reading this row can now see
+        // what actually changed, not just that something did.
         let audit_id = self
             .record_admin_event(
                 tenant,
@@ -184,7 +215,13 @@ impl Engine {
                 Reason::new(
                     ReasonCode::PolicyInvalid,
                     &format!("policy configuration replaced: {before} -> {after}"),
-                    features! {},
+                    features! {
+                        "duplicate_threshold" => cfg.duplicate_threshold,
+                        "merge_threshold" => cfg.merge_threshold,
+                        "near_duplicate_floor" => cfg.near_duplicate_floor,
+                        "replay_quota" => cfg.replay_quota,
+                        "mmr_lambda" => cfg.mmr_lambda,
+                    },
                 ),
                 after.clone(),
             )
@@ -367,15 +404,18 @@ impl Engine {
     /// memories disappear on Tuesday" unanswerable from a trail that records
     /// the evictions themselves in full detail.
     ///
-    /// `AuditEvent::PolicyChanged` is the variant for it, and this is its
-    /// first and only construction site in the workspace.
+    /// `AuditEvent::PolicyChanged` is the variant for it. **No longer this
+    /// method's only construction site**: `set_tenant_policy_config` and
+    /// `set_tenant_retention` (both above, Plan 3's Task 2) build the same
+    /// variant for their own admin-scope rows.
     ///
-    /// `Actor::system()`, with the same engine-wide gap `purge_subject`'s doc
-    /// comment (`mutate.rs`) records in full: no engine method below the
-    /// boundary takes an actor yet, and threading one is Plan 3's Task 2. It
-    /// is worth more here than anywhere else — "who raised this tenant's
-    /// ceiling" is the question the row exists to answer — so this is the
-    /// site to revisit first when actors land.
+    /// `Actor::system()`, unlike those two: actors have landed for the
+    /// per-tenant policy/retention setters, `export_ndjson_as`,
+    /// `import_ndjson_as` and `purge_subject` (`mutate.rs`), but `set_budget`
+    /// was not in that task's scope and remains unattributed. It is worth
+    /// more here than anywhere else — "who raised this tenant's ceiling" is
+    /// the question the row exists to answer — so this is still the site to
+    /// revisit first, next.
     ///
     /// **The new ceiling itself is not in the row, only the fact that it
     /// changed.** `AuditRecord` has no field free to carry two numbers:

@@ -69,7 +69,8 @@ async fn setting_a_policy_config_changes_only_that_tenant() {
 #[tokio::test]
 async fn a_policy_change_writes_exactly_one_audit_record_naming_both_versions() {
     let e = engine();
-    e.set_tenant_policy_config(&acme(), BaselineConfig::default(), &operator())
+    let cfg = BaselineConfig::default();
+    e.set_tenant_policy_config(&acme(), cfg.clone(), &operator())
         .await
         .unwrap();
 
@@ -96,11 +97,43 @@ async fn a_policy_change_writes_exactly_one_audit_record_naming_both_versions() 
         !decision.reasons.is_empty(),
         "a policy change must say what changed"
     );
+
+    // `BaselinePolicy::id()` is `"baseline"@BASELINE_VERSION` unconditionally
+    // (it does not vary with the config), so `before`/`after` are always this
+    // same string for a `BaselinePolicy` transition. Asserted exactly, not
+    // merely `.contains("baseline")`, so a mutant that dropped the
+    // surrounding "policy configuration replaced: ... -> ..." template (e.g.
+    // formatting `{after}` alone) or hardcoded a bare `"baseline"` literal
+    // would fail here.
+    let policy_id = format!("baseline@{}", memorysafe_policy::BASELINE_VERSION);
     let detail = &decision.reasons[0].detail;
-    assert!(
-        detail.contains("baseline"),
-        "the reason names the policy: {detail}"
+    assert_eq!(
+        *detail,
+        format!("policy configuration replaced: {policy_id} -> {policy_id}")
     );
+
+    // Since `before`/`after` alone cannot distinguish one `BaselineConfig`
+    // from another, the actual thresholds go into the reason's evidence —
+    // this is what an operator would actually need to read to learn what
+    // changed.
+    let evidence = &decision.reasons[0].evidence;
+    assert_eq!(
+        evidence.get("duplicate_threshold"),
+        Some(&(cfg.duplicate_threshold as f64))
+    );
+    assert_eq!(
+        evidence.get("merge_threshold"),
+        Some(&(cfg.merge_threshold as f64))
+    );
+    assert_eq!(
+        evidence.get("near_duplicate_floor"),
+        Some(&(cfg.near_duplicate_floor as f64))
+    );
+    assert_eq!(
+        evidence.get("replay_quota"),
+        Some(&(cfg.replay_quota as f64))
+    );
+    assert_eq!(evidence.get("mmr_lambda"), Some(&(cfg.mmr_lambda as f64)));
 }
 
 #[tokio::test]
@@ -173,6 +206,29 @@ async fn retention_is_per_tenant_and_purge_honours_the_tenant_it_is_purging() {
         "hipaa_retain must keep the decision record"
     );
     assert_eq!(kept.audit_rows_removed, 0);
+
+    // hipaa_retain preserves audit rows, including the SubjectPurged record
+    // itself, so the actor purge_subject was given can be read back and
+    // checked here — pinning that purge_subject actually threads the
+    // caller's `Actor` into the record rather than silently keeping
+    // `Actor::system()`. (globex's own SubjectPurged row cannot pin this:
+    // gdpr_strict cascades and removes it along with everything else.)
+    let purged = e
+        .audit(
+            &scope("acme"),
+            &AuditFilter {
+                events: vec![AuditEvent::SubjectPurged],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(purged.len(), 1);
+    assert_eq!(
+        purged[0].actor,
+        operator(),
+        "purge_subject must record the actor who ordered the erasure"
+    );
 
     assert_eq!(dropped.items_removed, 1);
     assert!(dropped.audit_rows_removed >= 1, "gdpr_strict must cascade");

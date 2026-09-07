@@ -89,10 +89,12 @@ impl Engine {
         // and a digest and never a body, so this discloses nothing a
         // `Recalled` row does not.
         let refs: Vec<ItemRef> = matched.iter().map(ItemRef::from_item).collect();
-        // `Actor::system()`, not a caller-identified human: no engine method
-        // below the boundary has one to attribute yet. See `purge_subject`'s
-        // doc comment below for the full account of this gap and where it
-        // closes (Plan 3 Task 2).
+        // `Actor::system()`, not a caller-identified human. Plan 3's Task 2
+        // threaded a real `Actor` through `purge_subject` below,
+        // `set_tenant_policy_config`/`set_tenant_retention` and
+        // `export_ndjson_as`/`import_ndjson_as` (`lib.rs`) — but not through
+        // `forget`, which was out of that task's scope and still has no actor
+        // parameter to attribute this row to.
         let audit = AuditRecord::new(
             scope.clone(),
             AuditEvent::Forgotten,

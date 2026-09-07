@@ -31,8 +31,9 @@ impl Engine {
     /// otherwise ordinary body must survive a round trip; see
     /// `an_import_cannot_use_fresh_detection_to_downgrade_an_already_high_classification`).
     ///
-    /// This detection deliberately does **not** go through the configured
-    /// `self.policy: Arc<dyn GovernancePolicy>` the way `remember` does.
+    /// This detection deliberately does **not** go through the tenant's
+    /// configured `Arc<dyn GovernancePolicy>` (`Engine::policy_for`) the way
+    /// `remember` does.
     /// `GovernancePolicy::assess` requires an `AssessContext` — nearest
     /// neighbours and scope statistics — which costs a `Backend::neighbours`
     /// and a `Backend::scope_stats` round trip *per item*, and neighbour
@@ -65,7 +66,7 @@ impl Engine {
     ///   `maintain`-time `Retain` routed through `protect`. **This is true
     ///   for `BaselinePolicy` specifically, not in general**: `Action::Retain
     ///   { protection }` is applied verbatim in `write.rs` regardless of
-    ///   which policy produced it, `self.policy` is an
+    ///   which policy produced it, `Engine::policy_for(tenant)` returns an
     ///   `Arc<dyn GovernancePolicy>`, and nothing stops a custom policy from
     ///   legally setting `Pinned` at admission. `Pinned` carries no bound to
     ///   clamp — it is a flag, not a window — so there is no value-level
