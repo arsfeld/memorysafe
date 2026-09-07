@@ -247,16 +247,19 @@ impl Backend for SqliteBackend {
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| tenant::storage_error(e, false))?;
-                // Must stay the transaction's first statement, ahead of the
-                // eviction loop below — this is an `INSERT OR IGNORE` (a
-                // write) so a DEFERRED transaction takes its write lock right
-                // here, before the eviction loop's `items::delete` can open
-                // it with a `SELECT` instead. `capacity::adjust` also calls
-                // `ensure_row` internally, so this call is redundant for
-                // *its* correctness — its only job is to go first. See
-                // `crate::aggregates`' module doc for the hazard this
-                // ordering closes and why nothing in this crate's suite can
-                // fail if the order regresses.
+                // Stays the transaction's first statement, ahead of the
+                // eviction loop below — but not because statement order
+                // decides the lock any more. This transaction opens as
+                // `TransactionBehavior::Immediate`, which takes the write
+                // lock the moment it opens, before any statement runs, so
+                // going first no longer determines how the transaction
+                // opened. `capacity::adjust` also calls `ensure_row`
+                // internally, so this call was always redundant for *its*
+                // own correctness. It stays first anyway, as defence in
+                // depth: insurance against a future path that opens this
+                // transaction as `Deferred` again, at which point statement
+                // order would matter exactly as it used to. See
+                // `crate::aggregates`' module doc for the full history.
                 capacity::ensure_row(&tx, &txn.scope)?;
 
                 let mut delta_items: i64 = 0;
