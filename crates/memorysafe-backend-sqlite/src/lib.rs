@@ -215,7 +215,6 @@ impl Backend for SqliteBackend {
 
                 for id in &txn.evictions {
                     let size = items::delete(&tx, &txn.scope, id)?;
-                    vectors::delete(&tx, id)?;
                     if size > 0 {
                         delta_items -= 1;
                         delta_bytes -= size as i64;
@@ -268,7 +267,7 @@ impl Backend for SqliteBackend {
                     if let Some(v) = &m.vector {
                         vectors::insert(&tx, &m.target, &txn.scope, v)?;
                     } else {
-                        vectors::delete(&tx, &m.target)?;
+                        vectors::delete(&tx, &txn.scope, &m.target)?;
                     }
                     delta_bytes += diff;
                     item_id = Some(m.target.clone());
@@ -528,6 +527,32 @@ mod tests {
             .unwrap()
     }
 
+    /// Reads the `vectors` table directly, unjoined to `items` — the only way
+    /// to see a vector row at all rather than a vector row that also happens
+    /// to have a live, in-scope item on the other side of a join. `search`
+    /// cannot substitute for this: it joins `vectors` to `items` on `item_id`
+    /// and filters on the *item's* scope, so it would report zero for a
+    /// vector row orphaned in another scope just as readily as for one that
+    /// was actually deleted.
+    async fn vector_row_count(b: &SqliteBackend, scope: &Scope, id: &ItemId) -> i64 {
+        let (subject, namespace, id) = (
+            scope.subject.as_str().to_string(),
+            scope.namespace.as_str().to_string(),
+            id.as_str().to_string(),
+        );
+        b.tenants
+            .with_conn(&scope.tenant.clone(), move |c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM vectors WHERE item_id=?1 AND subject=?2 AND namespace=?3",
+                    params![id, subject, namespace],
+                    |r| r.get(0),
+                )
+                .sql()
+            })
+            .await
+            .unwrap()
+    }
+
     /// `AppliedWrite::evicted` is the ids **actually removed**, not the ids the
     /// caller asked to remove — see its doc on `WriteTransaction`. Nothing
     /// forbids a transaction naming an eviction that matches no row, and the
@@ -772,6 +797,70 @@ mod tests {
              post-merge size rather than left at its pre-merge value — a \
              nonzero residue here is exactly the permanent capacity drift a \
              stale column produces"
+        );
+    }
+
+    /// A merge with `vector: None` must delete the target's existing vector
+    /// row, not merely skip writing a new one. `items::merge` is an
+    /// `UPDATE`, so the item row survives and no `ON DELETE CASCADE` fires —
+    /// unlike eviction, nothing else in the write path removes a vector left
+    /// behind here. Observed through `vector_row_count`, which reads the
+    /// `vectors` table directly rather than through `search`'s join to
+    /// `items`: a row orphaned by a dropped or swapped scope predicate would
+    /// still be invisible to a joined reader.
+    ///
+    /// **The precondition is asserted before the merge.** A target with no
+    /// vector row to begin with reports zero afterwards whether or not the
+    /// deletion actually runs, so the fixture admits the target through
+    /// `admit_txn_embedded` and the test confirms the row exists first — the
+    /// merge's `vector: None` deletion is only proven by a row count that
+    /// goes from one to zero, never by one that starts and stays at zero.
+    #[tokio::test]
+    async fn merging_with_no_vector_deletes_the_targets_existing_vector_row() {
+        let b = backend();
+        let s = scope("s", "n");
+
+        let target = fx::item(&s, "a body with a vector");
+        b.apply(fx::admit_txn_embedded(&s, target.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            vector_row_count(&b, &s, &target.id).await,
+            1,
+            "the premise: the target must already carry a vector row, or the \
+             post-merge assertion below would pass vacuously"
+        );
+
+        let new_body = "a body with no vector at all";
+        let audit = memorysafe_core::AuditRecord::new(
+            s.clone(),
+            AuditEvent::Merged,
+            vec![memorysafe_core::ItemRef::from_item(&target)],
+            Actor::system(),
+            target.created_at,
+        );
+        let mut txn = memorysafe_backend::WriteTransaction::new(s.clone(), audit);
+        txn.merge = Some(memorysafe_backend::write::MergeWrite {
+            target: target.id.clone(),
+            body: new_body.into(),
+            tags: vec![],
+            attrs: Default::default(),
+            vector: None,
+            byte_size: new_body.len() as u64,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // biconditional, now enforced by `is_valid()` — not a judgement
+            // about this test's subject (the stale vector row).
+            pending_embedding: true,
+        });
+        assert!(txn.is_valid(), "the premise: this transaction is valid");
+
+        b.apply(txn).await.unwrap();
+
+        assert_eq!(
+            vector_row_count(&b, &s, &target.id).await,
+            0,
+            "the target's stale vector row survived a merge that supplied no \
+             new vector"
         );
     }
 
