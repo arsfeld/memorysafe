@@ -3,8 +3,8 @@ use crate::error::EngineError;
 use crate::outcome::{ForgetOutcome, PurgeOutcome, WriteOutcome};
 use memorysafe_backend::{ItemWrite, Page, WriteTransaction};
 use memorysafe_core::{
-    Action, Actor, AuditEvent, AuditRecord, ItemId, ItemRef, Protection, PurgeCascade, Reason,
-    ReasonCode, Scope, SubjectId, TenantId, features,
+    Action, Actor, AuditEvent, AuditRecord, ItemId, ItemRef, Protection, Reason, ReasonCode, Scope,
+    SubjectId, TenantId, features,
 };
 use time::OffsetDateTime;
 
@@ -200,9 +200,12 @@ impl Engine {
     /// audit record, so `remember` is actor-attributed today and these three
     /// are not — an inconsistency in the trail, not a symmetric gap.
     ///
-    /// `PurgeCascade::Cascade` is hard-coded here — it is `balanced`, the
-    /// default profile's behaviour. Task 38 replaces this one expression with
-    /// `self.retention.retention().purge_cascade` and changes nothing else.
+    /// The cascade is read from `self.retention`, the engine's configured
+    /// `RetentionProfile` — not hard-coded, as an earlier draft of this method
+    /// left it (see Task 38). `Preserve` is entirely the *backend's*
+    /// behaviour, selected by this one argument: the engine reads no audit
+    /// rows and replays none, for the reasons `Backend::purge_subject`'s own
+    /// doc comment gives in full.
     pub async fn purge_subject(
         &self,
         tenant: &TenantId,
@@ -222,9 +225,14 @@ impl Engine {
             Actor::system(),
             OffsetDateTime::now_utc(),
         );
+        // The whole of Task 38's change to this method: the cascade comes
+        // from the configured profile instead of Task 35's hard-coded
+        // `PurgeCascade::Cascade`. Everything else — building the record,
+        // choosing its namespace, mapping the report — is untouched.
+        let cascade = self.retention.retention().purge_cascade;
         let report = self
             .backend
-            .purge_subject(tenant, subject, PurgeCascade::Cascade, audit)
+            .purge_subject(tenant, subject, cascade, audit)
             .await?;
 
         // Any write invalidates its scope — but a subject spans namespaces

@@ -9,6 +9,7 @@ pub mod maintain;
 pub mod mutate;
 pub mod outcome;
 pub mod read;
+pub mod retention;
 pub mod validate;
 pub mod write;
 
@@ -17,6 +18,7 @@ pub use error::EngineError;
 pub use maintain::{MAINTAIN_BATCH, MaintainCursor, MaintainReport};
 pub use mutate::ForgetSelector;
 pub use outcome::{ForgetOutcome, PurgeOutcome, WriteOutcome};
+pub use retention::{AuditRetention, PurgeCascade, RetentionProfile, RetentionSpan};
 pub use validate::FailureStance;
 pub use write::RememberRequest;
 
@@ -38,6 +40,9 @@ pub struct EngineConfig {
     /// How many items to offer the policy as eviction candidates.
     pub eviction_candidates: usize,
     pub cache: CacheConfig,
+    /// Which named audit-retention policy governs `Engine::purge_subject`.
+    /// See `retention` module doc.
+    pub retention: RetentionProfile,
 }
 
 impl EngineConfig {
@@ -55,6 +60,7 @@ impl EngineConfig {
             neighbour_k: 16,
             eviction_candidates: 128,
             cache: CacheConfig::default(),
+            retention: RetentionProfile::default(),
         }
     }
 }
@@ -68,6 +74,7 @@ pub struct Engine {
     pub(crate) neighbour_k: usize,
     pub(crate) eviction_candidates: usize,
     pub(crate) cache: cache::EngineCache,
+    pub(crate) retention: RetentionProfile,
 }
 
 impl Engine {
@@ -81,6 +88,7 @@ impl Engine {
             neighbour_k: config.neighbour_k,
             eviction_candidates: config.eviction_candidates,
             cache: cache::EngineCache::new(config.cache),
+            retention: config.retention,
         }
     }
 
