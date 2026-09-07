@@ -1,7 +1,7 @@
 use memorysafe_backend::{Backend, CandidateQuery, HardFilters};
 use memorysafe_backend_sqlite::SqliteBackend;
 use memorysafe_core::{
-    Action, AuditEvent, AuditFilter, Namespace, PURGED_COMPONENT, Protection, ReasonCode,
+    Action, Actor, AuditEvent, AuditFilter, Namespace, PURGED_COMPONENT, Protection, ReasonCode,
     RecallBudget, RecallMode, RecallRequest, Scope, SensitivityLevel, SubjectId, TenantId,
 };
 use memorysafe_embed::{DeterministicEmbedder, Embedder};
@@ -610,6 +610,7 @@ async fn purging_a_subject_removes_everything_it_owns() {
         .purge_subject(
             &TenantId::new("acme").unwrap(),
             &SubjectId::new("doomed").unwrap(),
+            &Actor::system(),
         )
         .await
         .unwrap();
@@ -652,6 +653,7 @@ async fn purging_a_subject_with_cascade_removes_its_pre_existing_audit_rows() {
         .purge_subject(
             &TenantId::new("acme").unwrap(),
             &SubjectId::new("doomed-cascade").unwrap(),
+            &Actor::system(),
         )
         .await
         .unwrap();
@@ -697,7 +699,10 @@ async fn purge_subject_files_its_record_under_the_lexicographically_first_namesp
         .await
         .unwrap();
 
-    let report = e.purge_subject(&tenant, &subject).await.unwrap();
+    let report = e
+        .purge_subject(&tenant, &subject, &Actor::system())
+        .await
+        .unwrap();
     assert_eq!(report.items_removed, 2, "both namespaces must be purged");
 
     let purged_filter = AuditFilter {
@@ -727,7 +732,10 @@ async fn purging_a_subject_that_owns_nothing_falls_back_to_the_purged_namespace(
     let tenant = TenantId::new("acme").unwrap();
     let subject = SubjectId::new("ghost-subject").unwrap();
 
-    let report = e.purge_subject(&tenant, &subject).await.unwrap();
+    let report = e
+        .purge_subject(&tenant, &subject, &Actor::system())
+        .await
+        .unwrap();
     assert_eq!(report.items_removed, 0);
 
     let fallback_scope = Scope {

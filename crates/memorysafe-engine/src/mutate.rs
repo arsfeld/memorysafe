@@ -89,10 +89,12 @@ impl Engine {
         // and a digest and never a body, so this discloses nothing a
         // `Recalled` row does not.
         let refs: Vec<ItemRef> = matched.iter().map(ItemRef::from_item).collect();
-        // `Actor::system()`, not a caller-identified human: no engine method
-        // below the boundary has one to attribute yet. See `purge_subject`'s
-        // doc comment below for the full account of this gap and where it
-        // closes (Plan 3 Task 2).
+        // `Actor::system()`, not a caller-identified human. Plan 3's Task 2
+        // threaded a real `Actor` through `purge_subject` below,
+        // `set_tenant_policy_config`/`set_tenant_retention` and
+        // `export_ndjson_as`/`import_ndjson_as` (`lib.rs`) — but not through
+        // `forget`, which was out of that task's scope and still has no actor
+        // parameter to attribute this row to.
         let audit = AuditRecord::new(
             scope.clone(),
             AuditEvent::Forgotten,
@@ -257,39 +259,35 @@ impl Engine {
     /// The `SubjectPurged` record is built **here**, not in the backend:
     /// `Backend::purge_subject` inserts the record it is handed and mints
     /// nothing (the echo rule on `Backend`), so whatever actor this method
-    /// writes is what ends up in the log — which today is `Actor::system()`,
-    /// not the actor who ordered the erasure.
+    /// writes is what ends up in the log — which is now `actor`, the caller's
+    /// own, rather than an anonymous placeholder.
     ///
-    /// `Actor::system()`, not the `ActorKind::Human` literal an earlier draft
-    /// used: the workspace's own idiom for "no attributed actor" (used at
-    /// dozens of sites across the backend crates, and what the conformance
-    /// suite's own fixtures explicitly contrast a *real, identified* human
-    /// actor against) is an honest absence, where a `Human` kind carrying no
-    /// id affirmatively claims a person ordered the erasure while recording
-    /// no identity for them — the sharper defect in a compliance record.
+    /// **Plumbing a real actor** (Plan 3's Task 2, "Engine — per-tenant
+    /// policy and retention, actor-attributed governance events") is what
+    /// this parameter is: every call site — the HTTP route
+    /// (`ops::purge_subject`), the CLI command, and this crate's own tests —
+    /// already has an `Actor` in scope to hand in. `forget` and `protect`
+    /// above still write `Actor::system()`; that gap is engine-wide,
+    /// pre-existing, and out of this task's scope, so it remains. An earlier
+    /// draft of this method used `Actor { kind: ActorKind::Human, id: None }`
+    /// as its placeholder, which the workspace's own idiom for "no
+    /// attributed actor" (`Actor::system()`, used at dozens of sites across
+    /// the backend crates) rightly avoided: a `Human` kind carrying no id
+    /// affirmatively claims a person ordered the erasure while recording no
+    /// identity for them — the sharper defect in a compliance record. That
+    /// placeholder is gone now that a real actor is threaded through.
     ///
-    /// **Plumbing a real actor is deferred to Plan 3's Task 2** ("Engine —
-    /// per-tenant policy and retention, actor-attributed governance events"),
-    /// which is where engine methods start taking an `Actor` from the
-    /// boundary that has one. `Engine::purge_subject` has no actor parameter
-    /// to thread, and adding one here would change a signature that Plan 3's
-    /// HTTP route (`ops::purge_subject`), CLI command (`purge-subject`) and
-    /// engine tests all already call — so the gap is recorded rather than
-    /// closed. The same placeholder appears in `forget` and `protect` above;
-    /// it is engine-wide and pre-existing, not specific to this method.
-    /// `RememberRequest::actor` is already threaded through `remember`'s own
-    /// audit record, so `remember` is actor-attributed today and these three
-    /// are not — an inconsistency in the trail, not a symmetric gap.
-    ///
-    /// The cascade is read from `self.retention`, the engine's configured
-    /// `RetentionProfile` — not hard-coded. `Preserve` is entirely the
-    /// *backend's* behaviour, selected by this one argument: the engine reads
-    /// no audit rows and replays none, for the reasons `Backend::purge_subject`'s
-    /// own doc comment gives in full.
+    /// The cascade is read from `self.retention_for(tenant)`, the tenant's
+    /// configured `RetentionProfile` — not hard-coded, and not the engine's
+    /// single global default, now that retention is per-tenant. `Preserve` is
+    /// entirely the *backend's* behaviour, selected by this one argument: the
+    /// engine reads no audit rows and replays none, for the reasons
+    /// `Backend::purge_subject`'s own doc comment gives in full.
     pub async fn purge_subject(
         &self,
         tenant: &TenantId,
         subject: &SubjectId,
+        actor: &Actor,
     ) -> Result<PurgeOutcome, EngineError> {
         // Computed once, up front, and reused for two purposes below: which
         // namespace the audit record is filed under (`purge_scope`), and
@@ -302,10 +300,10 @@ impl Engine {
             Self::purge_scope(tenant, subject, &namespaces),
             AuditEvent::SubjectPurged,
             vec![],
-            Actor::system(),
+            actor.clone(),
             OffsetDateTime::now_utc(),
         );
-        let cascade = self.retention.retention().purge_cascade;
+        let cascade = self.retention_for(tenant).retention().purge_cascade;
         let report = self
             .backend
             .purge_subject(tenant, subject, cascade, audit)
@@ -543,7 +541,10 @@ mod cache_invalidation_tests {
         e.cache.put_stats(&ns_z, sentinel()).await;
         e.cache.put_stats(&unrelated, sentinel()).await;
 
-        let report = e.purge_subject(&tenant, &subject).await.unwrap();
+        let report = e
+            .purge_subject(&tenant, &subject, &Actor::system())
+            .await
+            .unwrap();
         assert_eq!(report.items_removed, 2, "premise: both namespaces purged");
 
         assert!(
@@ -586,7 +587,9 @@ mod cache_invalidation_tests {
         e.cache.put_stats(&fallback, sentinel()).await;
         e.cache.put_stats(&unrelated, sentinel()).await;
 
-        e.purge_subject(&tenant, &subject).await.unwrap();
+        e.purge_subject(&tenant, &subject, &Actor::system())
+            .await
+            .unwrap();
 
         assert!(
             e.cache.stats(&fallback).await.is_some(),

@@ -85,7 +85,7 @@ impl Engine {
             now: OffsetDateTime::now_utc(),
         };
 
-        let policy = self.policy.clone();
+        let policy = self.policy_for(&scope.tenant);
         let x = ctx.clone();
         // `Arc<dyn GovernancePolicy>` is not `RefUnwindSafe` (see `run_assess`
         // and `run_admit` in `write.rs` for the same escape hatch): this call

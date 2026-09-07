@@ -1,7 +1,7 @@
 use memorysafe_backend_sqlite::SqliteBackend;
 use memorysafe_core::{Action, Budget, Protection, ReasonCode, Scope, SensitivityLevel};
 use memorysafe_embed::DeterministicEmbedder;
-use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
+use memorysafe_engine::{Engine, EngineConfig, EngineError, RememberRequest};
 use memorysafe_policy::BaselinePolicy;
 use std::sync::Arc;
 
@@ -324,6 +324,40 @@ async fn a_retried_rejected_write_replays_the_original_rejection() {
         e.review(&scope(), &Default::default()).await.unwrap().len(),
         1,
         "only the seed item is stored"
+    );
+}
+
+/// §9 of the spec names "idempotency key reused with a different payload" as
+/// the Conflict row's own condition, and `SqliteBackend::apply` is exactly
+/// what raises `BackendError::IdempotencyConflict` for it (the write-lock
+/// check in `backend-sqlite/src/lib.rs`, keyed on `(subject, namespace,
+/// key)`, comparing the stored payload digest against the new one) — a real,
+/// reachable path from `Engine::remember`, not a hypothetical. Before the
+/// `From<BackendError> for EngineError` fix this collapsed into
+/// `EngineError::Backend` via the blanket `#[from]`, which every adapter
+/// answers as a 503 with `retryable` from `is_retryable()` (always `false`
+/// for this kind, since it isn't `Storage`) — the wrong status entirely for
+/// a condition §9 assigns 409. This pins the corrected mapping directly at
+/// the engine seam, not just in an adapter's own `From<EngineError>`, so a
+/// future adapter inherits the right `EngineError` variant instead of having
+/// to work around a wrong one.
+#[tokio::test]
+async fn reusing_an_idempotency_key_with_a_different_payload_is_a_conflict() {
+    let e = engine();
+    let mut first = req("the first body stored under this key");
+    first.idempotency_key = Some("shared-key".into());
+    e.remember(first).await.unwrap();
+
+    let mut second = req("a completely different body, same key");
+    second.idempotency_key = Some("shared-key".into());
+    let err = e
+        .remember(second)
+        .await
+        .expect_err("a reused idempotency key with a different payload must be refused");
+
+    assert!(
+        matches!(err, EngineError::Conflict(_)),
+        "expected EngineError::Conflict, got {err:?}"
     );
 }
 

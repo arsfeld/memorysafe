@@ -2,6 +2,7 @@ use crate::assessment::SensitivityLevel;
 use crate::ids::{ItemId, Scope};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +42,60 @@ impl Protection {
             Protection::Pinned => false,
             Protection::Protected { until } => *until <= now,
         }
+    }
+}
+
+/// Why a caller-supplied `(level, until)` pair could not be turned into a
+/// `Protection`. Every adapter that exposes protection to a caller — MCP,
+/// HTTP, CLI — maps this into its own error type rather than re-deriving the
+/// decision table `parse_protection` implements: the table was hand-copied
+/// three times in this plan's own text before a line of it was written, and
+/// the timestamp-validation branch had already drifted between the copies.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProtectionParseError {
+    #[error("'until' is not a valid Unix timestamp")]
+    InvalidTimestamp,
+    #[error("'protected' requires 'until'; use 'pinned' for permanent protection")]
+    MissingUntil,
+    #[error("'until' is meaningless for level '{level}'")]
+    UnexpectedUntil { level: String },
+    #[error("unknown protection level '{level}'; expected normal, protected, or pinned")]
+    UnknownLevel { level: String },
+}
+
+/// The one decision table for turning a caller's `level`/`until` pair into a
+/// `Protection`. `pinned` is absolute; `protected` is a window and must carry
+/// its deadline — defaulting the deadline would silently turn a time-boxed
+/// exemption into a permanent one, so a `protected` with no `until` is
+/// refused rather than guessed at. An out-of-range `until` (whatever
+/// `OffsetDateTime::from_unix_timestamp` rejects) is likewise an error, never
+/// a panic and never a silent clamp.
+///
+/// | `level`               | `until`   | result |
+/// |------------------------|-----------|--------|
+/// | `"normal"`             | `None`    | `Protection::Normal` |
+/// | `"pinned"`             | `None`    | `Protection::Pinned` |
+/// | `"protected"`          | `Some(s)` | `Protection::Protected { until }` if `s` is a valid Unix timestamp, else `InvalidTimestamp` |
+/// | `"protected"`          | `None`    | `MissingUntil` |
+/// | `"normal"`/`"pinned"`  | `Some(_)` | `UnexpectedUntil` |
+/// | anything else          | any       | `UnknownLevel` |
+pub fn parse_protection(
+    level: &str,
+    until: Option<i64>,
+) -> Result<Protection, ProtectionParseError> {
+    match (level, until) {
+        ("normal", None) => Ok(Protection::Normal),
+        ("pinned", None) => Ok(Protection::Pinned),
+        ("protected", Some(seconds)) => OffsetDateTime::from_unix_timestamp(seconds)
+            .map(|until| Protection::Protected { until })
+            .map_err(|_| ProtectionParseError::InvalidTimestamp),
+        ("protected", None) => Err(ProtectionParseError::MissingUntil),
+        ("normal" | "pinned", Some(_)) => Err(ProtectionParseError::UnexpectedUntil {
+            level: level.to_owned(),
+        }),
+        (other, _) => Err(ProtectionParseError::UnknownLevel {
+            level: other.to_owned(),
+        }),
     }
 }
 
@@ -360,6 +415,84 @@ mod tests {
         // And prove old bytes still parse — the actual compatibility question.
         let from_disk: MemoryItem = serde_json::from_str(expected).unwrap();
         assert_eq!(from_disk, item);
+    }
+
+    // Six rows, not a spot check: `parse_protection`'s decision table was
+    // hand-copied three times across this plan's adapter tasks before a line
+    // of it was written, and the timestamp branch had already drifted
+    // between the copies. Each row below is its own test so a regression
+    // narrowing one branch cannot hide behind an assertion for another.
+
+    #[test]
+    fn parse_protection_normal_with_no_until_is_normal() {
+        assert_eq!(parse_protection("normal", None), Ok(Protection::Normal));
+    }
+
+    #[test]
+    fn parse_protection_pinned_with_no_until_is_pinned() {
+        assert_eq!(parse_protection("pinned", None), Ok(Protection::Pinned));
+    }
+
+    #[test]
+    fn parse_protection_protected_with_a_valid_until_is_protected() {
+        let until = OffsetDateTime::from_unix_timestamp(86_400).unwrap();
+        assert_eq!(
+            parse_protection("protected", Some(86_400)),
+            Ok(Protection::Protected { until })
+        );
+    }
+
+    #[test]
+    fn parse_protection_protected_with_no_until_is_an_error() {
+        assert_eq!(
+            parse_protection("protected", None),
+            Err(ProtectionParseError::MissingUntil)
+        );
+    }
+
+    #[test]
+    fn parse_protection_normal_or_pinned_with_an_until_is_an_error() {
+        // A time-boxed exemption on a level that carries no window at all —
+        // silently ignoring `until` here would let a caller believe a
+        // `normal` item is protected until some deadline it never actually
+        // gets.
+        assert_eq!(
+            parse_protection("normal", Some(1)),
+            Err(ProtectionParseError::UnexpectedUntil {
+                level: "normal".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_protection("pinned", Some(1)),
+            Err(ProtectionParseError::UnexpectedUntil {
+                level: "pinned".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_protection_an_unknown_level_is_an_error() {
+        assert_eq!(
+            parse_protection("locked", None),
+            Err(ProtectionParseError::UnknownLevel {
+                level: "locked".to_owned()
+            })
+        );
+    }
+
+    /// The branch that drifted between the plan's three hand-copied tables:
+    /// an out-of-range `until` on `protected` must be a structured error,
+    /// never a panic and never a silent clamp into range.
+    #[test]
+    fn parse_protection_an_out_of_range_until_is_an_error_not_a_panic_or_a_clamp() {
+        assert_eq!(
+            parse_protection("protected", Some(i64::MAX)),
+            Err(ProtectionParseError::InvalidTimestamp)
+        );
+        assert_eq!(
+            parse_protection("protected", Some(i64::MIN)),
+            Err(ProtectionParseError::InvalidTimestamp)
+        );
     }
 
     #[test]

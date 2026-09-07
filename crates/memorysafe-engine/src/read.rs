@@ -99,7 +99,7 @@ impl Engine {
             now: OffsetDateTime::now_utc(),
         };
 
-        let policy = self.policy.clone();
+        let policy = self.policy_for(&req.scope.tenant);
         let (r, c, x) = (req.clone(), candidates.clone(), ctx.clone());
         debug_assert!(
             candidates.iter().all(|c| c.item.scope == req.scope),

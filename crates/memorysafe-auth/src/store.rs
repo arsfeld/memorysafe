@@ -17,6 +17,30 @@ use subtle::ConstantTimeEq;
 /// check below iterates it and cannot itself go stale.
 const RESERVED_COMPONENTS: &[&str] = &[ADMIN_COMPONENT, PURGED_COMPONENT];
 
+/// Reject a caller-supplied scope component that names a reserved word.
+///
+/// Exposed (not just used internally by `Authenticated::scope`) because not
+/// every adapter path has an `Authenticated` to go through: the MCP stdio
+/// transport is configured with its tenant and subject rather than
+/// authenticating a key, and must still refuse the same words
+/// `Authenticated::scope` refuses — otherwise the two transports would
+/// disagree about which scopes are reachable, and `_purged` in particular
+/// would go unguarded on the transport that never authenticates a key.
+///
+/// Takes `Option<&str>` rather than `&str` because a caller may not always
+/// have both components in hand yet (the MCP stdio path checks the prelude
+/// before the namespace default is resolved); `None` never matches a
+/// reserved word.
+pub fn check_reserved(subject: Option<&str>, namespace: Option<&str>) -> Result<(), AuthError> {
+    if let Some(&component) = RESERVED_COMPONENTS
+        .iter()
+        .find(|&&reserved| subject == Some(reserved) || namespace == Some(reserved))
+    {
+        return Err(AuthError::Reserved { component });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ApiKeyStore {
     by_id: HashMap<String, ApiKeyRecord>,
@@ -94,16 +118,23 @@ impl Authenticated {
         }
     }
 
-    /// The only constructor of a `Scope` in the network adapters. The tenant is
-    /// taken from the credential and never from the request, so a scope that
-    /// crosses tenants is unrepresentable rather than merely rejected.
+    /// The constructor of a `Scope` for any adapter path that authenticates
+    /// an API key. The tenant is taken from the credential and never from
+    /// the request, so a scope that crosses tenants is unrepresentable
+    /// rather than merely rejected.
+    ///
+    /// Not the only site a `Scope` is built in the network adapters, so do
+    /// not assume routing a caller-supplied subject/namespace through this
+    /// method is the only way scope construction gets guarded: MCP's stdio
+    /// transport (`memorysafe-mcp`'s `ScopeSource::Stdio` arm) builds one
+    /// directly, because there is no API key to authenticate on that path at
+    /// all — the tenant (and there, the subject too) is the server's own
+    /// configuration, fixed when the process starts, the way a CLI process
+    /// already runs as a fixed OS user. That site is safe for the same
+    /// reason this one is: tenant comes from a value the caller never
+    /// supplies, never from request input, on either path.
     pub fn scope(&self, subject: &str, namespace: &str) -> Result<Scope, AuthError> {
-        if let Some(&component) = RESERVED_COMPONENTS
-            .iter()
-            .find(|&&reserved| subject == reserved || namespace == reserved)
-        {
-            return Err(AuthError::Reserved { component });
-        }
+        check_reserved(Some(subject), Some(namespace))?;
         Ok(Scope::new(self.tenant.as_str(), subject, namespace)?)
     }
 }
@@ -259,6 +290,30 @@ mod tests {
             ),
             "'_purged' as namespace was accepted, or reported the wrong component"
         );
+    }
+
+    #[test]
+    fn check_reserved_treats_a_missing_component_as_never_reserved() {
+        // The only caller of `check_reserved` that can pass `None` at all is
+        // MCP's stdio `resolve`, checking its prelude before a namespace
+        // default is resolved. `Authenticated::scope` always passes
+        // `Some(_)` for both, so this path is untested by any existing
+        // `Authenticated::scope` test.
+        assert!(check_reserved(None, None).is_ok());
+        assert!(check_reserved(Some("user-42"), None).is_ok());
+        assert!(check_reserved(None, Some("agent")).is_ok());
+        assert!(matches!(
+            check_reserved(Some(ADMIN_COMPONENT), None),
+            Err(AuthError::Reserved {
+                component: "_admin"
+            })
+        ));
+        assert!(matches!(
+            check_reserved(None, Some(PURGED_COMPONENT)),
+            Err(AuthError::Reserved {
+                component: "_purged"
+            })
+        ));
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{
+  "name": "novelty",
+  "embedder_dim": 256,
+  "budgets": [],
+  "writes": [
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the production database migration runs on Sundays at 02:00 UTC",
+      "kind": "fact", "tags": ["ops"] },
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the on-call rotation starts Monday morning and hands over on Friday",
+      "kind": "fact", "tags": ["ops"] },
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the customer prefers written summaries over meetings",
+      "kind": "preference", "tags": ["style"] }
+  ],
+  "unreplayable": []
+}

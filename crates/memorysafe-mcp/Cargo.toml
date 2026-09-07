@@ -1,0 +1,44 @@
+[package]
+name = "memorysafe-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MCP server for the MemorySafe governed-memory engine"
+
+[dependencies]
+memorysafe-auth.workspace = true
+memorysafe-backend.workspace = true
+memorysafe-core.workspace = true
+memorysafe-engine.workspace = true
+anyhow.workspace = true
+http.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros", "io-std"] }
+
+[dev-dependencies]
+memorysafe-backend-sqlite.workspace = true
+memorysafe-embed.workspace = true
+memorysafe-policy.workspace = true
+axum.workspace = true
+# No TLS feature: the brief's own Cargo.toml snippet named `rustls-tls`,
+# which does not exist in this version of reqwest at all (renamed `rustls` —
+# verified against the vendored `reqwest-0.13.4/Cargo.toml`, not guessed).
+# But reqwest needs no TLS backend feature just to compile — it gates every
+# TLS path behind `__tls` and otherwise builds a plain HTTP-only connector
+# (`src/async_impl/client.rs`), and every request `tests/http_transport.rs`
+# makes is to a plain-HTTP loopback listener. Enabling `rustls` here would
+# needlessly pull `aws-lc-sys`/`ring`/`rustls-platform-verifier` — a
+# cmake-plus-C build — into `Cargo.lock` for a feature nothing exercises.
+reqwest.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tokio-util.workspace = true
+
+[lints]
+workspace = true

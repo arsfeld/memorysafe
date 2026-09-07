@@ -1,0 +1,17 @@
+{
+  "name": "redundancy",
+  "embedder_dim": 256,
+  "budgets": [],
+  "writes": [
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the deploy key rotates every ninety days",
+      "kind": "fact", "tags": [] },
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the deploy key rotates every ninety days",
+      "kind": "fact", "tags": [] },
+    { "scope": { "tenant": "acme", "subject": "user-42", "namespace": "agent" },
+      "body": "the deploy key rotates every ninety days, per the security policy",
+      "kind": "fact", "tags": [] }
+  ],
+  "unreplayable": []
+}

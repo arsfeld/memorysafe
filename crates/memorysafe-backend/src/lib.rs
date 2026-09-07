@@ -22,7 +22,7 @@ pub use portability::{
     ExportRecord, ExportStream, ExportVector, FORMAT_VERSION, ImportReport, ImportStream,
     ScopeSelector,
 };
-pub use query::{CandidateQuery, HardFilters, MAX_PAGE_LIMIT, Page};
+pub use query::{CandidateQuery, HardFilters, MAX_AUDIT_LIMIT, MAX_PAGE_LIMIT, Page};
 pub use write::{AppliedWrite, ItemWrite, MergeWrite, PurgeReport, WriteTransaction};
 
 #[derive(Debug, Error)]

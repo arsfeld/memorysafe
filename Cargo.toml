@@ -15,6 +15,35 @@ memorysafe-backend-sqlite = { path = "crates/memorysafe-backend-sqlite" }
 memorysafe-policy = { path = "crates/memorysafe-policy" }
 memorysafe-auth = { path = "crates/memorysafe-auth" }
 memorysafe-engine = { path = "crates/memorysafe-engine" }
+memorysafe-mcp = { path = "crates/memorysafe-mcp" }
+memorysafe-api = { path = "crates/memorysafe-api" }
+memorysafe-cli = { path = "crates/memorysafe-cli" }
+memorysafe-shadow = { path = "crates/memorysafe-shadow" }
+rmcp = { version = "3.2.0", default-features = false, features = [
+    "server", "macros", "schemars", "transport-io", "transport-streamable-http-server",
+] }
+schemars = "1.2.2"
+http = "1.3.1"
+anyhow = "1.0.104"
+# Not part of the plan's own workspace-dependencies diff for this task: the
+# task's Cargo.toml puts `tempfile.workspace = true` under
+# `memorysafe-mcp`'s `[dev-dependencies]`, but nothing before this task ever
+# added `tempfile` to `[workspace.dependencies]` (memorysafe-engine and
+# memorysafe-backend-sqlite each pin their own local `tempfile = "3.27.0"`
+# instead). Promoted here, pinned to the same version already used
+# workspace-wide, so `memorysafe-mcp` can resolve it the way its own
+# Cargo.toml is written.
+tempfile = "3.27.0"
+# Also not part of the plan's own workspace-dependencies diff, for the same
+# reason as `tempfile` above: `memorysafe-engine`, `memorysafe-backend` and
+# `memorysafe-backend-sqlite` each pin their own local `tokio = "1.53.1"`
+# rather than a workspace one, so nothing before this task ever added
+# `tokio` to `[workspace.dependencies]` -- and `memorysafe-mcp`'s own
+# Cargo.toml (this task's brief, verbatim) inherits it via
+# `tokio = { workspace = true, features = [...] }` in both
+# `[dependencies]` and `[dev-dependencies]`. No default features here:
+# every consumer already states its own feature set explicitly.
+tokio = { version = "1.53.1", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 # `float_roundtrip`: serde_json's DEFAULT float parser is a fast, non-exact
 # `significand as f64` times/divided-by an approximate `POW10` lookup (see
@@ -51,6 +80,54 @@ blake3 = "1.5"
 base64 = "0.22"
 subtle = "2.6.1"
 getrandom = "0.4.3"
+# Streamable-HTTP transport (Task 6): a real tower service to mount and a
+# real listener to bind in tests. No `macros` feature: nothing here uses
+# `#[axum::debug_handler]`, and enabling it would pull `axum-macros` into
+# `Cargo.lock` for nothing.
+axum = "0.8.9"
+# `default-features = false`, and no TLS feature enabled anywhere in this
+# workspace: reqwest 0.13.4 gates every TLS path behind its `__tls` feature
+# (`src/async_impl/client.rs`, checked against the vendored source) and
+# builds a plain HTTP-only connector without it — there is no
+# `compile_error!` guard that would force a backend choice just to compile.
+# Nothing here makes an HTTPS request: the reqwest client this pulls in
+# exists only as the transport `rmcp`'s streamable-HTTP *client* feature uses
+# in `memorysafe-mcp`'s tests, against a plain-HTTP loopback listener. A
+# consumer that does need TLS adds a backend feature (e.g. `rustls`) on its
+# own `[dependencies]` line; enabling one workspace-wide for a loopback test
+# would needlessly pull `aws-lc-sys`/`ring`/`rustls-platform-verifier` (a
+# cmake-plus-C build) into every build's dependency graph.
+reqwest = { version = "0.13.4", default-features = false }
+# `CancellationToken`, used by `memorysafe-mcp`'s `tests/http_transport.rs`
+# to drive `axum::serve(...).with_graceful_shutdown(...)` for the test
+# listener. Only a dev-dependency there — nothing in any crate's `src/` uses
+# it — but promoted to the workspace table like the other Task 6 additions
+# so its version is pinned in one place.
+tokio-util = "0.7.19"
+# `tower::ServiceExt::oneshot`, used by `memorysafe-api`'s test harness to
+# drive its `axum::Router` directly without binding a real listener. Only
+# `util`: nothing here needs `tower`'s load-balancing, retry, or timeout
+# middleware.
+tower = { version = "0.5.3", features = ["util"] }
+# `TraceLayer`, mounted on `memorysafe-api`'s router. Only `trace`: no other
+# tower-http middleware is used.
+tower-http = { version = "0.7.1", features = ["trace"] }
+tracing = "0.1.44"
+# `memorysafe-cli` (Task 11), the workspace's composition root: `msafe`'s
+# argument parsing (`derive`) and its `env` fallback for `--tenant`/
+# `--subject`/`--namespace` (`MSAFE_TENANT` etc.), so a flag and its
+# environment variable are declared once, not parsed twice by hand.
+clap = { version = "4.6.6", features = ["derive", "env"] }
+# `msafe.toml` parsing/writing (`memorysafe-cli::config`).
+toml = "1.1.5"
+# `main.rs`'s stderr-only log writer, so a stray log line never corrupts the
+# stdout MCP-over-stdio transport a later task adds under this same binary.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# `memorysafe-cli`'s `tests/memory.rs`: drives the built `msafe` binary as a
+# subprocess rather than calling its internals directly, which is the only
+# way to observe real exit codes and real stdout/stderr framing.
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

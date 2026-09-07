@@ -1,0 +1,27 @@
+[package]
+name = "memorysafe-shadow"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shadow evaluation: replay governance decisions against another policy and diff them"
+
+[dependencies]
+memorysafe-backend.workspace = true
+memorysafe-backend-sqlite.workspace = true
+memorysafe-core.workspace = true
+memorysafe-embed.workspace = true
+memorysafe-engine.workspace = true
+memorysafe-policy.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

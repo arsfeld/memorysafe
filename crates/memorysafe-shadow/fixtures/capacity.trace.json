@@ -1,0 +1,110 @@
+{
+  "scenario": "capacity",
+  "policy": {
+    "name": "baseline",
+    "version": "0.1.0"
+  },
+  "decisions": [
+    {
+      "seq": 0,
+      "scope": {
+        "tenant": "acme",
+        "subject": "user-42",
+        "namespace": "agent"
+      },
+      "body_digest": "ddc4d35d988c21bfb6a3079b40c23d7eaff03f96aaa9453079074532d31a4ff4",
+      "action": {
+        "kind": "retain",
+        "protection": {
+          "kind": "protected",
+          "window_seconds": 2592000
+        }
+      },
+      "reason_codes": [
+        "protected_fragile"
+      ],
+      "evicted": 0,
+      "sensitivity": "internal"
+    },
+    {
+      "seq": 1,
+      "scope": {
+        "tenant": "acme",
+        "subject": "user-42",
+        "namespace": "agent"
+      },
+      "body_digest": "59d7d50002a393426e26d6edeaf20079659ceaf8a052def11bc3622b23bab272",
+      "action": {
+        "kind": "retain",
+        "protection": {
+          "kind": "normal"
+        }
+      },
+      "reason_codes": [
+        "novel_content"
+      ],
+      "evicted": 0,
+      "sensitivity": "internal"
+    },
+    {
+      "seq": 2,
+      "scope": {
+        "tenant": "acme",
+        "subject": "user-42",
+        "namespace": "agent"
+      },
+      "body_digest": "3c3c8987fb4550fc860d9901ca8a4d0d546b1076279ececbd3219e811429d03e",
+      "action": {
+        "kind": "retain",
+        "protection": {
+          "kind": "normal"
+        }
+      },
+      "reason_codes": [
+        "novel_content"
+      ],
+      "evicted": 1,
+      "sensitivity": "internal"
+    },
+    {
+      "seq": 3,
+      "scope": {
+        "tenant": "acme",
+        "subject": "user-42",
+        "namespace": "agent"
+      },
+      "body_digest": "b69f72c242d8ac4a749f6a32dff7303f5bc0fe8df938b0c0b25d9c05e8b57da8",
+      "action": {
+        "kind": "retain",
+        "protection": {
+          "kind": "normal"
+        }
+      },
+      "reason_codes": [
+        "novel_content"
+      ],
+      "evicted": 1,
+      "sensitivity": "internal"
+    },
+    {
+      "seq": 4,
+      "scope": {
+        "tenant": "acme",
+        "subject": "user-42",
+        "namespace": "agent"
+      },
+      "body_digest": "8933a95d9f08f407b71fef04cb1b11ac77fc6667c6ae52e9babef7e73633b140",
+      "action": {
+        "kind": "retain",
+        "protection": {
+          "kind": "normal"
+        }
+      },
+      "reason_codes": [
+        "novel_content"
+      ],
+      "evicted": 1,
+      "sensitivity": "internal"
+    }
+  ]
+}

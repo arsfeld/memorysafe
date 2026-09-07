@@ -40,6 +40,20 @@ fn req_with_query(query: Option<&str>) -> RecallRequest {
     }
 }
 
+// Both tests below assert the guard's own wording
+// (`"filter-only recall"`), not just the `EngineError::Validation` variant.
+// Since fix round 1 of Task 7 (`memorysafe-engine/src/error.rs`'s
+// `From<BackendError> for EngineError`), `BackendError::InvalidQuery` — which
+// `CandidateQuery::is_valid()` also raises, further down in
+// `SqliteBackend::retrieve_candidates`, for the exact same "no embedding, no
+// text" condition — maps to `EngineError::Validation` too. A variant-only
+// assertion can no longer tell "the engine's own pre-backend guard caught
+// this" from "the guard was deleted and the backend's own validity check
+// caught it instead, one layer down" — both now produce the same
+// `EngineError` variant. This file's whole reason to exist (its own module
+// doc: deleting the guard "survives every test in `tests/read.rs`") depends
+// on that distinction staying visible, so the message text is the only
+// remaining way to prove specifically the ENGINE's guard fired.
 #[tokio::test]
 async fn a_recall_with_no_query_is_a_validation_error() {
     let e = engine();
@@ -50,6 +64,10 @@ async fn a_recall_with_no_query_is_a_validation_error() {
     assert!(
         matches!(err, EngineError::Validation(_)),
         "expected EngineError::Validation, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("filter-only recall"),
+        "expected the engine's own pre-backend guard message, got: {err}"
     );
 }
 
@@ -63,5 +81,9 @@ async fn a_recall_with_a_whitespace_only_query_is_a_validation_error() {
     assert!(
         matches!(err, EngineError::Validation(_)),
         "expected EngineError::Validation, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("filter-only recall"),
+        "expected the engine's own pre-backend guard message, got: {err}"
     );
 }

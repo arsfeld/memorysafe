@@ -24,7 +24,9 @@ pub use error::CoreError;
 pub use ids::{
     ADMIN_COMPONENT, AuditId, ItemId, Namespace, PURGED_COMPONENT, Scope, SubjectId, TenantId,
 };
-pub use item::{MemoryItem, Protection, Source, SourceKind};
+pub use item::{
+    MemoryItem, Protection, ProtectionParseError, Source, SourceKind, parse_protection,
+};
 pub use policy::{
     AdmitContext, AssessContext, Assessed, Candidate, ComposeContext, GovernancePolicy,
     MaintainContext, MaintenanceCandidate, PolicyError,

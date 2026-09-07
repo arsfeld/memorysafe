@@ -110,6 +110,17 @@ impl RetentionProfile {
             _ => None,
         }
     }
+
+    /// The inverse of `from_name`. These four strings are the documented,
+    /// tested surface — a customer's configuration file names one of them.
+    pub fn name(self) -> &'static str {
+        match self {
+            RetentionProfile::Balanced => "balanced",
+            RetentionProfile::GdprStrict => "gdpr_strict",
+            RetentionProfile::HipaaRetain => "hipaa_retain",
+            RetentionProfile::Forensic => "forensic",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,5 +172,17 @@ mod tests {
         let wire = serde_json::to_string(&days).unwrap();
         assert_eq!(wire, "{\"days\":90}");
         assert_eq!(serde_json::from_str::<RetentionSpan>(&wire).unwrap(), days);
+    }
+
+    #[test]
+    fn every_profile_name_parses_back_to_its_profile() {
+        for profile in [
+            RetentionProfile::Balanced,
+            RetentionProfile::GdprStrict,
+            RetentionProfile::HipaaRetain,
+            RetentionProfile::Forensic,
+        ] {
+            assert_eq!(RetentionProfile::from_name(profile.name()), Some(profile));
+        }
     }
 }

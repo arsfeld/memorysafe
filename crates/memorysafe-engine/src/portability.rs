@@ -4,8 +4,8 @@ use memorysafe_backend::{
     ExportRecord, ExportStream, ImportReport, ImportStream, ScopeSelector, WriteTransaction,
 };
 use memorysafe_core::{
-    ADMIN_COMPONENT, Actor, AuditEvent, AuditRecord, ItemRef, Namespace, Protection, Scope,
-    SubjectId, TenantId,
+    ADMIN_COMPONENT, Actor, AuditEvent, AuditId, AuditRecord, ItemId, ItemRef, Namespace,
+    Protection, Scope, SubjectId, TenantId,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -31,8 +31,9 @@ impl Engine {
     /// otherwise ordinary body must survive a round trip; see
     /// `an_import_cannot_use_fresh_detection_to_downgrade_an_already_high_classification`).
     ///
-    /// This detection deliberately does **not** go through the configured
-    /// `self.policy: Arc<dyn GovernancePolicy>` the way `remember` does.
+    /// This detection deliberately does **not** go through the tenant's
+    /// configured `Arc<dyn GovernancePolicy>` (`Engine::policy_for`) the way
+    /// `remember` does.
     /// `GovernancePolicy::assess` requires an `AssessContext` — nearest
     /// neighbours and scope statistics — which costs a `Backend::neighbours`
     /// and a `Backend::scope_stats` round trip *per item*, and neighbour
@@ -65,7 +66,7 @@ impl Engine {
     ///   `maintain`-time `Retain` routed through `protect`. **This is true
     ///   for `BaselinePolicy` specifically, not in general**: `Action::Retain
     ///   { protection }` is applied verbatim in `write.rs` regardless of
-    ///   which policy produced it, `self.policy` is an
+    ///   which policy produced it, `Engine::policy_for(tenant)` returns an
     ///   `Arc<dyn GovernancePolicy>`, and nothing stops a custom policy from
     ///   legally setting `Pinned` at admission. `Pinned` carries no bound to
     ///   clamp — it is a flag, not a window — so there is no value-level
@@ -107,12 +108,14 @@ impl Engine {
     /// left no trace of itself at all: the imported *items* are auditable, and
     /// the act of importing them was not.
     ///
-    /// The plan defers `Imported`/`Exported` "for want of an actor". That
-    /// reason does not hold — `forget`, `protect` and `purge_subject` all ship
-    /// today with `Actor::system()` and a recorded gap, and this follows that
-    /// precedent: `Actor::system()`, not the actor who ordered the import,
-    /// with the same deferral to Plan 3's Task 2 that `purge_subject`'s doc
-    /// (`mutate.rs`) sets out in full.
+    /// **`Actor::system()` here, but not always.** This method (`import`,
+    /// called directly with no actor in hand) writes `Actor::system()`, the
+    /// same placeholder `forget` and `protect` still use. The actor-attributed
+    /// case — the caller identified in `Engine::import_ndjson_as` (`lib.rs`,
+    /// Plan 3's Task 2) — reuses this same write path through `import_as`
+    /// below rather than layering a second `Imported` row on top: exactly one
+    /// row is written per import either way, naming whichever actor the
+    /// caller had.
     ///
     /// **What the record carries, and the one thing it does not.** Its scope
     /// names the destination tenant; its `items` name every item record the
@@ -137,27 +140,53 @@ impl Engine {
     /// an import that happened with no record of itself. Closing that is a
     /// `Backend` signature change, which belongs with the next contract batch.
     ///
-    /// **Audit rows in the *stream* are not part of either defence.** This function maps
-    /// only `ExportRecord::Item`; `ExportRecord::Header` and
-    /// `ExportRecord::Audit` pass through the `other => other` arm
-    /// untouched. That asymmetry — items re-assessed, audit rows trusted
-    /// outright — is real, and it is **unexamined, not deliberate**: nothing
-    /// in this task's design considered whether an import stream's audit
-    /// rows should be trusted before storing them. A crafted stream can
-    /// inject arbitrary audit history into the destination tenant,
-    /// including a fabricated `SubjectPurged` row manufacturing evidence
-    /// that an erasure occurred that never did, and `Reason::detail` (a free
-    /// `String` reachable through `Decision::reasons`, itself embedded in
-    /// `AuditRecord`) is unconstrained text an attacker-controlled import
-    /// could use to smuggle an item body into an audit row — a route around
-    /// the "audit rows never contain item bodies" constraint that nothing
-    /// here validates against. Whether audit content should be validated on
-    /// import is a design decision beyond this task's scope; it is recorded
-    /// here rather than fixed.
+    /// **Structure is re-validated; content is not.** `Scope`'s and
+    /// `ItemId`'s/`AuditId`'s `Deserialize` impls route through a bare inner
+    /// `String`, never through `Scope::new`/`ItemId::parse`/`AuditId::parse`
+    /// (see `memorysafe_core::ids`'s own doc on why `validate_component` runs
+    /// only in `::new`) — so a caller-supplied stream can carry a
+    /// structurally illegal tenant/subject/namespace, or an item or audit id
+    /// that is not a well-formed ULID, neither of which this crate's own
+    /// constructors could ever produce. Both are re-checked here, per
+    /// record, for both `ExportRecord::Item` and `ExportRecord::Audit`
+    /// (`ExportRecord::Header` carries neither and is unaffected), and the
+    /// whole stream is rejected — before anything is written — on the first
+    /// failure. Left unchecked, such a row is not merely malformed: once
+    /// persisted, `row_to_item`/audit's own scope reconstruction rebuilds the
+    /// same `Scope` through `Scope::new` on every read, so a row with an
+    /// illegal namespace becomes permanently unreachable by `get`, `review`,
+    /// `export`, and `purge_subject` alike — there is no path back through
+    /// the product once it lands.
+    ///
+    /// **Audit *content* is a narrower, still-open gap, not the one this
+    /// re-validation closes.** A structurally well-formed `AuditId` — a
+    /// legal ULID an attacker minted for the occasion — still carries
+    /// whatever `event`, `actor`, and `decision` the stream claims: nothing
+    /// here checks that a `SubjectPurged` row's actor is who it says, or that
+    /// `Reason::detail` (free text reachable through `Decision::reasons`,
+    /// itself embedded in `AuditRecord`) does not smuggle an item body into
+    /// an audit row. That trust question predates this validation and is
+    /// unrelated to it; it is tracked in `docs/known-gaps.md`, not fixed
+    /// here.
     pub async fn import(
         &self,
         destination: &TenantId,
         stream: ImportStream,
+    ) -> Result<ImportReport, EngineError> {
+        self.import_as(destination, stream, &Actor::system()).await
+    }
+
+    /// `import`'s body, parameterised on the actor its one `Imported` row
+    /// names. `import` itself supplies `Actor::system()`; `import_ndjson_as`
+    /// (via `import_ndjson_with_actor` below) supplies the caller's own —
+    /// there is exactly one construction site for the `Imported` row
+    /// (`audit` a few lines down), so the two callers can never produce two
+    /// rows for the one import between them.
+    pub(crate) async fn import_as(
+        &self,
+        destination: &TenantId,
+        stream: ImportStream,
+        actor: &Actor,
     ) -> Result<ImportReport, EngineError> {
         let cfg = memorysafe_policy::BaselineConfig::default();
         let now = OffsetDateTime::now_utc();
@@ -165,33 +194,74 @@ impl Engine {
 
         let reassessed: ImportStream = stream
             .into_iter()
-            .map(|record| match record {
-                ExportRecord::Item { mut item, vector } => {
-                    let candidate = memorysafe_core::Candidate {
-                        body: item.body.clone(),
-                        kind: item.kind.clone(),
-                        tags: item.tags.clone(),
-                        attrs: item.attrs.clone(),
-                        sensitivity_hint: None,
-                        embedding: None,
-                        byte_size: item.byte_size(),
-                    };
-                    let detected = memorysafe_policy::sensitivity::assess(&candidate, &cfg).level;
-                    item.sensitivity = item.sensitivity.max(detected);
-                    item.protection = match item.protection {
-                        Protection::Pinned => Protection::Normal,
-                        Protection::Protected { until } if until > max_protected_until => {
-                            Protection::Protected {
-                                until: max_protected_until,
+            .map(|record| -> Result<ExportRecord, EngineError> {
+                match record {
+                    ExportRecord::Item { mut item, vector } => {
+                        Scope::new(
+                            item.scope.tenant.as_str(),
+                            item.scope.subject.as_str(),
+                            item.scope.namespace.as_str(),
+                        )
+                        .map_err(|e| {
+                            EngineError::Validation(format!(
+                                "import item {} names a structurally invalid scope: {e}",
+                                item.id
+                            ))
+                        })?;
+                        ItemId::parse(item.id.as_str()).map_err(|e| {
+                            EngineError::Validation(format!(
+                                "import item has a structurally invalid id {}: {e}",
+                                item.id
+                            ))
+                        })?;
+
+                        let candidate = memorysafe_core::Candidate {
+                            body: item.body.clone(),
+                            kind: item.kind.clone(),
+                            tags: item.tags.clone(),
+                            attrs: item.attrs.clone(),
+                            sensitivity_hint: None,
+                            embedding: None,
+                            byte_size: item.byte_size(),
+                        };
+                        let detected =
+                            memorysafe_policy::sensitivity::assess(&candidate, &cfg).level;
+                        item.sensitivity = item.sensitivity.max(detected);
+                        item.protection = match item.protection {
+                            Protection::Pinned => Protection::Normal,
+                            Protection::Protected { until } if until > max_protected_until => {
+                                Protection::Protected {
+                                    until: max_protected_until,
+                                }
                             }
-                        }
-                        other => other,
-                    };
-                    ExportRecord::Item { item, vector }
+                            other => other,
+                        };
+                        Ok(ExportRecord::Item { item, vector })
+                    }
+                    ExportRecord::Audit { audit } => {
+                        Scope::new(
+                            audit.scope.tenant.as_str(),
+                            audit.scope.subject.as_str(),
+                            audit.scope.namespace.as_str(),
+                        )
+                        .map_err(|e| {
+                            EngineError::Validation(format!(
+                                "import audit row {} names a structurally invalid scope: {e}",
+                                audit.id
+                            ))
+                        })?;
+                        AuditId::parse(audit.id.as_str()).map_err(|e| {
+                            EngineError::Validation(format!(
+                                "import audit row has a structurally invalid id {}: {e}",
+                                audit.id
+                            ))
+                        })?;
+                        Ok(ExportRecord::Audit { audit })
+                    }
+                    other => Ok(other),
                 }
-                other => other,
             })
-            .collect();
+            .collect::<Result<ImportStream, EngineError>>()?;
 
         // Read off the reassessed stream, before it is moved into the backend
         // — and from the *reassessed* stream rather than the caller's, so the
@@ -233,13 +303,13 @@ impl Engine {
             namespace: Namespace::new(ADMIN_COMPONENT)
                 .expect("the reserved component is a valid namespace"),
         };
-        // `Actor::system()` and the gap it stands for: see this method's doc,
-        // and `purge_subject`'s in `mutate.rs` for the full account.
+        // `actor.clone()`: see this method's doc for who that is on each of
+        // its two call paths.
         let audit = AuditRecord::new(
             audit_scope.clone(),
             AuditEvent::Imported,
             refs,
-            Actor::system(),
+            actor.clone(),
             OffsetDateTime::now_utc(),
         );
         self.backend
@@ -283,6 +353,23 @@ impl Engine {
         ndjson: &str,
         destination: &TenantId,
     ) -> Result<ImportReport, EngineError> {
+        self.import_ndjson_with_actor(ndjson, destination, &Actor::system())
+            .await
+    }
+
+    /// `import_ndjson`'s body, parameterised on the actor `import_as` should
+    /// name. `Engine::import_ndjson_as` (`lib.rs`) is this method's other
+    /// caller, supplying the caller-identified actor instead of
+    /// `Actor::system()` — see `import_as`'s own doc for why routing through
+    /// this shared parse-then-import path, rather than calling
+    /// `import_ndjson` and separately auditing the result, is what keeps the
+    /// `Imported` row to exactly one.
+    pub(crate) async fn import_ndjson_with_actor(
+        &self,
+        ndjson: &str,
+        destination: &TenantId,
+        actor: &Actor,
+    ) -> Result<ImportReport, EngineError> {
         let mut stream: ImportStream = Vec::new();
         for (i, line) in ndjson.lines().enumerate() {
             if line.trim().is_empty() {
@@ -292,7 +379,7 @@ impl Engine {
                 .map_err(|e| EngineError::Validation(format!("line {}: {e}", i + 1)))?;
             stream.push(record);
         }
-        self.import(destination, stream).await
+        self.import_as(destination, stream, actor).await
     }
 
     /// A human-readable rendering. This is what makes "your memory is yours"

@@ -2,7 +2,7 @@ use memorysafe_backend::ScopeSelector;
 use memorysafe_backend_sqlite::SqliteBackend;
 use memorysafe_core::{Protection, Scope, SensitivityLevel, TenantId};
 use memorysafe_embed::DeterministicEmbedder;
-use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
+use memorysafe_engine::{Engine, EngineConfig, EngineError, RememberRequest};
 use memorysafe_policy::{BaselineConfig, BaselinePolicy};
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
@@ -484,5 +484,170 @@ async fn an_import_writes_an_audit_record_naming_the_tenant_and_what_it_carried(
         target.audit(&scope(), &imported).await.unwrap().is_empty(),
         "the record is tenant-level and must not be filed under an imported \
          item's own subject"
+    );
+}
+
+/// C1 (final review): `Scope`'s `Deserialize` impl routes through a bare
+/// inner `String`, not through `Namespace::new`/`validate_component` (only
+/// `::new` runs it — see `memorysafe_core::ids`'s own doc), so a
+/// caller-supplied import stream can carry a namespace no legitimate write
+/// could ever produce. The reviewer reproduced the consequence end-to-end
+/// through the shipped binary: once such a row lands, every read rebuilds the
+/// same `Scope` through `Scope::new`, so `export`/`purge_subject` over that
+/// tenant fail *forever* afterwards — `namespace contains an illegal
+/// character`, with no recovery through the product. `Engine::import_as` now
+/// re-validates structure per record and rejects the whole stream before
+/// anything is written.
+///
+/// The property that actually matters is asserted here, per the brief: not
+/// merely that the bad import errors, but that the tenant is left exactly as
+/// it was — a later export and a later purge both still work.
+#[tokio::test]
+async fn import_with_a_structurally_invalid_namespace_is_rejected_and_nothing_is_persisted() {
+    let e = engine();
+    let ndjson = format!(
+        "{}\n{}\n",
+        r#"{"record":"header","format_version":1,"exported_at":0}"#,
+        serde_json::json!({
+            "record": "item",
+            "item": {
+                "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "scope": {"tenant": "acme", "subject": "user-42", "namespace": "BAD/NS"},
+                "body": "a namespace no Namespace::new call could ever produce",
+                "kind": "fact",
+                "source": {"kind": "agent", "id": serde_json::Value::Null},
+                "occurred_at": serde_json::Value::Null,
+                "created_at": 0,
+                "tags": [],
+                "attrs": {},
+                "sensitivity": "internal",
+                "ttl": serde_json::Value::Null,
+                "protection": {"kind": "normal"},
+                "pending_embedding": false
+            }
+        })
+    );
+
+    let err = e.import_ndjson(&ndjson, &tenant()).await.unwrap_err();
+    assert!(
+        matches!(err, EngineError::Validation(_)),
+        "malformed caller input must surface as Validation (400 at the HTTP \
+         boundary), not a Backend/503 error the backend never got a chance to \
+         raise: {err:?}"
+    );
+
+    // Nothing was persisted: an export of the whole tenant carries only the
+    // header line, and a purge over the subject the forged record named
+    // succeeds rather than tripping the "namespace contains an illegal
+    // character" failure the reviewer reproduced end-to-end.
+    let exported = e
+        .export_ndjson(&selector(true))
+        .await
+        .expect("export must still work after a rejected import");
+    assert_eq!(
+        exported.lines().count(),
+        1,
+        "only the header — the malformed record must not have been written"
+    );
+
+    let subject = memorysafe_core::SubjectId::new("user-42").unwrap();
+    e.purge_subject(&tenant(), &subject, &memorysafe_core::Actor::system())
+        .await
+        .expect("purge must still work after a rejected import");
+}
+
+/// Same defect, the other structural field: `ItemId`'s `Deserialize` impl
+/// also bypasses `ItemId::parse`'s ULID check, so an import stream can carry
+/// an id `ItemId::parse` would refuse.
+#[tokio::test]
+async fn import_with_a_malformed_item_id_is_rejected_and_nothing_is_persisted() {
+    let e = engine();
+    let ndjson = format!(
+        "{}\n{}\n",
+        r#"{"record":"header","format_version":1,"exported_at":0}"#,
+        serde_json::json!({
+            "record": "item",
+            "item": {
+                "id": "not-a-valid-ulid",
+                "scope": {"tenant": "acme", "subject": "user-42", "namespace": "agent"},
+                "body": "an id no ItemId::parse call could ever produce",
+                "kind": "fact",
+                "source": {"kind": "agent", "id": serde_json::Value::Null},
+                "occurred_at": serde_json::Value::Null,
+                "created_at": 0,
+                "tags": [],
+                "attrs": {},
+                "sensitivity": "internal",
+                "ttl": serde_json::Value::Null,
+                "protection": {"kind": "normal"},
+                "pending_embedding": false
+            }
+        })
+    );
+
+    let err = e.import_ndjson(&ndjson, &tenant()).await.unwrap_err();
+    assert!(
+        matches!(err, EngineError::Validation(_)),
+        "a malformed item id must surface as Validation, not a Backend error: {err:?}"
+    );
+
+    let exported = e
+        .export_ndjson(&selector(true))
+        .await
+        .expect("export must still work after a rejected import");
+    assert_eq!(exported.lines().count(), 1, "only the header");
+
+    let subject = memorysafe_core::SubjectId::new("user-42").unwrap();
+    e.purge_subject(&tenant(), &subject, &memorysafe_core::Actor::system())
+        .await
+        .expect("purge must still work after a rejected import");
+}
+
+/// Same defect, on the audit side: `AuditId`'s `Deserialize` impl bypasses
+/// `AuditId::parse` too, so a forged `ExportRecord::Audit` can carry an id
+/// that is not a well-formed ULID at all. This is deliberately narrower than
+/// the still-open gap in `docs/known-gaps.md` (a *legal* forged ULID
+/// attributed to an arbitrary human is still accepted verbatim — that trust
+/// question is unrelated to this one and is not fixed here): this test
+/// proves only that a *structurally* invalid audit id cannot reach storage,
+/// where it would sit unreadable by every audit query going forward, exactly
+/// as an invalid item id or namespace would.
+#[tokio::test]
+async fn import_with_a_malformed_audit_id_is_rejected_and_nothing_is_persisted() {
+    use memorysafe_backend::ExportRecord;
+    use memorysafe_core::{Actor, ActorKind, AuditEvent, AuditRecord};
+
+    let e = engine();
+    let record = AuditRecord::new(
+        scope(),
+        AuditEvent::SubjectPurged,
+        vec![],
+        Actor {
+            kind: ActorKind::Human,
+            id: Some("arbitrary-human".into()),
+        },
+        OffsetDateTime::now_utc(),
+    );
+    let mut audit_json = serde_json::to_value(ExportRecord::Audit {
+        audit: Box::new(record),
+    })
+    .unwrap();
+    audit_json["audit"]["id"] = serde_json::json!("not-a-valid-ulid");
+
+    let ndjson = format!(
+        "{}\n{}\n",
+        r#"{"record":"header","format_version":1,"exported_at":0}"#, audit_json
+    );
+
+    let err = e.import_ndjson(&ndjson, &tenant()).await.unwrap_err();
+    assert!(
+        matches!(err, EngineError::Validation(_)),
+        "a malformed audit id must surface as Validation, not a Backend error: {err:?}"
+    );
+
+    let rows = e.audit(&scope(), &Default::default()).await.unwrap();
+    assert!(
+        rows.is_empty(),
+        "the forged audit row must not have been persisted: {rows:?}"
     );
 }

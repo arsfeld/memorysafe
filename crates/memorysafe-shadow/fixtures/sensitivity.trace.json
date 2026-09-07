@@ -1,0 +1,30 @@
+{
+  "scenario": "sensitivity",
+  "policy": {
+    "name": "baseline",
+    "version": "0.1.0"
+  },
+  "decisions": [
+    {
+      "seq": 0,
+      "scope": {
+        "tenant": "acme",
+        "subject": "user-42",
+        "namespace": "agent"
+      },
+      "body_digest": "f1af197e6e03235629b3b0b4d492e017d7efb3dcedf1636aeef88b1db76da321",
+      "action": {
+        "kind": "retain",
+        "protection": {
+          "kind": "protected",
+          "window_seconds": 2592000
+        }
+      },
+      "reason_codes": [
+        "sensitivity_conflict"
+      ],
+      "evicted": 0,
+      "sensitivity": "restricted"
+    }
+  ]
+}

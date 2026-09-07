@@ -758,12 +758,21 @@ amend the frozen conformance suite:
 ### Before Plan 3 exposes any of this over HTTP
 
 - **`Engine::import` writes caller-supplied audit rows verbatim.** The import path re-assesses
-  items — sensitivity raised, `Pinned` stripped, `Protected.until` clamped — but passes header
-  and audit records through untouched. A crafted stream can inject arbitrary audit history into
-  the destination tenant, including a fabricated `SubjectPurged` row manufacturing evidence of
-  an erasure that never happened, and `Reason::detail` is free text that routes an item body
-  into an audit row. The import now records *itself*, which was the merge-blocking half; the
-  trust question is this one and it is not closed.
+  items — sensitivity raised, `Pinned` stripped, `Protected.until` clamped — and, as of the C1 fix
+  in the adapters-and-shadow final review, re-validates that every item and audit record's
+  `Scope`/`ItemId`/`AuditId` is *structurally* well-formed (closing a separate, worse defect: an
+  unvalidated illegal namespace or malformed id was permanently unreachable by every later
+  `get`/`review`/`export`/`purge_subject` call once persisted, because those rebuild the same
+  `Scope` through `Scope::new` on every read). Structure is now checked; *content* is not — event,
+  actor, decision, and `Reason::detail` still pass through untouched. A crafted stream carrying a
+  structurally legal (but forged) `AuditId` can still inject arbitrary audit history into the
+  destination tenant, including a fabricated `SubjectPurged` row manufacturing evidence of an
+  erasure that never happened, and `Reason::detail` is free text that routes an item body into an
+  audit row. This entry predates any remote exposure of `import`; this branch (Plan 3) made it
+  reachable by every tenant-scoped API key through `POST /v1/import` (the `import` handler in
+  `crates/memorysafe-api/src/ops.rs`), not just trusted in-process callers. The import now records
+  *itself*, which was the merge-blocking half; the content-trust question is this one and it is
+  not closed.
 - **`Engine::review` and `Engine::export` are unaudited, unfiltered full-corpus reads.** Neither
   applies a `sensitivity_ceiling` and neither writes an audit record, while `recall` audits even
   when it returns nothing. Deferring these was accepted *on the condition* that Plan 3 expose
