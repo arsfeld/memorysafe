@@ -16,6 +16,7 @@ memorysafe-policy = { path = "crates/memorysafe-policy" }
 memorysafe-auth = { path = "crates/memorysafe-auth" }
 memorysafe-engine = { path = "crates/memorysafe-engine" }
 memorysafe-mcp = { path = "crates/memorysafe-mcp" }
+memorysafe-api = { path = "crates/memorysafe-api" }
 rmcp = { version = "3.2.0", default-features = false, features = [
     "server", "macros", "schemars", "transport-io", "transport-streamable-http-server",
 ] }
@@ -101,6 +102,15 @@ reqwest = { version = "0.13.4", default-features = false }
 # it — but promoted to the workspace table like the other Task 6 additions
 # so its version is pinned in one place.
 tokio-util = "0.7.19"
+# `tower::ServiceExt::oneshot`, used by `memorysafe-api`'s test harness to
+# drive its `axum::Router` directly without binding a real listener. Only
+# `util`: nothing here needs `tower`'s load-balancing, retry, or timeout
+# middleware.
+tower = { version = "0.5.3", features = ["util"] }
+# `TraceLayer`, mounted on `memorysafe-api`'s router. Only `trace`: no other
+# tower-http middleware is used.
+tower-http = { version = "0.7.1", features = ["trace"] }
+tracing = "0.1.44"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
