@@ -4,6 +4,7 @@
 //! Subject and namespace arrive per request and are validated against the key's
 //! tenant. A governance decision is never an HTTP error.
 
+pub mod admin;
 pub mod auth;
 pub mod error;
 pub mod json;
@@ -57,6 +58,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/subjects/{id}",
             axum::routing::delete(ops::purge_subject),
+        )
+        .route(
+            "/v1/admin/tenants/{tenant}/budgets",
+            get(admin::get_budget).put(admin::put_budget),
+        )
+        .route(
+            "/v1/admin/tenants/{tenant}/policy",
+            get(admin::get_policy).put(admin::put_policy),
+        )
+        .route(
+            "/v1/admin/tenants/{tenant}/retention",
+            get(admin::get_retention).put(admin::put_retention),
         )
         // ADD EVERY NEW `.route(...)` ABOVE THIS LINE, NEVER BELOW IT.
         //

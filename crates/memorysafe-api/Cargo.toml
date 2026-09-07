@@ -12,6 +12,14 @@ memorysafe-auth.workspace = true
 memorysafe-backend.workspace = true
 memorysafe-core.workspace = true
 memorysafe-engine.workspace = true
+# `BaselineConfig`: `Engine::tenant_settings`/`set_tenant_policy_config`
+# (`memorysafe-engine`) type the tenant policy configuration as this concrete
+# struct, not a trait object, so the admin policy routes (`src/admin.rs`)
+# serialize and deserialize it directly. Not the same exception as the
+# workspace's "no concrete backend" rule (Global Constraints) — that rule is
+# about `memorysafe-backend-sqlite`/`rusqlite`; `memorysafe-policy` is the
+# crate that already defines the type this adapter's wire format is.
+memorysafe-policy.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,10 +30,6 @@ tracing.workspace = true
 [dev-dependencies]
 memorysafe-backend-sqlite.workspace = true
 memorysafe-embed.workspace = true
-# Only the test harness (`tests/support/mod.rs`) constructs a
-# `BaselinePolicy` to build an `Engine`; no route handler in `src/` depends
-# on a concrete policy.
-memorysafe-policy.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower.workspace = true
