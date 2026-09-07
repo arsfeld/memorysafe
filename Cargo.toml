@@ -32,13 +32,14 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Set here, not on a single crate's dependency: the parser must not vary by
 # build scope. `memorysafe-core` owns the wire-format tests over `Decision`
 # and `FeatureMap` that this shape actually hits, and by this workspace's
-# Global Constraints `memorysafe-core` must not depend on any backend crate
-# (a CI purity job builds it in isolation) -- so it cannot inherit the
-# feature from `memorysafe-backend-sqlite`. A crate-level override there
-# unified into a full `cargo test --workspace` run but silently reverted to
-# the inexact parser under `cargo test -p memorysafe-core` or the purity
-# job's isolated build, which is worse than the original defect: the
-# original was consistently wrong, that half-fix was inconsistently right.
+# Global Constraints `memorysafe-core` cannot depend on a backend crate, so
+# it cannot inherit a crate-level feature from one -- that constraint is
+# real and CI enforces it, via the purity job's `cargo tree` dependency
+# check, not a build. A crate-level override therefore unifies into a full
+# `cargo test --workspace` run but silently reverts to the inexact parser
+# under any per-crate build, `cargo test -p memorysafe-core` being the
+# obvious one -- which is worse than the original defect: the original was
+# consistently wrong, that half-fix was inconsistently right.
 # See `memorysafe-backend-sqlite::audit`'s module doc and
 # `audit::tests::evidence_shaped_by_f32_widening_survives_the_audit_round_trip_exactly`
 # for the reproduction this closes.
