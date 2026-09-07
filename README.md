@@ -79,8 +79,9 @@ memorysafe/
     memorysafe-embed/           # Int8 quantization, DeterministicEmbedder, model2vec integration
     memorysafe-backend/         # Backend trait contract and reusable conformance suite
     memorysafe-backend-sqlite/  # Single-tenant SQLite backend with WAL mode and atomic writes
-    memorysafe-policy/          # [In Progress] Baseline governance policy implementation
-    memorysafe-engine/          # [In Progress] Pipeline orchestrator (remember/recall/maintain)
+    memorysafe-policy/          # Baseline governance policy implementation (assess, admit, compose, maintain)
+    memorysafe-engine/          # Pipeline orchestrator (remember, recall, maintain, export/import)
+    memorysafe-auth/            # Tenant-scoped API keys, secret hashing, and scope validation
     memorysafe-mcp/             # [Planned] Model Context Protocol server (stdio & streamable HTTP)
     memorysafe-api/             # [Planned] REST API (axum)
     memorysafe-cli/             # [Planned] `msafe` command-line tool
@@ -91,84 +92,104 @@ memorysafe/
 
 | Crate | Purpose | Status |
 |---|---|---|
-| [`memorysafe-core`](crates/memorysafe-core) | Core domain types (`Scope`, `MemoryItem`, `Assessment`, `Decision`, `AuditRecord`, `GovernancePolicy`). Zero I/O dependencies. | Complete (77 tests) |
-| [`memorysafe-embed`](crates/memorysafe-embed) | Vector quantization (int8 SIMD), deterministic test embedder, optional static model embeddings (`model2vec-rs`). | Complete (14 tests) |
-| [`memorysafe-backend`](crates/memorysafe-backend) | Unified `Backend` trait (CRUD, hybrid search, capacity, audit, export/import, purge) + test conformance suite. | Complete |
-| [`memorysafe-backend-sqlite`](crates/memorysafe-backend-sqlite) | Single-tenant SQLite storage engine, connection pooling, and atomic transaction execution. | Active (Persistence, isolation, & atomicity conformance passing) |
+| [`memorysafe-core`](crates/memorysafe-core) | Core domain types (`Scope`, `MemoryItem`, `Assessment`, `Decision`, `AuditRecord`, `GovernancePolicy`). Zero I/O dependencies. | Complete (80 tests) |
+| [`memorysafe-embed`](crates/memorysafe-embed) | Vector quantization (int8 SIMD), deterministic test embedder, optional static model embeddings (`model2vec-rs`). | Complete (17 tests) |
+| [`memorysafe-backend`](crates/memorysafe-backend) | Unified `Backend` trait (CRUD, hybrid search, capacity, audit, export/import, purge) + test conformance suite. | Complete (41 tests, 50-test conformance contract) |
+| [`memorysafe-backend-sqlite`](crates/memorysafe-backend-sqlite) | Single-tenant SQLite storage engine, connection pooling, FTS5 + exact vector search, and atomic transactions. | Complete (104 unit tests, full conformance suite passing) |
+| [`memorysafe-policy`](crates/memorysafe-policy) | `BaselinePolicy` implementation: value scoring, corpus-calibrated fragility, pattern-based sensitivity detection, redundancy/merge classification, MMR diversity working set composition, and background maintenance. | Complete (152 tests) |
+| [`memorysafe-engine`](crates/memorysafe-engine) | Pipeline orchestrator (`Engine`): `remember`, `recall`, `maintain`, content-addressed embedding cache, policy validation, panic safety, portable ndjson export/import, audit retention profiles, and re-embedding migrations. | Complete (157 tests) |
+| [`memorysafe-auth`](crates/memorysafe-auth) | Tenant-scoped API keys, secret hashing, and scope authorization across tenant boundaries. | Complete (14 tests) |
 
 ---
 
 ## Quickstart (Rust API)
 
-Here is how to initialize the SQLite backend, construct a scoped memory item, and commit it with an atomic audit trail:
+Here is how to initialize the storage engine, embedder, and baseline policy into an `Engine`, submit a memory through the governance pipeline, and recall a governed working set:
 
 ```rust
-use std::collections::BTreeMap;
 use std::path::PathBuf;
-use time::OffsetDateTime;
-use memorysafe_core::{
-    Actor, AuditEvent, AuditRecord, ItemId, ItemRef,
-    MemoryItem, Protection, Scope, SensitivityLevel, Source, SourceKind,
-};
-use memorysafe_backend::{Backend, ItemWrite, WriteTransaction};
+use std::sync::Arc;
 use memorysafe_backend_sqlite::SqliteBackend;
+use memorysafe_core::{Action, RecallBudget, RecallMode, RecallRequest, Scope, SensitivityLevel};
+use memorysafe_embed::DeterministicEmbedder;
+use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
+use memorysafe_policy::BaselinePolicy;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Open the SQLite backend (stores one file per tenant in the target directory)
-    let backend = SqliteBackend::open(PathBuf::from("./data/tenants"));
+    // 1. Initialize the SQLite backend, embedder, and baseline governance policy
+    let backend = Arc::new(SqliteBackend::open(PathBuf::from("./data/tenants")));
+    let embedder = Arc::new(DeterministicEmbedder::new(256));
+    let policy = Arc::new(BaselinePolicy::default());
 
-    // 2. Define a target scope: tenant -> subject -> namespace
+    // 2. Instantiate the orchestrating Engine
+    let engine = Engine::new(EngineConfig::new(backend, embedder, policy));
+
+    // 3. Define a target scope: tenant -> subject -> namespace
     let scope = Scope::new("tenant_alpha", "user_42", "preferences")?;
-    let now = OffsetDateTime::now_utc();
 
-    // 3. Construct a memory item
-    let item = MemoryItem {
-        id: ItemId::new(),
-        scope: scope.clone(),
-        body: "User prefers concise code snippets with Rust 2024 edition syntax.".to_string(),
-        kind: "preference".to_string(),
-        source: Source {
-            kind: SourceKind::Agent,
-            id: Some("session-abc".to_string()),
-        },
-        occurred_at: Some(now),
-        created_at: now,
-        tags: vec!["coding".to_string(), "rust".to_string()],
-        attrs: BTreeMap::new(),
-        sensitivity: SensitivityLevel::Personal,
-        ttl: None,
-        protection: Protection::Normal,
-        pending_embedding: false,
-    };
+    // 4. Remember a memory item (assessed, governed, and committed atomically with audit)
+    let outcome = engine
+        .remember(RememberRequest::new(
+            scope.clone(),
+            "User prefers concise code snippets with Rust 2024 edition syntax.",
+        ))
+        .await?;
 
-    // 4. Create an audit record (audit stores content digests, never plaintext bodies)
-    let audit = AuditRecord::new(
-        scope.clone(),
-        AuditEvent::Admitted,
-        vec![ItemRef::from_item(&item)],
-        Actor::system(),
-        now,
-    );
+    match outcome.action {
+        Action::Retain { .. } => {
+            println!(
+                "Admitted memory item {:?} (audit record: {})",
+                outcome.item_id, outcome.audit_id
+            );
+        }
+        Action::Merge { target, .. } => {
+            println!(
+                "Merged into existing item {target} (audit record: {})",
+                outcome.audit_id
+            );
+        }
+        Action::Reject => {
+            println!(
+                "Rejected by governance policy (audit record: {})",
+                outcome.audit_id
+            );
+        }
+    }
 
-    // 5. Commit item write, evictions, and audit together atomically
-    let mut txn = WriteTransaction::new(scope.clone(), audit);
-    txn.upsert = Some(ItemWrite {
-        item: item.clone(),
-        vector: None, // Or attach an int8 QuantizedVector
-    });
+    // 5. Governed recall with MMR diversity, replay quotas, and budget limits
+    let working_set = engine
+        .recall(RecallRequest {
+            scope: scope.clone(),
+            query: Some("coding preferences".to_string()),
+            tags_any: vec![],
+            kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
+            mode: RecallMode::WorkingSet,
+            budget: RecallBudget::default(),
+            sensitivity_ceiling: SensitivityLevel::Restricted,
+        })
+        .await?;
 
-    let applied = backend.apply(txn).await?;
-    println!("Committed memory item: {:?}", applied.item_id);
-    println!("Audit record created: {}", applied.audit_id);
-
-    // 6. Retrieve stored item
-    if let Some(retrieved) = backend.get(&scope, &item.id).await? {
-        println!("Retrieved body: {}", retrieved.body);
+    for item in &working_set.items {
+        println!("Recalled: {} (reason: {:?})", item.item.body, item.reason.code);
     }
 
     Ok(())
 }
+```
+
+### Low-Level Storage Access
+
+For custom storage backend implementations or low-level transaction control, `SqliteBackend` also directly satisfies the `Backend` contract from `memorysafe-backend` with atomic `apply(WriteTransaction)` execution:
+
+```rust
+use std::path::PathBuf;
+use memorysafe_backend_sqlite::SqliteBackend;
+
+// Direct atomic write transactions: items, evictions, and audit records commit together.
+let backend = SqliteBackend::open(PathBuf::from("./data/tenants"));
 ```
 
 ---
@@ -181,14 +202,15 @@ MemorySafe requires **Rust 1.97.1** or newer (Rust 2024 edition).
 
 ```bash
 cargo build --workspace
+cargo build --workspace --all-features
 ```
 
 ### Run Tests
 
-Run the full workspace test suite, including pure domain tests and SQLite backend conformance tests:
+Run the full workspace test suite, including pure domain tests, policy scoring tests, engine integration tests, and SQLite backend conformance tests:
 
 ```bash
-cargo test
+cargo test --workspace --all-features
 ```
 
 ### Run Conformance Suite Only
@@ -203,7 +225,7 @@ cargo test -p memorysafe-backend-sqlite --test conformance
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --check
+cargo fmt --all -- --check
 ```
 
 ---
