@@ -87,6 +87,7 @@ where
         atomicity::every_mutation_writes_exactly_one_audit_record,
         atomicity::idempotent_writes_replay_the_original_outcome,
         atomicity::idempotency_conflict_on_different_payload,
+        atomicity::idempotency_keys_do_not_collide_across_subjects,
         retrieval::sensitivity_ceiling_is_enforced_in_the_query,
         retrieval::tag_and_kind_filters_narrow_results,
         retrieval::vector_search_ranks_by_similarity,

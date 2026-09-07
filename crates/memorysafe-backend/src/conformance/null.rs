@@ -384,6 +384,7 @@ async fn run_census() -> Vec<(&'static str, Verdict)> {
         super::atomicity::every_mutation_writes_exactly_one_audit_record,
         super::atomicity::idempotent_writes_replay_the_original_outcome,
         super::atomicity::idempotency_conflict_on_different_payload,
+        super::atomicity::idempotency_keys_do_not_collide_across_subjects,
         super::retrieval::sensitivity_ceiling_is_enforced_in_the_query,
         super::retrieval::tag_and_kind_filters_narrow_results,
         super::retrieval::vector_search_ranks_by_similarity,
@@ -607,8 +608,11 @@ struct Tolerance {
 /// `AuditId` rather than the one its transaction carried. Nor is the
 /// fifty-second, `capacity::a_merge_adjusts_capacity_by_the_delta_not_the_new_size`:
 /// it fails on its very first substantive assertion, `used_items == 2` after
-/// two admits, since `NullBackend::capacity_state` always reports zero. The
-/// census figures above are left at the reading they were taken at rather
+/// two admits, since `NullBackend::capacity_state` always reports zero. Nor is
+/// the fifty-third, `atomicity::idempotency_keys_do_not_collide_across_subjects`:
+/// it fails on its first presence assertion, since `NullBackend::list` always
+/// returns an empty vec and can never contain the item an "admit" just wrote.
+/// The census figures above are left at the reading they were taken at rather
 /// than adjusted by arithmetic; retake them to update them.
 ///
 /// Both survivors are *absence-shaped*: each asserts that something is not
@@ -798,7 +802,7 @@ async fn the_census_measures_every_test_the_suite_runs() {
     );
     assert_eq!(
         suite.len(),
-        52,
+        53,
         "the suite's size changed; update the census record"
     );
 }

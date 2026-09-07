@@ -318,3 +318,146 @@ pub async fn idempotency_conflict_on_different_payload<F: BackendFactory>(factor
         "got {err:?}"
     );
 }
+
+/// An idempotency key is scoped to the transaction's `Scope`, not global —
+/// see the requirement stated on [`crate::Backend::apply`].
+///
+/// **The implementation this rejects:** one whose idempotency table is keyed
+/// on `idempotency_key` alone, ignoring `Scope`. Such a backend passes both
+/// `idempotent_writes_replay_the_original_outcome` and
+/// `idempotency_conflict_on_different_payload` above — each uses exactly one
+/// scope, `("t", "s", "n")` — while silently serving one subject's write back
+/// as another subject's replay, or refusing a second subject's legitimate
+/// write as a conflict with the first's.
+///
+/// **Two axes, checked independently, because the contract names the whole
+/// `Scope`.** `known-gaps.md` ranks this gap by subject, but a backend keyed
+/// on `(tenant, subject, key)` — forgetting namespace — would still pass a
+/// subjects-only version of this test. Same trap as the item filter's
+/// one-directional case: a test that varies only one component of `Scope`
+/// proves nothing about the components it holds fixed.
+///
+/// 1. **Subject axis.** Same tenant, same namespace, two subjects. Admitting
+///    under subject B with subject A's exact key string and a *different*
+///    payload must succeed as an independent write — not
+///    `IdempotencyConflict`, which is the reaction a bare-key backend would
+///    have — and `replayed` must be `false`.
+/// 2. **Namespace axis.** Same tenant, same subject, two namespaces, one
+///    shared key. Same shape, same assertions.
+///
+/// Each axis also asserts both items are visible **only** in their own
+/// scope, on ids rather than lengths, so a backend that let the second write
+/// land inside the first write's scope — rather than genuinely treating them
+/// as independent — is still caught.
+///
+/// **Not vacuous.** A backend with idempotency disabled entirely would also
+/// let every cross-scope write through, so a final arm reuses the subject
+/// axis's own scope A and repeats
+/// `idempotency_conflict_on_different_payload`'s shape there: same key,
+/// different payload, same scope, must still raise `IdempotencyConflict`.
+/// Without this arm nothing distinguishes "correctly scoped" from "not
+/// enforced at all".
+pub async fn idempotency_keys_do_not_collide_across_subjects<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+
+    // --- Subject axis: same tenant, same namespace, two subjects. ---
+    let scope_a = Scope::new("t", "subject-a", "n").unwrap();
+    let scope_b = Scope::new("t", "subject-b", "n").unwrap();
+
+    let item_a = fx::item(&scope_a, "subject a's payload");
+    let mut txn_a = fx::admit_txn(&scope_a, item_a.clone(), None);
+    txn_a.idempotency_key = Some("shared-key".into());
+    txn_a.payload_digest = Some(item_a.digest());
+    let applied_a = backend.apply(txn_a).await.unwrap();
+    assert!(!applied_a.replayed);
+
+    let item_b = fx::item(&scope_b, "subject b's completely different payload");
+    let mut txn_b = fx::admit_txn(&scope_b, item_b.clone(), None);
+    txn_b.idempotency_key = Some("shared-key".into());
+    txn_b.payload_digest = Some(item_b.digest());
+    let applied_b = backend.apply(txn_b).await.expect(
+        "a backend keyed on the bare idempotency key raises IdempotencyConflict \
+         here; the key must be scoped to the subject",
+    );
+    assert!(
+        !applied_b.replayed,
+        "subject b's write was treated as a replay of subject a's"
+    );
+
+    let list_a = backend.list(&scope_a, &Page::default()).await.unwrap();
+    assert!(
+        list_a.iter().any(|i| i.id == item_a.id),
+        "subject a's item is missing from its own scope"
+    );
+    assert!(
+        !list_a.iter().any(|i| i.id == item_b.id),
+        "subject b's item leaked into subject a's scope"
+    );
+
+    let list_b = backend.list(&scope_b, &Page::default()).await.unwrap();
+    assert!(
+        list_b.iter().any(|i| i.id == item_b.id),
+        "subject b's item is missing from its own scope"
+    );
+    assert!(
+        !list_b.iter().any(|i| i.id == item_a.id),
+        "subject a's item leaked into subject b's scope"
+    );
+
+    // --- Namespace axis: same tenant, same subject, two namespaces. ---
+    let scope_c = Scope::new("t", "subject-c", "ns-1").unwrap();
+    let scope_d = Scope::new("t", "subject-c", "ns-2").unwrap();
+
+    let item_c = fx::item(&scope_c, "namespace one's payload");
+    let mut txn_c = fx::admit_txn(&scope_c, item_c.clone(), None);
+    txn_c.idempotency_key = Some("shared-key".into());
+    txn_c.payload_digest = Some(item_c.digest());
+    let applied_c = backend.apply(txn_c).await.unwrap();
+    assert!(!applied_c.replayed);
+
+    let item_d = fx::item(&scope_d, "namespace two's completely different payload");
+    let mut txn_d = fx::admit_txn(&scope_d, item_d.clone(), None);
+    txn_d.idempotency_key = Some("shared-key".into());
+    txn_d.payload_digest = Some(item_d.digest());
+    let applied_d = backend.apply(txn_d).await.expect(
+        "a backend keyed on (tenant, subject, key) -- forgetting namespace -- \
+         raises IdempotencyConflict here",
+    );
+    assert!(
+        !applied_d.replayed,
+        "namespace two's write was treated as a replay of namespace one's"
+    );
+
+    let list_c = backend.list(&scope_c, &Page::default()).await.unwrap();
+    assert!(
+        list_c.iter().any(|i| i.id == item_c.id),
+        "namespace one's item is missing from its own scope"
+    );
+    assert!(
+        !list_c.iter().any(|i| i.id == item_d.id),
+        "namespace two's item leaked into namespace one's scope"
+    );
+
+    let list_d = backend.list(&scope_d, &Page::default()).await.unwrap();
+    assert!(
+        list_d.iter().any(|i| i.id == item_d.id),
+        "namespace two's item is missing from its own scope"
+    );
+    assert!(
+        !list_d.iter().any(|i| i.id == item_c.id),
+        "namespace one's item leaked into namespace two's scope"
+    );
+
+    // --- Not vacuous: within one scope, the same key still conflicts. ---
+    let other = fx::item(&scope_a, "a third, conflicting payload");
+    let mut conflicting = fx::admit_txn(&scope_a, other.clone(), None);
+    conflicting.idempotency_key = Some("shared-key".into());
+    conflicting.payload_digest = Some(other.digest());
+    let err = backend.apply(conflicting).await.unwrap_err();
+    assert!(
+        matches!(err, BackendError::IdempotencyConflict),
+        "a same-scope, same-key, different-payload write must still conflict \
+         -- otherwise a backend with idempotency disabled entirely would pass \
+         this test too: got {err:?}"
+    );
+}
