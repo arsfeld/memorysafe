@@ -9,8 +9,10 @@ pub mod resources;
 pub mod scope;
 mod tools_curate;
 mod tools_write;
+mod transport;
 
 pub use scope::{Resolved, ScopeSource};
+pub use transport::{http_service, serve_stdio};
 
 use crate::resources::{ResourceKind, resource_uri, uri_template};
 use memorysafe_core::AuditFilter;
@@ -127,14 +129,25 @@ impl ServerHandler for MemorySafeServer {
 
         let body = match parsed.kind {
             ResourceKind::Audit => {
+                let filter = AuditFilter::default();
                 let records = self
                     .engine
-                    .audit(&resolved.scope, &AuditFilter::default())
+                    .audit(&resolved.scope, &filter)
                     .await
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 serde_json::json!({
                     "scope": resolved.scope,
                     "records": records,
+                    // `AuditFilter::limit`'s own doc: truncation is
+                    // detectable only via `returned.len() < limit`, since
+                    // there is no separate `truncated` flag. This resource
+                    // has no cursor in its URI grammar and always uses the
+                    // default filter, so without echoing the limit here a
+                    // client at exactly the cap has no way to tell "this is
+                    // everything" from "this is the first page" — the
+                    // signal the rest of the workspace relies on never
+                    // reaches it.
+                    "limit": filter.limit,
                 })
             }
             ResourceKind::Stats => {

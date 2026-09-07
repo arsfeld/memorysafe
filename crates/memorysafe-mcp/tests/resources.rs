@@ -85,6 +85,43 @@ async fn the_audit_resource_shows_the_decisions_without_the_bodies() {
     client.cancel().await.unwrap();
 }
 
+/// `AuditFilter::default().limit` caps the audit resource at 100 rows, and
+/// this workspace's convention (documented on `AuditFilter::limit`) is that
+/// truncation is detectable *only* via `returned.len() < limit` — a client
+/// needs the limit to apply that rule at all. Without this field the
+/// resource silently discarded the one number the convention depends on.
+#[tokio::test]
+async fn the_audit_resource_reports_its_effective_limit() {
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
+    client
+        .call_tool(
+            CallToolRequestParams::new("memory_remember")
+                .with_arguments(args(json!({ "body": "one audited memory" }))),
+        )
+        .await
+        .unwrap();
+
+    let read = client
+        .read_resource(ReadResourceRequestParams::new(
+            "memorysafe://acme/user-42/coding-agent/audit",
+        ))
+        .await
+        .unwrap();
+    let (text, _) = text_and_mime(&read.contents[0]);
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+    assert_eq!(
+        value["limit"],
+        json!(memorysafe_core::AuditFilter::default().limit),
+        "the resource's envelope: {value}"
+    );
+    // Keep the existing keys alongside the new one, not in place of them.
+    assert!(value["records"].is_array());
+    assert!(value["scope"].is_object());
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn the_stats_resource_reports_capacity_and_corpus_shape() {
     let (eng, _dir) = engine();

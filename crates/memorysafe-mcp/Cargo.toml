@@ -19,14 +19,25 @@ serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "macros", "io-std"] }
+tokio-util.workspace = true
 
 [dev-dependencies]
 memorysafe-backend-sqlite.workspace = true
 memorysafe-embed.workspace = true
 memorysafe-policy.workspace = true
-rmcp = { workspace = true, features = ["client"] }
+axum.workspace = true
+# `rustls`, not `rustls-tls`: reqwest 0.13 renamed the feature (the brief's
+# own Cargo.toml snippet names `rustls-tls`, which does not exist on this
+# version and fails `cargo` feature resolution — verified against the
+# vendored `reqwest-0.13.4/Cargo.toml`, not guessed). `rustls` is reqwest's
+# real default TLS backend feature name; nothing here makes an HTTPS
+# request, but reqwest needs one connector backend compiled in regardless of
+# scheme.
+reqwest = { workspace = true, features = ["rustls"] }
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tokio-util.workspace = true
 
 [lints]
 workspace = true

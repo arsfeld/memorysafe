@@ -77,6 +77,18 @@ blake3 = "1.5"
 base64 = "0.22"
 subtle = "2.6.1"
 getrandom = "0.4.3"
+# Streamable-HTTP transport (Task 6): a real tower service to mount, a real
+# listener to bind in tests, and the cancellation primitive rmcp's own
+# streamable-HTTP server config takes for graceful shutdown.
+axum = { version = "0.8.9", features = ["macros"] }
+# `default-features = false`: no TLS backend selected here, since none of
+# this workspace's own code makes an HTTPS request — the reqwest client this
+# pulls in exists only as the transport rmcp's streamable-HTTP *client*
+# feature uses in tests, against a plain-HTTP loopback listener. A consumer
+# that does need TLS enables it on its own `[dependencies]` line the same way
+# `memorysafe-mcp`'s `[dev-dependencies]` does.
+reqwest = { version = "0.13.4", default-features = false }
+tokio-util = "0.7.19"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

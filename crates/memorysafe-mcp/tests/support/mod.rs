@@ -1,3 +1,11 @@
+// Shared test support, `mod`-included separately by every integration-test
+// binary in this crate's `tests/` directory. No single binary uses every
+// function here — `http_transport.rs` builds its own server/transport pair
+// rather than `connect`'s duplex, and `stdio_transport.rs` needs only
+// `engine` — so per-binary `dead_code` would otherwise fire depending on
+// which test file is compiling this module.
+#![allow(dead_code)]
+
 use memorysafe_backend_sqlite::SqliteBackend;
 use memorysafe_core::{Namespace, SubjectId, TenantId};
 use memorysafe_embed::DeterministicEmbedder;
