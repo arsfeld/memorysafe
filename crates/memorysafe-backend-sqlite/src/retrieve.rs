@@ -624,7 +624,8 @@ mod tests {
     /// widened SQL predicate. Measured during the correctness-invariants task,
     /// the asymmetry runs the other way too: neutering `passes`'s ceiling arm
     /// — `if item.sensitivity > f.sensitivity_ceiling` mutated to `if false` —
-    /// left the **entire workspace suite green**, all 543 tests, because
+    /// left the **entire workspace suite green** under
+    /// `cargo test --workspace --all-features`, because
     /// `filter_sql` was covering for `passes` in exactly the way `passes` had
     /// been covering for `filter_sql`. Defence in depth is the right design
     /// and neither layer should go; the consequence is that each needs a test

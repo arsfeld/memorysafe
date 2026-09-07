@@ -133,8 +133,10 @@ impl Engine {
     /// caches `ScopeStats`, never `CapacityState`, and even that stats cache
     /// is currently unreachable from any read path — `gather::assess_context`,
     /// `read::recall` and `maintain` all call `Backend::scope_stats` directly,
-    /// and the only callers of `EngineCache::stats`/`put_stats` in the
-    /// workspace are that module's own tests. So there is no cached capacity
+    /// and the only callers of `EngineCache::stats`/`put_stats` anywhere in
+    /// the workspace are this crate's own test modules in `mutate.rs` and
+    /// `maintain.rs` (`cache.rs` itself has no `#[cfg(test)]` module at all,
+    /// so do not go looking there). So there is no cached capacity
     /// figure anywhere to go stale, and none should be introduced here: this
     /// is the accessor `capacity_is_never_exceeded` (`tests/invariants.rs`)
     /// cross-checks the stored item count against, and a cached answer would

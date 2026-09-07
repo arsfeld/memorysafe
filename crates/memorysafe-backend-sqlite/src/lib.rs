@@ -1360,6 +1360,21 @@ mod tests {
     /// guard, and the premise is asserted before the loop: with only
     /// pending items the loop body would never run, and with only embedded
     /// ones the guard itself would be untested.
+    ///
+    /// **This is not a pure Direction-1 instrument, and the same argument
+    /// Direction 2 makes about `vectors::search` applies one level up to the
+    /// helper used here.** `vector_rows_for_item` matches on `item_id AND
+    /// subject AND namespace`, so a row whose scope columns have **diverged**
+    /// reads as zero exactly as a row that is genuinely **missing** does.
+    /// This test cannot tell those two apart; it reports "no vector row for
+    /// this item in this scope", which is the union of both failures. That is
+    /// why a mutation transposing `vectors::insert`'s scope columns is killed
+    /// by this test as well as by
+    /// `every_vector_rows_scope_columns_agree_with_the_item_it_references` —
+    /// the two directions overlap here rather than partitioning cleanly.
+    /// Direction 2 is the one that can name a divergence as a divergence,
+    /// because `vector_scope_columns` reads the columns instead of filtering
+    /// on them.
     #[tokio::test]
     async fn no_live_item_lacks_a_vector_row_unless_it_is_pending_embedding() {
         let b = backend();

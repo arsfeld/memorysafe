@@ -41,6 +41,29 @@ fn bodies() -> impl Strategy<Value = Vec<String>> {
     })
 }
 
+// Every property below carries an inline premise assertion, in the shape the
+// sixth invariant's two tests use ("the premise: ..."). They are guards, not
+// restatements of the invariant: each one fails if the case reached its
+// assertions without exercising the thing the invariant is about.
+//
+// The reason they are here rather than in a measurement someone once took:
+// every one of the five has a live vacuity path. If all writes fail,
+// Invariant 1's `stored.len() <= max` and `used_items == 0` both hold. If no
+// eviction pressure occurs, Invariant 2's `any(|i| i.id == pinned)` holds
+// trivially. If the corpus is empty, Invariant 5 compares two empty vectors
+// and Invariant 3's loop runs zero times. `bodies()`' own doc comment names
+// the concrete rot path: change the strategy, or `duplicate_threshold`, so
+// generated bodies collapse into merges, and three of the five go quietly
+// vacuous with nothing to report it.
+//
+// **A premise assertion must hold for every input the strategy can draw, not
+// merely for typical ones** — a flaky invariant suite is worse than a vacuous
+// one. Two of the five are therefore conditional, and each says on what:
+// `bodies()` draws `1..40`, so a single-body draw creates no eviction
+// pressure against Invariant 2's budget of 2, and Invariant 3's `Public`
+// ceiling admits nothing by construction (see that test's own doc). The
+// conditions are written as implications so the guard still fails when the
+// condition holds and the premise does not.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
@@ -60,6 +83,16 @@ proptest! {
             let stored = e.review(&scope(), &memorysafe_backend::Page { offset: 0, limit: 1000 })
                 .await
                 .unwrap();
+            // Unconditional: `bodies()` draws at least one body, and the
+            // first write into an empty scope cannot fail — the corpus has
+            // no neighbour to be redundant against, and `max >= 1` leaves
+            // room for it. If nothing is stored, every assertion below holds
+            // for the wrong reason.
+            prop_assert!(
+                !stored.is_empty(),
+                "the premise: no write survived, so `len() <= {max}` and \
+                 `used_items == 0` would both hold vacuously"
+            );
             prop_assert!(
                 stored.len() <= max,
                 "budget {max} exceeded: {} items stored",
@@ -97,6 +130,48 @@ proptest! {
             let stored = e.review(&scope(), &memorysafe_backend::Page { offset: 0, limit: 1000 })
                 .await
                 .unwrap();
+
+            // The premise, and the sharp case of the whole exercise: this
+            // invariant is trivially true if nothing ever pressured the pin.
+            //
+            // Read back from the audit trail rather than from the write
+            // loop's outcomes, so the mandated loop above stays exactly as
+            // the plan wrote it. `Decision` is stored on the audit record, so
+            // `retained` counts every admission (the pinned item's own
+            // included — `protect` files a record with no `decision` and is
+            // correctly not counted) and `planned_evictions` counts every
+            // eviction a decision called for.
+            //
+            // **Conditional, and this is the trap it avoids.** `bodies()`
+            // draws `1..40`. A one-body draw puts the pin plus one item
+            // against a budget of 2, which fits, so no eviction is required
+            // and a bare `planned_evictions > 0` would fail legitimately —
+            // a flaky suite, which is worse than a vacuous one. Written as an
+            // implication instead: eviction is required exactly when the
+            // admissions exceed the budget, and the guard fires when that
+            // holds and no eviction happened. I chose the implication over
+            // constraining `bodies()` to `2..40` because the strategy is
+            // plan-mandated and shared by four other properties, and because
+            // the small draws are worth keeping — they are the ones that
+            // exercise admission below the budget.
+            let trail = e
+                .audit(&scope(), &AuditFilter { limit: 100_000, ..Default::default() })
+                .await
+                .unwrap();
+            let decisions: Vec<_> = trail.iter().filter_map(|r| r.decision.as_ref()).collect();
+            let retained = decisions
+                .iter()
+                .filter(|d| matches!(d.action, memorysafe_core::Action::Retain { .. }))
+                .count();
+            let planned_evictions: usize =
+                decisions.iter().map(|d| d.evictions.len()).sum();
+            prop_assert!(
+                retained <= 2 || planned_evictions > 0,
+                "the premise: {retained} admissions against a budget of 2 must have \
+                 forced an eviction, but the trail records none — this case cannot \
+                 show a pin surviving pressure"
+            );
+
             prop_assert!(
                 stored.iter().any(|i| i.id == pinned),
                 "a pinned item was evicted"
@@ -137,10 +212,24 @@ proptest! {
     /// WorkingSet mode"`.
     ///
     /// The `is_empty` assertion earns its place for a different reason: it
-    /// pins the structural claim above. If `BaselinePolicy` ever starts
-    /// emitting `Public` — a new detector arm, a configurable floor — the
-    /// loop would quietly begin passing non-vacuously and nobody would learn
-    /// that this arm's premise had changed. The assertion goes red instead.
+    /// pins the structural claim above. **Its unique coverage is narrower
+    /// than "any change that makes `BaselinePolicy` emit `Public`", and the
+    /// narrower statement is the true one.** A change that lowers the floor
+    /// wholesale — `let mut detected = SensitivityLevel::Public` — is caught
+    /// first by `memorysafe_policy::sensitivity::tests::ordinary_text_is_internal`
+    /// and by `import_uses_the_baseline_floor_not_a_deployments_tightened_config`,
+    /// measured: workspace-wide with `--all-features`, that mutation fails
+    /// three tests, of which this is only one.
+    ///
+    /// What nothing else catches is a **new detector arm that emits `Public`
+    /// for some inputs while leaving ordinary text at `Internal`** — the
+    /// realistic shape of the change, since a deliberate "this content is
+    /// public" classifier would be conditional, not a lowered floor. Measured
+    /// with exactly that mutation (`Public` when the body contains a token
+    /// the generated corpus carries and `ordinary_text_is_internal`'s fixture
+    /// does not): workspace-wide with `--all-features`, **1 failed, 546
+    /// passed**, and the one failure is this property.
+    ///
     /// **That failure is the signal to replace this special case with the
     /// general assertion**, not to delete it: once `Public` items can exist,
     /// the arm should assert what every other ceiling asserts, and the loop
@@ -172,6 +261,22 @@ proptest! {
                 })
                 .await
                 .unwrap();
+
+                // The premise. Conditional on the ceiling, because the
+                // `Public` arm returns nothing by construction — see this
+                // test's doc comment. At every other ceiling the loop below
+                // must actually iterate: `bodies()` draws at least one body,
+                // its hint is `i % 5 == 0` so its resolved level is the
+                // `Internal` floor, and an `Internal` item satisfies any
+                // ceiling from `Internal` up. A zero-iteration loop at those
+                // ceilings means retrieval returned nothing and the
+                // assertion checked nothing.
+                prop_assert!(
+                    level == SensitivityLevel::Public || !ws.items.is_empty(),
+                    "the premise: a {:?} ceiling in {:?} mode returned nothing, so the \
+                     leak check below never ran",
+                    level, mode
+                );
 
                 for s in &ws.items {
                     prop_assert!(
@@ -217,13 +322,28 @@ proptest! {
             let audit = e.audit(&scope(), &AuditFilter { limit: 100_000, ..Default::default() })
                 .await
                 .unwrap();
+            // Unconditional, for the same reason as Invariant 1: at least one
+            // body is drawn and the first write into an empty scope cannot
+            // fail. `0 == 0` would satisfy the equality below.
+            prop_assert!(
+                mutations > 0,
+                "the premise: no write succeeded, so the count below compares 0 with 0"
+            );
             prop_assert_eq!(
                 audit.len(), mutations,
                 "{} mutations produced {} audit records",
                 mutations, audit.len()
             );
 
-            // And no body ever reached the trail.
+            // And no body ever reached the trail. Its own premise: the trail
+            // must actually carry item data, or "no body reached it" is true
+            // because nothing reached it. An admitted write files an
+            // `ItemRef`, and the first write is always an admission.
+            prop_assert!(
+                audit.iter().any(|r| !r.items.is_empty()),
+                "the premise: no audit record references an item, so the leak check \
+                 below has nothing to find a body in"
+            );
             let json = serde_json::to_string(&audit).unwrap();
             prop_assert!(!json.contains("concerning subject"), "audit leaked a body");
             Ok(())
@@ -256,6 +376,16 @@ proptest! {
             before.sort_by(|a, b| a.id.cmp(&b.id));
             after.sort_by(|a, b| a.id.cmp(&b.id));
 
+            // Unconditional: at least one body is drawn and the first write
+            // into an empty scope cannot fail. Without this, an export that
+            // emitted nothing and an import that stored nothing compare equal
+            // — two empty vectors — and the round trip "succeeds" having
+            // moved no data at all.
+            prop_assert!(
+                !before.is_empty(),
+                "the premise: the source corpus is empty, so the comparison below \
+                 is between two empty vectors"
+            );
             prop_assert_eq!(before, after, "the round trip lost or altered items");
             Ok(())
         })?;
