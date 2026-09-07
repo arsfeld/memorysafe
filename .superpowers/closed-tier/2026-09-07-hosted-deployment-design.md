@@ -176,6 +176,26 @@ cached for display, and must be refreshed rather than trusted.
 revoking someone's GitHub org access does not revoke their access to that tenant's memories.
 The staleness window must be a session, not a cache TTL.
 
+> **Correction, from the Plan 4 implementation review.** The paragraph above does not survive
+> contact with §5.1's own design, and stating it as written would have shipped a false guarantee.
+> A signed session cookie with a seven-day `MAX_AGE` **is** a cache with a seven-day TTL. Membership
+> is read from GitHub once, at login, and then carried in the cookie until it expires — so removing
+> someone from a GitHub org leaves them able to act as that org's tenant for up to a week.
+>
+> Worse, and this is the part that makes it more than a staleness question: **an API key minted
+> during that window has no expiry and no link to the membership that authorised it.** Revocation
+> from the GitHub org therefore leaves the key working *permanently*, not for a week. The blast
+> radius of a stale session is not one session; it is every credential created from it.
+>
+> Three ways to close it, in ascending cost, to be decided before login is exposed to real users:
+> 1. **Shorten the session** — minutes, not days — and accept a GitHub round trip per renewal. Bounds the window but does not touch keys already minted.
+> 2. **Re-verify membership at mint time**, so a key for an org tenant is only ever created against a membership confirmed against GitHub in that request. Closes the permanent-key path, which is the serious half.
+> 3. **Bind keys to the membership** and re-check on use, or expire org-tenant keys. Correct, and the most expensive.
+>
+> Option 2 is the minimum that removes the permanent grant, and it is cheap — one API call on a
+> path that already talks to GitHub. Nothing in Plan 4 implements any of them; the code is
+> consistent with §5.1, and it is this paragraph that was wrong.
+
 ### 5.3 Provisioning is free
 
 Under `SharedPartitioned`, a new tenant is just rows with a new `tenant_id`. No `CREATE SCHEMA`,
@@ -355,6 +375,29 @@ limiter.
 A per-key request rate limit at the app layer covers the orthogonal abuse case (volume rather
 than volume-of-data).
 
+> **Correction, from the Plan 4 implementation review.** "Provisioning sets a default free-tier
+> budget" is true and insufficient, and as written it invites exactly the mistake Plan 4 made:
+> provisioning sets a budget on **one scope**, `tenant/default/default`.
+>
+> But a `Scope` is tenant → subject → namespace, and `Authenticated::scope(subject, namespace)`
+> takes both of those **from the request**, rejecting only reserved words. An unbudgeted scope
+> carries `Budget::UNLIMITED`. So a caller who simply passes any other namespace writes into an
+> unmetered scope, and the free tier bounds one namespace out of infinitely many. The limiter does
+> not limit.
+>
+> This is a design error, not an implementation slip — the sentence above describes a per-tenant
+> guarantee while the mechanism it names is per-scope. Two ways to reconcile them, to be settled
+> before the API surface is exposed:
+> 1. **Budget at the tenant level**, so capacity is a property of the customer rather than of one
+>    namespace they happened to use first. This is what the prose already promises and requires
+>    checking whether the engine's capacity model supports a tenant-wide budget or only per-scope.
+> 2. **Provision on first use of each scope**, applying the free-tier budget whenever a caller
+>    reaches a scope that has none. Keeps the per-scope model but removes the unmetered default.
+>
+> Option 1 matches the intent; option 2 is achievable without touching the engine. Either way the
+> per-key rate limit above is the only thing currently bounding a free tenant's *volume*, and
+> nothing bounds their *storage* beyond the single default namespace.
+
 ### 9.3 Backups
 
 - **Nightly `pg_dump`** to object storage, as a CronJob. Mandatory (D10).
@@ -426,7 +469,8 @@ New tests the hosted layer requires:
 |---|---|---|
 | Single box: app and database share fate | Nightly dump + rehearsed restore | Yes (D10) |
 | No PITR — data written since the last dump is lost on disk failure | Up to 24h loss accepted at design-partner scale | Yes (D10) |
-| Free self-serve with no billing invites cost abuse | Default per-tenant `Budget` + per-key rate limit (§9.2) | Mitigated |
+| Free self-serve with no billing invites cost abuse | Per-key rate limit bounds request volume. Storage is **not** bounded — the free-tier `Budget` covers only the default namespace, see §9.2's correction | **Open** |
+| A GitHub org member removed from the org keeps access, permanently via keys minted first | Unresolved; three options in §5.2's correction, of which re-verifying membership at key-mint time is the minimum | **Open** |
 | pgvector filtered-ANN recall degradation as the shared corpus grows | `hnsw.iterative_scan` (pgvector 0.8+) and 16-way hash partitioning, both already Plan 2 defaults | Mitigated |
 | RLS silently inactive if the pool ever connects as owner or superuser | Non-superuser role, `FORCE ROW LEVEL SECURITY`, plus the predicate-removal test in §10 | Mitigated |
 | Backup retention vs. erasure: `purge_subject` does not reach dumps | Document the retention window; revisit if a client requires a DPA | Deferred |

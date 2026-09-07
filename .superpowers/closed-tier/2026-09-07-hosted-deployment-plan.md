@@ -1806,7 +1806,23 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env(&std::env::vars().collect())?;
     tracing_subscriber::registry()
         .with(memorysafe_cloud_control::redact::redacting_layer())
-        .with(tracing_subscriber::fmt::layer().json())
+        // DO NOT add `.with(tracing_subscriber::fmt::layer().json())` here.
+        // An earlier draft of this plan did, and it defeats Task 13 entirely:
+        // every Layer in a registry receives each event and formats and writes
+        // it INDEPENDENTLY, so a second formatter emits the same events
+        // unredacted alongside the redacted ones. Layer ORDER is irrelevant —
+        // this is not a pipeline. Task 13's tests would still pass, because
+        // they exercise the redacting layer in isolation.
+        //
+        // Two further facts before wiring this up:
+        //   * `redacting_layer` as built in Task 13 writes FIELDS ONLY — no
+        //     timestamp, level or target, and no `on_new_span`, so `#[instrument]`
+        //     span fields are neither printed nor redacted. Deleting the JSON
+        //     layer is therefore NOT sufficient; the redacting layer must first
+        //     become a real formatter, or redaction must move into a format
+        //     wrapper that every writer goes through.
+        //   * Whatever shape it takes, the invariant to hold is: there is
+        //     exactly ONE path from an event to a sink, and it redacts.
         .init();
 
     let pool = PgPoolOptions::new().max_connections(config.max_connections)
