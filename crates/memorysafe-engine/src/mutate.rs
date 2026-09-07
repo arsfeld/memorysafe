@@ -30,10 +30,15 @@ pub enum ForgetSelector {
 /// on `ForgetOutcome` pushes the loop onto every caller Plan 3 adds — the HTTP
 /// route, the CLI command, the MCP tool — and a caller that forgets to loop
 /// reproduces exactly this bug one layer up, where it is harder to see. The
-/// cost of paging is that a very large selector does more work in one call;
-/// the scan holds only `MemoryItem`s one page at a time and keeps only ids and
-/// digests, and the removal stays a **single** `WriteTransaction`, which is
-/// what makes the erasure atomic. A paged *write* would leave a
+/// cost of paging is that a very large selector does more work in one call,
+/// and it costs memory as well as time: `scan_all` reads one page at a time,
+/// but every *matched* item is kept — as a whole `MemoryItem`, body included —
+/// until the transaction is applied, because the audit record's `ItemRef`s are
+/// built from the same items. Peak memory is therefore proportional to the
+/// selector's total reach times the item size, not to the page size. That is
+/// the price of the single **`WriteTransaction`** below, which is what makes
+/// the erasure atomic, and it wants a bound before Plan 3 exposes `forget`
+/// over HTTP. A paged *write* would leave a
 /// partially-forgotten scope observable between transactions, which is the
 /// defect this fixes, not a smaller version of it.
 const FORGET_SCAN_LIMIT: usize = 1000;
@@ -96,7 +101,7 @@ impl Engine {
             OffsetDateTime::now_utc(),
         );
         let mut txn = WriteTransaction::new(scope.clone(), audit);
-        txn.evictions = targets.clone();
+        txn.evictions = targets;
 
         let applied = self.backend.apply(txn).await?;
         // Any write invalidates its scope (see `write.rs`'s own call for the

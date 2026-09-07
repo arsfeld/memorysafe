@@ -62,9 +62,19 @@ impl Default for CacheConfig {
 /// change this engine can make invalidates the scope it changed* — so state
 /// it that way, and check it by enumeration rather than against a number that
 /// goes stale the moment a method is added. The enumeration is
-/// mechanical: `grep -n 'backend\.\(apply\|purge_subject\|import\)' src/*.rs`
-/// lists every corpus-changing backend call this crate makes, and each must
-/// have an `invalidate_scope` beside it. Today that is `remember`
+/// mechanical: `grep -n '\.\(apply\|purge_subject\|import\)(' src/*.rs`
+/// lists every call to a corpus-changing backend method, and each one that
+/// changes the corpus must have an `invalidate_scope` beside it.
+///
+/// Match on the method name alone, never on a `backend\.` prefix. An earlier
+/// revision of this comment did the latter and the check silently missed
+/// `purge_subject`, because rustfmt had split the receiver across lines as
+/// `self` / `.backend` / `.purge_subject(...)`. A grep anchored to a receiver
+/// is a check whose answer depends on line width. This form over-matches
+/// instead — it also lists test call sites and `Engine::import`'s own
+/// self-call — and that is the right direction to be wrong in: a superset you
+/// must read is honest, a subset that stays silent is not. Today the
+/// corpus-changing set is `remember`
 /// (`write.rs`), `forget`, `protect`, `purge_subject` (`mutate.rs`),
 /// `maintain`'s decision-application write and `apply_merge` (`maintain.rs`),
 /// `reembed` (`reembed.rs`, once per committed write, not once per pass) and
