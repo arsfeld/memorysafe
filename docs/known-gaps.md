@@ -195,3 +195,94 @@ for the pattern you most recently removed, before committing a fix for anything 
   owner's call; the join cost is unmeasured.
 - **`Protection::Protected { until }` is constructed nowhere in the suite**, so the
   `protected_until` column is written by no conformance test.
+
+## Carried out of Plan 1's final review — triaged, not fixed
+
+The whole-branch review of Tasks 31-41 raised three Critical and eleven Important findings.
+Everything merge-blocking was fixed on that branch. What follows was triaged as
+fix-after-merge and is recorded here because the review that decided it is not part of the
+repository.
+
+**One finding was withdrawn rather than fixed, and the reason is worth keeping.** The review
+graded as Critical that `ProptestConfig::with_cases(24)` in `memorysafe-engine`'s invariants
+overrides CI's `PROPTEST_CASES: 64`, so the gate asserted a guarantee it never checked. That is
+false for the resolved proptest version: `proptest!` passes the supplied config through
+`contextualize_config`, which overwrites `cases` from the environment. Confirmed black-box —
+one case runs the invariants in 0.2s, sixty-four in 7.4s, and a 35x spread is impossible if the
+literal won. The review's own empirical check printed `Config::with_cases(24).cases` and read
+`24`, which is true and is not the question: it measured the constructor, not the effective
+config the runner uses. Do not "fix" this without re-measuring end to end.
+
+### The next backend contract batch — one trait revision, not four
+
+These four all block on the same change and should land together, since each separately would
+amend the frozen conformance suite:
+
+- **`Backend::list` must carry access statistics.** `gather::admit_context` and `maintain` hand
+  the policy `value: 0.5`, `fragility: 0.5`, `last_accessed_at: None`, `access_count: 0` for
+  every candidate, because `list` returns bare `MemoryItem`s. `eviction::cost` is
+  `value * fragility`, so every candidate ties at `0.25` and the stable sort leaves `list`'s
+  order — **"evict the lowest value-weighted retention cost" is, today, "evict the oldest".**
+  The byte-budget reclaim and the maintenance job are both wired to a scorer that cannot
+  discriminate. Honest and deterministic, but it must be named work before anything here is
+  called production-ready.
+- **A namespace query.** `mutate::namespaces_of` calls `Backend::export` to pull a subject's
+  entire corpus, bodies included, into memory purely to learn a list of namespace names — on
+  the erasure path.
+- **A pending-only read.** `HardFilters::exclude_pending_embedding` exists in the exclusion
+  direction only, so `backfill_embeddings` must page an entire scope to find the stragglers.
+- **`AuditFilter`'s `item`, `subject` and `namespace` fields.** The SQLite backend silently
+  ignores all three. `remember`'s idempotency replay builds a filter with `item: Some(id)` and
+  gets the newest hundred rows in the whole scope instead; the lookup still succeeds because it
+  searches by audit id, but it degrades to the approximation path far more often than its doc
+  used to admit. No conformance test pins any of the three, so Plan 2's backend may implement or
+  ignore them and pass either way.
+
+### Before Plan 3 exposes any of this over HTTP
+
+- **`Engine::import` writes caller-supplied audit rows verbatim.** The import path re-assesses
+  items — sensitivity raised, `Pinned` stripped, `Protected.until` clamped — but passes header
+  and audit records through untouched. A crafted stream can inject arbitrary audit history into
+  the destination tenant, including a fabricated `SubjectPurged` row manufacturing evidence of
+  an erasure that never happened, and `Reason::detail` is free text that routes an item body
+  into an audit row. The import now records *itself*, which was the merge-blocking half; the
+  trust question is this one and it is not closed.
+- **`Engine::review` and `Engine::export` are unaudited, unfiltered full-corpus reads.** Neither
+  applies a `sensitivity_ceiling` and neither writes an audit record, while `recall` audits even
+  when it returns nothing. Deferring these was accepted *on the condition* that Plan 3 expose
+  neither without a ceiling and a record. That condition is the reason they are not fixed.
+- **`forget` writes one audit row naming every item it erased.** Correct, and the `items` column
+  grows with the selector's reach. It wants a bound.
+- **Two audit records cannot carry their own counts.** `Imported` and `PolicyChanged` name their
+  scope but not their record counts, because `AuditRecord`'s only structured numeric fields are
+  `decision` and `assessment`, and both feed `audit_aggregates` buckets that counts would
+  corrupt. The real fix is a field on `AuditRecord`.
+
+### Smaller, and safe to leave
+
+- **`AuditRetention::detail` and `::aggregate` are enforced by nothing.** Only `purge_cascade`
+  is read; no audit row expires on a schedule. Documented on the type rather than implemented.
+- **The sixth invariant does not run under the `invariants` CI job.** Vector/item scope
+  consistency lives in `memorysafe-backend-sqlite`'s unit tests, because neither of its
+  directions is observable through the `Backend` trait. It therefore gets no release mode and no
+  proptest cases. If the plan means six invariants, the job should name it.
+- **`memorysafe-backend-sqlite/src/lib.rs` is ~1600 lines, over two-thirds of it `mod tests`.**
+  The location is correct — those tests need the private `tenants` field — so the fix is a
+  `#[cfg(test)] #[path = "tests.rs"] mod tests;` split, not a relocation.
+- **`SCHEMA_VERSION` is gated with no migration path**, and `items::list` sorts on `created_at`
+  with no index containing it, so every paged sweep sorts the whole scope.
+
+### A pattern, recorded because it cost more than any single bug
+
+Six times across these tasks, someone made a correct measurement of the wrong thing and reported
+it as fact: a test suite counted without `--all-features`; a caller list grepped in one directory
+and claimed for the workspace; mutation runs scoped to one target and reported as workspace
+uniqueness; a proptest constructor read instead of the runner's effective config; and a stale
+count replaced by a mechanical grep that was itself anchored to a receiver rustfmt had split
+across lines. None was a careless error and every author was checking something real.
+
+The rule that came out of it: **a claim's scope and its measurement's scope must match, and the
+measurement is the half that needs verifying.** Its corollary for this repository: a counted
+list in a doc comment is a claim nothing checks, which silently falsifies whenever anyone adds
+to the thing it counts. Prefer a pointer to a canonical list, or a count backed by a literal in
+the same file where the compiler can see it.
