@@ -142,6 +142,14 @@ impl Engine {
             )
             .await?;
 
+        // A fast path, and only that. Falling through produces the identical
+        // report — `scanned` is 0, the target list is empty, the loop does not
+        // run, and `0 < REEMBED_BATCH` gives `next_cursor: None` — and, since
+        // invalidation moved inside the loop, it no longer differs in cache
+        // effect either. Kept because it states the empty case in one place
+        // rather than leaving a reader to derive it; not kept because anything
+        // depends on it. Deleting it is an equivalent mutation and no test is
+        // owed for it.
         if batch.is_empty() {
             return Ok(ReembedReport {
                 scanned: 0,
@@ -170,7 +178,13 @@ impl Engine {
             };
             let vector = QuantizedVector::from_embedding(&embedding);
 
-            let mut updated = item.clone();
+            // `item` is moved into `updated`, not cloned. The id is taken
+            // first because `txn.evictions` needs it after the move; an
+            // `ItemId` clone is cheap where a `MemoryItem` clone is a whole
+            // body plus its tags and attrs, up to `REEMBED_BATCH` times a
+            // pass.
+            let id = item.id.clone();
+            let mut updated = item;
             updated.pending_embedding = false;
 
             // Replacing the row is what clears the flag and rewrites the
@@ -190,25 +204,28 @@ impl Engine {
                 OffsetDateTime::now_utc(),
             );
             let mut txn = WriteTransaction::new(scope.clone(), audit);
-            txn.evictions = vec![item.id.clone()];
+            txn.evictions = vec![id];
             txn.upsert = Some(ItemWrite {
-                item: updated.clone(),
+                item: updated,
                 vector: Some(vector),
             });
 
             self.backend.apply(txn).await?;
+            // **Inside the loop, once per committed write, not once per
+            // pass.** Every other invalidation surface `EngineCache`'s doc
+            // comment enumerates guards exactly one `Backend::apply`; this is
+            // the first that can commit many. A single call after the loop
+            // would be skipped entirely by the `?` above once any write in the
+            // batch failed — leaving the scope's cached statistics stale
+            // against the re-embeds that *did* commit, and making that doc's
+            // "each invalidates before the write it guards can be observed"
+            // false for this surface alone. The cost is one in-process `moka`
+            // invalidation per item, bounded by `REEMBED_BATCH`; the
+            // alternative was a caveat in a paragraph whose whole value is
+            // being unconditional.
+            self.cache.invalidate_scope(scope).await;
             embedded += 1;
         }
-
-        // Any write invalidates its scope, on the same terms as `remember`,
-        // `forget`, `protect`, `purge_subject` and `maintain` — see
-        // `EngineCache`'s own doc comment. Unconditional on a non-empty page,
-        // exactly as `remember`'s is: at worst one needless refetch, never a
-        // stale statistic. The empty-scope early return above is what keeps a
-        // pass that read no rows from reaching it, and
-        // `a_pass_over_an_empty_scope_leaves_the_cache_alone` is what makes
-        // that early return load-bearing rather than redundant.
-        self.cache.invalidate_scope(scope).await;
 
         let next_cursor = if scanned < REEMBED_BATCH {
             None
@@ -265,7 +282,7 @@ mod cache_invalidation_tests {
     }
 
     /// The positive case. Its negative control is
-    /// `a_pass_over_an_empty_scope_leaves_the_cache_alone` below — without
+    /// `a_pass_that_commits_no_write_leaves_the_cache_alone` below — without
     /// one, "the cache was cleared" is satisfied by clearing it always.
     #[tokio::test]
     async fn reembed_invalidates_the_scopes_cached_stats() {
@@ -288,20 +305,17 @@ mod cache_invalidation_tests {
         );
     }
 
-    /// The negative control, and what makes `reembed`'s empty-batch early
-    /// return load-bearing rather than a redundant shape copied from
-    /// `maintain`.
+    /// The negative control. Invalidation is tied to a **committed write**,
+    /// not to the pass — so both a scope with no rows and a scope with
+    /// nothing to backfill must leave the cache exactly as they found it.
     ///
-    /// Invalidation is unconditional on any **non-empty** page — the same
-    /// terms `remember` invalidates on, and for the same reason: at worst one
-    /// needless refetch, never a stale statistic. The empty-batch arm returns
-    /// before reaching it. Note the asymmetry with `maintain`, whose
-    /// invalidation sits behind `!to_forget.is_empty() || released > 0` and
-    /// so is skipped even on a full page that decided to do nothing; here a
-    /// full page that embeds nothing still invalidates. Only a scope with no
-    /// rows at all is exempt, because only then was nothing read.
+    /// Both halves are here because they fail differently: the empty scope
+    /// never reaches the loop at all, while the healthy scope reaches it with
+    /// an empty target list. An implementation that invalidated once per pass
+    /// rather than once per write — which is what this module's own code did
+    /// before review round 1 — passes the first half and fails the second.
     #[tokio::test]
-    async fn a_pass_over_an_empty_scope_leaves_the_cache_alone() {
+    async fn a_pass_that_commits_no_write_leaves_the_cache_alone() {
         let e = engine();
 
         e.cache.put_stats(&scope(), sentinel()).await;
@@ -310,6 +324,23 @@ mod cache_invalidation_tests {
         assert!(
             e.cache.stats(&scope()).await.is_some(),
             "a pass that read no rows must not invalidate a scope's cache"
+        );
+
+        // Now a scope with a row in it, but nothing for `backfill` to do.
+        e.remember(RememberRequest::new(scope(), "a healthy, embedded memory"))
+            .await
+            .unwrap();
+        e.cache.put_stats(&scope(), sentinel()).await;
+        let report = e.backfill_embeddings(&scope(), None).await.unwrap();
+        assert_eq!(
+            (report.scanned, report.embedded),
+            (1, 0),
+            "premise: one row read, nothing written"
+        );
+        assert!(
+            e.cache.stats(&scope()).await.is_some(),
+            "a pass that read a row but wrote nothing must not invalidate \
+             either"
         );
     }
 }

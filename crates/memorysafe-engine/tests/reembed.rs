@@ -98,6 +98,14 @@ fn engine_with(embedder: Arc<dyn Embedder>) -> Engine {
 /// appears in its results **iff** a `vectors` row exists for it. That is the
 /// only instrument in this file that can tell a written vector from a cleared
 /// flag.
+fn engine_over(backend: Arc<SqliteBackend>, embedder: Arc<dyn Embedder>) -> Engine {
+    Engine::new(EngineConfig::new(
+        backend,
+        embedder,
+        Arc::new(BaselinePolicy::default()),
+    ))
+}
+
 fn engine_and_backend_with(embedder: Arc<dyn Embedder>) -> (Engine, Arc<SqliteBackend>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let backend = Arc::new(SqliteBackend::open(dir.keep()));
@@ -247,15 +255,19 @@ async fn backfill_leaves_items_pending_when_the_embedder_is_still_down() {
 }
 
 /// **A no-op assertion needs a presence control, or it is a test of nothing.**
-/// Every number this asserts is zero, and an implementation that returned an
-/// all-zero report unconditionally would pass the first half. So the second
-/// half drives the *same* engine and the *same* instrument — one
+/// Every number the first half asserts is zero, and an implementation that
+/// returned an all-zero report unconditionally would pass it. So the second
+/// half drives the *same* engine and the *same* instruments — one
 /// `backfill_embeddings` call, one `Reembedded` audit count — into the state
 /// where something does happen, and checks that both report it. The premise
 /// assertions (`scanned`, and the item actually being non-pending) are there
 /// so "nothing to do" cannot be confused with "nothing was looked at".
+///
+/// The name covers both halves deliberately. A name narrower than its body is
+/// the same defect as a body narrower than its name, and this file already
+/// contains one instance of the latter.
 #[tokio::test]
-async fn backfill_over_a_healthy_scope_does_nothing() {
+async fn backfill_does_nothing_over_a_healthy_scope_and_only_the_pending_item_in_a_mixed_one() {
     let flaky = Arc::new(FlakyEmbedder::new());
     let e = engine_with(flaky.clone());
     e.remember(RememberRequest::new(
@@ -385,11 +397,12 @@ async fn reembedding_preserves_the_items_themselves() {
 }
 
 /// **A no-op assertion needs a presence control** — see
-/// `backfill_over_a_healthy_scope_does_nothing` for the full argument. Here
-/// the same `scanned` counter is driven from an empty scope to a populated
-/// one inside one test, so a `scanned` hard-wired to zero cannot pass.
+/// `backfill_does_nothing_over_a_healthy_scope_and_only_the_pending_item_in_a_mixed_one`
+/// for the full argument. Here the same `scanned` counter is driven from an
+/// empty scope to a populated one inside one test, so a `scanned` hard-wired
+/// to zero cannot pass.
 #[tokio::test]
-async fn backfill_on_an_empty_scope_is_a_no_op() {
+async fn backfill_scans_nothing_on_an_empty_scope_and_one_item_once_it_is_populated() {
     let e = engine_with(Arc::new(DeterministicEmbedder::new(256)));
     assert!(
         e.review(&scope(), &Page::default())
@@ -498,6 +511,102 @@ async fn a_failed_reembed_of_a_healthy_item_is_not_reported_as_still_pending() {
         reembed_audit_count(&e).await,
         0,
         "nothing was written, so nothing may be audited"
+    );
+}
+
+/// **The scenario `reembed_scope` exists for: an actual change of embedding
+/// model, end to end.**
+///
+/// Every other test in this file runs one embedder, so none of them can see
+/// whether `vectors.embedder` and `vectors.dim` are rewritten — the migration's
+/// entire point. Two `DeterministicEmbedder`s of different dimension give two
+/// different `EmbedderId`s *and* two different dims, and
+/// `SqliteBackend::neighbours` refuses a probe whose model disagrees with what
+/// the scope is indexed with (`vectors::scope_embedder`, returning
+/// `BackendError::EmbedderMismatch`). That refusal is the instrument: the new
+/// model's probe is rejected before the migration and accepted after, and the
+/// old model's probe swaps places with it. Both engines share one backend,
+/// which is what makes this a migration of an existing corpus rather than two
+/// unrelated scopes.
+#[tokio::test]
+async fn reembed_scope_migrates_a_scope_to_a_new_embedding_model() {
+    let old_model = Arc::new(DeterministicEmbedder::new(256));
+    let (before, backend) = engine_and_backend_with(old_model.clone());
+
+    let bodies: Vec<String> = (0..3)
+        .map(|i| format!("memory {i} about subject {i}"))
+        .collect();
+    for body in &bodies {
+        before
+            .remember(RememberRequest::new(scope(), body))
+            .await
+            .unwrap();
+    }
+
+    // The new model. Different dimension, therefore a different `EmbedderId`
+    // as well — `DeterministicEmbedder::new` derives its id from its dim.
+    let new_model = Arc::new(DeterministicEmbedder::new(384));
+    let after = engine_over(backend.clone(), new_model.clone());
+    assert_ne!(
+        old_model.id(),
+        new_model.id(),
+        "the premise: this is a change of model, not of instance"
+    );
+
+    let old_probe = old_model.embed(&bodies[0]).unwrap();
+    let new_probe = new_model.embed(&bodies[0]).unwrap();
+
+    assert!(
+        !backend
+            .neighbours(&scope(), &old_probe, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the premise: the corpus is indexed with the old model and answers it"
+    );
+    assert!(
+        matches!(
+            backend.neighbours(&scope(), &new_probe, 10).await,
+            Err(memorysafe_backend::BackendError::EmbedderMismatch { .. })
+        ),
+        "before the migration the new model's probe must be refused, not \
+         silently compared across two vector spaces"
+    );
+
+    let report = after.reembed_scope(&scope(), None).await.unwrap();
+    assert_eq!((report.scanned, report.embedded), (3, 3));
+
+    // The two probes have swapped places: this is the whole migration.
+    assert_eq!(
+        backend
+            .neighbours(&scope(), &new_probe, 10)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "after the migration every item answers the new model's probe"
+    );
+    assert!(
+        matches!(
+            backend.neighbours(&scope(), &old_probe, 10).await,
+            Err(memorysafe_backend::BackendError::EmbedderMismatch { .. })
+        ),
+        "and the old model's probe is now the one refused"
+    );
+
+    assert_eq!(
+        reembed_audit_count(&after).await,
+        3,
+        "an explicit migration is an audited one"
+    );
+    assert_eq!(
+        after
+            .review(&scope(), &Page::default())
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "changing model must not cost the corpus an item"
     );
 }
 

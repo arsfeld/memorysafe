@@ -136,10 +136,15 @@ impl Engine {
     /// is currently unreachable from any read path — `gather::assess_context`,
     /// `read::recall` and `maintain` all call `Backend::scope_stats` directly,
     /// and the only callers of `EngineCache::stats`/`put_stats` anywhere in
-    /// the workspace are this crate's own test modules in `mutate.rs`,
-    /// `maintain.rs` and `reembed.rs` (`cache.rs` itself has no
-    /// `#[cfg(test)]` module at all, so do not go looking there). So there is
-    /// no cached capacity
+    /// the workspace are this crate's own tests — the `#[cfg(test)]` modules
+    /// in `mutate.rs`, `maintain.rs` and `reembed.rs`, and the integration
+    /// test `tests/cache.rs`, which is where the cache's own unit coverage
+    /// lives because `src/cache.rs` has no `#[cfg(test)]` module of its own.
+    /// (An earlier revision of this sentence named only the three `src`
+    /// modules and told the reader not to look for cache tests. It was
+    /// written from a grep over `src/*.rs` alone while claiming workspace
+    /// scope, and it pointed away from `tests/cache.rs` at exactly the moment
+    /// that file is what a reader wants.) So there is no cached capacity
     /// figure anywhere to go stale, and none should be introduced here: this
     /// is the accessor `capacity_is_never_exceeded` (`tests/invariants.rs`)
     /// cross-checks the stored item count against, and a cached answer would

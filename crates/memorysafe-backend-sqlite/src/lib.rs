@@ -1479,7 +1479,11 @@ mod tests {
     ///    `ON DELETE CASCADE` above takes the vector row with it. The
     ///    upsert's `vectors::insert` therefore hits **no** conflict and
     ///    writes `subject`/`namespace` fresh from the item's own scope.
-    ///    **Re-embedding heals Direction-2 divergence**; nothing else does.
+    ///    **Re-embedding heals Direction-2 divergence**; nothing else
+    ///    *repairs* it. `forget` and `purge::subject` reach a divergent row
+    ///    through the same cascade, but they erase it along with the item —
+    ///    which ends the divergence by ending the data. Re-embedding is the
+    ///    only path that leaves a correct row where a wrong one was.
     /// 2. **The scoped `vectors::delete` silently no-ops on such a row** — it
     ///    matches on `item_id AND subject AND namespace`. With (1): a merge
     ///    that drops an embedding leaves a stale vector row that no *merge's*
