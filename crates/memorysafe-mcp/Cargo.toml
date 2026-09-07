@@ -26,14 +26,16 @@ memorysafe-backend-sqlite.workspace = true
 memorysafe-embed.workspace = true
 memorysafe-policy.workspace = true
 axum.workspace = true
-# `rustls`, not `rustls-tls`: reqwest 0.13 renamed the feature (the brief's
-# own Cargo.toml snippet names `rustls-tls`, which does not exist on this
-# version and fails `cargo` feature resolution — verified against the
-# vendored `reqwest-0.13.4/Cargo.toml`, not guessed). `rustls` is reqwest's
-# real default TLS backend feature name; nothing here makes an HTTPS
-# request, but reqwest needs one connector backend compiled in regardless of
-# scheme.
-reqwest = { workspace = true, features = ["rustls"] }
+# No TLS feature: the brief's own Cargo.toml snippet named `rustls-tls`,
+# which does not exist in this version of reqwest at all (renamed `rustls` —
+# verified against the vendored `reqwest-0.13.4/Cargo.toml`, not guessed).
+# But reqwest needs no TLS backend feature just to compile — it gates every
+# TLS path behind `__tls` and otherwise builds a plain HTTP-only connector
+# (`src/async_impl/client.rs`), and every request `tests/http_transport.rs`
+# makes is to a plain-HTTP loopback listener. Enabling `rustls` here would
+# needlessly pull `aws-lc-sys`/`ring`/`rustls-platform-verifier` — a
+# cmake-plus-C build — into `Cargo.lock` for a feature nothing exercises.
+reqwest.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }

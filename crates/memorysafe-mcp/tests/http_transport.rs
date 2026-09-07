@@ -195,9 +195,14 @@ async fn a_client_cannot_read_another_tenants_resource_by_naming_it_in_the_uri_o
         "memorysafe://globex/user-42/agent/audit",
     )))
     .await;
+    let err = denied.expect_err("a resource URI crossed a tenant boundary over http");
+    // Pin the reason, not just the outcome: `read_resource`'s tenant-mismatch
+    // guard returns exactly this message. Without checking it, an unrelated
+    // failure — a broken route, a session that never established, another
+    // auth regression — could masquerade as this test still passing.
     assert!(
-        denied.is_err(),
-        "a resource URI crossed a tenant boundary over http"
+        format!("{err:?}").contains("no such resource"),
+        "expected a tenant-mismatch refusal (\"no such resource\"), got: {err:?}"
     );
 
     with_timeout(client.cancel()).await.unwrap();

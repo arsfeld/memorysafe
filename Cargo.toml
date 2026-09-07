@@ -81,12 +81,18 @@ getrandom = "0.4.3"
 # listener to bind in tests, and the cancellation primitive rmcp's own
 # streamable-HTTP server config takes for graceful shutdown.
 axum = { version = "0.8.9", features = ["macros"] }
-# `default-features = false`: no TLS backend selected here, since none of
-# this workspace's own code makes an HTTPS request — the reqwest client this
-# pulls in exists only as the transport rmcp's streamable-HTTP *client*
-# feature uses in tests, against a plain-HTTP loopback listener. A consumer
-# that does need TLS enables it on its own `[dependencies]` line the same way
-# `memorysafe-mcp`'s `[dev-dependencies]` does.
+# `default-features = false`, and no TLS feature enabled anywhere in this
+# workspace: reqwest 0.13.4 gates every TLS path behind its `__tls` feature
+# (`src/async_impl/client.rs`, checked against the vendored source) and
+# builds a plain HTTP-only connector without it — there is no
+# `compile_error!` guard that would force a backend choice just to compile.
+# Nothing here makes an HTTPS request: the reqwest client this pulls in
+# exists only as the transport `rmcp`'s streamable-HTTP *client* feature uses
+# in `memorysafe-mcp`'s tests, against a plain-HTTP loopback listener. A
+# consumer that does need TLS adds a backend feature (e.g. `rustls`) on its
+# own `[dependencies]` line; enabling one workspace-wide for a loopback test
+# would needlessly pull `aws-lc-sys`/`ring`/`rustls-platform-verifier` (a
+# cmake-plus-C build) into every build's dependency graph.
 reqwest = { version = "0.13.4", default-features = false }
 tokio-util = "0.7.19"
 
