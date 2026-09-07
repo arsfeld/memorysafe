@@ -10,3 +10,11 @@ devenv.local.yaml
 
 # direnv
 .direnv
+
+# Closed tier. This repository is PUBLIC; .superpowers/closed-tier/ holds the
+# commercial tier's substance -- the Postgres schema and RLS design, the
+# hosted deployment topology, the control plane. Those documents live in the
+# private memorysafe-cloud repository. Ignoring the path here is what stops
+# `git add -A` in a worktree from republishing them, which is how
+# 2026-09-05-postgres-backend.md reached origin/master in the first place.
+.superpowers/closed-tier/
