@@ -1,6 +1,6 @@
 use super::{BackendFactory, fx};
 use crate::{Backend, BackendError, Page};
-use memorysafe_core::{AuditFilter, ItemId, Scope};
+use memorysafe_core::{AuditFilter, ItemId, MemoryItem, Scope};
 
 /// The item insert, the evictions, and the audit row must land together.
 pub async fn admit_evict_and_audit_commit_together<F: BackendFactory>(factory: &F) {
@@ -218,6 +218,197 @@ pub async fn an_invalid_transaction_is_rejected_and_writes_nothing<F: BackendFac
         audit_before,
         "a rejected transaction still wrote its audit row"
     );
+}
+
+/// The other two of `WriteTransaction::is_valid`'s three rejection
+/// conditions must also be rejected at the `Backend::apply` seam, with the
+/// corpus left exactly as it was — the same obligation
+/// `an_invalid_transaction_is_rejected_and_writes_nothing` states and, for
+/// the third condition, drives through the trait above.
+///
+/// **Condition 1 — `upsert` and `merge` set together — has its own test
+/// above and is not repeated here.** It carries a three-axis "nothing
+/// changed" assertion (a new item, a rewritten merge body, an eviction) that
+/// folding it into this test would lose, and rewriting a passing,
+/// frozen-suite test is out of scope.
+///
+/// **One contract, enumerated over its remaining cases — not one test per
+/// case.** The obligation is a single sentence; splitting it into one test
+/// per condition would fragment that sentence into three and let a future
+/// backend satisfy some of them while failing the obligation, with the suite
+/// reporting mostly-green. `cases` below is where a further condition is
+/// added, not a new test kept in sync with this one by hand.
+///
+/// **Each case's wrong scope differs from the right one in exactly one
+/// component** — the suite's established rule for a scope-shaped predicate
+/// (`isolation::retrieval_never_crosses_a_scope_boundary` and `write.rs`'s
+/// own unit tests use the same one): changing two components at once
+/// certifies a backend that checks only one of them. Condition 2 (the
+/// upserted item's own scope) varies **subject**; condition 3 (the audit
+/// record's scope) varies **namespace** — between the two, a backend that
+/// checks only one component of a disagreeing scope is caught by whichever
+/// case exercises the other.
+///
+/// **Each case also checks the scope it disagrees on, not just the home
+/// scope**, because that is the one distinctive way this pair of conditions
+/// can fail silently: `WriteTransaction::is_valid`'s own doc says a real
+/// backend reads the item row's scope from the item itself and the audit
+/// row's scope from the audit record, so a backend that skips the check may
+/// file the offending row under the *disagreeing* scope rather than the
+/// transaction's nominal one — invisible to a comparison that only reads the
+/// home scope back.
+///
+/// **Non-vacuous.** Each case seeds a survivor item, reads the corpus and
+/// the audit count as a baseline immediately before the failing call, and
+/// asserts that baseline is non-empty before trusting any "nothing changed"
+/// comparison against it. Each case also asserts `!txn.is_valid()` first, so
+/// if a future change makes that case's transaction valid, the case fails
+/// loudly rather than silently asserting nothing.
+pub async fn every_is_valid_rejection_is_rejected_by_the_backend<F: BackendFactory>(factory: &F) {
+    use crate::write::WriteTransaction;
+
+    /// Which row a naive backend would misfile under the disagreeing scope,
+    /// for the corresponding case below.
+    enum Leak {
+        /// Condition 2: the upserted item's own scope disagrees. A backend
+        /// that skips the check may still write the item row, keyed on the
+        /// item's own (wrong) scope.
+        Item,
+        /// Condition 3: the audit record's scope disagrees. A backend that
+        /// skips the check may still write the audit row, keyed on the
+        /// audit record's own (wrong) scope.
+        Audit,
+    }
+
+    struct Case {
+        condition: &'static str,
+        /// The one scope this case disagrees with the home scope on,
+        /// differing in exactly one component.
+        foreign: fn() -> Scope,
+        /// Builds an otherwise-valid transaction that violates exactly this
+        /// condition, and the item it upserts.
+        build: fn(&Scope, &Scope) -> (WriteTransaction, MemoryItem),
+        leak: Leak,
+    }
+
+    let cases: [Case; 2] = [
+        Case {
+            condition: "an upserted item whose scope disagrees with the \
+                        transaction's scope (subject)",
+            foreign: || Scope::new("t", "other-subject", "n").unwrap(),
+            build: |scope, foreign| {
+                let newcomer = fx::item(foreign, "must never be written");
+                let txn = fx::admit_txn(scope, newcomer.clone(), None);
+                (txn, newcomer)
+            },
+            leak: Leak::Item,
+        },
+        Case {
+            condition: "the audit record's scope disagreeing with the \
+                        transaction's scope (namespace)",
+            foreign: || Scope::new("t", "s", "other-ns").unwrap(),
+            build: |scope, foreign| {
+                let newcomer = fx::item(scope, "must never be written");
+                let mut txn = fx::admit_txn(scope, newcomer.clone(), None);
+                txn.audit.scope = foreign.clone();
+                (txn, newcomer)
+            },
+            leak: Leak::Audit,
+        },
+    ];
+
+    for case in &cases {
+        let backend = factory.create().await;
+        let scope = Scope::new("t", "s", "n").unwrap();
+        let foreign = (case.foreign)();
+
+        let survivor = fx::item(&scope, "must survive untouched");
+        backend
+            .apply(fx::admit_txn(&scope, survivor.clone(), None))
+            .await
+            .unwrap();
+
+        let before = backend.list(&scope, &Page::default()).await.unwrap();
+        assert!(
+            !before.is_empty(),
+            "{}: the corpus must exist before a 'nothing changed' comparison \
+             means anything",
+            case.condition,
+        );
+        let audit_before = backend
+            .audit(&scope, &AuditFilter::default())
+            .await
+            .unwrap()
+            .len();
+
+        let (txn, newcomer) = (case.build)(&scope, &foreign);
+        assert!(
+            !txn.is_valid(),
+            "{}: the premise of this case -- the transaction it submits must \
+             be one `WriteTransaction::is_valid` rejects",
+            case.condition,
+        );
+
+        let err = backend.apply(txn).await.expect_err(&format!(
+            "{}: an invalid transaction must be refused, not applied",
+            case.condition,
+        ));
+        assert!(
+            matches!(err, BackendError::InvalidTransaction(_)),
+            "{}: an invalid transaction must be refused as invalid, not \
+             applied and not refused for some incidental reason: got {err:?}",
+            case.condition,
+        );
+
+        assert!(
+            backend.get(&scope, &newcomer.id).await.unwrap().is_none(),
+            "{}: a rejected transaction still inserted its item under the \
+             transaction's own scope -- the contract requires both \
+             rejection and an untouched corpus",
+            case.condition,
+        );
+        match case.leak {
+            Leak::Item => assert!(
+                backend.get(&foreign, &newcomer.id).await.unwrap().is_none(),
+                "{}: a rejected transaction still inserted its item, filed \
+                 under the scope it disagreed on -- the contract requires \
+                 both rejection and an untouched corpus, in every scope the \
+                 transaction named",
+                case.condition,
+            ),
+            Leak::Audit => assert!(
+                backend
+                    .audit(&foreign, &AuditFilter::default())
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{}: a rejected transaction still wrote an audit row, filed \
+                 under the scope it disagreed on -- the contract requires \
+                 both rejection and an untouched corpus, in every scope the \
+                 transaction named",
+                case.condition,
+            ),
+        }
+
+        let after = backend.list(&scope, &Page::default()).await.unwrap();
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "{}: the corpus changed size across a rejected transaction -- \
+             the contract requires both rejection and an untouched corpus",
+            case.condition,
+        );
+        assert_eq!(
+            backend
+                .audit(&scope, &AuditFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            audit_before,
+            "{}: a rejected transaction still wrote its audit row",
+            case.condition,
+        );
+    }
 }
 
 /// Invariant 4 from the spec, at the backend level.

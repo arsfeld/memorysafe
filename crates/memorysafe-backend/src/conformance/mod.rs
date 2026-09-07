@@ -84,6 +84,7 @@ where
         atomicity::admit_evict_and_audit_commit_together,
         atomicity::a_failed_transaction_leaves_no_trace,
         atomicity::an_invalid_transaction_is_rejected_and_writes_nothing,
+        atomicity::every_is_valid_rejection_is_rejected_by_the_backend,
         atomicity::every_mutation_writes_exactly_one_audit_record,
         atomicity::idempotent_writes_replay_the_original_outcome,
         atomicity::idempotency_conflict_on_different_payload,

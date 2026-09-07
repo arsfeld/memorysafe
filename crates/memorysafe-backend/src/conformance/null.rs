@@ -381,6 +381,7 @@ async fn run_census() -> Vec<(&'static str, Verdict)> {
         super::atomicity::admit_evict_and_audit_commit_together,
         super::atomicity::a_failed_transaction_leaves_no_trace,
         super::atomicity::an_invalid_transaction_is_rejected_and_writes_nothing,
+        super::atomicity::every_is_valid_rejection_is_rejected_by_the_backend,
         super::atomicity::every_mutation_writes_exactly_one_audit_record,
         super::atomicity::idempotent_writes_replay_the_original_outcome,
         super::atomicity::idempotency_conflict_on_different_payload,
@@ -618,6 +619,12 @@ struct Tolerance {
 /// it fails on its first inclusive-bound assertion, since
 /// `NullBackend::retrieve_candidates` always returns an empty vec and none of
 /// the dated items it expects back ever appear.
+/// Nor is the fifty-fifth,
+/// `atomicity::every_is_valid_rejection_is_rejected_by_the_backend`: it fails
+/// on its first case's own non-vacuity guard, "the corpus must exist before a
+/// 'nothing changed' comparison means anything", since `NullBackend::list`
+/// always returns an empty vec even after the seeding `apply` call the case
+/// makes just before reading it.
 /// The census figures above are left at the reading they were taken at rather
 /// than adjusted by arithmetic; retake them to update them.
 ///
@@ -808,7 +815,7 @@ async fn the_census_measures_every_test_the_suite_runs() {
     );
     assert_eq!(
         suite.len(),
-        54,
+        55,
         "the suite's size changed; update the census record"
     );
 }
