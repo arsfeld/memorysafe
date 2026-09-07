@@ -402,6 +402,7 @@ async fn run_census() -> Vec<(&'static str, Verdict)> {
         super::capacity::concurrent_admits_do_not_double_count,
         super::capacity::scope_stats_reflect_the_corpus,
         super::lifecycle::audit_filter_narrows_by_event_and_time,
+        super::lifecycle::audit_filter_narrows_by_item,
         super::lifecycle::audit_returns_min_of_the_limit_and_the_rows_that_remain,
         super::lifecycle::audit_pages_by_the_after_cursor_without_repeating_a_row,
         super::lifecycle::audit_since_and_until_include_a_record_on_the_boundary,
@@ -595,13 +596,16 @@ struct Tolerance {
 /// assertion, 4 by panicking on an empty vec or a `None`, all of which are the
 /// right outcome.
 ///
-/// The suite has since reached 50. The fiftieth,
+/// The suite has since reached 51. The fiftieth,
 /// `lifecycle::every_audit_writing_path_increments_the_aggregates`, was added
 /// after this census was taken and is **not** among the survivors: it fails
 /// against the null backend on its first delta assertion, since
-/// `audit_aggregates` returns an empty vec and the count never rises. The
-/// census figures above are left at the reading they were taken at rather than
-/// adjusted by arithmetic; retake them to update them.
+/// `audit_aggregates` returns an empty vec and the count never rises. Nor is
+/// the fifty-first, `lifecycle::audit_filter_narrows_by_item`: it fails on its
+/// first echo-rule assertion, since `NullBackend::apply` returns a fixed nil
+/// `AuditId` rather than the one its transaction carried. The census figures
+/// above are left at the reading they were taken at rather than adjusted by
+/// arithmetic; retake them to update them.
 ///
 /// Both survivors are *absence-shaped*: each asserts that something is not
 /// there, which an empty result satisfies for free. Neither is vacuous,
@@ -790,7 +794,7 @@ async fn the_census_measures_every_test_the_suite_runs() {
     );
     assert_eq!(
         suite.len(),
-        50,
+        51,
         "the suite's size changed; update the census record"
     );
 }

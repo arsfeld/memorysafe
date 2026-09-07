@@ -217,6 +217,17 @@ pub trait Backend: Send + Sync {
     /// depending on the inclusivity choice, so the two tests fail for
     /// different reasons.
     ///
+    /// `filter.item`, when `Some(id)`, narrows the result to records whose
+    /// `items` contain an `ItemRef` for that `ItemId`; `None` leaves the
+    /// result unnarrowed. It ANDs with `events`, `since`, `until` and `after`
+    /// exactly as they AND with each other, and it is applied **before**
+    /// `limit` — the `min(filter.limit, rows matching the whole filter)` rule
+    /// below still holds with `item` set, which a filter applied after
+    /// truncation would silently break.
+    /// `conformance::lifecycle::audit_filter_narrows_by_item` enforces this,
+    /// including the arm a count alone cannot: a record that names no item at
+    /// all must be excluded rather than treated as a match for every `item`.
+    ///
     /// **Truncation is detectable from the page size, so there is no
     /// `truncated` flag.** An implementation must return exactly
     /// `min(filter.limit, rows still matching after the cursor)` — never

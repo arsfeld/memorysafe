@@ -105,6 +105,7 @@ where
         capacity::concurrent_admits_do_not_double_count,
         capacity::scope_stats_reflect_the_corpus,
         lifecycle::audit_filter_narrows_by_event_and_time,
+        lifecycle::audit_filter_narrows_by_item,
         lifecycle::audit_returns_min_of_the_limit_and_the_rows_that_remain,
         lifecycle::audit_pages_by_the_after_cursor_without_repeating_a_row,
         lifecycle::audit_since_and_until_include_a_record_on_the_boundary,
