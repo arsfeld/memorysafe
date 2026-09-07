@@ -419,3 +419,70 @@ async fn exporting_an_empty_scope_yields_a_header_and_nothing_else() {
     let ndjson = e.export_ndjson(&selector(false)).await.unwrap();
     assert_eq!(ndjson.lines().count(), 1);
 }
+
+/// **An import must leave a record of itself.** Everything else about an
+/// import is auditable through the items it created; the act of injecting a
+/// corpus into a tenant was not recorded anywhere, so "who put this here, and
+/// when" had no answer for the one path that takes a whole corpus as input.
+///
+/// The record is filed under the destination tenant's reserved administrative
+/// scope, not under any imported item's own subject: an import is
+/// tenant-level, and a subject spans namespaces. Asserted by *reading it back
+/// from that exact scope* — a record filed anywhere else fails here rather
+/// than being found by a scan.
+///
+/// **The controls.** The imported items' own scope is asserted to hold no
+/// `Imported` row, so "the record exists" cannot be satisfied by one filed in
+/// the wrong place; and `items.len()` is asserted at exactly 3, so a record
+/// written with an empty `items` list — the shape the first draft of every
+/// other audit site in this crate had — fails.
+#[tokio::test]
+async fn an_import_writes_an_audit_record_naming_the_tenant_and_what_it_carried() {
+    use memorysafe_core::{ADMIN_COMPONENT, AuditEvent, AuditFilter, Namespace, SubjectId};
+
+    let source = engine();
+    seed(&source).await;
+    let ndjson = source.export_ndjson(&selector(false)).await.unwrap();
+
+    let target = engine();
+    let report = target.import_ndjson(&ndjson, &tenant()).await.unwrap();
+    assert_eq!(
+        report.items_imported, 3,
+        "premise: the import did something"
+    );
+
+    let admin = Scope {
+        tenant: tenant(),
+        subject: SubjectId::new(ADMIN_COMPONENT).unwrap(),
+        namespace: Namespace::new(ADMIN_COMPONENT).unwrap(),
+    };
+    let imported = AuditFilter {
+        events: vec![AuditEvent::Imported],
+        ..Default::default()
+    };
+    let rows = target.audit(&admin, &imported).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "an import must write exactly one Imported record, under the \
+         destination tenant's administrative scope"
+    );
+    assert_eq!(rows[0].scope.tenant, tenant());
+    assert_eq!(
+        rows[0].actor,
+        memorysafe_core::Actor::system(),
+        "the actor gap is Actor::system(), not a fabricated human"
+    );
+    assert_eq!(
+        rows[0].items.len(),
+        3,
+        "the record must name the item records the stream carried, not be \
+         written with an empty items list"
+    );
+
+    assert!(
+        target.audit(&scope(), &imported).await.unwrap().is_empty(),
+        "the record is tenant-level and must not be filed under an imported \
+         item's own subject"
+    );
+}

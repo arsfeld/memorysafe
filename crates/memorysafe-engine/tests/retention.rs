@@ -1,3 +1,13 @@
+//! **`the_four_profiles_match_the_documented_table` asserts a table against
+//! itself for two of its three columns, and that is all it can do.**
+//! `purge_cascade` has a mechanism behind it and the behavioural tests below
+//! exercise it end to end; `detail` and `aggregate` have none — nothing in
+//! this workspace expires an audit row or an aggregate row on a schedule — so
+//! there is no behaviour for a test here to reach. See `AuditRetention`'s own
+//! doc comment (`src/retention.rs`) for the full statement of that gap and
+//! what closing it needs. This file is not evidence that a `GdprStrict`
+//! deployment gets ninety-day detail retention, and must not be read as such.
+
 use memorysafe_backend_sqlite::SqliteBackend;
 use memorysafe_core::{AuditFilter, Scope, SubjectId, TenantId};
 use memorysafe_embed::DeterministicEmbedder;

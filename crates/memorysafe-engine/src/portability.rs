@@ -1,7 +1,12 @@
 use crate::Engine;
 use crate::error::EngineError;
-use memorysafe_backend::{ExportRecord, ExportStream, ImportReport, ImportStream, ScopeSelector};
-use memorysafe_core::{Protection, TenantId};
+use memorysafe_backend::{
+    ExportRecord, ExportStream, ImportReport, ImportStream, ScopeSelector, WriteTransaction,
+};
+use memorysafe_core::{
+    ADMIN_COMPONENT, Actor, AuditEvent, AuditRecord, ItemRef, Namespace, Protection, Scope,
+    SubjectId, TenantId,
+};
 use time::{Duration, OffsetDateTime};
 
 impl Engine {
@@ -93,7 +98,46 @@ impl Engine {
     ///   consuming the namespace's budget, since `portability::import` calls
     ///   `capacity::adjust` with no budget check of its own.
     ///
-    /// **Audit rows are not part of either defence.** This function maps
+    /// **The import audits itself.** One `AuditEvent::Imported` record is
+    /// written after the backend commits, filed under the destination tenant's
+    /// reserved administrative scope (`memorysafe_core::ADMIN_COMPONENT` as
+    /// both subject and namespace — an import is a tenant-level event and a
+    /// subject spans namespaces, exactly the situation that constant exists
+    /// for). Without it the one path that injects a whole corpus into a tenant
+    /// left no trace of itself at all: the imported *items* are auditable, and
+    /// the act of importing them was not.
+    ///
+    /// The plan defers `Imported`/`Exported` "for want of an actor". That
+    /// reason does not hold — `forget`, `protect` and `purge_subject` all ship
+    /// today with `Actor::system()` and a recorded gap, and this follows that
+    /// precedent: `Actor::system()`, not the actor who ordered the import,
+    /// with the same deferral to Plan 3's Task 2 that `purge_subject`'s doc
+    /// (`mutate.rs`) sets out in full.
+    ///
+    /// **What the record carries, and the one thing it does not.** Its scope
+    /// names the destination tenant; its `items` name every item record the
+    /// stream carried into that tenant, so `items.len()` is an exact record
+    /// count — but it is the count of items *offered*, which is
+    /// `items_imported + items_skipped_existing`, since the backend decides
+    /// which of them already existed and does not report *which*. The
+    /// remaining `ImportReport` figures — `vectors_imported`, `audit_imported`
+    /// and the imported/skipped split — are returned to the caller and are
+    /// **not** in the row, because `AuditRecord` has no numeric field that is
+    /// free to carry them: `decision` keys the row's `audit_aggregates` bucket
+    /// on its `PolicyId` (`aggregates::increment`), and `assessment` adds a
+    /// sample to that bucket's value and fragility histograms — so smuggling
+    /// counts through either would file a non-policy event under a fabricated
+    /// policy name, or push zeros into the score distributions. A dedicated
+    /// field on `AuditRecord` is the right home and is a `memorysafe-core`
+    /// wire-format change; ledgered, not made here.
+    ///
+    /// **The record is not atomic with the import it describes.**
+    /// `Backend::import` takes no `AuditRecord` (unlike `purge_subject`, which
+    /// does), so the row is a second transaction: a crash between them leaves
+    /// an import that happened with no record of itself. Closing that is a
+    /// `Backend` signature change, which belongs with the next contract batch.
+    ///
+    /// **Audit rows in the *stream* are not part of either defence.** This function maps
     /// only `ExportRecord::Item`; `ExportRecord::Header` and
     /// `ExportRecord::Audit` pass through the `other => other` arm
     /// untouched. That asymmetry — items re-assessed, audit rows trusted
@@ -148,7 +192,72 @@ impl Engine {
                 other => other,
             })
             .collect();
-        Ok(self.backend.import(destination, reassessed).await?)
+
+        // Read off the reassessed stream, before it is moved into the backend
+        // — and from the *reassessed* stream rather than the caller's, so the
+        // digests in these refs are of what was actually stored, not of what
+        // was offered. (`ItemRef::from_item` hashes body/kind/tags, none of
+        // which the reassessment touches, so the two agree today; taking them
+        // from the stored side means they still agree if that ever changes.)
+        let refs: Vec<ItemRef> = reassessed
+            .iter()
+            .filter_map(|r| match r {
+                ExportRecord::Item { item, .. } => Some(ItemRef::from_item(item)),
+                _ => None,
+            })
+            .collect();
+        // Every scope the import can have written to. `Backend::import`
+        // preserves each item's own subject and namespace and only *checks*
+        // its tenant against `destination`, so the scopes are the items' own.
+        let mut written: Vec<Scope> = reassessed
+            .iter()
+            .filter_map(|r| match r {
+                ExportRecord::Item { item, .. } => Some(item.scope.clone()),
+                _ => None,
+            })
+            .collect();
+        written.sort();
+        written.dedup();
+
+        let report = self.backend.import(destination, reassessed).await?;
+
+        // `_admin`/`_admin`: an import is a tenant-level event and a subject
+        // spans namespaces, which is what `ADMIN_COMPONENT` is reserved for.
+        // The alternative — filing it under the first imported item's scope —
+        // would make a tenant-wide event look like one subject's, and would
+        // have nothing to file at all for a header-only stream.
+        let audit_scope = Scope {
+            tenant: destination.clone(),
+            subject: SubjectId::new(ADMIN_COMPONENT)
+                .expect("the reserved component is a valid subject"),
+            namespace: Namespace::new(ADMIN_COMPONENT)
+                .expect("the reserved component is a valid namespace"),
+        };
+        // `Actor::system()` and the gap it stands for: see this method's doc,
+        // and `purge_subject`'s in `mutate.rs` for the full account.
+        let audit = AuditRecord::new(
+            audit_scope.clone(),
+            AuditEvent::Imported,
+            refs,
+            Actor::system(),
+            OffsetDateTime::now_utc(),
+        );
+        self.backend
+            .apply(WriteTransaction::new(audit_scope, audit))
+            .await?;
+
+        // An import is a corpus change, so it invalidates like every other
+        // one — see `EngineCache`'s doc, which used to claim every corpus
+        // change this engine can make went through one of its enumerated
+        // surfaces while this one went through none of them. Every namespace
+        // the stream wrote into, individually, for the reason `purge_subject`
+        // gives: `invalidate_scope` takes one `Scope` and an import spans as
+        // many as the stream carries.
+        for scope in &written {
+            self.cache.invalidate_scope(scope).await;
+        }
+
+        Ok(report)
     }
 
     /// The round-trip format: one JSON object per line.
@@ -268,4 +377,99 @@ fn escape_markdown_structure(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// `import` is a corpus change and joins the invalidation surfaces
+// `EngineCache`'s doc comment enumerates — it was the one that did not, which
+// is what made that doc's "every corpus change this engine can make goes
+// through one of those surfaces" false rather than merely miscounted. A unit
+// test rather than one in `tests/portability.rs` for the same reason
+// `mutate.rs`'s and `reembed.rs`'s are: `Engine::cache` is `pub(crate)` and
+// invalidation is not observable from outside the crate.
+#[cfg(test)]
+mod cache_invalidation_tests {
+    use super::*;
+    use crate::write::RememberRequest;
+    use crate::{Engine, EngineConfig};
+    use memorysafe_backend_sqlite::SqliteBackend;
+    use memorysafe_core::ScopeStats;
+    use memorysafe_embed::DeterministicEmbedder;
+    use memorysafe_policy::BaselinePolicy;
+    use std::sync::Arc;
+
+    fn engine() -> Engine {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Engine::new(EngineConfig::new(
+            Arc::new(SqliteBackend::open(dir.keep())),
+            Arc::new(DeterministicEmbedder::new(256)),
+            Arc::new(BaselinePolicy::default()),
+        ))
+    }
+
+    fn sentinel() -> ScopeStats {
+        ScopeStats {
+            item_count: 999_999,
+            ..Default::default()
+        }
+    }
+
+    /// An import spans as many scopes as its stream carries, so it must
+    /// invalidate each of them and nothing else.
+    ///
+    /// **The negative control is the point.** Seeding only the scopes the
+    /// import writes to would pass against an implementation that flushed the
+    /// whole cache, which is a different (and worse) behaviour than the one
+    /// claimed. `untouched` is a namespace under the same tenant that the
+    /// stream never mentions.
+    #[tokio::test]
+    async fn import_invalidates_every_namespace_the_stream_wrote_into_and_nothing_else() {
+        let tenant = TenantId::new("acme").unwrap();
+        let ns_a = Scope::new("acme", "user-42", "aaa-namespace").unwrap();
+        let ns_z = Scope::new("acme", "user-42", "zzz-namespace").unwrap();
+        let untouched = Scope::new("acme", "user-42", "never-in-the-stream").unwrap();
+
+        let source = engine();
+        source
+            .remember(RememberRequest::new(ns_a.clone(), "in namespace a"))
+            .await
+            .unwrap();
+        source
+            .remember(RememberRequest::new(ns_z.clone(), "in namespace z"))
+            .await
+            .unwrap();
+        let ndjson = source
+            .export_ndjson(&ScopeSelector {
+                tenant: tenant.clone(),
+                subject: None,
+                namespace: None,
+                include_audit: false,
+            })
+            .await
+            .unwrap();
+
+        let target = engine();
+        for s in [&ns_a, &ns_z, &untouched] {
+            target.cache.put_stats(s, sentinel()).await;
+            assert!(
+                target.cache.stats(s).await.is_some(),
+                "premise: cache seeded for {s:?}"
+            );
+        }
+
+        let report = target.import_ndjson(&ndjson, &tenant).await.unwrap();
+        assert_eq!(report.items_imported, 2, "premise: both namespaces landed");
+
+        assert!(
+            target.cache.stats(&ns_a).await.is_none(),
+            "import must invalidate every namespace it wrote into (a)"
+        );
+        assert!(
+            target.cache.stats(&ns_z).await.is_none(),
+            "import must invalidate every namespace it wrote into (z)"
+        );
+        assert!(
+            target.cache.stats(&untouched).await.is_some(),
+            "import must not invalidate a scope its stream never mentioned"
+        );
+    }
 }

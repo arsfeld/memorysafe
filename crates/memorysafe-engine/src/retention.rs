@@ -16,12 +16,41 @@ pub enum RetentionSpan {
 // name it without a second import path.
 pub use memorysafe_core::PurgeCascade;
 
+/// **One of these three fields is enforced. Two are not.**
+///
+/// `purge_cascade` is live: `Engine::purge_subject` reads it and passes it to
+/// `Backend::purge_subject`, which honours it (`mutate.rs`). `detail` and
+/// `aggregate` have no reader outside a test — `grep -rn 'retention()\.'
+/// crates/` finds exactly one hit under `src/`, and it reads `purge_cascade`;
+/// every other hit is `tests/retention.rs` asserting the table below against
+/// itself. Nothing expires an audit row or an aggregate row on a schedule.
+/// There is no expiry job, and no `Backend` method to build one on.
+///
+/// **This is stated because leaving it unstated makes it a false claim rather
+/// than a known gap.** An operator who selects `GdprStrict` reads
+/// `detail: Days(90)` as "detail rows are deleted after ninety days" and
+/// configures a compliance posture on it; what they get is rows that live
+/// until the subject is purged, exactly as `Balanced` gives — the two
+/// profiles are indistinguishable in everything but their cascade today. The
+/// profile table below is therefore a *declaration of intent* for two of its
+/// three columns and a working switch for the third.
+///
+/// Building the expiry pass is deliberately not done here. It needs a
+/// `Backend` method to delete audit rows older than a bound (there is none;
+/// `purge_subject` is by subject, not by age), a scheduler to run it, and a
+/// decision about what `UntilSubjectPurge` means for a subject that is never
+/// purged. That is a task, not a fix, and it is ledgered as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRetention {
+    /// How long detail rows are meant to live. **Not enforced** — see this
+    /// type's doc.
     pub detail: RetentionSpan,
+    /// The one field with a mechanism behind it: `Engine::purge_subject`
+    /// reads it on every erasure.
     pub purge_cascade: PurgeCascade,
     /// Counts, rates, and score distributions by policy version. Never
-    /// identifying, so it can outlive everything else.
+    /// identifying, so it can outlive everything else. **Not enforced** — see
+    /// this type's doc.
     pub aggregate: RetentionSpan,
 }
 

@@ -58,26 +58,41 @@ impl Default for CacheConfig {
 /// signature change, not a two-line wiring edit.
 ///
 /// **What leaving it unwired costs today: nothing, for a single-instance,
-/// sole-writer deployment.** Invalidation is wired into all seven
-/// `Backend::apply`/`Backend::purge_subject` call sites in this engine
-/// (`remember`, `forget`, `protect`, `purge_subject`, `maintain`'s
-/// decision-application write, `apply_merge`, and `reembed` — see each
-/// one's own call to `invalidate_scope`). Since every corpus change this
-/// engine can make goes through one of those seven surfaces, and each
-/// invalidates before the write it guards can be observed,
-/// `Backend::scope_stats` read directly (as every caller does today) can
-/// never be stale relative to *this engine's
-/// own writes* — there is no window for `stats_ttl` to matter yet. The
-/// exposure a read-through would start bounding is external to any single
-/// `Engine`: a second engine instance, or a writer outside this engine
-/// entirely, changing the same backend's data through a path that calls
-/// none of the seven surfaces above. Wiring `stats()`/`put_stats()` into a
-/// read path would only turn that unbounded exposure into one bounded by
-/// `stats_ttl` (30 seconds by default) — and that bound would come *entirely*
-/// from those seven surfaces staying wired. **Unwiring `invalidate_scope`
-/// from any one of them would silently widen this bound back toward unbounded,
-/// with no test able to catch the regression until the stats cache actually
-/// has a reader to make it observable.**
+/// sole-writer deployment.** The claim that makes that true is *every corpus
+/// change this engine can make invalidates the scope it changed* — so state
+/// it that way, and check it by enumeration rather than against a number that
+/// goes stale the moment a method is added. The enumeration is
+/// mechanical: `grep -n 'backend\.\(apply\|purge_subject\|import\)' src/*.rs`
+/// lists every corpus-changing backend call this crate makes, and each must
+/// have an `invalidate_scope` beside it. Today that is `remember`
+/// (`write.rs`), `forget`, `protect`, `purge_subject` (`mutate.rs`),
+/// `maintain`'s decision-application write and `apply_merge` (`maintain.rs`),
+/// `reembed` (`reembed.rs`, once per committed write, not once per pass) and
+/// `import` (`portability.rs`, once per namespace the stream wrote into).
+///
+/// **A count was written here instead, and it was wrong in both directions.**
+/// It said seven; `write.rs`'s `handle_invalid_decision` is an eighth
+/// `Backend::apply` call site, and it is *correctly* absent from the list
+/// above because it writes only an audit row and changes no corpus. And
+/// `Engine::import` — a corpus change, through `Backend::import`, which is
+/// neither of the two methods the sentence named — invalidated nothing at
+/// all, which made the paragraph's load-bearing claim false rather than
+/// merely miscounted. That is now fixed at the source (`portability.rs`
+/// invalidates), not by adjusting the number.
+///
+/// Since each of those surfaces invalidates before the write it guards can be
+/// observed, `Backend::scope_stats` read directly (as every caller does
+/// today) can never be stale relative to *this engine's own writes* — there
+/// is no window for `stats_ttl` to matter yet. The exposure a read-through
+/// would start bounding is external to any single `Engine`: a second engine
+/// instance, or a writer outside this engine entirely, changing the same
+/// backend's data. Wiring `stats()`/`put_stats()` into a read path would only
+/// turn that unbounded exposure into one bounded by `stats_ttl` (30 seconds
+/// by default) — and that bound would come *entirely* from those surfaces
+/// staying wired. **Unwiring `invalidate_scope` from any one of them, or
+/// adding a corpus-changing method without one, would silently widen this
+/// bound back toward unbounded, with no test able to catch the regression
+/// until the stats cache actually has a reader to make it observable.**
 pub struct EngineCache {
     embeddings: Cache<String, Embedding>,
     stats: Cache<String, ScopeStats>,

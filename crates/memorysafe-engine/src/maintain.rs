@@ -106,6 +106,7 @@ impl Engine {
         };
 
         let mut to_forget: Vec<ItemId> = Vec::new();
+        let mut forgotten_refs: Vec<ItemRef> = Vec::new();
         let mut to_release: Vec<(ItemId, Protection)> = Vec::new();
         let mut released = 0usize;
         let mut consolidated = 0usize;
@@ -130,6 +131,12 @@ impl Engine {
                     continue;
                 };
                 if candidate.item.protection != Protection::Pinned {
+                    // The ref is built here, from the candidate already in
+                    // hand, and not after the loop: `to_forget` is moved into
+                    // `txn.evictions` on the way to the backend, and a
+                    // `MaintenanceRun` record that named nothing was the
+                    // result of trying to derive the refs from it afterwards.
+                    forgotten_refs.push(ItemRef::from_item(&candidate.item));
                     to_forget.push(e.item.clone());
                 }
             }
@@ -180,10 +187,16 @@ impl Engine {
         }
 
         if !to_forget.is_empty() || released > 0 {
+            // Names the items this run removed, like every other mutating
+            // path in this engine. The refs cover `to_forget` only: the
+            // protection releases counted in `released` each write their own
+            // audit record through `self.protect` above, which already names
+            // its own item, so repeating them here would double-count them in
+            // the trail.
             let audit = AuditRecord::new(
                 scope.clone(),
                 AuditEvent::MaintenanceRun,
-                vec![],
+                std::mem::take(&mut forgotten_refs),
                 Actor::system(),
                 OffsetDateTime::now_utc(),
             );

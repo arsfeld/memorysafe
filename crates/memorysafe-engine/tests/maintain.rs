@@ -53,6 +53,71 @@ async fn an_expired_item_is_removed_and_the_reason_is_recorded() {
     assert!(!audit.is_empty(), "maintenance must write an audit record");
 }
 
+/// **A `MaintenanceRun` record must name what the run removed.** It was
+/// written with an empty `items` list while `to_forget` was in hand on the
+/// very next line — and a background pass is the one mutation nobody asked
+/// for, so its record is the only way to find out afterwards which memories
+/// it took.
+///
+/// The digest is compared against the item's own, captured before the run: an
+/// `ItemRef` is an id **and** a content digest, so a ref assembled from the
+/// wrong item, or from an id with a placeholder digest, would still have the
+/// right length and the right count.
+///
+/// **Two items expire, not one**, so a record naming only the first — the
+/// shape a `first()` instead of a full collect would produce — fails; and the
+/// unexpired third is asserted absent from the record, so "names everything
+/// it scanned" fails too.
+#[tokio::test]
+async fn a_maintenance_run_names_the_items_it_removed() {
+    let e = engine();
+    for body in ["this one expires", "so does this one"] {
+        let mut r = RememberRequest::new(scope(), body);
+        r.ttl = Some(Duration::seconds(-1));
+        e.remember(r).await.unwrap();
+    }
+    e.remember(RememberRequest::new(scope(), "this one survives"))
+        .await
+        .unwrap();
+
+    let mut expected: Vec<(memorysafe_core::ItemId, String)> = e
+        .review(&scope(), &Default::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.body != "this one survives")
+        .map(|i| (i.id.clone(), i.digest()))
+        .collect();
+    assert_eq!(expected.len(), 2, "premise: two items are due to expire");
+
+    let report = e.maintain(&scope(), None).await.unwrap();
+    assert_eq!(report.forgotten, 2, "premise: both were removed");
+
+    let rows = e
+        .audit(
+            &scope(),
+            &AuditFilter {
+                events: vec![AuditEvent::MaintenanceRun],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "premise: one run, one record");
+    let mut got: Vec<(memorysafe_core::ItemId, String)> = rows[0]
+        .items
+        .iter()
+        .map(|r| (r.id().clone(), r.digest().to_string()))
+        .collect();
+    got.sort();
+    expected.sort();
+    assert_eq!(
+        got, expected,
+        "the MaintenanceRun record must name every item the run removed, by \
+         id and digest, and only those"
+    );
+}
+
 #[tokio::test]
 async fn maintenance_over_a_healthy_scope_changes_nothing() {
     let e = engine();

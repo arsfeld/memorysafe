@@ -195,3 +195,69 @@ async fn the_multiset_form_survives_the_ordering_that_breaks_the_old_positional_
     assert_eq!(count(&events, AuditEvent::Admitted), 1);
     assert_eq!(count(&events, AuditEvent::Rejected), 1);
 }
+
+/// **Changing a namespace's ceiling is a governance change and must be
+/// audited.** Nothing recorded it: `Engine::set_budget` read through to the
+/// backend, which writes no audit row of its own, so a lowered budget caused
+/// evictions — each of them audited in full — with nothing anywhere saying
+/// the ceiling had moved or who moved it.
+///
+/// **The absence is established first.** Asserting "there is a
+/// `PolicyChanged` row" against a fresh scope that has never had one is only
+/// evidence if the count was zero before the call; without that a row left by
+/// some earlier operation would satisfy it.
+#[tokio::test]
+async fn changing_a_budget_is_audited_as_a_policy_change() {
+    use memorysafe_core::Budget;
+
+    let e = engine();
+    assert_eq!(
+        count(&events(&e).await, AuditEvent::PolicyChanged),
+        0,
+        "the absence has to be established before the presence means anything"
+    );
+
+    e.set_budget(
+        &scope(),
+        Budget {
+            max_items: Some(3),
+            max_bytes: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = e.audit(&scope(), &Default::default()).await.unwrap();
+    let changes: Vec<&AuditRecord> = rows
+        .iter()
+        .filter(|r| r.event == AuditEvent::PolicyChanged)
+        .collect();
+    assert_eq!(
+        changes.len(),
+        1,
+        "one budget change must write exactly one PolicyChanged record"
+    );
+    assert_eq!(
+        changes[0].actor,
+        Actor::system(),
+        "the actor gap is Actor::system(), not a fabricated human"
+    );
+    assert_eq!(
+        changes[0].scope,
+        scope(),
+        "the record must name the namespace whose ceiling moved"
+    );
+
+    // A second change writes a second row: the trail is of changes, not of
+    // "a budget was set at some point".
+    e.set_budget(
+        &scope(),
+        Budget {
+            max_items: Some(9),
+            max_bytes: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(count(&events(&e).await, AuditEvent::PolicyChanged), 2);
+}

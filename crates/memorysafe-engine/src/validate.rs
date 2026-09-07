@@ -1,6 +1,7 @@
 use memorysafe_core::{
-    Action, AdmitContext, Decision, ItemId, PolicyError, ScoredCandidate, WorkingSet,
+    Action, AdmitContext, Decision, ItemId, PolicyError, RecallBudget, ScoredCandidate, WorkingSet,
 };
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// What the engine does when a policy misbehaves.
@@ -27,6 +28,12 @@ pub enum Invalid {
     TokenAccountingWrong { reported: u32, actual: u32 },
     #[error("decision merges into {item}, which does not exist in the request's scope")]
     MergeTargetMissing { item: ItemId },
+    #[error("working set returns {item} more than once")]
+    DuplicateItem { item: ItemId },
+    #[error("working set returns {returned} items against a budget of {allowed}")]
+    OverItemBudget { returned: usize, allowed: usize },
+    #[error("working set reports {returned} tokens against a budget of {allowed}")]
+    OverTokenBudget { returned: u32, allowed: u32 },
 }
 
 #[derive(Debug, Error)]
@@ -106,38 +113,90 @@ pub fn merge_target(
 /// `omitted` is serialised into the MCP and HTTP responses, so an
 /// out-of-scope id smuggled in there reaches a caller exactly as an
 /// unvalidated `ws.items` entry would.
-pub fn working_set(ws: &WorkingSet, offered: &[ScoredCandidate]) -> Result<(), Invalid> {
+///
+/// **The caller's `RecallBudget` is enforced here and nowhere else.**
+/// `read::recall` clamps only its own *fetch* (`max_items * OVERFETCH`,
+/// bounded by `MAX_CANDIDATES`), which is a load control on the backend, not
+/// a bound on what the policy may return: a policy handed 500 candidates was
+/// free to return all 500 to a caller who asked for 5, and the engine shipped
+/// it. `RecallBudget::fits` is the same predicate a policy is expected to
+/// compose against, so this can only reject a policy that ignored the budget
+/// it was given. A `None` on either half of the budget means "no bound", and
+/// is not a defect to report.
+///
+/// **A repeated item is refused.** Nothing above catches it on its own:
+/// `offered.iter().any(...)` is satisfied by each copy independently, and the
+/// token sum double-counts the repeat *consistently*, so a policy returning
+/// one item twice with the doubled `tokens_used` passed every check. The
+/// caller then gets the same memory twice inside a budget that was supposed
+/// to be spent on distinct ones. `ws.omitted` is not deduplicated here —
+/// `omitted` is documented as a truncated *sample*, so a repeat there is
+/// cosmetic rather than a budget or leak defect.
+///
+/// The offered set is indexed by id once rather than rescanned per selected
+/// item; the identity comparison is unchanged, since the whole
+/// `MemoryItem` is still compared against the candidate the id resolves to.
+pub fn working_set(
+    ws: &WorkingSet,
+    offered: &[ScoredCandidate],
+    budget: &RecallBudget,
+) -> Result<(), Invalid> {
+    let by_id: HashMap<&ItemId, &ScoredCandidate> =
+        offered.iter().map(|c| (&c.item.id, c)).collect();
+
+    let mut seen: HashSet<&ItemId> = HashSet::with_capacity(ws.items.len());
+    let mut actual: u32 = 0;
     for selected in &ws.items {
-        if !offered.iter().any(|c| c.item == selected.item) {
-            return Err(Invalid::UnofferedItem {
-                item: selected.item.id.clone(),
-            });
+        let id = &selected.item.id;
+        match by_id.get(id) {
+            Some(candidate) if candidate.item == selected.item => {
+                actual = actual.saturating_add(candidate.estimated_tokens);
+            }
+            // Both "never offered" and "offered id, substituted body" are the
+            // same refusal, as they were before the index: the id is not a
+            // licence to attach an arbitrary item to it.
+            _ => {
+                return Err(Invalid::UnofferedItem { item: id.clone() });
+            }
+        }
+        if !seen.insert(id) {
+            return Err(Invalid::DuplicateItem { item: id.clone() });
         }
     }
 
     for omitted in &ws.omitted {
-        if !offered.iter().any(|c| c.item.id == omitted.id) {
+        if !by_id.contains_key(&omitted.id) {
             return Err(Invalid::UnofferedItem {
                 item: omitted.id.clone(),
             });
         }
     }
 
-    let actual: u32 = ws
-        .items
-        .iter()
-        .map(|s| {
-            offered
-                .iter()
-                .find(|c| c.item.id == s.item.id)
-                .map(|c| c.estimated_tokens)
-                .unwrap_or(0)
-        })
-        .sum();
     if ws.tokens_used != actual {
         return Err(Invalid::TokenAccountingWrong {
             reported: ws.tokens_used,
             actual,
+        });
+    }
+
+    // After the accounting check, so a policy that overran the budget *and*
+    // misreported its total is reported as the accounting failure — the more
+    // fundamental of the two, and the one that makes the budget figure below
+    // untrustworthy in the first place.
+    if let Some(max) = budget.max_items
+        && ws.items.len() > max
+    {
+        return Err(Invalid::OverItemBudget {
+            returned: ws.items.len(),
+            allowed: max,
+        });
+    }
+    if let Some(max) = budget.max_tokens
+        && ws.tokens_used > max
+    {
+        return Err(Invalid::OverTokenBudget {
+            returned: ws.tokens_used,
+            allowed: max,
         });
     }
 
@@ -177,6 +236,18 @@ mod tests {
 
     fn scope() -> Scope {
         Scope::new("t", "s", "n").unwrap()
+    }
+
+    /// No budget at all, so the tests that predate budget enforcement keep
+    /// testing exactly what they tested. `RecallBudget::default()` would
+    /// **not** do: it is `Some(20)`/`Some(2000)`, so an over-budget bug in
+    /// one of those tests could be masked or manufactured by a limit the test
+    /// never meant to set.
+    fn unbounded() -> RecallBudget {
+        RecallBudget {
+            max_tokens: None,
+            max_items: None,
+        }
     }
 
     fn item(body: &str) -> MemoryItem {
@@ -474,7 +545,7 @@ mod tests {
             audit_id: None,
         };
         assert_eq!(
-            working_set(&ws, std::slice::from_ref(&offered)),
+            working_set(&ws, std::slice::from_ref(&offered), &unbounded()),
             Err(Invalid::UnofferedItem { item: smuggled_id }),
             "the payload must name the smuggled item, not just the variant"
         );
@@ -504,7 +575,7 @@ mod tests {
             audit_id: None,
         };
         assert_eq!(
-            working_set(&ws, std::slice::from_ref(&offered)),
+            working_set(&ws, std::slice::from_ref(&offered), &unbounded()),
             Err(Invalid::UnofferedItem { item: offered_id })
         );
     }
@@ -528,7 +599,7 @@ mod tests {
             audit_id: None,
         };
         assert_eq!(
-            working_set(&ws, std::slice::from_ref(&offered)),
+            working_set(&ws, std::slice::from_ref(&offered), &unbounded()),
             Err(Invalid::UnofferedItem { item: smuggled_id })
         );
     }
@@ -548,7 +619,7 @@ mod tests {
             omitted_total: 0,
             audit_id: None,
         };
-        assert!(working_set(&ws, &[a, b]).is_ok());
+        assert!(working_set(&ws, &[a, b], &unbounded()).is_ok());
     }
 
     #[test]
@@ -572,12 +643,157 @@ mod tests {
             audit_id: None,
         };
         assert_eq!(
-            working_set(&ws, std::slice::from_ref(&a)),
+            working_set(&ws, std::slice::from_ref(&a), &unbounded()),
             Err(Invalid::TokenAccountingWrong {
                 reported: 999,
                 actual: 5,
             })
         );
+    }
+
+    /// **The same item twice passed every other check in this function, and
+    /// the reason it did is the whole point of this test.** `offered` is
+    /// scanned with `any`, which each copy satisfies independently; and the
+    /// token sum double-counts the repeat *consistently*, so a policy that
+    /// also doubles `tokens_used` — as this test does — keeps the accounting
+    /// check happy too. The caller then receives the same memory twice,
+    /// inside a budget meant to be spent on distinct ones.
+    ///
+    /// `tokens_used` is deliberately the *consistent* 10, not 5: at 5 this
+    /// would be caught by `TokenAccountingWrong` and would prove nothing
+    /// about duplicate detection.
+    #[test]
+    fn a_working_set_returning_the_same_item_twice_is_refused() {
+        let a = candidate(item("a")); // estimated_tokens: 5
+        let selected = || SelectedItem {
+            item: a.item.clone(),
+            relevance: 0.9,
+            reason: reason(),
+        };
+        let ws = WorkingSet {
+            items: vec![selected(), selected()],
+            tokens_used: 10,
+            omitted: vec![],
+            omitted_total: 0,
+            audit_id: None,
+        };
+        assert_eq!(
+            working_set(&ws, std::slice::from_ref(&a), &unbounded()),
+            Err(Invalid::DuplicateItem {
+                item: a.item.id.clone()
+            }),
+            "the payload must name the repeated item, not just the variant"
+        );
+    }
+
+    /// **`read::recall` clamps the fetch, not the answer.** A policy handed
+    /// 500 candidates for a request that asked for 5 could return all 500 and
+    /// the engine shipped them; nothing between the policy and the caller
+    /// compared the working set against `RecallBudget`.
+    ///
+    /// Two items against `max_items: 1`, so the refusal cannot be an
+    /// off-by-one reading of "at least one over"; and the whole payload is
+    /// pinned, not just the variant, so a swapped `returned`/`allowed` pair
+    /// is visible.
+    #[test]
+    fn a_working_set_over_the_callers_item_budget_is_refused() {
+        let a = candidate(item("a"));
+        let b = candidate(item("b"));
+        let ws = WorkingSet {
+            items: vec![
+                SelectedItem {
+                    item: a.item.clone(),
+                    relevance: 0.9,
+                    reason: reason(),
+                },
+                SelectedItem {
+                    item: b.item.clone(),
+                    relevance: 0.8,
+                    reason: reason(),
+                },
+            ],
+            tokens_used: 10,
+            omitted: vec![],
+            omitted_total: 0,
+            audit_id: None,
+        };
+        let budget = RecallBudget {
+            max_tokens: None,
+            max_items: Some(1),
+        };
+        assert_eq!(
+            working_set(&ws, &[a.clone(), b.clone()], &budget),
+            Err(Invalid::OverItemBudget {
+                returned: 2,
+                allowed: 1
+            })
+        );
+        // Exactly at the budget is fine — the check is `>`, not `>=`, and a
+        // test that only proved the over case would pass against either.
+        let at_budget = RecallBudget {
+            max_tokens: None,
+            max_items: Some(2),
+        };
+        assert!(working_set(&ws, &[a, b], &at_budget).is_ok());
+    }
+
+    /// The token half of the same rule. Separate from the item half because
+    /// each is separately deletable: a budget check that enforced only
+    /// `max_items` would pass the test above and let a caller who asked for
+    /// 2000 tokens receive far more in five very large items.
+    #[test]
+    fn a_working_set_over_the_callers_token_budget_is_refused() {
+        let a = candidate(item("a")); // estimated_tokens: 5
+        let ws = WorkingSet {
+            items: vec![SelectedItem {
+                item: a.item.clone(),
+                relevance: 0.9,
+                reason: reason(),
+            }],
+            tokens_used: 5,
+            omitted: vec![],
+            omitted_total: 0,
+            audit_id: None,
+        };
+        let budget = RecallBudget {
+            max_tokens: Some(4),
+            max_items: None,
+        };
+        assert_eq!(
+            working_set(&ws, std::slice::from_ref(&a), &budget),
+            Err(Invalid::OverTokenBudget {
+                returned: 5,
+                allowed: 4
+            })
+        );
+        let at_budget = RecallBudget {
+            max_tokens: Some(5),
+            max_items: None,
+        };
+        assert!(working_set(&ws, std::slice::from_ref(&a), &at_budget).is_ok());
+    }
+
+    /// A `None` on either half means "no bound" — `RecallBudget`'s own
+    /// `fits` reads it that way — so a caller who omits a limit must not have
+    /// one invented for them. Without this, a plausible implementation that
+    /// substituted `RecallBudget::default()`'s `Some(20)`/`Some(2000)` for an
+    /// absent bound would go unnoticed until a large legitimate recall
+    /// started failing.
+    #[test]
+    fn an_absent_budget_bound_is_no_bound() {
+        let a = candidate(item("a"));
+        let ws = WorkingSet {
+            items: vec![SelectedItem {
+                item: a.item.clone(),
+                relevance: 0.9,
+                reason: reason(),
+            }],
+            tokens_used: 5,
+            omitted: vec![],
+            omitted_total: 0,
+            audit_id: None,
+        };
+        assert!(working_set(&ws, std::slice::from_ref(&a), &unbounded()).is_ok());
     }
 
     #[test]

@@ -3,9 +3,12 @@
 //! `write.rs` actually *calls* it. `BaselinePolicy` — the only policy every
 //! other integration test in this crate uses — never returns a decision that
 //! fails validation, so deleting the `if let Err(invalid) =
-//! validate::decision(...)` guard from `remember()` wholesale left all 8 of
-//! `tests/write.rs`'s tests, and both of `tests/merge_target_check.rs`'s,
-//! green. That is a genuine gap, not an equivalent mutant: without the guard,
+//! validate::decision(...)` guard from `remember()` wholesale left **every**
+//! test in `tests/write.rs` and in `tests/merge_target_check.rs` green — the
+//! whole of both files, however many each holds today. (An earlier version of
+//! this sentence counted them, and the count went stale as soon as a test was
+//! added; the property is "all of them", and the number was never the point.)
+//! That is a genuine gap, not an equivalent mutant: without the guard,
 //! a policy returning a `Decision` with no reason at all is silently written
 //! and audited rather than refused — `WriteTransaction::is_valid` has no
 //! opinion on `Decision::reasons`, so nothing else in the pipeline would have

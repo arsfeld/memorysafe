@@ -168,6 +168,102 @@ pub fn insert(conn: &Connection, item: &MemoryItem) -> Result<(), BackendError> 
     Ok(())
 }
 
+/// The `items` columns that do **not** live on [`MemoryItem`], and which
+/// [`insert`] therefore cannot write.
+///
+/// Four columns are in that position — `value_score`, `fragility_score`,
+/// `last_access` and `access_count` — and **only the last two carry data.**
+/// `value_score` and `fragility_score` are written by nothing anywhere in
+/// this workspace: they appear in the schema's `CREATE TABLE` and nowhere
+/// else, in no `INSERT` column list, no `UPDATE` set clause and no `SELECT`.
+/// They hold their schema default of `0.0` for every row that has ever
+/// existed, so carrying them across a replace would carry zeros — which is
+/// why this type deliberately does not model them.
+///
+/// `last_access` and `access_count` are the opposite. `SqliteBackend::record_recall`
+/// advances both, in the same transaction as the recall's own audit row, for
+/// every item the recall returned; and `retrieve::candidates`,
+/// `vectors::search` and `keyword::search` all read them back into
+/// `ScoredCandidate::last_accessed_at`/`access_count`, where they feed the
+/// replay quota's staleness signal and the eviction ranking. Losing them
+/// resets an item's whole accumulated recall history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccessHistory {
+    /// Unix seconds, or `None` for an item that has never been recalled.
+    pub last_access: Option<i64>,
+    pub access_count: i64,
+}
+
+/// Reads the access history of a row that is about to be replaced. The first
+/// half of a replace; [`restore_access_history`] is the second.
+///
+/// Must be called **before** the [`delete`]: the row is gone afterwards, and
+/// the answer would then be `None`. `None` and `Some(AccessHistory::default())`
+/// are genuinely different answers — no such row, versus a stored item that
+/// has never been recalled — which is why this is an `Option` rather than a
+/// defaulted struct.
+pub fn access_history(
+    conn: &Connection,
+    scope: &Scope,
+    id: &ItemId,
+) -> Result<Option<AccessHistory>, BackendError> {
+    conn.query_row(
+        "SELECT last_access, access_count FROM items
+         WHERE id=?1 AND subject=?2 AND namespace=?3",
+        params![
+            id.as_str(),
+            scope.subject.as_str(),
+            scope.namespace.as_str()
+        ],
+        |r| {
+            Ok(AccessHistory {
+                last_access: r.get(0)?,
+                access_count: r.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .sql()
+}
+
+/// Writes an access history back onto a freshly re-inserted row.
+///
+/// **The pair exists because a replace is a delete plus an insert here, and
+/// `insert` writes `MemoryItem`'s fields and nothing else.** Three engine
+/// paths replace a stored row that way — `Engine::protect`, `Engine::reembed`,
+/// and `Engine::maintain`'s protection-release pass, which routes through
+/// `protect` — each handing `Backend::apply` a transaction whose `evictions`
+/// and `upsert` name the same id. Without this, every one of them reset the
+/// row's recall history to the schema defaults. See [`AccessHistory`] for
+/// what the two columns mean and who reads them.
+///
+/// Scoped exactly as [`get`] and [`merge`] are, repeating the predicate
+/// rather than trusting the id alone, for the reason `merge`'s doc gives.
+///
+/// The `items_au` FTS trigger is guarded on `body`/`tags` (see the schema),
+/// neither of which this statement touches, so restoring a history costs no
+/// FTS write.
+pub fn restore_access_history(
+    conn: &Connection,
+    scope: &Scope,
+    id: &ItemId,
+    history: AccessHistory,
+) -> Result<(), BackendError> {
+    conn.execute(
+        "UPDATE items SET last_access = ?4, access_count = ?5
+         WHERE id = ?1 AND subject = ?2 AND namespace = ?3",
+        params![
+            id.as_str(),
+            scope.subject.as_str(),
+            scope.namespace.as_str(),
+            history.last_access,
+            history.access_count,
+        ],
+    )
+    .sql()?;
+    Ok(())
+}
+
 pub fn get(
     conn: &Connection,
     scope: &Scope,

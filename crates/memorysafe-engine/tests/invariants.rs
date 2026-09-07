@@ -227,8 +227,12 @@ proptest! {
     /// public" classifier would be conditional, not a lowered floor. Measured
     /// with exactly that mutation (`Public` when the body contains a token
     /// the generated corpus carries and `ordinary_text_is_internal`'s fixture
-    /// does not): workspace-wide with `--all-features`, **1 failed, 546
-    /// passed**, and the one failure is this property.
+    /// does not): workspace-wide with `--all-features`, **exactly one test
+    /// failed, and it was this property** — everything else in the workspace
+    /// stayed green. (The passing total was written out alongside it and is
+    /// dropped: it dated the measurement to a workspace of that size, so
+    /// every test added since made the sentence read as a stale or wrong
+    /// claim. The number that carries the argument is the one.)
     ///
     /// **That failure is the signal to replace this special case with the
     /// general assertion**, not to delete it: once `Public` items can exist,

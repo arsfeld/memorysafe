@@ -125,8 +125,55 @@ impl Engine {
         Ok(self.backend.audit(scope, filter).await?)
     }
 
+    /// Sets a namespace's capacity ceiling, and **audits the change**.
+    ///
+    /// A budget is governance state, not a tuning knob: `maintain` reclaims a
+    /// namespace that is over its ceiling, and `admit` decides against the
+    /// capacity pressure the ceiling defines — so lowering one causes
+    /// evictions, and raising one stops them. Neither the change nor its
+    /// author was recorded anywhere before this, which made "why did these
+    /// memories disappear on Tuesday" unanswerable from a trail that records
+    /// the evictions themselves in full detail.
+    ///
+    /// `AuditEvent::PolicyChanged` is the variant for it, and this is its
+    /// first and only construction site in the workspace.
+    ///
+    /// `Actor::system()`, with the same engine-wide gap `purge_subject`'s doc
+    /// comment (`mutate.rs`) records in full: no engine method below the
+    /// boundary takes an actor yet, and threading one is Plan 3's Task 2. It
+    /// is worth more here than anywhere else — "who raised this tenant's
+    /// ceiling" is the question the row exists to answer — so this is the
+    /// site to revisit first when actors land.
+    ///
+    /// **The new ceiling itself is not in the row, only the fact that it
+    /// changed.** `AuditRecord` has no field free to carry two numbers:
+    /// `decision` keys the row's `audit_aggregates` bucket on its `PolicyId`
+    /// and `assessment` feeds that bucket's score histograms, so either would
+    /// corrupt the aggregates to smuggle a budget through. Same gap, and same
+    /// ledger entry, as `Engine::import`'s record counts.
+    ///
+    /// **Not atomic with the change.** `Backend::set_budget` takes no audit
+    /// record (unlike `purge_subject`, which does), so this is a second
+    /// transaction: a crash between them leaves a changed ceiling with no
+    /// record. Written *after* the change so a failed change is not audited
+    /// as having happened; closing the window is a `Backend` signature change
+    /// for the next contract batch.
     pub async fn set_budget(&self, scope: &Scope, budget: Budget) -> Result<(), EngineError> {
-        Ok(self.backend.set_budget(scope, budget).await?)
+        self.backend.set_budget(scope, budget).await?;
+        let audit = AuditRecord::new(
+            scope.clone(),
+            memorysafe_core::AuditEvent::PolicyChanged,
+            vec![],
+            memorysafe_core::Actor::system(),
+            time::OffsetDateTime::now_utc(),
+        );
+        self.backend
+            .apply(memorysafe_backend::WriteTransaction::new(
+                scope.clone(),
+                audit,
+            ))
+            .await?;
+        Ok(())
     }
 
     /// A namespace's budget and what it has used, read through to the backend.

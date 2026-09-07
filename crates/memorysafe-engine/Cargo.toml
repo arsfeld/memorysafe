@@ -10,9 +10,7 @@ memorysafe-core.workspace = true
 memorysafe-embed.workspace = true
 memorysafe-backend.workspace = true
 memorysafe-policy.workspace = true
-tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 moka = { version = "0.12.16", features = ["future"] }
-async-trait = "0.1.92"
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,6 +21,17 @@ blake3.workspace = true
 memorysafe-backend-sqlite.workspace = true
 tempfile = "3.27.0"
 proptest = "1.11.0"
+# Test-only, and moved here from `[dependencies]` in the final review round —
+# the same ruling already applied to `memorysafe-policy` (see
+# `docs/superpowers/open-items-memorysafe-policy.md`, "Resolved"), which was
+# not carried across to the crate created in the same branch. `tokio` appears
+# in `src/` only as `#[tokio::test]`, and `async-trait` only as the
+# `#[async_trait::async_trait]` on `gather.rs`'s `#[cfg(test)]` fake backend.
+# The engine itself is runtime-agnostic: it uses `moka`'s future cache and
+# plain `async fn`, and declaring a runtime as a hard dependency would have
+# forced one on every consumer of the crate.
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+async-trait = "0.1.92"
 
 [lints]
 workspace = true

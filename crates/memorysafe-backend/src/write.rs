@@ -21,6 +21,34 @@ pub struct MergeWrite {
     pub tags: Vec<String>,
     pub attrs: BTreeMap<String, serde_json::Value>,
     pub vector: Option<QuantizedVector>,
+    /// **Advisory. A backend must never use this for capacity accounting.**
+    ///
+    /// It is not the merged item's storage charge and does not claim to be.
+    /// Both engine construction sites set it to `body.len()` — the merged
+    /// body's length in bytes — while the charge that capacity is kept in is
+    /// [`memorysafe_core::MemoryItem::charge`], which additionally counts
+    /// `kind`, the tags, the serialised attrs, the source id, the scope
+    /// components and a fixed overhead. The two differ for every real item.
+    ///
+    /// The authoritative number is the **delta**, and only the backend can
+    /// compute it: a merge folds new tags and attrs into the target's
+    /// existing ones, so the post-merge charge depends on the stored row, not
+    /// on this write. `memorysafe-backend-sqlite` does exactly that
+    /// (`items::merge` reads the target, computes `after - before`, and
+    /// returns it), which is why nothing has ever read this field.
+    ///
+    /// **Stated because an unread public field on a frozen contract is a trap
+    /// rather than a harmless leftover.** Plan 2's Postgres backend is free
+    /// to trust it, would then account capacity in a unit SQLite does not,
+    /// and would pass the frozen suite while doing so — no conformance test
+    /// reads capacity across a merge, and the suite's own `MergeWrite`
+    /// literals set this to hand-written constants (`11`, `41`) that are not
+    /// any item's charge.
+    ///
+    /// Deleting the field would be better than documenting it, and is not
+    /// available: it is constructed by name at three sites inside the frozen
+    /// conformance suite, so removing it is a change to the suite. Revisit
+    /// with the next contract batch.
     pub byte_size: u64,
     /// Mirrors `MemoryItem::pending_embedding`'s own rule
     /// (`write.rs`: `pending_embedding = embedding.is_none()`): true exactly

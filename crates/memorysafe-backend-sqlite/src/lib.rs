@@ -146,9 +146,16 @@ impl Backend for SqliteBackend {
         // nothing**, and rejecting after writing half of it is the same defect
         // with an error attached.
         if !txn.is_valid() {
+            // Enumerates all four of `is_valid`'s conditions, not two. The
+            // message is what an operator sees when a write is refused, and a
+            // message that lists half the reasons sends them looking at the
+            // wrong field — the pairing check in particular is invisible in
+            // "scope-bearing fields must agree".
             return Err(BackendError::InvalidTransaction(
-                "a transaction may not both insert and merge, and its scope-bearing \
-                 fields must agree"
+                "a transaction may not both insert and merge; its scope-bearing fields \
+                 (scope, the upserted item's own scope, and audit.scope) must agree; \
+                 and a merge's pending_embedding must be true exactly when its vector \
+                 is absent"
                     .into(),
             ));
         }
@@ -209,6 +216,28 @@ impl Backend for SqliteBackend {
                 // fail if the order regresses.
                 capacity::ensure_row(&tx, &txn.scope)?;
 
+                // **A transaction whose `evictions` names the same id its
+                // `upsert` writes is a row *replacement*, and `Backend::apply`
+                // requires the item's accumulated access statistics to survive
+                // it.** They cannot survive on their own: `last_access` and
+                // `access_count` do not live on `MemoryItem`, so `items::insert`
+                // cannot write them and the re-inserted row would come back at
+                // the schema defaults. Read here, before the eviction loop
+                // deletes the row it is being read from; written back after the
+                // insert below. See `items::AccessHistory`.
+                //
+                // The eviction loop itself is deliberately left alone rather
+                // than made to skip the replaced id: `AppliedWrite::evicted`
+                // means "the ids actually removed", and a replace *does* remove
+                // the old row, so the report and the capacity counters keep
+                // exactly the meaning their own docs give them.
+                let replaced = match &txn.upsert {
+                    Some(w) if txn.evictions.contains(&w.item.id) => {
+                        items::access_history(&tx, &txn.scope, &w.item.id)?
+                    }
+                    _ => None,
+                };
+
                 let mut delta_items: i64 = 0;
                 let mut delta_bytes: i64 = 0;
                 let mut evicted = Vec::new();
@@ -233,6 +262,15 @@ impl Backend for SqliteBackend {
 
                 if let Some(w) = &txn.upsert {
                     items::insert(&tx, &w.item)?;
+                    // The second half of the replace read above. Only when the
+                    // row really existed before: `None` here means the id named
+                    // no row in this scope, and a fresh insert must keep the
+                    // schema's own "never recalled" defaults rather than have
+                    // zeros written over them from a struct that stands for
+                    // nothing.
+                    if let Some(history) = replaced {
+                        items::restore_access_history(&tx, &txn.scope, &w.item.id, history)?;
+                    }
                     if let Some(v) = &w.vector {
                         vectors::insert(&tx, &w.item.id, &txn.scope, v)?;
                     }
@@ -467,7 +505,8 @@ mod tests {
     use super::*;
     use memorysafe_backend::conformance::fx;
     use memorysafe_core::{
-        Actor, ActorKind, AuditEvent, AuditRecord, ItemRef, PolicyId, Reason, ReasonCode,
+        Actor, ActorKind, AuditEvent, AuditRecord, ItemRef, PolicyId, Protection, Reason,
+        ReasonCode,
     };
     use time::{Duration, OffsetDateTime};
 
@@ -614,6 +653,141 @@ mod tests {
         // The premise: the real eviction did happen, so an empty vec cannot
         // satisfy the assertion above for the wrong reason.
         assert!(b.get(&s, &real.id).await.unwrap().is_none());
+    }
+
+    /// **`Backend::apply`'s replacement rule, which the frozen conformance
+    /// suite cannot see.** No conformance test builds a transaction whose
+    /// `evictions` and `upsert` name the same id, so a backend that treats
+    /// the pair as a literal delete-then-insert of `ItemWrite::item` passes
+    /// the suite while resetting the item's recall history — and that shape
+    /// is how `Engine::protect`, `Engine::reembed` and `Engine::maintain`'s
+    /// protection-release pass all write.
+    ///
+    /// `last_access` and `access_count` are the two columns at stake:
+    /// `record_recall` maintains them, `retrieve_candidates` and `neighbours`
+    /// report them, and neither has a `MemoryItem` field to ride back in on.
+    /// (`value_score` and `fragility_score` are in the same structural
+    /// position and are deliberately *not* asserted here: nothing in this
+    /// workspace writes either, so they are zero before and after and an
+    /// assertion on them would pass against any implementation.)
+    ///
+    /// Read back with raw SQL rather than through `retrieve_candidates`,
+    /// because this test is about the stored columns and must not depend on
+    /// a retrieval arm's filters, ranking, or its own reading of them.
+    ///
+    /// **The controls matter.** A stamped, non-default history (`7` recalls
+    /// at second `555`) means a reset to the schema default is visible as an
+    /// exact mismatch, not as a plausible-looking small number; the
+    /// unreplaced bystander proves the restore is scoped to the replaced row
+    /// rather than a blanket `UPDATE`; and the plain admit at the end proves
+    /// a *fresh* insert still gets the schema's own "never recalled"
+    /// defaults, which is what fails if the carry-forward is unconditional.
+    #[tokio::test]
+    async fn replacing_a_row_in_one_transaction_preserves_its_access_history() {
+        let b = backend();
+        let s = scope("s", "n");
+
+        let target = fx::item(&s, "the row that gets replaced");
+        let bystander = fx::item(&s, "an untouched neighbour");
+        b.apply(fx::admit_txn(&s, target.clone(), None))
+            .await
+            .unwrap();
+        b.apply(fx::admit_txn(&s, bystander.clone(), None))
+            .await
+            .unwrap();
+
+        stamp_access(&b, &s, &target.id, 7, 555).await;
+        stamp_access(&b, &s, &bystander.id, 4, 444).await;
+
+        assert_eq!(
+            stored_history(&b, &s, &target.id).await,
+            (7, Some(555)),
+            "premise: the stamp must have landed, or the replacement below \
+             would be compared against the schema default either way"
+        );
+
+        // The replacement: one transaction, same id in `evictions` and in
+        // `upsert`, with a genuinely changed item so the row really is
+        // rewritten rather than left alone.
+        let mut replaced = target.clone();
+        replaced.protection = Protection::Pinned;
+        let mut txn = fx::admit_txn(&s, replaced, None);
+        txn.evictions = vec![target.id.clone()];
+        let applied = b.apply(txn).await.unwrap();
+
+        assert_eq!(
+            applied.evicted,
+            vec![target.id.clone()],
+            "a replacement still removes the old row, so `evicted` must name it"
+        );
+        assert_eq!(
+            b.get(&s, &target.id)
+                .await
+                .unwrap()
+                .expect("the replaced row must exist")
+                .protection,
+            Protection::Pinned,
+            "premise: the row was actually rewritten"
+        );
+        assert_eq!(
+            stored_history(&b, &s, &target.id).await,
+            (7, Some(555)),
+            "apply must carry the replaced row's access history across the \
+             delete-and-reinsert"
+        );
+        assert_eq!(
+            stored_history(&b, &s, &bystander.id).await,
+            (4, Some(444)),
+            "the restore must be scoped to the replaced row"
+        );
+
+        // And a plain admit — no eviction of its own id — must still land on
+        // the schema's "never recalled" defaults.
+        let fresh = fx::item(&s, "an ordinary new admission");
+        b.apply(fx::admit_txn(&s, fresh.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_history(&b, &s, &fresh.id).await,
+            (0, None),
+            "a fresh insert must keep the schema's never-recalled defaults"
+        );
+    }
+
+    /// Writes an access history directly, so a test can establish a stamped,
+    /// non-default one without driving a real recall.
+    async fn stamp_access(b: &SqliteBackend, s: &Scope, id: &ItemId, count: i64, at: i64) {
+        let id = id.clone();
+        b.tenants
+            .with_write(&s.tenant.clone(), move |c| {
+                c.execute(
+                    "UPDATE items SET access_count = ?2, last_access = ?3 WHERE id = ?1",
+                    params![id.as_str(), count, at],
+                )
+                .sql()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// `(access_count, last_access)` straight off the row. Raw SQL on purpose:
+    /// the property under test is what is stored, and reading it back through
+    /// a retrieval arm would make the assertion depend on that arm's filters
+    /// and on its own decoding of the same two columns.
+    async fn stored_history(b: &SqliteBackend, s: &Scope, id: &ItemId) -> (i64, Option<i64>) {
+        let id = id.clone();
+        b.tenants
+            .with_conn(&s.tenant.clone(), move |c| {
+                c.query_row(
+                    "SELECT access_count, last_access FROM items WHERE id = ?1",
+                    params![id.as_str()],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+                )
+                .sql()
+            })
+            .await
+            .unwrap()
     }
     /// **The aggregate write rule, on `apply`, and this test is the only thing
     /// that can see it.**

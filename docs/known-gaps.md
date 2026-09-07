@@ -126,6 +126,35 @@ predicate: `items.id` is `TEXT PRIMARY KEY` and `get` already refused an out-of-
   Only `sensitivity` has an exactness test; `occurred_after >=` → `>` and
   `occurred_before <=` → `<` both survive.
 
+## Reading a `cargo test` run: headers must equal results
+
+**A run with zero `test result: FAILED` lines is not necessarily a green run.** On some
+toolchains the targets that link bundled SQLite fail to *link* rather than to test. A
+target that never links never runs, so it prints no `test result:` line at all — and a
+grep for `FAILED`, or an eye scanning for red, reads that as success. Three people have
+now rediscovered this the hard way.
+
+The detection rule is machine-independent, and does not require knowing anything about
+what went wrong:
+
+```
+cargo test --workspace --all-features --no-fail-fast > /tmp/tf.log 2>&1
+grep -cE '^\s*Running |^\s*Doc-tests ' /tmp/tf.log   # headers: targets cargo started
+grep -cE '^test result:' /tmp/tf.log                 # results: targets that finished
+grep -cE '^test result: FAILED' /tmp/tf.log          # failures
+```
+
+**A run is green only if `headers == results` AND failures is 0.** The first equality is
+what proves nothing was silently truncated; the second is the ordinary check. Report both
+numbers, not just the second. At the time of writing the workspace has 45 of each.
+
+If the two disagree, the missing targets are named by the `Running` lines with no
+`test result:` after them, and the cause is usually a link error higher up the log. On a
+Nix-based setup the fix is generally to put the toolchain's `libstdc++` on
+`LD_LIBRARY_PATH` for the run; the specific store path is machine-local and deliberately
+not written down here, because a pinned path rots and a rotted path is worse than none.
+Find yours rather than copying someone else's.
+
 ## One process note, because it cost a near-miss at the freeze
 
 **The highest-risk moment for a retired pattern is inside the fix for a different one.**

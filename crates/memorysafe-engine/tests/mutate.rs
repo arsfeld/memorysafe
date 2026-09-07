@@ -109,6 +109,144 @@ async fn forgetting_by_kind_removes_only_matching_items() {
     assert_eq!(left[0].body, "beta note");
 }
 
+/// **A selector-based forget must reach past its first scan page.**
+///
+/// `ForgetSelector::Tag` and `Kind` read one page of `FORGET_SCAN_LIMIT`
+/// (1000) at offset 0 and stopped, so in a scope larger than that they
+/// forgot the matches on page one, left the rest, and reported success with
+/// no error and no truncation flag. In a product that sells erasure a silent
+/// partial delete is the wrong failure mode, and this pins the fix.
+///
+/// **The corpus straddles the page boundary deliberately.** 1002 items, every
+/// one tagged `"doomed"`, is two items past the boundary — so a
+/// still-single-page implementation forgets exactly 1000 and this test reads
+/// the shortfall directly, and a paging implementation with an off-by-one in
+/// its offset arithmetic (skipping or repeating a row at the seam) also
+/// fails. A corpus of exactly 1000 would pass either way.
+///
+/// Seeded through `Backend::apply` rather than `Engine::remember`: the
+/// property is about the scan's paging, and a thousand admissions would pay
+/// for an embedding and a full policy pipeline per item to establish a
+/// premise that has nothing to do with either. The two survivors are tagged
+/// differently, so "forgot everything" cannot pass.
+#[tokio::test]
+async fn forgetting_by_selector_pages_past_the_first_scan_page() {
+    use memorysafe_backend::conformance::fx;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend = Arc::new(SqliteBackend::open(dir.keep()));
+    let e = Engine::new(EngineConfig::new(
+        backend.clone(),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::default()),
+    ));
+
+    const DOOMED: usize = 1002;
+    for i in 0..DOOMED {
+        let mut item = fx::item(&scope(), &format!("doomed memory {i}"));
+        item.tags = vec!["doomed".into()];
+        backend
+            .apply(fx::admit_txn(&scope(), item, None))
+            .await
+            .unwrap();
+    }
+    for i in 0..2 {
+        let mut item = fx::item(&scope(), &format!("survivor {i}"));
+        item.tags = vec!["keep".into()];
+        backend
+            .apply(fx::admit_txn(&scope(), item, None))
+            .await
+            .unwrap();
+    }
+
+    let f = e
+        .forget(&scope(), ForgetSelector::Tag("doomed".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.forgotten.len(),
+        DOOMED,
+        "a forget must page to exhaustion, not stop at the first scan page"
+    );
+
+    let left = e
+        .review(
+            &scope(),
+            &memorysafe_backend::Page {
+                offset: 0,
+                limit: 10_000,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        left.len(),
+        2,
+        "only the differently-tagged survivors may remain"
+    );
+    assert!(left.iter().all(|i| i.tags == vec!["keep".to_string()]));
+}
+
+/// **A `Forgotten` audit row must name what it erased.** The items are gone
+/// afterwards, so the row is the only remaining evidence of *which* memories
+/// were removed — and it was written with an empty `items` list while the
+/// targets were in hand three lines earlier.
+///
+/// The digest is asserted against the item's own, not merely for presence: an
+/// `ItemRef` is an id **and** a content digest, and a ref built from the wrong
+/// item would still be the right length.
+#[tokio::test]
+async fn a_forget_names_the_items_it_erased_in_its_audit_record() {
+    let e = engine();
+    let mut expected: Vec<(memorysafe_core::ItemId, String)> = Vec::new();
+    for (body, tag) in [
+        ("alpha note", "work"),
+        ("beta note", "home"),
+        ("gamma note", "work"),
+    ] {
+        let mut r = RememberRequest::new(scope(), body);
+        r.tags = vec![tag.into()];
+        let out = e.remember(r).await.unwrap();
+        if tag == "work" {
+            let item = e
+                .review(&scope(), &Default::default())
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|i| Some(&i.id) == out.item_id.as_ref())
+                .expect("the item just admitted must be readable");
+            expected.push((item.id.clone(), item.digest()));
+        }
+    }
+
+    e.forget(&scope(), ForgetSelector::Tag("work".into()))
+        .await
+        .unwrap();
+
+    let rows = e
+        .audit(
+            &scope(),
+            &AuditFilter {
+                events: vec![AuditEvent::Forgotten],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "premise: one forget, one record");
+    let mut got: Vec<(memorysafe_core::ItemId, String)> = rows[0]
+        .items
+        .iter()
+        .map(|r| (r.id().clone(), r.digest().to_string()))
+        .collect();
+    got.sort();
+    expected.sort();
+    assert_eq!(
+        got, expected,
+        "the Forgotten record must name every item it erased, by id and digest"
+    );
+}
+
 /// `ForgetOutcome.forgotten` must report what the backend actually removed
 /// (`applied.evicted`), not the selector's raw target list (`targets`).
 /// Substituting `targets` for `applied.evicted` survives every other test in
@@ -345,14 +483,26 @@ async fn protecting_a_nonexistent_item_returns_not_found() {
 }
 
 /// `protect` deletes the item's row and reinserts it (see the comment at
-/// `txn.evictions` in `mutate.rs`). `items::insert` writes `MemoryItem`'s
-/// own fields only; the `items` table's `access_count` and `last_access`
-/// columns have no counterpart on `MemoryItem`, so they cannot be carried
-/// forward and silently revert to schema defaults on every `protect` call.
-/// This pins that current behaviour — deliberately not fixed here; see this
-/// task's report for whether preserving it is the right long-term answer.
+/// `txn.evictions` in `mutate.rs`), and `items::insert` writes `MemoryItem`'s
+/// own fields only — the `items` table's `access_count` and `last_access`
+/// columns have no counterpart on `MemoryItem`. **`Backend::apply` therefore
+/// requires a same-id evict-and-upsert to be treated as a row replacement
+/// that carries those statistics across**, and this pins that the engine's
+/// pinning path actually gets it.
+///
+/// The assertions are exact values, not "unchanged": `access_count == 3` and
+/// the same `last_accessed_at` instant. A weaker `> 0` would pass against a
+/// backend that reset the count and then bumped it once for some unrelated
+/// reason, and `is_some()` would pass against one that stamped `now`.
+///
+/// This test previously asserted the opposite — that the history was reset —
+/// as documented, known behaviour. The final whole-branch review overruled
+/// that: the same delete-then-reinsert is `Engine::reembed`'s model-migration
+/// mechanism and `Engine::maintain`'s protection-release path, so the loss was
+/// not confined to an explicit operator action. See
+/// `reembedding_an_item_preserves_its_accumulated_access_history`.
 #[tokio::test]
-async fn protecting_an_item_resets_its_accumulated_access_history() {
+async fn protecting_an_item_preserves_its_accumulated_access_history() {
     let dir = tempfile::tempdir().expect("tempdir");
     let backend = Arc::new(SqliteBackend::open(dir.keep()));
     let e = Engine::new(EngineConfig::new(
@@ -407,11 +557,13 @@ async fn protecting_an_item_resets_its_accumulated_access_history() {
         .iter()
         .find(|c| c.item.id == id)
         .expect("the item must be found before protect");
-    assert!(
-        before_stats.access_count > 0,
-        "the recall loop above must have accumulated access history"
+    assert_eq!(
+        before_stats.access_count, 3,
+        "the recall loop above must have accumulated exactly three recalls"
     );
-    assert!(before_stats.last_accessed_at.is_some());
+    let before_last = before_stats
+        .last_accessed_at
+        .expect("premise: three recalls must have stamped last_accessed_at");
 
     e.protect(&scope(), &id, Protection::Pinned).await.unwrap();
 
@@ -421,12 +573,15 @@ async fn protecting_an_item_resets_its_accumulated_access_history() {
         .find(|c| c.item.id == id)
         .expect("the item must still be found after protect");
     assert_eq!(
-        after_stats.access_count, 0,
-        "protect's delete-then-reinsert silently resets access_count"
+        after_stats.access_count, 3,
+        "protect's delete-then-reinsert must carry access_count across the \
+         replacement, not reset it to the schema default"
     );
-    assert!(
-        after_stats.last_accessed_at.is_none(),
-        "protect's delete-then-reinsert silently resets last_accessed_at"
+    assert_eq!(
+        after_stats.last_accessed_at,
+        Some(before_last),
+        "protect's delete-then-reinsert must carry last_accessed_at across \
+         the replacement unchanged — not clear it, and not restamp it to now"
     );
 }
 

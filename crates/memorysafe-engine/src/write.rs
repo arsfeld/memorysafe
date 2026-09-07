@@ -268,32 +268,54 @@ impl Engine {
     /// call's fresh (and, for a retried admit, actively misleading) decision
     /// is exactly the bug this exists to avoid.
     ///
-    /// When the original write stored an item, its own audit row is looked
-    /// up by the `audit_id` the backend already returned, narrowed to that
-    /// item's history (small, and bounded by `AuditFilter`'s default page) —
+    /// The original write's own audit row is then found by scanning the
+    /// scope's audit page for the `audit_id` the backend already returned,
     /// recovering the real `Decision` and, with it, exact `action`/`reasons`/
     /// `merged_into`.
     ///
+    /// **`AuditFilter::item` is set below and, against the only backend that
+    /// exists, narrows nothing.** `memorysafe-backend-sqlite`'s `audit::query`
+    /// honours `events`, `since`, `until`, `after` and `limit`, and silently
+    /// ignores `item`, `subject` and `namespace` — so what actually comes back
+    /// is the scope's most recent `AuditFilter::default().limit` (100) rows,
+    /// newest first, not that item's history. The lookup still works, for a
+    /// reason that has nothing to do with the filter: the row being searched
+    /// for was written moments earlier in the same scope, so it is at or near
+    /// the top of the newest-first page, and the scan below matches on
+    /// `r.id == applied.audit_id` rather than trusting the filter to have
+    /// isolated it. What is lost is the *bound*: on a scope with heavy
+    /// concurrent write traffic, 100 newer rows can push the target off the
+    /// page, and the fallback below then runs instead of the exact recovery.
+    ///
+    /// The field is left set rather than removed: it is correct against the
+    /// contract, `AuditFilter::item`'s own doc says what it means, and a
+    /// backend that implements it makes this both narrower and exact.
+    /// Implementing it in SQLite is a change to the frozen conformance
+    /// contract (`Backend::audit` says nothing about these three fields —
+    /// `docs/known-gaps.md` ranks it second among the gaps the freeze locks
+    /// in), so it belongs to the next contract batch, not here.
+    ///
     /// **Known gap, not chased in this fix:** a replayed MERGE cannot be
-    /// found this way. A merge's own audit record carries no `ItemRef` (see
-    /// `refs` above — `item` is `None` on the `Merge` arm), so filtering by
-    /// item id never matches it, and the fallback below reports a
-    /// protection-accurate `Retain` instead of the true `Merge`. That is an
-    /// approximation, not a fabrication: the reported protection is read
-    /// fresh from the stored item, never guessed, and the outcome still
-    /// never contradicts `item_id`/`evicted`/`audit_id`, which stay exact.
+    /// recovered exactly. A merge's own audit record carries no `ItemRef` (see
+    /// `refs` above — `item` is `None` on the `Merge` arm), so even a backend
+    /// that implemented `AuditFilter::item` would not match it, and the
+    /// fallback below reports a protection-accurate `Retain` instead of the
+    /// true `Merge`. That is an approximation, not a fabrication: the reported
+    /// protection is read fresh from the stored item, never guessed, and the
+    /// outcome still never contradicts `item_id`/`evicted`/`audit_id`, which
+    /// stay exact.
     async fn replayed_outcome(
         &self,
         scope: &Scope,
         applied: memorysafe_backend::AppliedWrite,
     ) -> Result<WriteOutcome, EngineError> {
-        // Narrowed by item when there is one (bounds the scan to that item's
-        // own small history); unnarrowed when there is not (idempotency rows
-        // are written for genuine rejects too — `txn.idempotency_key` is set
-        // unconditionally above — so `applied.item_id` can be `None` here).
-        // Either way this is `AuditFilter`'s default page, newest first, and
-        // the record being searched for was written moments before this
-        // call, so it is reliably on it.
+        // `item` is set when there is one — and is ignored by the only
+        // backend that exists, so this is `AuditFilter`'s default page for
+        // the whole scope either way, newest first. See this method's doc for
+        // why the lookup still finds its row and what the unimplemented
+        // narrowing actually costs. (`applied.item_id` can be `None` here:
+        // idempotency rows are written for genuine rejects too, since
+        // `txn.idempotency_key` is set unconditionally above.)
         let filter = memorysafe_core::AuditFilter {
             item: applied.item_id.clone(),
             ..Default::default()

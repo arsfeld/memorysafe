@@ -149,7 +149,20 @@ impl Engine {
         // revisit this, `remember`'s `handle_invalid_decision` (`write.rs`)
         // is the site whose behaviour would need to change in step, and this
         // comment is the reason it has not.
-        if let Err(invalid) = validate::working_set(&composed, &candidates) {
+        //
+        // `validate::working_set` also enforces `req.budget` and refuses a
+        // repeated item, and both stay under the same fixed fail-closed rule.
+        // A budget overrun is over-disclosure — more of the corpus reaching
+        // the caller than the caller asked for — and the honest response to
+        // "the policy returned 500 items to a request for 5" is a refusal,
+        // not a silent truncation that would make the engine's answer differ
+        // from the one the policy actually composed and the audit row
+        // actually names. **The `req.budget` passed here is the caller's own,
+        // not the clamped fetch limit above**: `limit` is a load control on
+        // the backend, and validating against it would check the policy
+        // against the engine's over-fetch rather than against what the caller
+        // asked for.
+        if let Err(invalid) = validate::working_set(&composed, &candidates, &req.budget) {
             let audit = AuditRecord::new(
                 req.scope.clone(),
                 AuditEvent::Rejected,

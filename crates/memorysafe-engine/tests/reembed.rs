@@ -396,6 +396,106 @@ async fn reembedding_preserves_the_items_themselves() {
     assert_eq!(before, after, "re-embedding must not alter the items");
 }
 
+/// **What `reembedding_preserves_the_items_themselves` structurally cannot
+/// see.** That test compares `MemoryItem`s, and the access statistics are
+/// exactly the part of a stored item that has no `MemoryItem` field —
+/// `last_access` and `access_count` live only in the `items` table. So a
+/// re-embed that deleted the row and reinserted it at the schema defaults
+/// passed it, unchanged, while resetting every item's recall history.
+///
+/// That matters here more than anywhere else `Backend::apply` replaces a row:
+/// `reembed_scope` is this plan's Definition-of-Done model-migration
+/// mechanism, so the loss ran over an operator's whole corpus in one pass and
+/// left the replay quota and the eviction ranking reading zeros for
+/// everything. `Backend::apply`'s contract now requires a same-id
+/// evict-and-upsert to carry the statistics across; this pins that `reembed`
+/// gets it.
+///
+/// The probe is `Backend::retrieve_candidates` rather than `neighbours`
+/// because the assertion is about the statistics themselves, not about
+/// whether a vector row exists — and a keyword hit reaches the item whether
+/// or not the re-embed wrote a vector.
+#[tokio::test]
+async fn reembedding_an_item_preserves_its_accumulated_access_history() {
+    use memorysafe_backend::{CandidateQuery, HardFilters};
+
+    let (e, backend) = engine_and_backend_with(Arc::new(DeterministicEmbedder::new(256)));
+    let id = e
+        .remember(RememberRequest::new(
+            scope(),
+            "a memory with a distinctive marker9000 token",
+        ))
+        .await
+        .unwrap()
+        .item_id
+        .unwrap();
+
+    for _ in 0..3 {
+        e.recall(RecallRequest {
+            scope: scope(),
+            query: Some("marker9000".into()),
+            tags_any: vec![],
+            kinds: vec![],
+            occurred_after: None,
+            occurred_before: None,
+            mode: RecallMode::WorkingSet,
+            budget: RecallBudget {
+                max_tokens: Some(4000),
+                max_items: Some(5),
+            },
+            sensitivity_ceiling: SensitivityLevel::Restricted,
+        })
+        .await
+        .unwrap();
+    }
+
+    let query = CandidateQuery {
+        embedding: None,
+        text: Some("marker9000".into()),
+        filters: HardFilters {
+            sensitivity_ceiling: SensitivityLevel::Restricted,
+            ..HardFilters::default()
+        },
+        limit: 10,
+    };
+    let stats_of = |hits: Vec<memorysafe_core::ScoredCandidate>| {
+        let c = hits
+            .into_iter()
+            .find(|c| c.item.id == id)
+            .expect("the item must be retrievable by its marker token");
+        (c.access_count, c.last_accessed_at)
+    };
+
+    let (before_count, before_last) =
+        stats_of(backend.retrieve_candidates(&scope(), &query).await.unwrap());
+    assert_eq!(
+        before_count, 3,
+        "premise: the recall loop must have accumulated exactly three recalls"
+    );
+    let before_last = before_last.expect("premise: three recalls must stamp last_accessed_at");
+
+    let report = e.reembed_scope(&scope(), None).await.unwrap();
+    assert_eq!(
+        report.embedded, 1,
+        "premise: an unchanged statistic is only evidence if the row was \
+         actually deleted and rewritten"
+    );
+
+    let (after_count, after_last) =
+        stats_of(backend.retrieve_candidates(&scope(), &query).await.unwrap());
+    assert_eq!(
+        after_count, 3,
+        "a re-embed must carry access_count across the row replacement, not \
+         reset an operator's whole corpus to the schema default"
+    );
+    assert_eq!(
+        after_last,
+        Some(before_last),
+        "a re-embed must carry last_accessed_at across the row replacement \
+         unchanged — not clear it, and not restamp it to now"
+    );
+}
+
 /// **A no-op assertion needs a presence control** — see
 /// `backfill_does_nothing_over_a_healthy_scope_and_only_the_pending_item_in_a_mixed_one`
 /// for the full argument. Here the same `scanned` counter is driven from an

@@ -15,8 +15,27 @@ pub enum ForgetSelector {
     Kind(String),
 }
 
-/// Paging bound for selector-based forget. Beyond this a caller should purge
-/// the subject or narrow the selector.
+/// **Page size** for the selector-based forget scan — not a bound on how much
+/// a forget may remove.
+///
+/// It was the latter, and that was the defect: `ForgetSelector::Tag` and
+/// `ForgetSelector::Kind` read one page at offset 0 and stopped, so a
+/// 5,000-item scope forgot the matches in the first 1,000 and reported
+/// success. In a product that sells erasure, a silent partial delete reported
+/// as a complete one is the wrong failure mode — worse than an error, because
+/// the caller has no way to discover it.
+///
+/// `forget` now pages to exhaustion instead of reporting truncation. The two
+/// were the real alternatives, and this is why paging won: a `truncated` flag
+/// on `ForgetOutcome` pushes the loop onto every caller Plan 3 adds — the HTTP
+/// route, the CLI command, the MCP tool — and a caller that forgets to loop
+/// reproduces exactly this bug one layer up, where it is harder to see. The
+/// cost of paging is that a very large selector does more work in one call;
+/// the scan holds only `MemoryItem`s one page at a time and keeps only ids and
+/// digests, and the removal stays a **single** `WriteTransaction`, which is
+/// what makes the erasure atomic. A paged *write* would leave a
+/// partially-forgotten scope observable between transactions, which is the
+/// defect this fixes, not a smaller version of it.
 const FORGET_SCAN_LIMIT: usize = 1000;
 
 impl Engine {
@@ -39,47 +58,32 @@ impl Engine {
         scope: &Scope,
         selector: ForgetSelector,
     ) -> Result<ForgetOutcome, EngineError> {
-        let targets: Vec<ItemId> = match selector {
+        // The matched items themselves, not just their ids: the audit record
+        // below needs an `ItemRef` per target, and an `ItemRef` is an id *and*
+        // a content digest, which only the item can produce.
+        let matched: Vec<memorysafe_core::MemoryItem> = match selector {
             ForgetSelector::Ids(ids) => {
                 let mut present = Vec::new();
                 for id in ids {
-                    if self.backend.get(scope, &id).await?.is_some() {
-                        present.push(id);
+                    if let Some(item) = self.backend.get(scope, &id).await? {
+                        present.push(item);
                     }
                 }
                 present
             }
-            ForgetSelector::Tag(tag) => self
-                .backend
-                .list(
-                    scope,
-                    &Page {
-                        offset: 0,
-                        limit: FORGET_SCAN_LIMIT,
-                    },
-                )
-                .await?
-                .into_iter()
-                .filter(|i| i.tags.contains(&tag))
-                .map(|i| i.id)
-                .collect(),
-            ForgetSelector::Kind(kind) => self
-                .backend
-                .list(
-                    scope,
-                    &Page {
-                        offset: 0,
-                        limit: FORGET_SCAN_LIMIT,
-                    },
-                )
-                .await?
-                .into_iter()
-                .filter(|i| i.kind == kind)
-                .map(|i| i.id)
-                .collect(),
+            ForgetSelector::Tag(tag) => self.scan_all(scope, |i| i.tags.contains(&tag)).await?,
+            ForgetSelector::Kind(kind) => self.scan_all(scope, |i| i.kind == kind).await?,
         };
+        let targets: Vec<ItemId> = matched.iter().map(|i| i.id.clone()).collect();
 
-        let refs: Vec<ItemRef> = Vec::new();
+        // Populated, not left empty. Every other mutating path in this engine
+        // names its subjects in the audit record, and a `Forgotten` row that
+        // names nothing is the least useful of them all to have that gap: the
+        // items it is about are gone, so the row is the only remaining
+        // evidence of *which* memories were erased. `ItemRef` carries an id
+        // and a digest and never a body, so this discloses nothing a
+        // `Recalled` row does not.
+        let refs: Vec<ItemRef> = matched.iter().map(ItemRef::from_item).collect();
         // `Actor::system()`, not a caller-identified human: no engine method
         // below the boundary has one to attribute yet. See `purge_subject`'s
         // doc comment below for the full account of this gap and where it
@@ -103,6 +107,45 @@ impl Engine {
             forgotten: applied.evicted,
             audit_id: applied.audit_id,
         })
+    }
+
+    /// Every item in `scope` matching `keep`, read a page at a time until the
+    /// scope is exhausted.
+    ///
+    /// **Termination.** `Backend::list` is contractually a *total* order over
+    /// the whole scope with disjoint, complete pages, so advancing `offset` by
+    /// the number of rows returned reaches the end of a finite scope; the loop
+    /// stops on the first short page, which is the same "there is nothing
+    /// after it" signal `maintain` and `reembed` derive their cursors from.
+    /// Nothing is deleted while this runs, so no page shifts under the offset
+    /// — the hazard `maintain`'s own `next_offset` arithmetic exists to
+    /// handle, and which does not arise here precisely because scan and
+    /// removal are separated.
+    async fn scan_all(
+        &self,
+        scope: &Scope,
+        keep: impl Fn(&memorysafe_core::MemoryItem) -> bool,
+    ) -> Result<Vec<memorysafe_core::MemoryItem>, EngineError> {
+        let mut matched = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page = self
+                .backend
+                .list(
+                    scope,
+                    &Page {
+                        offset,
+                        limit: FORGET_SCAN_LIMIT,
+                    },
+                )
+                .await?;
+            let read = page.len();
+            matched.extend(page.into_iter().filter(&keep));
+            if read < FORGET_SCAN_LIMIT {
+                return Ok(matched);
+            }
+            offset += read;
+        }
     }
 
     /// The only path that changes `protection` outside admission.
@@ -172,16 +215,19 @@ impl Engine {
         // this task's report) confirmed a plain re-insert over an existing
         // id fails with a UNIQUE constraint, so this shape is load-bearing.
         //
-        // Its cost: the `items` table also carries `value_score`,
-        // `fragility_score`, `last_access` and `access_count`, none of which
-        // live on `MemoryItem`. `items::insert` writes `MemoryItem`'s own
-        // fields only, so those four columns cannot be carried forward and
-        // silently revert to schema defaults on every `protect` call — an
-        // item's entire accumulated recall history is reset the moment it is
-        // pinned or protected. Not fixed here; see
-        // `protecting_an_item_resets_its_accumulated_access_history` for what
-        // this does today, and this task's report for whether preserving it
-        // is the right long-term answer.
+        // A stored row also carries columns that do not live on `MemoryItem`
+        // and that `items::insert` therefore cannot write, so this shape used
+        // to reset an item's whole accumulated recall history the moment it
+        // was pinned. **That is now a `Backend::apply` requirement rather than
+        // a cost this method pays:** a transaction whose `evictions` and
+        // `upsert` name the same id is a *replacement*, and `apply` must carry
+        // the item's `last_accessed_at`/`access_count` across it. See that
+        // method's contract, and `items::AccessHistory` in
+        // `memorysafe-backend-sqlite` for the two columns and who reads them
+        // (`value_score` and `fragility_score` are the other two, and are
+        // written by nothing in the workspace — preserving them would preserve
+        // zeros). Pinned by
+        // `protecting_an_item_preserves_its_accumulated_access_history`.
         txn.evictions = vec![id.clone()];
         txn.upsert = Some(ItemWrite { item, vector });
 

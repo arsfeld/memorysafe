@@ -37,9 +37,10 @@ pub enum BackendError {
     IdempotencyConflict,
     #[error("query is invalid: {0}")]
     InvalidQuery(String),
-    /// `WriteTransaction::is_valid` rejected the transaction — it both
-    /// inserts and merges, or its scope-bearing fields disagree. `Backend::apply`
-    /// returns this having written nothing.
+    /// `WriteTransaction::is_valid` rejected the transaction. That method,
+    /// not this doc, is the list of conditions — it has four, and an
+    /// enumeration copied here is one edit away from being a shorter list
+    /// than the check. `Backend::apply` returns this having written nothing.
     #[error("transaction is invalid: {0}")]
     InvalidTransaction(String),
     #[error("vector uses embedder {got}, scope uses {expected}")]
@@ -150,6 +151,32 @@ pub trait Backend: Send + Sync {
     /// same defect with an error attached.
     /// `conformance::atomicity::an_invalid_transaction_is_rejected_and_writes_nothing`
     /// enforces both halves.
+    ///
+    /// **A transaction whose `evictions` names the same id its `upsert` writes
+    /// is a row *replacement*, and the item's accumulated access statistics —
+    /// the `last_accessed_at` and `access_count` that `record_recall` maintains
+    /// and that `retrieve_candidates`/`neighbours` report — MUST survive it.**
+    /// They are the one part of a stored item that does not live on
+    /// `MemoryItem`, so a backend that implements the replacement as a literal
+    /// delete-then-insert of `ItemWrite::item` silently resets them.
+    ///
+    /// This is not a hypothetical shape: it is how the engine pins an item
+    /// (`Engine::protect`), how it migrates an item to a new embedding model
+    /// (`Engine::reembed`), and how a background pass releases an expired
+    /// protection window (`Engine::maintain`, which routes releases through
+    /// `protect`). A backend that loses the statistics there makes a
+    /// re-embedding migration reset every item's recall history, which is
+    /// exactly what the replay quota and the eviction ranking read.
+    ///
+    /// `AppliedWrite::evicted` still reports the replaced id: a replace does
+    /// remove the old row, and that field means the ids actually removed.
+    ///
+    /// **Not covered by the frozen conformance suite** — no conformance test
+    /// builds a transaction that evicts and upserts one id, so this is a
+    /// contract a future backend can break while passing. `memorysafe-backend-sqlite`
+    /// pins it crate-locally in
+    /// `tests::replacing_a_row_in_one_transaction_preserves_its_access_history`,
+    /// and `memorysafe-engine` pins the three engine paths that depend on it.
     async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError>;
 
     /// Writes the recall's audit row **and**, in the same transaction, updates
@@ -177,6 +204,32 @@ pub trait Backend: Send + Sync {
     /// see the echo rule on this trait.
     async fn record_recall(&self, record: AuditRecord) -> Result<AuditId, BackendError>;
 
+    /// **`scope` is a filter, not a hint, and this is a security property.**
+    /// An id that names a real item in a *different* subject or namespace —
+    /// including one in the same tenant — must return `None`, exactly as an
+    /// id naming nothing does. A backend that resolves the id alone and
+    /// returns whatever row it finds satisfies this signature and breaks the
+    /// isolation the whole crate is built on.
+    ///
+    /// **Three engine call sites depend on it and would each fail differently
+    /// without it.**
+    /// - `Engine::forget` (`mutate.rs`) pre-checks existence with this call
+    ///   before evicting. Its own doc calls that defence in depth against a
+    ///   backend whose eviction does not cascade under the same scope
+    ///   predicate as the row: with an unscoped `get`, naming an id from
+    ///   another scope would pass the check and reach that eviction.
+    /// - `Engine::remember` (`write.rs`) validates `Action::Merge { into }`
+    ///   with a single call to this method, because a scope-filtered `get`
+    ///   answers "does it exist" and "is it in this write's scope" at once. An
+    ///   unscoped `get` turns that one lookup into a merge that folds a
+    ///   caller's content into another subject's item.
+    /// - `Engine::maintain`'s `apply_merge` (`maintain.rs`) resolves a
+    ///   policy-supplied merge target the same way, and says so.
+    ///
+    /// Each of those sites states the assumption; none of them could state it
+    /// as a *requirement*, because the trait did not. It does now.
+    /// `conformance::isolation::subjects_are_isolated` and
+    /// `namespaces_are_separated` cover it.
     async fn get(&self, scope: &Scope, id: &ItemId) -> Result<Option<MemoryItem>, BackendError>;
 
     /// Ordered ascending by `created_at`, ties broken by ascending `id`
