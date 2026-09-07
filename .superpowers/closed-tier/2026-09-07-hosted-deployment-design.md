@@ -202,26 +202,53 @@ useful operational visibility without ever exposing memory bodies.
 `memorysafe-auth` today is:
 
 ```rust
-pub struct ApiKeyStore { /* Vec<ApiKeyRecord> */ }
+pub struct ApiKeyStore { by_id: HashMap<String, ApiKeyRecord> }   // private field
 impl ApiKeyStore {
     pub fn new(records: Vec<ApiKeyRecord>) -> Self;
+    pub fn records(&self) -> impl Iterator<Item = &ApiKeyRecord>;
     pub fn authenticate(&self, presented: &str) -> Result<Authenticated, AuthError>;
 }
 ```
 
-A concrete, in-memory store, loaded once at construction, with a synchronous linear scan. That
-is correct for the CLI composition root Plan 3 targets, and **insufficient for the hosted
-service**: a key created in the dashboard would not authenticate until the process restarted,
-and with two replicas a key minted on one would be invisible to the other.
+Lookup is **already** `O(1)` — `authenticate` parses the id out of the presented key, hits the
+`HashMap`, and does a constant-time hash comparison. Performance is not the problem.
 
-**Resolution.** `memorysafe-cloud-control` owns key persistence in the `control` schema.
-Authentication is an indexed lookup by key id followed by a constant-time hash comparison —
-`O(1)` and always fresh — with a short-lived in-process cache for the hot path. `memorysafe-auth`
-keeps ownership of key generation, the BLAKE3 hashing, the show-once contract, and the
-`Authenticated` type; only storage and lookup move.
+**The problem is freshness.** The store is built from a `Vec` at construction and never changes.
+A key created in the dashboard would not authenticate until the process restarted, and with two
+replicas a key minted on one would be invisible to the other.
 
-**This does not change the public crate.** If a trait extraction in `memorysafe-auth` later turns
-out to be the cleaner factoring, it belongs in the public repository with its own review.
+### 6.1 Why the obvious fix is not available
+
+Reading a key row straight from Postgres and constructing an `Authenticated` from it **cannot be
+done from the closed repository**, by design:
+
+- `key::parse_presented` and `key::hash_presented` are `pub(crate)`. `lib.rs` exports only `ApiKeyRecord`, `GeneratedKey`, `KEY_PREFIX`, and `generate`.
+- `Authenticated`'s fields are private and it has no public constructor. Its doc states the invariant plainly: *"The only way to obtain one is `ApiKeyStore::authenticate`, so a handler that holds one cannot have skipped the check."*
+
+That is a security-by-construction property worth keeping, not an oversight to route around.
+
+### 6.2 Resolution: persist the records, keep the store
+
+`memorysafe-cloud-control` owns persistence of `ApiKeyRecord` rows in `control.api_keys`. It does
+**not** reimplement authentication. Instead it holds an `ArcSwap<ApiKeyStore>` and rebuilds the
+store from the table:
+
+- at startup;
+- on `LISTEN`/`NOTIFY` from Postgres, published by whichever instance mutated a key;
+- on a periodic refresh (30 s) as a backstop in case a notification is missed across a reconnect.
+
+Authentication remains `ApiKeyStore::authenticate` verbatim. `memorysafe-auth` is unchanged, its
+invariant intact, and the hot path stays a `HashMap` hit with no database round-trip.
+
+Memory is a non-issue: an `ApiKeyRecord` is on the order of 150 bytes, so 100 000 keys is a few
+megabytes.
+
+**The trade-off, stated explicitly.** Revocation is eventually consistent across replicas — bounded
+by notification latency, or by the 30 s refresh if a notification is lost. Creation is likewise
+not instantaneous on other replicas. For an API key that is acceptable, and it must be documented
+rather than discovered. If a hard, immediate revocation guarantee is required later, *that* is the
+moment to propose a trait extraction in `memorysafe-auth` — in the public repository, with its own
+review, and not before there is a reason.
 
 ---
 
@@ -373,7 +400,7 @@ New tests the hosted layer requires:
 |---|---|
 | Control-plane integration against a fake GitHub OAuth endpoint | Covers callback, org listing, session issuance |
 | Tenant derivation from numeric id | Proves a renamed login neither changes nor collides with a tenant id (§5.2) |
-| API key freshness across replicas | A key created against one connection authenticates immediately on another (§6) |
+| API key freshness across replicas | A key created against one connection authenticates on another once the `NOTIFY` or the 30 s refresh lands (§6.2), and a revoked one stops authenticating within the same bound |
 | Log redaction | No memory body or key secret reaches any log sink at any level (§9.4) |
 | RLS enforcement without predicates | A query with its `tenant_id` predicate removed returns zero rows — Plan 2's constraint, asserted at the hosted composition root with its real pool role |
 | Post-deploy smoke test | Provision tenant, mint key, remember, recall, read audit |
@@ -403,6 +430,7 @@ New tests the hosted layer requires:
 | pgvector filtered-ANN recall degradation as the shared corpus grows | `hnsw.iterative_scan` (pgvector 0.8+) and 16-way hash partitioning, both already Plan 2 defaults | Mitigated |
 | RLS silently inactive if the pool ever connects as owner or superuser | Non-superuser role, `FORCE ROW LEVEL SECURITY`, plus the predicate-removal test in §10 | Mitigated |
 | Backup retention vs. erasure: `purge_subject` does not reach dumps | Document the retention window; revisit if a client requires a DPA | Deferred |
+| API key revocation is eventually consistent across replicas (§6.2) | Bounded by `NOTIFY` latency or a 30 s refresh; documented, not discovered. Revisit only if a hard-immediate guarantee is required | Accepted |
 | k3s control-plane overhead squeezes Postgres on an undersized box | 4 GB floor; CX33 provides 8 GB; `--disable metrics-server` available if tight | Mitigated |
 | HNSW index build is the memory spike, not steady-state serving | 8 GB chosen over the 4 GB floor for this reason (§13); `halfvec` amendment (§13.1) would halve index memory if adopted | Mitigated |
 
