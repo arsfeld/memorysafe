@@ -255,20 +255,20 @@ Members differ in the size of the promise they break, ranked accordingly.
   nothing about `subject` at all. "Gaps that the freeze locks in" above already records that no
   test sets these fields; this is the same field found dead in the implementation, not merely
   untested.
-- **The engine crate's read-through cache for per-scope statistics — the write half. Open.
-  Cite `e5d810c`** (Task 37's cache work; this branch is based on `b91f72b` and does not
-  contain the file — verified at that commit, not this one). The cache's populate function is
-  called only from `#[cfg(test)]` code: in `crates/memorysafe-engine/src/maintain.rs` and
+- **`EngineCache::put_stats` — the write half of its per-scope statistics cache. Open. Cite
+  `e5d810c`** (Task 37's cache work; this branch is based on `b91f72b` and does not contain the
+  file — verified at that commit, not this one). `EngineCache::stats` and
+  `EngineCache::put_stats` are defined in `crates/memorysafe-engine/src/cache.rs`. Every call to
+  `put_stats` is `#[cfg(test)]`: in `crates/memorysafe-engine/src/maintain.rs` and
   `crates/memorysafe-engine/src/mutate.rs` every call sits below each file's `#[cfg(test)]`
-  boundary, and the rest are in the crate's dedicated cache test file — so that half of the
-  cache is never written outside a test. Production reads bypass it entirely: `gather.rs`,
-  `maintain.rs` and `read.rs` each call the backend's own `scope_stats` directly. Its sharp
-  edge: the cache's config type exposes two public, defaulted fields sizing and expiring this
-  half of the cache — operator-facing knobs for a mechanism nothing outside a test ever
-  populates. One field's own doc comment prices the governance cost of a stale corpus mean
-  skewing every assessment made against it, which shows the author had already reasoned this
-  through; wiring it now would ratify a decision already made, not fix an oversight. No
-  disposition recorded here — that call belongs to the engine lane.
+  boundary, and the rest are in `tests/cache.rs` — so the stats map is never written outside a
+  test. Production reads bypass it entirely: `gather.rs`, `maintain.rs` and `read.rs` each call
+  `backend.scope_stats(...)` directly. Its sharp edge: `CacheConfig` exposes `stats_capacity`
+  and `stats_ttl` as public, defaulted, tunable fields — operator-facing knobs for a cache that
+  is never populated. `stats_ttl`'s own doc comment prices the governance cost of a stale
+  corpus mean skewing every assessment made against it, which shows the author had already
+  reasoned this through; wiring it now would ratify a decision already made, not fix an
+  oversight. No disposition recorded here — that call belongs to the engine lane.
 - **`SqliteBackend::forget_tenant`. Open.** `pub`, zero callers in `crates/` other than the
   module doc at the top of the same file instructing an operator to "Call
   [`SqliteBackend::forget_tenant`] first" — a doc reference, not a call. Measured:
@@ -280,7 +280,7 @@ Members differ in the size of the promise they break, ranked accordingly.
 never feeds it.**
 
 - **`MergeWrite.byte_size`. Open; disposition is deleting the field, a tidy-up rather than a
-  defect fix.** Verified: `items::merge` ignores the caller-supplied `byte_size` entirely — it
+  defect fix.** Inspected: `items::merge` ignores the caller-supplied `byte_size` entirely — it
   is not even a parameter — and instead measures `before = existing.byte_size()` and
   `after = updated.byte_size()` at the storage layer, returning the difference, which
   accumulates into `delta_bytes` and lands in the single `capacity::adjust` at the end of
@@ -342,7 +342,7 @@ someone re-proposing the repair in six months when nobody remembers the conversa
 Four instances, from three separate lanes on one day. No lane could see the pattern from where
 it sat.
 
-1. **A too-literal grep.** Verified, and self-demonstrating:
+1. **A too-literal grep.** Measured, and self-demonstrating:
 
        grep -c "vectors::insert storing a wrong" docs/superpowers/plans/2026-09-05-engine-and-sqlite.md
        -> 0
@@ -353,15 +353,17 @@ it sat.
    zero read exactly like "the claim is false" and came within one keystroke of retracting a
    correct finding. The second grep is the point: it shows the instrument *can* report
    presence, which is what proves the first zero was the instrument's fault, not the world's.
-2. **A piped exit code.** Verified, and it happened twice independently the same day.
-   `cargo test … | tail` reports the pipe's exit status, not cargo's. In this lane, a baseline
-   run piped through `tail -30` silently discarded the test summary while the command still
-   reported success, so parsing the truncated output produced "0 passed, 0 failed" — a
-   manufactured absence that read as a measurement. General trap, not one lane's mistake:
-   `| tail` masks the real exit status and truncates the evidence in the same stroke.
+2. **A piped exit code. Relayed** — not reproduced for this entry; reported to have happened
+   twice independently the same day. `cargo test … | tail` reports the pipe's exit status, not
+   cargo's. In this lane, a baseline run piped through `tail -30` silently discarded the test
+   summary while the command still reported success, so parsing the truncated output produced
+   "0 passed, 0 failed" — a manufactured absence that read as a measurement. General trap, not
+   one lane's mistake: `| tail` masks the real exit status and truncates the evidence in the
+   same stroke.
 3. **`vectors::count`'s own scope predicate was unpinned. Closed. Cite `0163047`** (the tip of
    `worktree-sdd-sqlite-defects`; this branch is based on `b91f72b` and does not contain the
-   fix — verified by reading the file at that commit). `vectors::count` is the accessor built
+   fix — measured via `git show 0163047:crates/memorysafe-backend-sqlite/src/vectors.rs`, not
+   this branch's HEAD). `vectors::count` is the accessor built
    specifically to detect scope leaks, which is what makes this the sharpest of the four: the
    instrument *was* the leak detector, and its own predicate went untested. The surviving
    mutant replaced the entire `WHERE` with `?1 IS NOT NULL AND ?2 IS NOT NULL` — the bound
@@ -376,7 +378,7 @@ it sat.
    rather than an empty file), then asserts each scope counts 1 — a predicate dropping the
    whole `WHERE`, or just its subject half, or just its namespace half, each makes a different
    one of the three come out too high.
-4. **A survey that searched for the wrong statement shape.** Verified, and the most
+4. **A survey that searched for the wrong statement shape.** Measured, and the most
    instructive of the four. This file's own "Elsewhere" entry said the `vectors` table's
    `subject`/`namespace` are duplicated "with exactly one reader, `scope_embedder`" — wrong,
    and wrong before any of today's work:
