@@ -196,7 +196,31 @@ let backend = SqliteBackend::open(PathBuf::from("./data/tenants"));
 
 ## Development & Verification
 
-MemorySafe requires **Rust 1.97.1** or newer (Rust 2024 edition).
+MemorySafe requires **Rust 1.97.1** (Rust 2024 edition).
+
+### Developer Environment (Recommended: devenv)
+
+The recommended way to develop on MemorySafe is using [devenv](https://devenv.sh/), which provides a reproducible developer environment with the pinned Rust 1.97.1 toolchain, `rustfmt`, `clippy`, and required runtime libraries (`LD_LIBRARY_PATH` for SQLite linking).
+
+With [direnv](https://direnv.net/) installed, the environment activates automatically when you enter the directory:
+
+```bash
+direnv allow
+```
+
+Alternatively, enter the shell manually:
+
+```bash
+devenv shell
+```
+
+#### Alternative: Manual Toolchain Setup
+
+If you prefer not to use `devenv`, ensure the repository-pinned toolchain is installed via `rustup`:
+
+```bash
+rustup show active-toolchain
+```
 
 ### Build
 

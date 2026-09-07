@@ -6,9 +6,10 @@ MemorySafe is a Rust 2024 Cargo workspace for deterministic, governed memory inf
 
 ## Toolchain
 
-- Use the repository-pinned Rust toolchain from `rust-toolchain.toml` (Rust 1.97.1 with `rustfmt` and `clippy`).
+- **Recommended:** Use [devenv](https://devenv.sh/) (`devenv shell` or `direnv allow`) for an automatic, reproducible developer environment with the pinned Rust 1.97.1 toolchain, `rustfmt`, `clippy`, and required runtime libraries (`LD_LIBRARY_PATH` for SQLite linking).
+- Alternatively, use the repository-pinned Rust toolchain from `rust-toolchain.toml` via `rustup` (Rust 1.97.1 with `rustfmt` and `clippy`).
 - Run commands from the repository root.
-- Keep `Cargo.lock` committed and update it intentionally.
+- Keep `Cargo.lock` and `devenv.lock` committed and update them intentionally.
 - The workspace forbids `unsafe` code and denies the configured Rust and Clippy lints.
 
 ## Architecture and conventions
@@ -25,7 +26,7 @@ MemorySafe is a Rust 2024 Cargo workspace for deterministic, governed memory inf
 
 ## Build and run
 
-This repository currently builds libraries rather than a standalone application.
+This repository currently builds libraries rather than a standalone application. Enter the dev environment first (`devenv shell` or `direnv allow`), then:
 
 ```bash
 cargo build --workspace

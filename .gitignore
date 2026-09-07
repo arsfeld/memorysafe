@@ -2,3 +2,11 @@
 **/*.rs.bk
 .env
 /test_itemref_private
+
+# devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv

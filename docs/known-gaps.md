@@ -349,10 +349,11 @@ numbers, not just the second. At the time of writing the workspace has 45 of eac
 
 If the two disagree, the missing targets are named by the `Running` lines with no
 `test result:` after them, and the cause is usually a link error higher up the log. On a
-Nix-based setup the fix is generally to put the toolchain's `libstdc++` on
+manual Nix-based setup the fix is generally to put the toolchain's `libstdc++` on
 `LD_LIBRARY_PATH` for the run; the specific store path is machine-local and deliberately
 not written down here, because a pinned path rots and a rotted path is worse than none.
-Find yours rather than copying someone else's.
+Find yours rather than copying someone else's. (Note: The repository's recommended
+`devenv` configuration sets this automatically via `pkgs.stdenv.cc.cc.lib`.)
 ## A class, not a lone mutant: the declared-but-unreachable API
 
 `SqliteBackend::forget_tenant` was recorded here as a lone surviving mutant. It isn't one — it
