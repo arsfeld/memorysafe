@@ -333,22 +333,3 @@ async fn occurred_at_is_reachable_through_the_recall_time_filters() {
 
     client.cancel().await.unwrap();
 }
-
-#[tokio::test]
-async fn a_stdio_client_cannot_switch_subject() {
-    let (eng, _dir) = engine();
-    let client = connect(eng).await;
-    let result = client
-        .call_tool(
-            CallToolRequestParams::new("memory_remember").with_arguments(args(json!({
-                "body": "a memory for someone else",
-                "subject": "another-user"
-            }))),
-        )
-        .await;
-    assert!(
-        result.is_err(),
-        "stdio let a client name a different subject"
-    );
-    client.cancel().await.unwrap();
-}

@@ -270,9 +270,11 @@ pub struct RememberParams {
     pub ttl_seconds: Option<i64>,
     /// A retried write with the same key returns the original outcome.
     pub idempotency_key: Option<String>,
-    /// Required over HTTP; over stdio it must match the configured subject.
-    pub subject: Option<String>,
-    /// Required over HTTP; over stdio it defaults to the server's namespace.
+    /// Which namespace to act in. Defaults to the namespace this connection
+    /// declared — the working directory over stdio, the
+    /// `MemorySafe-Namespace` header over HTTP — and falls back to
+    /// `default`. Tenant and subject are fixed by the credential and cannot
+    /// be named here.
     pub namespace: Option<String>,
 }
 
@@ -294,7 +296,11 @@ pub struct RecallParams {
     /// sensitive, and restricted memories are excluded unless a caller names
     /// a wider ceiling explicitly.
     pub sensitivity_ceiling: Option<String>,
-    pub subject: Option<String>,
+    /// Which namespace to act in. Defaults to the namespace this connection
+    /// declared — the working directory over stdio, the
+    /// `MemorySafe-Namespace` header over HTTP — and falls back to
+    /// `default`. Tenant and subject are fixed by the credential and cannot
+    /// be named here.
     pub namespace: Option<String>,
 }
 
@@ -318,7 +324,11 @@ pub struct RecallParams {
 pub struct ReviewParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
-    pub subject: Option<String>,
+    /// Which namespace to act in. Defaults to the namespace this connection
+    /// declared — the working directory over stdio, the
+    /// `MemorySafe-Namespace` header over HTTP — and falls back to
+    /// `default`. Tenant and subject are fixed by the credential and cannot
+    /// be named here.
     pub namespace: Option<String>,
 }
 
@@ -345,7 +355,11 @@ pub struct ForgetParams {
     pub ids: Option<Vec<String>>,
     pub tag: Option<String>,
     pub kind: Option<String>,
-    pub subject: Option<String>,
+    /// Which namespace to act in. Defaults to the namespace this connection
+    /// declared — the working directory over stdio, the
+    /// `MemorySafe-Namespace` header over HTTP — and falls back to
+    /// `default`. Tenant and subject are fixed by the credential and cannot
+    /// be named here.
     pub namespace: Option<String>,
 }
 
@@ -362,7 +376,11 @@ pub struct ProtectParams {
     pub level: String,
     /// Unix seconds. Required for `protected`, rejected for the others.
     pub until: Option<i64>,
-    pub subject: Option<String>,
+    /// Which namespace to act in. Defaults to the namespace this connection
+    /// declared — the working directory over stdio, the
+    /// `MemorySafe-Namespace` header over HTTP — and falls back to
+    /// `default`. Tenant and subject are fixed by the credential and cannot
+    /// be named here.
     pub namespace: Option<String>,
 }
 
@@ -377,6 +395,49 @@ pub struct ProtectResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The field that used to lie. Its schema said optional on both
+    /// transports while HTTP hard-required it, so a model had to know which
+    /// transport it was on to call correctly. It is gone; this stops it
+    /// coming back.
+    #[test]
+    fn no_tool_parameter_schema_declares_a_subject() {
+        use schemars::schema_for;
+
+        let schemas = [
+            (
+                "RememberParams",
+                serde_json::to_string(&schema_for!(RememberParams)).unwrap(),
+            ),
+            (
+                "RecallParams",
+                serde_json::to_string(&schema_for!(RecallParams)).unwrap(),
+            ),
+            (
+                "ReviewParams",
+                serde_json::to_string(&schema_for!(ReviewParams)).unwrap(),
+            ),
+            (
+                "ForgetParams",
+                serde_json::to_string(&schema_for!(ForgetParams)).unwrap(),
+            ),
+            (
+                "ProtectParams",
+                serde_json::to_string(&schema_for!(ProtectParams)).unwrap(),
+            ),
+        ];
+
+        for (name, json) in schemas {
+            assert!(
+                !json.contains("\"subject\""),
+                "{name} still declares a `subject` property: {json}"
+            );
+            assert!(
+                json.contains("\"namespace\""),
+                "{name} must still accept a per-call namespace override: {json}"
+            );
+        }
+    }
 
     #[test]
     fn wire_names_match_the_core_serde_names() {

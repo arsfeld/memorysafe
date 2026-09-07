@@ -34,9 +34,9 @@ impl MemorySafeServer {
         Parameters(params): Parameters<ReviewParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ReviewResult>, ErrorData> {
-        let resolved = self.source.resolve(
+        let resolved = crate::scope::resolve_call(
+            self.resolver.as_ref(),
             &ctx.extensions,
-            params.subject.as_deref(),
             params.namespace.as_deref(),
         )?;
         let default_page = Page::default();
@@ -117,9 +117,9 @@ impl MemorySafeServer {
         Parameters(params): Parameters<ForgetParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ForgetResult>, ErrorData> {
-        let resolved = self.source.resolve(
+        let resolved = crate::scope::resolve_call(
+            self.resolver.as_ref(),
             &ctx.extensions,
-            params.subject.as_deref(),
             params.namespace.as_deref(),
         )?;
 
@@ -167,9 +167,9 @@ impl MemorySafeServer {
         Parameters(params): Parameters<ProtectParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ProtectResult>, ErrorData> {
-        let resolved = self.source.resolve(
+        let resolved = crate::scope::resolve_call(
+            self.resolver.as_ref(),
             &ctx.extensions,
-            params.subject.as_deref(),
             params.namespace.as_deref(),
         )?;
         let id = item_id(&params.id)?;

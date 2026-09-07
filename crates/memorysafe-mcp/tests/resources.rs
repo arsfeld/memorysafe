@@ -259,18 +259,9 @@ async fn an_empty_scope_reads_as_a_successful_empty_document_not_an_error() {
 }
 
 #[tokio::test]
-async fn a_resource_in_another_subject_is_refused_over_stdio() {
-    // Same rule as the tools: stdio is bound to one subject. A resource URI is
-    // not a way around it.
+async fn a_resource_in_another_tenant_is_refused_over_stdio() {
     let (eng, _dir) = engine();
     let client = connect(eng).await;
-    let denied = client
-        .read_resource(ReadResourceRequestParams::new(
-            "memorysafe://acme/someone-else/coding-agent/audit",
-        ))
-        .await;
-    assert!(denied.is_err(), "a resource URI crossed a subject boundary");
-
     let other_tenant = client
         .read_resource(ReadResourceRequestParams::new(
             "memorysafe://globex/user-42/coding-agent/audit",

@@ -60,9 +60,9 @@ impl MemorySafeServer {
         Parameters(params): Parameters<RememberParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<RememberResult>, ErrorData> {
-        let resolved = self.source.resolve(
+        let resolved = crate::scope::resolve_call(
+            self.resolver.as_ref(),
             &ctx.extensions,
-            params.subject.as_deref(),
             params.namespace.as_deref(),
         )?;
 
@@ -95,9 +95,9 @@ impl MemorySafeServer {
         Parameters(params): Parameters<RecallParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<RecallResult>, ErrorData> {
-        let resolved = self.source.resolve(
+        let resolved = crate::scope::resolve_call(
+            self.resolver.as_ref(),
             &ctx.extensions,
-            params.subject.as_deref(),
             params.namespace.as_deref(),
         )?;
 

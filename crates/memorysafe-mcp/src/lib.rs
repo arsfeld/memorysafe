@@ -11,10 +11,11 @@ mod tools_curate;
 mod tools_write;
 mod transport;
 
-pub use scope::{Resolved, ScopeSource};
+pub use scope::{auth_error, resolve_call};
 pub use transport::{HttpTransportConfig, http_service, http_service_with, serve_stdio};
 
 use crate::resources::{ResourceKind, resource_uri, uri_template};
+use memorysafe_auth::ScopeResolver;
 use memorysafe_core::AuditFilter;
 use memorysafe_engine::Engine;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -31,15 +32,15 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct MemorySafeServer {
     pub(crate) engine: Arc<Engine>,
-    pub(crate) source: ScopeSource,
+    pub(crate) resolver: Arc<dyn ScopeResolver>,
     tool_router: ToolRouter<Self>,
 }
 
 impl MemorySafeServer {
-    pub fn new(engine: Arc<Engine>, source: ScopeSource) -> Self {
+    pub fn new(engine: Arc<Engine>, resolver: Arc<dyn ScopeResolver>) -> Self {
         Self {
             engine,
-            source,
+            resolver,
             tool_router: Self::write_router() + Self::curate_router(),
         }
     }
@@ -70,7 +71,7 @@ impl ServerHandler for MemorySafeServer {
     ) -> Result<ListResourcesResult, ErrorData> {
         // Over HTTP the scope is a property of the request, not of the server,
         // so there is nothing concrete to list — the templates carry the shape.
-        let Some(scope) = self.source.default_scope() else {
+        let Some(scope) = self.resolver.default_scope() else {
             return Ok(ListResourcesResult::default());
         };
         Ok(ListResourcesResult::with_all_items(
@@ -115,9 +116,9 @@ impl ServerHandler for MemorySafeServer {
         // The URI names a scope; the transport decides which scopes this caller
         // may name. Resolving through the same path the tools use means a
         // resource URI can never reach further than a tool call could.
-        let resolved = self.source.resolve(
+        let resolved = crate::scope::resolve_call(
+            self.resolver.as_ref(),
             &context.extensions,
-            Some(parsed.subject),
             Some(parsed.namespace),
         )?;
         if resolved.scope.tenant.as_str() != parsed.tenant {

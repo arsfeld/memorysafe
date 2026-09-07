@@ -10,7 +10,7 @@ use memorysafe_backend_sqlite::SqliteBackend;
 use memorysafe_core::{Namespace, SubjectId, TenantId};
 use memorysafe_embed::DeterministicEmbedder;
 use memorysafe_engine::{Engine, EngineConfig};
-use memorysafe_mcp::{MemorySafeServer, ScopeSource};
+use memorysafe_mcp::MemorySafeServer;
 use memorysafe_policy::BaselinePolicy;
 use rmcp::{RoleClient, ServiceExt, service::RunningService};
 use std::sync::Arc;
@@ -39,12 +39,15 @@ pub fn engine() -> (Arc<Engine>, TempDir) {
     (engine, dir)
 }
 
-pub fn stdio_source() -> ScopeSource {
-    ScopeSource::Stdio {
-        tenant: TenantId::new("acme").unwrap(),
-        subject: SubjectId::new("user-42").unwrap(),
-        default_namespace: Namespace::new("coding-agent").unwrap(),
-    }
+pub fn fixed_resolver() -> std::sync::Arc<dyn memorysafe_auth::ScopeResolver> {
+    std::sync::Arc::new(
+        memorysafe_auth::FixedScope::new(
+            TenantId::new("acme").unwrap(),
+            SubjectId::new("user-42").unwrap(),
+            Namespace::new("coding-agent").unwrap(),
+        )
+        .expect("an ordinary test configuration"),
+    )
 }
 
 /// A real MCP client talking to a real MCP server over an in-memory duplex.
@@ -52,7 +55,7 @@ pub fn stdio_source() -> ScopeSource {
 /// structured results all go over the wire the way a client would see them.
 pub async fn connect(engine: Arc<Engine>) -> RunningService<RoleClient, ()> {
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-    let server = MemorySafeServer::new(engine, stdio_source());
+    let server = MemorySafeServer::new(engine, fixed_resolver());
     tokio::spawn(async move {
         let running = server.serve(server_transport).await.expect("serve");
         let _ = running.waiting().await;
