@@ -47,8 +47,14 @@ pub async fn serve_stdio(engine: Arc<Engine>, source: ScopeSource) -> anyhow::Re
 
 /// A tower service ready to be mounted, typically at `/mcp`.
 ///
-/// The factory runs once per session, so every session gets its own handler
-/// over the same shared engine — the engine is the thing with state, and it is
+/// With `legacy_session_mode(false)`, `StreamableHttpServerConfig`'s own doc
+/// says sessions are removed under protocol `2026-07-28` and every request
+/// negotiating it "is always served statelessly regardless of this setting"
+/// — confirmed against `rmcp-3.2.0`'s own request-handling code, which calls
+/// this factory again for each stateless request it serves directly. So the
+/// factory may run once per *request*, not once per session. Either way the
+/// cost is the same: it only clones an `Arc<Engine>` and a small
+/// `ScopeSource`, since the engine is the thing with state and it is
 /// `Arc`-shared deliberately.
 pub fn http_service(
     engine: Arc<Engine>,

@@ -77,10 +77,11 @@ blake3 = "1.5"
 base64 = "0.22"
 subtle = "2.6.1"
 getrandom = "0.4.3"
-# Streamable-HTTP transport (Task 6): a real tower service to mount, a real
-# listener to bind in tests, and the cancellation primitive rmcp's own
-# streamable-HTTP server config takes for graceful shutdown.
-axum = { version = "0.8.9", features = ["macros"] }
+# Streamable-HTTP transport (Task 6): a real tower service to mount and a
+# real listener to bind in tests. No `macros` feature: nothing here uses
+# `#[axum::debug_handler]`, and enabling it would pull `axum-macros` into
+# `Cargo.lock` for nothing.
+axum = "0.8.9"
 # `default-features = false`, and no TLS feature enabled anywhere in this
 # workspace: reqwest 0.13.4 gates every TLS path behind its `__tls` feature
 # (`src/async_impl/client.rs`, checked against the vendored source) and
@@ -94,6 +95,11 @@ axum = { version = "0.8.9", features = ["macros"] }
 # would needlessly pull `aws-lc-sys`/`ring`/`rustls-platform-verifier` (a
 # cmake-plus-C build) into every build's dependency graph.
 reqwest = { version = "0.13.4", default-features = false }
+# `CancellationToken`, used by `memorysafe-mcp`'s `tests/http_transport.rs`
+# to drive `axum::serve(...).with_graceful_shutdown(...)` for the test
+# listener. Only a dev-dependency there — nothing in any crate's `src/` uses
+# it — but promoted to the workspace table like the other Task 6 additions
+# so its version is pinned in one place.
 tokio-util = "0.7.19"
 
 [workspace.lints.rust]
