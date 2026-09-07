@@ -133,7 +133,17 @@ pub async fn review(
     let output = ReviewOutput {
         items,
         offset: page.offset,
-        limit: page.limit,
+        // Not `page.limit`: the backend clamps to `Page::effective_limit()`
+        // (`MAX_PAGE_LIMIT`) before running the query, and this echo is the
+        // only exhaustion signal a caller has — no `truncated` flag exists,
+        // by this workspace's own paging convention (`AuditFilter::limit`'s
+        // doc states the same rule; `memorysafe-api::memories::review` and
+        // `memorysafe-mcp::tools_curate::memory_review` carry the identical
+        // fix and comment). Echoing the raw, unclamped request would make a
+        // caller asking for more than the ceiling see fewer items than the
+        // (wrong) limit it was told, and wrongly conclude the scope was
+        // exhausted — silently hiding part of what is stored.
+        limit: page.effective_limit(),
     };
     render::emit(json, &output, || render::items(&output.items))
 }

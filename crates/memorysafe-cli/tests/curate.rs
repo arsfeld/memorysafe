@@ -261,3 +261,35 @@ fn creating_a_key_without_a_config_file_says_where_it_would_go() {
         .failure()
         .stderr(contains("msafe.toml"));
 }
+
+// Found by a consolidated Tasks 11-14 review, reproduced against the built
+// binary. `msafe keys ...` reads only the tenant — `cmd::keys::run`'s own
+// signature never takes a subject or namespace — but `main.rs::run` used to
+// resolve the full three-field scope before dispatching to any command,
+// this one included, so `keys list` failed on a missing `--subject`/
+// `--namespace` it never uses. No existing test in this suite caught it:
+// every helper here and in `tests/memory.rs` sets all three env vars
+// unconditionally, and `tests/serve.rs`'s spawned subprocess does too — a
+// feature that never worked shipped looking tested. This is deliberately
+// NOT routed through the `msafe()` helper above, which would silently
+// re-introduce the fully-populated environment this test exists to omit.
+#[test]
+fn keys_list_needs_only_the_tenant_not_a_subject_or_namespace() {
+    let dir = workspace();
+
+    let output = Command::cargo_bin("msafe")
+        .unwrap()
+        .current_dir(dir.path())
+        .env("MSAFE_TENANT", "acme")
+        .env_remove("MSAFE_SUBJECT")
+        .env_remove("MSAFE_NAMESPACE")
+        .args(["--json", "keys", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "keys list must not require a subject or namespace it never reads: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(json(&output)["keys"].as_array().unwrap().len(), 0);
+}

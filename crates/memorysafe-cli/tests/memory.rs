@@ -197,6 +197,46 @@ fn review_lists_what_is_stored() {
         .stdout(contains("beta memory"));
 }
 
+// Found by a consolidated Tasks 11-14 review, reproduced against the built
+// binary. `cmd::memory::review` used to echo the caller's raw, unclamped
+// `--limit` into `ReviewOutput.limit` rather than
+// `memorysafe_backend::Page::effective_limit()`, the value the backend
+// actually used. This workspace's paging convention carries no `truncated`
+// flag — `returned.len() < limit` is the sole exhaustion signal
+// (`AuditFilter::limit`'s own doc states the rule) — so a caller asking for
+// more than `MAX_PAGE_LIMIT` would see fewer items than the (wrong) limit it
+// was told and wrongly conclude the scope was exhausted, silently missing
+// everything past the ceiling. `memorysafe-api::memories::review` and
+// `memorysafe-mcp::tools_curate::memory_review` already carry the fix; this
+// is the third occurrence of the identical defect in this plan.
+#[test]
+fn review_echoes_the_effective_limit_not_the_raw_request() {
+    let dir = workspace();
+    msafe(dir.path())
+        .args(["remember", "a single memory to review"])
+        .assert()
+        .success();
+
+    let output = msafe(dir.path())
+        .args(["--json", "review", "--limit", "5000"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value = json(&output);
+    assert_eq!(
+        value["limit"],
+        memorysafe_backend::MAX_PAGE_LIMIT,
+        "a --limit above the backend's ceiling must be echoed as the ceiling \
+         actually used, not the raw request — otherwise `returned.len() < limit` \
+         (this workspace's only exhaustion signal) is unusable"
+    );
+}
+
 #[test]
 fn two_namespaces_do_not_see_each_other() {
     let dir = workspace();
