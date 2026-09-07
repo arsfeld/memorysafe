@@ -12,6 +12,66 @@ git-ignored workspace. Both are `/tmp` with extra steps — the same failure as 
 tools recovered from a dead session this week. **A number that lives in a conversation dies
 with it.**
 
+## Reach for this before either citation convention below: a durability hierarchy
+
+The two conventions below are both about citing things: **provenance marks**
+(`measured`/`inspected`/`relayed`) say *how* a claim was established; **commit-anchoring**, with
+its tree-vs-diff distinction, says *where in history* to check it. A third fact outranks both,
+and it was discovered by watching this file's own conventions fail, not by arguing about them.
+It goes here, before the conventions it qualifies, because it says what to reach for first.
+
+**The same day exercised all three durability levels a claim in this file can have, in
+descending order of how well each survived:**
+
+1. **A deferral naming a future task.** This file already carries that failure mode further
+   down — see "The quietest sub-case," below, and its counterpart correction for
+   `TransactionBehavior::Immediate` under "Elsewhere" — so it is not restated here. It rots
+   silently, exactly when the named task closes, because nothing revisits a comment that names a
+   task once the task is done.
+2. **A commit anchor**, adopted by this file specifically so a claim could be true "from any
+   branch at any time" instead of depending on a task staying open.
+3. **The commit anchor died too.** A repository-wide identity-only `git filter-branch` rewrote
+   every SHA in the repository, including every one this file cites, and a subsequent `gc`
+   pruned the pre-rewrite objects the old SHAs pointed to — the anchor namespace itself rewritten
+   underneath the citations resting on it.
+
+**Commit-anchoring beats task-naming and is still not immune.** Say that plainly: a convention
+this file recommends failed, once, in front of the people relying on it, and a file that only
+recommends a convention is less useful than one that also states the convention's ceiling.
+
+**The finding, which is the point:**
+
+> The only citation that survived untouched was the grep — because it regenerates rather than
+> refers.
+
+A SHA, a task number, a line number and a file path all *refer* to where a finding was found; a
+grep *re-derives* it, against whatever the tree currently is. Every `grep -rn ...` command
+already given in this file (for `forget_tenant`, for `TransactionBehavior::Immediate`, for the
+`vectors` readers) survived the rewrite untouched, needing no repair, because none of them name a
+commit. **When both are available, give the command and the anchor** — the anchor for
+provenance, the command so a reader can still get there when the anchor dies.
+
+**A second finding, from the same incident, and it belongs with the first because it is also
+about the gap between what a convention promises and what it can enforce.** A "do not run
+`git gc`" instruction was issued while the rewrite was still being verified, and it was never
+enforceable: `gc.auto` fires from ordinary git commands, not only an explicit `git gc`, and a
+rewrite across 265 commits blows straight past the loose-object threshold. The collection was
+going to happen on somebody's next `git status`, instruction or not. What actually preserved the
+evidence was copying it out of the repository, onto something the rewrite could not reach.
+
+> An instruction that depends on a side effect nobody controls is a wish.
+
+**A request and a copy are different kinds of thing**, and this is where that belongs: a
+durability claim about anything in this repository should say which kind it is relying on.
+
+**Measured** — the rewrite, the prune, and the surviving citations were each checked by running
+something, not by reading. The seven SHAs currently cited in this file were verified to resolve
+*after* the prune, which is a stronger statement than resolving before it: the collection removed
+everything unreachable, so anything still resolving is necessarily reachable from a live ref, not
+merely not-yet-collected. Re-run for this entry, one at a time rather than trusting the earlier
+count: `git cat-file -t <sha>` on each of `49fca6d`, `667909d`, `6e75fe4`, `8187bd9`, `8dd7ee6`,
+`c3e0d01`, `ce1af6b` — all seven print `commit`.
+
 ## A mark this file needs on itself: measured, inspected, or relayed
 
 This file opens by claiming *every line was verified by running something, not by reading* —
@@ -320,6 +380,60 @@ never feeds it.**
 tunable knob for a mechanism that does not run **misinforms** — it invites an operator to
 conclude a thing works because they configured it, which is a stronger and falser belief than
 simply not knowing the code exists.
+
+## Three kinds of unreachable, and only two of them are a defect
+
+They differ in **what would make the thing reachable**, which is the only distinction that
+changes what a reader should do about it.
+
+1. **Foreclosed by construction.** An orphaned vector row — a vector with no item — is reachable
+   only by changing the schema: `vectors.item_id REFERENCES items(id) ON DELETE CASCADE` with
+   the `foreign_keys` pragma on forecloses it structurally. Already recorded above, under
+   "Retired in the backend-sqlite defect lane" — see that entry rather than restating it here.
+2. **Unreachable by convention.** A mis-scoped vector row — FK-valid, its item alive, but the
+   row's own `subject`/`namespace` naming a scope the item is not in — is not structural: nothing
+   ties those columns to the item's actual scope, so a bug or a new code path could produce one.
+   Already recorded too, both further below in this file: "The vectors table stores scope
+   twice," under "Elsewhere," and the proposal rejected for reintroducing exactly this risk,
+   under "Derive from what exists, not from what the caller claims."
+3. **Unreachable by collaborator choice.** The new one, and the point of this section.
+
+**The third case, stated carefully.** `memorysafe-engine`'s `remember` has a
+merge-with-failed-embed branch: `write.rs`'s `Action::Merge` arm still runs when `embedding` is
+`None`, building a `MergeWrite` whose `vector` is then `None` too. **`BaselinePolicy` cannot
+reach it, and this is inspected, not measured** — established by reading, not by running:
+`gather::assess_context` fetches neighbours only when there is an embedding to probe with
+(`Some(e) => backend.neighbours(...)`, `None => vec![]`); `redundancy::assess(&[], _)` returns
+`Score::ZERO` with an empty `near_duplicates` (pinned by its own test,
+`no_neighbours_means_no_redundancy`); and `admit::decide`'s `Verdict::Mergeable` arm needs
+`RedundancyAssessment::best()` (`near_duplicates.first()`) to be `Some`, or it falls through to
+`Retain`. No embedding means no neighbours means no candidate to merge into: a merge decision
+paired with a failed embed is structurally unreachable **through this policy**, though nothing
+about the branch itself is unreachable.
+
+**Relayed, from the engine lane, and not run by me:** today that branch is exercised only through
+a test double. The `BaselinePolicy` chain above is the part read for this entry; whether a test
+double is presently the only caller that reaches it was not independently re-derived here, so it
+keeps the weaker mark.
+
+**The code is correct and necessary anyway.** A different `GovernancePolicy` could decide `Merge`
+on some signal other than the candidate's own neighbours, and the type should not lie about what
+is representable by refusing the combination. This is not dead code.
+
+**Why it earns a section rather than a bullet, and this is the sentence that matters:**
+
+> Its reachability is bounded by a **collaborator's** behaviour, not by its own structure. A new
+> policy makes it live tomorrow with **no change to this code at all.**
+
+**It is the one a future reader is most likely to delete.** It looks like dead code, and — once
+it has tests — they will look like they exercise a fiction. The correct response is the opposite
+of the obvious one: **reachability here is not this code's property to determine.**
+
+**This is NOT the declared-but-unreachable-API class above, and here is why in one line:** those
+members shipped a promise the code does not keep — `forget_tenant` is callable and nothing calls
+it, `AuditFilter.subject` is read from nowhere. This one keeps a promise nobody currently asks it
+to keep: no caller today needs a merge to survive a failed embed, so its silence is patience, not
+breakage. Filing it under that class would say the code is broken; it is the opposite.
 
 ## Derive from what exists, not from what the caller claims
 
