@@ -809,12 +809,14 @@ async fn maintenance_resumes_correctly_when_a_merge_lands_on_a_page_boundary() {
 //
 // `Engine`'s policy is one `Arc<dyn GovernancePolicy>` shared across every
 // scope it maintains. Before this fix, an id absent from `ctx.batch` was
-// treated as "not pinned" and forwarded to `txn.evictions` anyway;
-// `items::delete` is scope-filtered so the victim's ROW survives, but
-// `vectors::delete` carries no scope predicate at all and runs
-// unconditionally — so a policy that remembers an id from scope A's batch
-// and names it as an eviction while deciding for scope B silently strips
-// scope A's vector row.
+// treated as "not pinned" and forwarded to `txn.evictions` anyway. The fix is
+// defence in depth against a `Backend` whose eviction does not cascade a
+// removed item's other rows — its vector row, most concretely — under the
+// same scope predicate as the row itself: a backend failing that property
+// deletes the item row correctly (scoped) but would still strip the vector
+// regardless of scope (unscoped) — so a policy that remembers an id from
+// scope A's batch and names it as an eviction while deciding for scope B
+// would silently strip scope A's vector row.
 
 /// Reuses `SpyEmbedder` so a keyword-blind recall query can only succeed
 /// through a surviving vector row — the same reachability technique

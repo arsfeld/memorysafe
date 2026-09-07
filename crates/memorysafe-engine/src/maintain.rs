@@ -118,10 +118,13 @@ impl Engine {
                 // this engine handles; without this check a policy that
                 // retains an id it saw while deciding for scope A can hand
                 // that same id back as an "eviction" while deciding for scope
-                // B, and `items::delete` being scope-filtered only saves the
-                // ROW — `vectors::delete` carries no scope predicate at all
-                // and would silently strip scope A's vector regardless. The
-                // engine enforces pinning, and now membership, even if a
+                // B. This is defence in depth against a `Backend` whose
+                // eviction does not cascade a removed item's other rows —
+                // its vector row, most concretely — under the same scope
+                // predicate as the row itself: a backend failing that
+                // property would delete the item row correctly (scoped) but
+                // strip scope A's vector regardless (unscoped), silently.
+                // The engine enforces pinning, and now membership, even if a
                 // policy forgets.
                 let Some(candidate) = ctx.batch.iter().find(|c| c.item.id == e.item) else {
                     continue;
@@ -146,8 +149,9 @@ impl Engine {
             // it is looked up in THIS batch, not trusted as a bare id: a
             // subject `maintain` never offered is skipped rather than
             // forgotten sight-unseen, the same discipline `forget`'s own
-            // pre-existence check applies for the identical reason
-            // (`vectors::delete` has no scope predicate of its own).
+            // pre-existence check applies for the identical reason —
+            // defence in depth against a `Backend` whose eviction cascade is
+            // not itself scope-filtered.
             if let (Some(subject), Action::Merge { into, strategy }) = (&d.subject, &d.action) {
                 let Some(absorbed) = ctx.batch.iter().find(|c| &c.item.id == subject) else {
                     continue;

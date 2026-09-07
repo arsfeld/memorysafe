@@ -124,6 +124,31 @@ impl Engine {
         // audit trail even though nothing is returned to the caller, the
         // same way `write.rs`'s `handle_invalid_decision` audits an invalid
         // write decision as `Rejected` before deciding what to return.
+        //
+        // **Deliberately does not consult `self.stance` below, unlike
+        // `handle_invalid_decision`, which does branch on it (`FailSafe`
+        // there returns a usable `Action::Reject` outcome instead of
+        // erroring).** The two checks look parallel — both fire when a
+        // policy hands back a structurally invalid decision — but they are
+        // not the same kind of failure. `handle_invalid_decision`, and the
+        // `call_policy` failure just above this comment (a policy panic or
+        // returned `PolicyError`), are availability problems: the policy
+        // failed to produce a usable answer, and falling back to a
+        // conservative default (`Action::Reject`; `self.fallback_policy`) is
+        // a sensible way to keep serving traffic. This check is different in
+        // kind: the policy DID produce an answer, and that answer names data
+        // it was never offered — `ws.items`/`ws.omitted` containing an
+        // unoffered id, or an offered id wearing a substituted body (see
+        // `validate::working_set`'s own doc). That is a leak attempt, not a
+        // crash, and "degrade to a safe-looking substitute and keep going"
+        // is not obviously the safe move for a leak the way it is for a
+        // panic — an operator needs FailClosed's hard stop to be exactly
+        // that: a stop, not something a policy config can quietly widen back
+        // into "return whatever composed, minus the offending items." Fixed
+        // fail-closed here regardless of `self.stance`, on that basis. If you
+        // revisit this, `remember`'s `handle_invalid_decision` (`write.rs`)
+        // is the site whose behaviour would need to change in step, and this
+        // comment is the reason it has not.
         if let Err(invalid) = validate::working_set(&composed, &candidates) {
             let audit = AuditRecord::new(
                 req.scope.clone(),

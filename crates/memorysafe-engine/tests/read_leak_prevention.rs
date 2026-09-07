@@ -20,7 +20,7 @@ use memorysafe_core::{
     SensitivityLevel, Source, SourceKind, WorkingSet, features,
 };
 use memorysafe_embed::DeterministicEmbedder;
-use memorysafe_engine::{Engine, EngineConfig, EngineError, RememberRequest};
+use memorysafe_engine::{Engine, EngineConfig, EngineError, FailureStance, RememberRequest};
 use memorysafe_policy::BaselinePolicy;
 use std::sync::Arc;
 
@@ -252,4 +252,38 @@ async fn a_policys_omitted_list_naming_an_unoffered_item_is_also_refused() {
         }
         other => panic!("expected EngineError::PolicyRefused, got {other:?}"),
     }
+}
+
+/// `read.rs`'s own doc comment on this check states it fails closed
+/// unconditionally, regardless of `self.stance` — unlike `remember`'s
+/// analogous `handle_invalid_decision`, which does branch on it. Every test
+/// above builds its reader through `EngineConfig::new`, whose stance
+/// defaults to `FailSafe`, so they already exercise that claim implicitly;
+/// this test sets the stance explicitly so the guarantee does not quietly
+/// depend on what that default happens to be. `FailSafe` must not turn a
+/// smuggled item into a substituted-but-safe-looking working set — it must
+/// still refuse, exactly as `FailClosed` would.
+#[tokio::test]
+async fn a_smuggled_item_is_refused_even_under_the_failsafe_stance() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backend: Arc<dyn Backend> = Arc::new(SqliteBackend::open(dir.keep()));
+    let embedder = Arc::new(DeterministicEmbedder::new(256));
+    let writer = Engine::new(EngineConfig::new(
+        backend.clone(),
+        embedder.clone(),
+        Arc::new(BaselinePolicy::default()),
+    ));
+    let mut reader_config = EngineConfig::new(backend, embedder, Arc::new(SmugglesAnUnofferedItem));
+    reader_config.stance = FailureStance::FailSafe;
+    let reader = Engine::new(reader_config);
+
+    writer
+        .remember(RememberRequest::new(scope(), "a genuine memory about cats"))
+        .await
+        .unwrap();
+
+    let err = reader.recall(recall_req("cats")).await.expect_err(
+        "FailSafe must not change this outcome: a smuggled item is refused regardless of stance",
+    );
+    assert!(matches!(err, EngineError::PolicyRefused(_)));
 }

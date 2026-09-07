@@ -116,7 +116,15 @@ impl Engine {
             candidate: &candidate,
             assessment: &assessment,
         };
-        let decision = self.run_admit(&assessed, &admit_ctx)?;
+        let mut decision = self.run_admit(&assessed, &admit_ctx)?;
+        // `admit_context` (`gather.rs`) hands every eviction candidate a
+        // hardcoded `value`/`fragility` placeholder, and `admit` copies both
+        // — plus their product — verbatim into a `CapacityPressure`
+        // eviction's evidence. Scrubbed here, once, before that evidence can
+        // reach an audit row; see `strip_fabricated_eviction_evidence`'s own
+        // doc for why the fix lives at this call site rather than at the
+        // fabrication's source.
+        gather::strip_fabricated_eviction_evidence(&mut decision);
 
         // Nothing a policy returns is applied until it passes validation.
         if let Err(invalid) = validate::decision(&decision, &admit_ctx) {
@@ -355,6 +363,18 @@ impl Engine {
         let txn = WriteTransaction::new(req.scope.clone(), audit);
         let applied = self.backend.apply(txn).await?;
 
+        // Branches on `self.stance`; `read.rs`'s analogous check
+        // (`validate::working_set`'s failure inside `recall`) deliberately
+        // does not, and stays `FailClosed` unconditionally — see the comment
+        // at that call site for why the two are not held to the same rule.
+        // Short version: `FailSafe`'s substitute here is safe to hand back
+        // regardless of what made the decision invalid, because
+        // `Action::Reject` discloses nothing — the write simply does not
+        // happen. `recall`'s equivalent failure is the opposite shape: the
+        // policy handed back items it was never offered, which is a leak
+        // attempt, not an availability gap, and no substitute working set is
+        // obviously safe to serve in its place the way "reject this one
+        // write" is here.
         match self.stance {
             FailureStance::FailClosed => Err(EngineError::PolicyRefused(invalid.to_string())),
             FailureStance::FailSafe => Ok(WriteOutcome {

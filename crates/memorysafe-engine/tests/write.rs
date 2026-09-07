@@ -178,6 +178,68 @@ async fn a_full_namespace_evicts_to_make_room_and_reports_what_it_dropped() {
     assert_eq!(stored.len(), 3, "the budget was exceeded");
 }
 
+/// `gather::admit_context` hands every eviction candidate a hardcoded
+/// `value`/`fragility` placeholder (`Score::clamped(0.5)`, never measured),
+/// and `memorysafe-policy`'s `admit` copies both — plus their product — into
+/// a `CapacityPressure` eviction's `Reason::evidence` verbatim. An evidence
+/// field carrying a placeholder is a false attestation, and worse than an
+/// absent one because a reader of the audit trail cannot tell them apart.
+/// `write.rs::remember` scrubs it before the `Decision` reaches an audit
+/// row; this pins that the persisted row states an absence
+/// (`value_fragility_computed => 0.0`) rather than asserting a measurement
+/// it never made.
+#[tokio::test]
+async fn evicted_evidence_in_the_audit_trail_does_not_assert_fabricated_scores() {
+    let e = engine();
+    e.set_budget(
+        &scope(),
+        Budget {
+            max_items: Some(3),
+            max_bytes: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    for i in 0..3 {
+        e.remember(req(&format!("distinct memory number {i} about topic {i}")))
+            .await
+            .unwrap();
+    }
+    let out = e
+        .remember(req("a completely different subject entirely"))
+        .await
+        .unwrap();
+    assert_eq!(out.evicted.len(), 1, "premise: exactly one eviction");
+
+    let audit = e.audit(&scope(), &Default::default()).await.unwrap();
+    let record = audit
+        .iter()
+        .find(|r| r.id == out.audit_id)
+        .expect("the admitting write's own audit row must exist");
+    let decision = record
+        .decision
+        .as_ref()
+        .expect("premise: the audit row carries a decision");
+    let eviction = decision
+        .evictions
+        .iter()
+        .find(|ev| ev.reason.code == ReasonCode::CapacityPressure)
+        .expect("premise: a CapacityPressure eviction reason was recorded");
+
+    for fabricated in ["value", "fragility", "eviction_cost"] {
+        assert!(
+            !eviction.reason.evidence.contains_key(fabricated),
+            "audit evidence must not attest to a {fabricated} that was never computed"
+        );
+    }
+    assert_eq!(
+        eviction.reason.evidence.get("value_fragility_computed"),
+        Some(&0.0),
+        "the row must state the absence explicitly, not merely omit the fields"
+    );
+}
+
 #[tokio::test]
 async fn a_retried_write_returns_the_original_outcome() {
     let e = engine();

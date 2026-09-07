@@ -41,11 +41,18 @@ async fn a_retained_writes_audit_row_names_the_item_it_created() {
         .expect("a retained write always creates an item");
 
     let mut audit = e.audit(&scope(), &Default::default()).await.unwrap();
-    let newest = audit.remove(0);
+    // Exactly one write happened above, so exactly one record can exist in
+    // this scope — asserted explicitly, beside the access, rather than left
+    // implicit. `AuditId` is minted by the non-monotonic `ulid::Ulid::generate()`
+    // (see `audit_event_type.rs`'s module doc), so `.remove(0)` is only safe
+    // to treat as "the one record" because there IS only one; with a second
+    // record in scope it would be a coin flip which one comes back.
+    assert_eq!(audit.len(), 1, "premise: exactly one write happened");
+    let only_record = audit.remove(0);
     assert_eq!(
-        newest.items.len(),
+        only_record.items.len(),
         1,
         "the audit row for a retained write must reference exactly the one item"
     );
-    assert_eq!(*newest.items[0].id(), item_id);
+    assert_eq!(*only_record.items[0].id(), item_id);
 }

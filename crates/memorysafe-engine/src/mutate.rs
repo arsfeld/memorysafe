@@ -25,14 +25,14 @@ impl Engine {
     /// defence-in-depth against an already-safe design — `ForgetOutcome` is
     /// identical with or without it, since it is built from
     /// `AppliedWrite::evicted` (what the backend actually removed, itself
-    /// scope-filtered), never from the raw selector. **It is not
-    /// defence-in-depth; it is load-bearing.** Two lines above the guard
-    /// that builds `evicted`, `Backend::apply`'s eviction loop also calls
-    /// `vectors::delete(&tx, id)` — unconditionally and unscoped, no subject
-    /// or namespace predicate. Without this pre-check, naming an id from a
-    /// different scope in the same tenant leaves that item's row untouched
-    /// but permanently strips its vector, silently: `ForgetOutcome` reports
-    /// nothing forgotten, and the audit trail shows nothing happened. See
+    /// scope-filtered), never from the raw selector. **It is exactly that:
+    /// defence in depth against a `Backend` whose eviction does not cascade
+    /// a removed item's other rows — its vector row, most concretely —
+    /// under the same scope predicate as the row itself.** A backend
+    /// failing that property would let naming an id from a different scope
+    /// in the same tenant leave that item's row untouched but permanently
+    /// strip its vector, silently: `ForgetOutcome` would report nothing
+    /// forgotten, and the audit trail would show nothing happened. See
     /// `forgetting_an_id_from_another_scope_does_not_delete_its_vector`.
     pub async fn forget(
         &self,
@@ -110,6 +110,26 @@ impl Engine {
     /// Its own audit record's actor is `Actor::system()`, for the same
     /// engine-wide, deferred reason `purge_subject`'s doc comment below gives
     /// in full.
+    ///
+    /// **This method's brief (the plan document's Task 34 note, and the
+    /// design spec it echoes) claims this audit record makes "why is this
+    /// pinned?" answerable from the trail alone. It does not deliver that
+    /// today.** The record written below is `AuditEvent::Admitted` carrying
+    /// no assessment and no decision — `with_assessment`/`with_decision` are
+    /// never called on it, because there is no `Assessment` or `Decision` to
+    /// attach: this call never runs the admission pipeline that produces
+    /// either. A reader of the trail sees that the item's protection changed
+    /// and when, but not why an operator or caller pinned it — the one
+    /// question the brief promises is answerable. The gap is not a missing
+    /// call in this function; it is that `memorysafe_core::AuditEvent` has no
+    /// protection-related variant to record a reason against in the first
+    /// place, and adding one is a `memorysafe-core` change, out of reach from
+    /// this crate. **Deferred to Plan 3 Task 9**, bundled there with
+    /// `AuditFilter.subject`'s inexpressible compliance query ("every audit
+    /// row for subject X") for the same reason: both are core additions the
+    /// engine can consume but not make itself. Until that lands, this
+    /// method's own claim to answer "why is this pinned?" is aspirational,
+    /// not delivered.
     pub async fn protect(
         &self,
         scope: &Scope,
@@ -122,12 +142,22 @@ impl Engine {
         item.protection = protection;
 
         // Deleting the row (the eviction below) cascades its vector away, so
-        // the item must be re-embedded before it is written back.
-        let vector = self
-            .embedder
-            .embed(&item.body)
-            .ok()
-            .map(|e| memorysafe_embed::QuantizedVector::from_embedding(&e));
+        // the item must be re-embedded before it is written back. One rule,
+        // already used on the write path (`write.rs`'s `remember`:
+        // `let embedding = self.embed_cached(&req.body).await; let
+        // pending_embedding = embedding.is_none();`): `pending_embedding` is
+        // derived from the SAME `Option` the vector comes from, not left at
+        // whatever the fetched item already carried. Skipping this — as an
+        // earlier version of this method did — let an embedder failure here
+        // leave the item with no vector row (the delete above cascaded it
+        // away) AND `pending_embedding: false`, which is invisible to both
+        // vector search and the backfill job that exists to repair exactly
+        // that gap.
+        let embedding = self.embedder.embed(&item.body).ok();
+        item.pending_embedding = embedding.is_none();
+        let vector = embedding
+            .as_ref()
+            .map(memorysafe_embed::QuantizedVector::from_embedding);
 
         let audit = AuditRecord::new(
             scope.clone(),

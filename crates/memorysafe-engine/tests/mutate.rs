@@ -141,15 +141,16 @@ async fn forgetting_the_same_id_twice_reports_it_once() {
 /// (`self.backend.get(scope, &id).await?.is_some()`, in `mutate.rs`) looks
 /// removable: `ForgetOutcome` is unchanged with or without it, since it is
 /// built from what the backend actually evicted, never from the raw
-/// selector. It is not removable. `Backend::apply`'s eviction loop also
-/// calls `vectors::delete(&tx, id)`, unconditionally and unscoped — no
-/// subject or namespace predicate — two lines above the guard that produces
-/// `evicted`. Without the pre-check, naming another scope's item id (same
-/// tenant) leaves that item's row untouched but silently strips its vector.
-/// This seeds an item in a second scope, forgets from a different scope
-/// naming that item's id, and confirms the item survives both as a row
-/// (`review`) and as a vector (`Backend::neighbours` against its own
-/// recomputed embedding) — the property `ForgetOutcome` alone cannot show.
+/// selector. It is not removable: it is defence in depth against a
+/// `Backend` whose eviction does not cascade a removed item's other rows —
+/// its vector row, most concretely — under the same scope predicate as the
+/// row itself. A backend failing that property would let naming another
+/// scope's item id (same tenant) leave that item's row untouched but
+/// silently strip its vector. This seeds an item in a second scope, forgets
+/// from a different scope naming that item's id, and confirms the item
+/// survives both as a row (`review`) and as a vector (`Backend::neighbours`
+/// against its own recomputed embedding) — the property `ForgetOutcome`
+/// alone cannot show.
 #[tokio::test]
 async fn forgetting_an_id_from_another_scope_does_not_delete_its_vector() {
     let dir = tempfile::tempdir().expect("tempdir");

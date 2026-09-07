@@ -1,6 +1,8 @@
 use crate::error::EngineError;
 use memorysafe_backend::Backend;
-use memorysafe_core::{AdmitContext, AssessContext, Embedding, MaintenanceCandidate, Scope};
+use memorysafe_core::{
+    AdmitContext, AssessContext, Decision, Embedding, MaintenanceCandidate, ReasonCode, Scope,
+};
 use time::OffsetDateTime;
 
 /// Gathers everything `assess` may see. Not one I/O pass: this makes up to
@@ -73,17 +75,31 @@ pub async fn admit_context(
             // for every candidate — computing the real ones needs a neighbour
             // query per candidate, a design decision this task cannot make
             // (see `BaselinePolicy::assess`, which the policy crate spends a
-            // whole module on for exactly one candidate at a time). Two
-            // consequences follow, and both are silent: `eviction::cost` is
-            // `value * fragility`, so every candidate here ties at `0.25`,
-            // and `admit`'s stable sort then leaves the order exactly as
+            // whole module on for exactly one candidate at a time), and
+            // `MaintenanceCandidate::value`/`::fragility` are plain `Score`,
+            // not `Option<Score>` — the type gives this function no way to
+            // say "unknown" instead of handing over a number. Two
+            // consequences follow from the tie. `eviction::cost` is `value *
+            // fragility`, so every candidate here ties at `0.25`, and
+            // `admit`'s stable sort then leaves the order exactly as
             // `Backend::list` returned it — ascending `created_at` — so
             // "evict the lowest value-weighted retention cost" degrades to
-            // "evict the oldest" without anything saying so. Worse, `admit`
-            // writes `"value" => 0.5, "fragility" => 0.5, "eviction_cost" =>
-            // 0.25` into the eviction `Reason`'s evidence, and that reason is
-            // what lands in the audit row — three fabricated constants
-            // presented as measurements in a compliance record.
+            // "evict the oldest" without anything saying so; that ordering
+            // effect is unchanged by anything below and is not this task's to
+            // fix. The second consequence — `admit` writing `"value" => 0.5,
+            // "fragility" => 0.5, "eviction_cost" => 0.25` into the eviction
+            // `Reason`'s evidence, three fabricated constants presented as
+            // measurements in a compliance record — IS fixed, but not here:
+            // `memorysafe-policy` builds that evidence map from these two
+            // fields, and this task does not touch that crate. Instead
+            // `strip_fabricated_eviction_evidence` below scrubs the
+            // `Decision` `admit` hands back, once, in `write.rs`, right
+            // before it is written into an audit row — turning "0.5 asserted
+            // as measured" into an explicit "not computed" rather than
+            // leaving a silent placeholder in the trail. It does not, and
+            // cannot, touch `eviction::cost` or the stable sort above: by the
+            // time it runs, which items were evicted and in what order is
+            // already decided.
             //
             // `last_accessed_at`/`access_count` are the second, narrower gap:
             // `Backend::list` returns bare `MemoryItem`s, and the access
@@ -125,6 +141,55 @@ pub async fn admit_context(
         stats: assess.stats.clone(),
         now,
     })
+}
+
+/// Evidence keys whose value comes straight from the `value`/`fragility`
+/// placeholder `admit_context` hands every eviction candidate above — see
+/// that function's `OPEN` comment. `memorysafe-policy`'s `admit` (a separate,
+/// independently owned crate this task does not modify) copies those two
+/// numbers, plus their product, verbatim into a `CapacityPressure` eviction's
+/// `Reason::evidence` under exactly these three keys.
+const FABRICATED_EVICTION_EVIDENCE: [&str; 3] = ["value", "fragility", "eviction_cost"];
+
+/// Scrubs the fabricated eviction evidence `admit` returns before a
+/// `Decision` is written into an audit row.
+///
+/// An evidence field carrying a placeholder is a false attestation, and it is
+/// worse than an absent one because a reader of the audit trail cannot tell
+/// them apart. Since the placeholder originates here (`admit_context`, above)
+/// but the evidence map it taints is assembled downstream, in a crate this
+/// task must not touch, the fix has to be a scrub applied to what that crate
+/// hands back, not a change to how it builds the map. `write.rs`'s `remember`
+/// is the only caller, applied once, right before `AuditRecord::with_decision`
+/// — everywhere else `decision` is used (`txn.evictions`, the returned
+/// `WriteOutcome`), only item ids and top-level `reasons` are read, never an
+/// eviction's evidence map, so scrubbing it here changes nothing else.
+///
+/// Deliberately narrow: only a `CapacityPressure` eviction's evidence is
+/// touched, since that is the one reason code `admit` builds from these two
+/// fields today. Replaces the three fabricated keys with a single explicit
+/// `"value_fragility_computed" => 0.0` flag — a reader can tell "computed:
+/// no" from a genuine `0.0` measurement, which a silently-absent key could
+/// not.
+///
+/// Does not, and must not, touch `eviction::cost`, the stable sort in
+/// `admit`, or `decision.evictions`'s order or membership: all three are
+/// already fixed by the time this runs, so which items were evicted and in
+/// what order is unaffected — only the evidence recorded about each one
+/// changes.
+pub(crate) fn strip_fabricated_eviction_evidence(decision: &mut Decision) {
+    for eviction in &mut decision.evictions {
+        if eviction.reason.code != ReasonCode::CapacityPressure {
+            continue;
+        }
+        for key in FABRICATED_EVICTION_EVIDENCE {
+            eviction.reason.evidence.remove(key);
+        }
+        eviction
+            .reason
+            .evidence
+            .insert("value_fragility_computed".to_string(), 0.0);
+    }
 }
 
 #[cfg(test)]
