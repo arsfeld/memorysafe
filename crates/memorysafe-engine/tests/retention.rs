@@ -9,7 +9,7 @@
 //! deployment gets ninety-day detail retention, and must not be read as such.
 
 use memorysafe_backend_sqlite::SqliteBackend;
-use memorysafe_core::{AuditFilter, Scope, SubjectId, TenantId};
+use memorysafe_core::{Actor, AuditFilter, Scope, SubjectId, TenantId};
 use memorysafe_embed::DeterministicEmbedder;
 use memorysafe_engine::{
     Engine, EngineConfig, PurgeCascade, RememberRequest, RetentionProfile, RetentionSpan,
@@ -150,6 +150,7 @@ async fn balanced_cascades_audit_with_the_subject() {
         .purge_subject(
             &TenantId::new("acme").unwrap(),
             &SubjectId::new("user-42").unwrap(),
+            &Actor::system(),
         )
         .await
         .unwrap();
@@ -186,6 +187,7 @@ async fn hipaa_retain_preserves_audit_across_a_subject_purge() {
         .purge_subject(
             &TenantId::new("acme").unwrap(),
             &SubjectId::new("user-42").unwrap(),
+            &Actor::system(),
         )
         .await
         .unwrap();
@@ -225,6 +227,7 @@ async fn the_item_is_always_removed_regardless_of_profile() {
         e.purge_subject(
             &TenantId::new("acme").unwrap(),
             &SubjectId::new("user-42").unwrap(),
+            &Actor::system(),
         )
         .await
         .unwrap();

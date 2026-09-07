@@ -107,12 +107,14 @@ impl Engine {
     /// left no trace of itself at all: the imported *items* are auditable, and
     /// the act of importing them was not.
     ///
-    /// The plan defers `Imported`/`Exported` "for want of an actor". That
-    /// reason does not hold — `forget`, `protect` and `purge_subject` all ship
-    /// today with `Actor::system()` and a recorded gap, and this follows that
-    /// precedent: `Actor::system()`, not the actor who ordered the import,
-    /// with the same deferral to Plan 3's Task 2 that `purge_subject`'s doc
-    /// (`mutate.rs`) sets out in full.
+    /// **`Actor::system()` here, but not always.** This method (`import`,
+    /// called directly with no actor in hand) writes `Actor::system()`, the
+    /// same placeholder `forget` and `protect` still use. The actor-attributed
+    /// case — the caller identified in `Engine::import_ndjson_as` (`lib.rs`,
+    /// Plan 3's Task 2) — reuses this same write path through `import_as`
+    /// below rather than layering a second `Imported` row on top: exactly one
+    /// row is written per import either way, naming whichever actor the
+    /// caller had.
     ///
     /// **What the record carries, and the one thing it does not.** Its scope
     /// names the destination tenant; its `items` name every item record the
@@ -158,6 +160,21 @@ impl Engine {
         &self,
         destination: &TenantId,
         stream: ImportStream,
+    ) -> Result<ImportReport, EngineError> {
+        self.import_as(destination, stream, &Actor::system()).await
+    }
+
+    /// `import`'s body, parameterised on the actor its one `Imported` row
+    /// names. `import` itself supplies `Actor::system()`; `import_ndjson_as`
+    /// (via `import_ndjson_with_actor` below) supplies the caller's own —
+    /// there is exactly one construction site for the `Imported` row
+    /// (`audit` a few lines down), so the two callers can never produce two
+    /// rows for the one import between them.
+    pub(crate) async fn import_as(
+        &self,
+        destination: &TenantId,
+        stream: ImportStream,
+        actor: &Actor,
     ) -> Result<ImportReport, EngineError> {
         let cfg = memorysafe_policy::BaselineConfig::default();
         let now = OffsetDateTime::now_utc();
@@ -233,13 +250,13 @@ impl Engine {
             namespace: Namespace::new(ADMIN_COMPONENT)
                 .expect("the reserved component is a valid namespace"),
         };
-        // `Actor::system()` and the gap it stands for: see this method's doc,
-        // and `purge_subject`'s in `mutate.rs` for the full account.
+        // `actor.clone()`: see this method's doc for who that is on each of
+        // its two call paths.
         let audit = AuditRecord::new(
             audit_scope.clone(),
             AuditEvent::Imported,
             refs,
-            Actor::system(),
+            actor.clone(),
             OffsetDateTime::now_utc(),
         );
         self.backend
@@ -283,6 +300,23 @@ impl Engine {
         ndjson: &str,
         destination: &TenantId,
     ) -> Result<ImportReport, EngineError> {
+        self.import_ndjson_with_actor(ndjson, destination, &Actor::system())
+            .await
+    }
+
+    /// `import_ndjson`'s body, parameterised on the actor `import_as` should
+    /// name. `Engine::import_ndjson_as` (`lib.rs`) is this method's other
+    /// caller, supplying the caller-identified actor instead of
+    /// `Actor::system()` — see `import_as`'s own doc for why routing through
+    /// this shared parse-then-import path, rather than calling
+    /// `import_ndjson` and separately auditing the result, is what keeps the
+    /// `Imported` row to exactly one.
+    pub(crate) async fn import_ndjson_with_actor(
+        &self,
+        ndjson: &str,
+        destination: &TenantId,
+        actor: &Actor,
+    ) -> Result<ImportReport, EngineError> {
         let mut stream: ImportStream = Vec::new();
         for (i, line) in ndjson.lines().enumerate() {
             if line.trim().is_empty() {
@@ -292,7 +326,7 @@ impl Engine {
                 .map_err(|e| EngineError::Validation(format!("line {}: {e}", i + 1)))?;
             stream.push(record);
         }
-        self.import(destination, stream).await
+        self.import_as(destination, stream, actor).await
     }
 
     /// A human-readable rendering. This is what makes "your memory is yours"

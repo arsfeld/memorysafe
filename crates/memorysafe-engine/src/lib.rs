@@ -12,6 +12,7 @@ pub mod portability;
 pub mod read;
 pub mod reembed;
 pub mod retention;
+pub mod settings;
 pub mod validate;
 pub mod write;
 
@@ -22,14 +23,20 @@ pub use mutate::ForgetSelector;
 pub use outcome::{ForgetOutcome, PurgeOutcome, WriteOutcome};
 pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 pub use retention::{AuditRetention, PurgeCascade, RetentionProfile, RetentionSpan};
+pub use settings::TenantSettings;
 pub use validate::FailureStance;
 pub use write::RememberRequest;
 
-use memorysafe_backend::{Backend, Page};
-use memorysafe_core::{AuditFilter, AuditRecord, Budget, GovernancePolicy, MemoryItem, Scope};
+use memorysafe_backend::{Backend, ImportReport, Page, ScopeSelector, WriteTransaction};
+use memorysafe_core::{
+    Action, Actor, AuditEvent, AuditFilter, AuditId, AuditRecord, Budget, Decision,
+    GovernancePolicy, MemoryItem, PolicyId, Reason, ReasonCode, Scope, TenantId, features,
+};
 use memorysafe_embed::Embedder;
-use memorysafe_policy::BaselinePolicy;
-use std::sync::Arc;
+use memorysafe_policy::{BaselineConfig, BaselinePolicy};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use time::OffsetDateTime;
 
 pub struct EngineConfig {
     pub backend: Arc<dyn Backend>,
@@ -68,16 +75,27 @@ impl EngineConfig {
     }
 }
 
+/// A tenant's policy override: the `BaselineConfig` kept alongside the built
+/// `Arc<dyn GovernancePolicy>` so `Engine::tenant_settings` can hand a
+/// snapshot back without downcasting a trait object to recover it.
+type TenantPolicyOverride = (BaselineConfig, Arc<dyn GovernancePolicy>);
+
 pub struct Engine {
     pub(crate) backend: Arc<dyn Backend>,
     pub(crate) embedder: Arc<dyn Embedder>,
-    pub(crate) policy: Arc<dyn GovernancePolicy>,
+    pub(crate) default_policy: Arc<dyn GovernancePolicy>,
     pub(crate) fallback_policy: Arc<dyn GovernancePolicy>,
     pub(crate) stance: FailureStance,
     pub(crate) neighbour_k: usize,
     pub(crate) eviction_candidates: usize,
     pub(crate) cache: cache::EngineCache,
-    pub(crate) retention: RetentionProfile,
+    pub(crate) default_retention: RetentionProfile,
+    /// Per-tenant policy overrides, keyed by tenant. A tenant with no entry
+    /// here uses `default_policy`.
+    pub(crate) policies: RwLock<HashMap<TenantId, TenantPolicyOverride>>,
+    /// Per-tenant retention overrides, keyed by tenant. A tenant with no entry
+    /// here uses `default_retention`.
+    pub(crate) retentions: RwLock<HashMap<TenantId, RetentionProfile>>,
 }
 
 impl Engine {
@@ -85,14 +103,228 @@ impl Engine {
         Self {
             backend: config.backend,
             embedder: config.embedder,
-            policy: config.policy,
+            default_policy: config.policy,
             fallback_policy: config.fallback_policy,
             stance: config.stance,
             neighbour_k: config.neighbour_k,
             eviction_candidates: config.eviction_candidates,
             cache: cache::EngineCache::new(config.cache),
-            retention: config.retention,
+            default_retention: config.retention,
+            policies: RwLock::new(HashMap::new()),
+            retentions: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The policy that governs `tenant`. Every pipeline calls this instead of
+    /// reading a field directly, so a tenant override cannot be missed on one
+    /// path.
+    pub fn policy_for(&self, tenant: &TenantId) -> Arc<dyn GovernancePolicy> {
+        self.policies
+            .read()
+            .expect("policy registry lock poisoned")
+            .get(tenant)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| self.default_policy.clone())
+    }
+
+    /// The `RetentionProfile` that governs `tenant`'s audit retention and
+    /// `purge_subject` cascade.
+    pub fn retention_for(&self, tenant: &TenantId) -> RetentionProfile {
+        self.retentions
+            .read()
+            .expect("retention registry lock poisoned")
+            .get(tenant)
+            .copied()
+            .unwrap_or(self.default_retention)
+    }
+
+    /// A snapshot of everything `tenant` has configured, falling back to the
+    /// engine's defaults for anything it has not overridden. Returned by
+    /// value so a caller never holds the registries' locks.
+    pub fn tenant_settings(&self, tenant: &TenantId) -> TenantSettings {
+        let policy_config = self
+            .policies
+            .read()
+            .expect("policy registry lock poisoned")
+            .get(tenant)
+            .map(|(c, _)| c.clone())
+            .unwrap_or_default();
+        TenantSettings {
+            policy_config,
+            retention: self.retention_for(tenant),
+        }
+    }
+
+    /// Replaces `tenant`'s policy configuration, and audits the change under
+    /// the tenant's reserved admin scope.
+    ///
+    /// Validated before anything observable happens: a refused change must
+    /// leave neither a new policy installed nor an audit row claiming one
+    /// happened. `PolicyChanged` is written once, after validation and before
+    /// the new policy is installed, so a crash between the two leaves the
+    /// audited transition ahead of the registry rather than the reverse — the
+    /// same ordering `set_budget` documents for its own two-transaction gap.
+    pub async fn set_tenant_policy_config(
+        &self,
+        tenant: &TenantId,
+        cfg: BaselineConfig,
+        actor: &Actor,
+    ) -> Result<AuditId, EngineError> {
+        settings::validate(&cfg)?;
+
+        let before = self.policy_for(tenant).id();
+        let policy: Arc<dyn GovernancePolicy> = Arc::new(BaselinePolicy::new(cfg.clone()));
+        let after = policy.id();
+
+        let audit_id = self
+            .record_admin_event(
+                tenant,
+                AuditEvent::PolicyChanged,
+                actor,
+                Reason::new(
+                    ReasonCode::PolicyInvalid,
+                    &format!("policy configuration replaced: {before} -> {after}"),
+                    features! {},
+                ),
+                after.clone(),
+            )
+            .await?;
+
+        self.policies
+            .write()
+            .expect("policy registry lock poisoned")
+            .insert(tenant.clone(), (cfg, policy));
+        Ok(audit_id)
+    }
+
+    /// Replaces `tenant`'s audit-retention profile, and audits the change
+    /// under the tenant's reserved admin scope.
+    pub async fn set_tenant_retention(
+        &self,
+        tenant: &TenantId,
+        profile: RetentionProfile,
+        actor: &Actor,
+    ) -> Result<AuditId, EngineError> {
+        let before = self.retention_for(tenant);
+        let audit_id = self
+            .record_admin_event(
+                tenant,
+                AuditEvent::PolicyChanged,
+                actor,
+                Reason::new(
+                    ReasonCode::PolicyInvalid,
+                    &format!("audit retention changed: {before:?} -> {profile:?}"),
+                    features! {},
+                ),
+                self.policy_for(tenant).id(),
+            )
+            .await?;
+
+        self.retentions
+            .write()
+            .expect("retention registry lock poisoned")
+            .insert(tenant.clone(), profile);
+        Ok(audit_id)
+    }
+
+    /// `Engine::export_ndjson` (`portability.rs`) with the export itself
+    /// audited as a governance event, naming the actor who asked for it.
+    /// `Exported` is filed under the *selector's* tenant, which is always the
+    /// caller's own — nothing here constructs a `Scope` for any other
+    /// tenant.
+    pub async fn export_ndjson_as(
+        &self,
+        sel: &ScopeSelector,
+        actor: &Actor,
+    ) -> Result<String, EngineError> {
+        let ndjson = self.export_ndjson(sel).await?;
+        self.record_admin_event(
+            &sel.tenant,
+            AuditEvent::Exported,
+            actor,
+            Reason::new(
+                ReasonCode::PolicyInvalid,
+                &format!(
+                    "exported subject={} namespace={} include_audit={}",
+                    sel.subject.as_ref().map_or("*", |s| s.as_str()),
+                    sel.namespace.as_ref().map_or("*", |n| n.as_str()),
+                    sel.include_audit
+                ),
+                features! {},
+            ),
+            self.policy_for(&sel.tenant).id(),
+        )
+        .await?;
+        Ok(ndjson)
+    }
+
+    /// `Engine::import_ndjson` (`portability.rs`) with the `Imported` row
+    /// naming `actor` rather than `Actor::system()`.
+    ///
+    /// **Not** implemented as `self.import_ndjson(...)` followed by a second,
+    /// `record_admin_event`-built `Imported` row: `import` already writes one
+    /// `Imported` row internally (see its own doc), and layering a second on
+    /// top would leave every actor-attributed import with two rows for one
+    /// event — caught by
+    /// `an_import_is_audited_with_the_actor_who_asked_for_it`
+    /// (`tests/settings.rs`), which counts exactly one. Instead this calls
+    /// straight through to `import_ndjson_with_actor`, the same parse-and-import
+    /// path `import_ndjson` itself uses, so there is exactly one `Imported`
+    /// construction site (`import_as`, `portability.rs`) no matter which
+    /// public entry point a caller used.
+    ///
+    /// `Engine::import_ndjson` takes the destination tenant explicitly (Plan
+    /// 1 Task 39); this wrapper already has the authorised one in hand, so
+    /// it passes it rather than letting the payload name its own target.
+    pub async fn import_ndjson_as(
+        &self,
+        ndjson: &str,
+        tenant: &TenantId,
+        actor: &Actor,
+    ) -> Result<ImportReport, EngineError> {
+        self.import_ndjson_with_actor(ndjson, tenant, actor).await
+    }
+
+    /// One audit row in the tenant's reserved admin scope, carrying no
+    /// items — these events are about the tenant, not about any memory.
+    ///
+    /// `Action::Reject` on an administrative decision is deliberate:
+    /// `Action` describes what happened to a *memory*, and a policy change
+    /// happens to no memory, so `Reject` is the variant that admits nothing.
+    /// A fifth `Action` variant would change a serialised wire format Plan 1
+    /// froze in audit rows, for the sake of three administrative events; the
+    /// event discriminates, the action does not. `ReasonCode` has no
+    /// administrative variant for the same reason — it too is a wire format
+    /// where renaming or adding is tracked deliberately — so
+    /// `ReasonCode::PolicyInvalid` is the closest existing code and the
+    /// `detail` string carries the actual transition.
+    async fn record_admin_event(
+        &self,
+        tenant: &TenantId,
+        event: AuditEvent,
+        actor: &Actor,
+        reason: Reason,
+        policy: PolicyId,
+    ) -> Result<AuditId, EngineError> {
+        let scope = Scope::admin(tenant);
+        let decision = Decision {
+            subject: None,
+            action: Action::Reject,
+            evictions: vec![],
+            reasons: vec![reason],
+            policy,
+        };
+        let record = AuditRecord::new(
+            scope.clone(),
+            event,
+            vec![],
+            actor.clone(),
+            OffsetDateTime::now_utc(),
+        )
+        .with_decision(decision);
+
+        let txn = WriteTransaction::new(scope, record);
+        Ok(self.backend.apply(txn).await?.audit_id)
     }
 
     /// Embeds through the content-addressed cache: the same text always

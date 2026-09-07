@@ -5,7 +5,8 @@ use crate::{Engine, gather};
 use memorysafe_backend::{ItemWrite, MergeWrite, WriteTransaction};
 use memorysafe_core::{
     Action, Actor, ActorKind, AssessContext, Assessed, AuditEvent, AuditRecord, Candidate, ItemId,
-    ItemRef, MemoryItem, Reason, ReasonCode, Scope, SensitivityLevel, Source, SourceKind, features,
+    ItemRef, MemoryItem, Reason, ReasonCode, Scope, SensitivityLevel, Source, SourceKind, TenantId,
+    features,
 };
 use memorysafe_embed::QuantizedVector;
 use serde_json::Value;
@@ -102,7 +103,7 @@ impl Engine {
         )
         .await?;
 
-        let assessment = self.run_assess(&candidate, &ctx)?;
+        let assessment = self.run_assess(&candidate, &ctx, &req.scope.tenant)?;
 
         let admit_ctx = gather::admit_context(
             self.backend.as_ref(),
@@ -116,7 +117,7 @@ impl Engine {
             candidate: &candidate,
             assessment: &assessment,
         };
-        let mut decision = self.run_admit(&assessed, &admit_ctx)?;
+        let mut decision = self.run_admit(&assessed, &admit_ctx, &req.scope.tenant)?;
         // `admit_context` (`gather.rs`) hands every eviction candidate a
         // hardcoded `value`/`fragility` placeholder, and `admit` copies both
         // — plus their product — verbatim into a `CapacityPressure`
@@ -420,8 +421,9 @@ impl Engine {
         &self,
         cand: &Candidate,
         ctx: &AssessContext,
+        tenant: &TenantId,
     ) -> Result<memorysafe_core::Assessment, EngineError> {
-        let policy = self.policy.clone();
+        let policy = self.policy_for(tenant);
         let (c, x) = (cand.clone(), ctx.clone());
         // `Arc<dyn GovernancePolicy>` is not `RefUnwindSafe` — the compiler
         // cannot see into a closed-source policy to know it holds no interior
@@ -439,8 +441,9 @@ impl Engine {
         &self,
         assessed: &Assessed,
         ctx: &memorysafe_core::AdmitContext,
+        tenant: &TenantId,
     ) -> Result<memorysafe_core::Decision, EngineError> {
-        let policy = self.policy.clone();
+        let policy = self.policy_for(tenant);
         let (c, a, x) = (
             assessed.candidate.clone(),
             assessed.assessment.clone(),
