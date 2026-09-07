@@ -201,11 +201,10 @@ impl Engine {
     /// are not — an inconsistency in the trail, not a symmetric gap.
     ///
     /// The cascade is read from `self.retention`, the engine's configured
-    /// `RetentionProfile` — not hard-coded, as an earlier draft of this method
-    /// left it (see Task 38). `Preserve` is entirely the *backend's*
-    /// behaviour, selected by this one argument: the engine reads no audit
-    /// rows and replays none, for the reasons `Backend::purge_subject`'s own
-    /// doc comment gives in full.
+    /// `RetentionProfile` — not hard-coded. `Preserve` is entirely the
+    /// *backend's* behaviour, selected by this one argument: the engine reads
+    /// no audit rows and replays none, for the reasons `Backend::purge_subject`'s
+    /// own doc comment gives in full.
     pub async fn purge_subject(
         &self,
         tenant: &TenantId,
@@ -225,10 +224,6 @@ impl Engine {
             Actor::system(),
             OffsetDateTime::now_utc(),
         );
-        // The whole of Task 38's change to this method: the cascade comes
-        // from the configured profile instead of Task 35's hard-coded
-        // `PurgeCascade::Cascade`. Everything else — building the record,
-        // choosing its namespace, mapping the report — is untouched.
         let cascade = self.retention.retention().purge_cascade;
         let report = self
             .backend

@@ -82,3 +82,55 @@ impl RetentionProfile {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Mirrors `memorysafe_core::audit::purge_cascade_serializes_as_snake_case`.
+    // That test's own comment gives the reason this one exists too:
+    // `AuditRetention` is deserialized from tenant configuration, so a variant
+    // renamed on the wire silently turns a configured `gdpr_strict` into a
+    // parse error in the one path that erases a subject. `from_name` pins the
+    // *config-key* spelling; nothing pinned the *wire* spelling until this
+    // test — the two are independent (a rename on one enum's `#[serde(...)]`
+    // attribute cannot touch the other's `match` arms), so deleting either
+    // guard leaves the other blind to it.
+    //
+    // Rejects: the plausible struct/enum written without the
+    // `#[serde(rename_all = "snake_case")]` attribute every neighbour in this
+    // module carries — it would emit `"GdprStrict"`/`"UntilSubjectPurge"`.
+    //
+    // Vacuous if: nothing, unlike the sibling test — `GdprStrict` and
+    // `UntilSubjectPurge` each mix multiple words, so `snake_case` and a
+    // hypothetical unrenamed default diverge visibly, and `Days`'s wire key
+    // (a struct-variant-like `{"days": n}`) diverges too.
+    #[test]
+    fn retention_profile_and_span_serialize_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&RetentionProfile::GdprStrict).unwrap(),
+            "\"gdpr_strict\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RetentionProfile>("\"gdpr_strict\"").unwrap(),
+            RetentionProfile::GdprStrict
+        );
+
+        assert_eq!(
+            serde_json::to_string(&RetentionSpan::UntilSubjectPurge).unwrap(),
+            "\"until_subject_purge\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RetentionSpan>("\"until_subject_purge\"").unwrap(),
+            RetentionSpan::UntilSubjectPurge
+        );
+
+        // `Days` carries a value, so it round-trips through its tagged form
+        // (`{"days":90}`) rather than a bare string; the tag itself still
+        // owes its `days` spelling to `rename_all`.
+        let days = RetentionSpan::Days(90);
+        let wire = serde_json::to_string(&days).unwrap();
+        assert_eq!(wire, "{\"days\":90}");
+        assert_eq!(serde_json::from_str::<RetentionSpan>(&wire).unwrap(), days);
+    }
+}

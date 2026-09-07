@@ -14436,7 +14436,7 @@ Add `pub mod retention;` and
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 127 tests ok (117 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: Task 37 landed 121, not 111 — see its own Step 4 note — carrying a further +10 into every later count in this plan.)
+Expected: PASS — 128 tests ok (117 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: Task 37 landed 121, not 111 — see its own Step 4 note — carrying a further +10 into every later count in this plan. Re-propagated again: Task 38's own review fix round 1 added a serde round-trip test for `RetentionSpan`/`RetentionProfile` — a third shipped mechanism the original mutation pass missed — carrying a further +1 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -14748,7 +14748,7 @@ Add `pub mod portability;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 134 tests ok (124 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan.)
+Expected: PASS — 135 tests ok (124 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -15023,7 +15023,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 139 memorysafe-engine tests (129 planned + the 9 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan.)
+Expected: PASS — the whole workspace green: 5 invariants, 140 memorysafe-engine tests (129 planned + the 9 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -15397,7 +15397,7 @@ pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine && cargo test --workspace --all-features`
-Expected: PASS — 146 engine tests ok (136 planned + the 9 propagated from Task 35's mutation-testing closures), whole workspace green. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan.)
+Expected: PASS — 147 engine tests ok (136 planned + the 9 propagated from Task 35's mutation-testing closures), whole workspace green. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
