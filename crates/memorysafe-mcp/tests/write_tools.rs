@@ -183,6 +183,94 @@ async fn recall_over_an_empty_namespace_is_an_empty_success() {
 }
 
 #[tokio::test]
+async fn the_default_sensitivity_ceiling_fails_closed() {
+    // The plan's own text specified `restricted` (which excludes nothing) as
+    // `memory_recall`'s default `sensitivity_ceiling`. The controller ruled
+    // it should be `internal` instead, to match
+    // `memorysafe_backend::query::HardFilters::default`'s own documented
+    // `// Fail closed.` comment for this exact field -- a deliberate
+    // deviation from the plan's literal text, made because
+    // `memorysafe-engine`'s `read.rs` builds `HardFilters` as a struct
+    // literal from whatever this adapter supplies, so whatever this crate
+    // defaults to is what actually runs in SQL, not `HardFilters`'s own
+    // default.
+    //
+    // Nothing else in this workspace pinned that default before this test:
+    // reverting `tools_write.rs`'s `.unwrap_or(SensitivityLevel::Internal)`
+    // back to `Restricted` failed zero other tests. This test exists so a
+    // silent revert of a security-relevant governance default does not pass
+    // review a second time.
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
+
+    // `sensitivity_hint` can only RAISE the level `BaselinePolicy` detects,
+    // never lower it (`SensitivityLevel::raised_by`), and
+    // `memorysafe-engine`'s `write.rs` applies that unconditionally,
+    // regardless of what the policy assessed ("Applied by the ENGINE, not
+    // trusted from the policy" — see that file's comment on this exact
+    // line). Passing the maximum level as the hint therefore guarantees the
+    // item's STORED sensitivity is `restricted`, deterministically,
+    // regardless of what the detectors would have assigned to this
+    // ordinary-looking body on their own — this test does not need to
+    // guess or inspect detector behaviour to know what got stored.
+    let write = client
+        .call_tool(
+            CallToolRequestParams::new("memory_remember").with_arguments(args(json!({
+                "body": "the quarterly planning notes are attached",
+                "sensitivity_hint": "restricted"
+            }))),
+        )
+        .await
+        .unwrap();
+    let write_value = structured(&write);
+    assert_eq!(
+        write_value["action"], "retain",
+        "the item was not retained, so this test cannot prove anything about recall: {write_value}"
+    );
+
+    // Step 2, the assertion that pins the default: no `sensitivity_ceiling`
+    // named, so the default (`internal`) applies, and a `restricted` item
+    // must not come back.
+    let default_ceiling = client
+        .call_tool(
+            CallToolRequestParams::new("memory_recall").with_arguments(args(json!({
+                "query": "quarterly planning notes"
+            }))),
+        )
+        .await
+        .unwrap();
+    let default_value = structured(&default_ceiling);
+    assert_eq!(
+        default_value["items"].as_array().unwrap().len(),
+        0,
+        "a restricted item was returned under the default sensitivity ceiling: {default_value}"
+    );
+
+    // Step 3 proves step 2 failed for the right reason. If the write had
+    // silently failed to persist, or the query missed the item for some
+    // unrelated reason, step 2 would also show zero items — vacuously
+    // "passing" a broken default exactly as readily as a correct one.
+    // Naming a wide ceiling explicitly must still find the same item.
+    let wide_ceiling = client
+        .call_tool(
+            CallToolRequestParams::new("memory_recall").with_arguments(args(json!({
+                "query": "quarterly planning notes",
+                "sensitivity_ceiling": "restricted"
+            }))),
+        )
+        .await
+        .unwrap();
+    let wide_value = structured(&wide_ceiling);
+    assert!(
+        !wide_value["items"].as_array().unwrap().is_empty(),
+        "the item was not found even with an explicit wide ceiling -- step 2's empty \
+         result was not actually caused by the sensitivity ceiling: {wide_value}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn occurred_at_is_reachable_through_the_recall_time_filters() {
     // `RememberParams` had no `occurred_at` field: every item written
     // through MCP got `occurred_at: None`, and `memorysafe-backend`'s
