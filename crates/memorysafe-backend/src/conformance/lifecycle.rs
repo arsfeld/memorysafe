@@ -3271,6 +3271,10 @@ mod mutation_probe {
             .await
             .expect_err("a backend that inverts the item comparison must fail this test");
         let message = panic_message(outcome.into_panic());
+        // Coupled by literal substring to the panic messages in
+        // `audit_filter_narrows_by_item` above — if those messages are
+        // reworded, update the strings below in lockstep or this probe can
+        // silently stop verifying anything, or fail for an unrelated reason.
         assert!(
             message.contains("must return item A's own admit record"),
             "expected the wrong-value mutant to fail on the presence check for \
