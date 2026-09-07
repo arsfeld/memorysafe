@@ -42,6 +42,10 @@ enum Command {
     Maintain(cmd::curate::MaintainArgs),
     /// Delete everything belonging to one subject.
     PurgeSubject(cmd::curate::PurgeArgs),
+    /// Write a portable archive of this scope.
+    Export(cmd::portable::ExportArgs),
+    /// Read a portable archive back in.
+    Import(cmd::portable::ImportArgs),
     /// Manage API keys for the HTTP and MCP-over-HTTP servers.
     Keys {
         #[command(subcommand)]
@@ -93,6 +97,8 @@ async fn run(cli: Cli, config: MsafeConfig) -> Result<()> {
         Command::PurgeSubject(args) => {
             cmd::curate::purge_subject(&engine, &scope.tenant, cli.json, args).await
         }
+        Command::Export(args) => cmd::portable::export(&engine, scope, cli.json, args).await,
+        Command::Import(args) => cmd::portable::import(&engine, scope, cli.json, args).await,
         Command::Keys { .. } => unreachable!(),
     }
 }
