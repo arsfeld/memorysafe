@@ -5,6 +5,35 @@ use time::OffsetDateTime;
 
 pub const MAX_PAGE_LIMIT: usize = 1000;
 
+/// Ceiling for an `AuditFilter::limit`-driven query, mirroring
+/// `MAX_PAGE_LIMIT` above for `Page`.
+///
+/// `AuditFilter` itself (`memorysafe-core`) carries no clamp of its own and
+/// cannot: `memorysafe-core` may not depend on this crate (see the
+/// dependency-purity constraint documented at that crate's edges), so an
+/// `AuditFilter::effective_limit()` mirroring `Page::effective_limit()` has
+/// nowhere to live. This constant exists here, one layer up, for whichever
+/// caller sits above both crates — `memorysafe-engine`'s `Engine::audit_page`
+/// — to apply.
+///
+/// **Without a ceiling somewhere, the largest `usize` a caller can send is
+/// the one that removes the limit entirely, not merely exceeds it.**
+/// `memorysafe-backend-sqlite`'s `audit::query` binds `filter.limit as i64`
+/// into the SQL `LIMIT` clause. `Engine::audit_page`'s own probe adds one to
+/// whatever `requested` it is given before handing it to the backend
+/// (`requested.saturating_add(1)`, so it can tell whether the log had more
+/// rows than the caller's page); with no ceiling, a `requested` near
+/// `i64::MAX` (reachable through an ordinary HTTP `?limit=` query parameter
+/// deserialised as `usize`) turns that `+ 1` into a value at or beyond
+/// `2^63`. Cast to `i64`, that wraps to a **negative** number — and SQLite
+/// treats a negative `LIMIT` as unbounded, not zero. So the single largest
+/// input a caller can send is the one that removes the ceiling, which is the
+/// opposite of what every other bound in this workspace does when exceeded.
+/// Clamping `requested` to this constant *before* the `saturating_add(1)`
+/// keeps the value handed to the backend always small and always positive,
+/// closing the wrap regardless of what a caller asks for.
+pub const MAX_AUDIT_LIMIT: usize = 1000;
+
 /// Filters that MUST be applied inside the backend's own query. A policy may
 /// narrow a candidate set further but may never widen it, so anything
 /// security-relevant belongs here rather than in `compose`.

@@ -422,12 +422,27 @@ impl Engine {
     /// regardless of whatever `filter.limit` happened to already hold — so a
     /// caller passes `requested` once and cannot accidentally fight it by
     /// also setting `filter.limit` to something else.
+    ///
+    /// **`requested` is clamped to `memorysafe_backend::MAX_AUDIT_LIMIT`
+    /// before anything else happens** — fix round 1, Important 3.
+    /// `AuditFilter` carries no clamp of its own (`MAX_AUDIT_LIMIT`'s own doc
+    /// says why it cannot live there), so without one here the largest
+    /// `usize` a caller can send is the one that removes the ceiling
+    /// entirely rather than merely exceeding it:
+    /// `requested.saturating_add(1)` on an unclamped `requested` near
+    /// `i64::MAX` produces a value at or beyond `2^63`, and
+    /// `memorysafe-backend-sqlite`'s `audit::query` binds that into the SQL
+    /// `LIMIT` clause with `filter.limit as i64` — which wraps a value that
+    /// large to a *negative* `i64`, and SQLite treats a negative `LIMIT` as
+    /// unbounded. Clamping first keeps the value this method ever hands the
+    /// backend small and positive, regardless of what `requested` was.
     pub async fn audit_page(
         &self,
         scope: &Scope,
         filter: &AuditFilter,
         requested: usize,
     ) -> Result<(Vec<AuditRecord>, bool), EngineError> {
+        let requested = requested.min(memorysafe_backend::MAX_AUDIT_LIMIT);
         let mut probe = filter.clone();
         probe.limit = requested.saturating_add(1);
         let mut records = self.backend.audit(scope, &probe).await?;

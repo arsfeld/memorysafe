@@ -13,13 +13,15 @@ use crate::error::ApiError;
 use crate::json::ValidatedJson;
 use crate::query::ValidatedQuery;
 use crate::scope::ScopeParams;
+use crate::text::ValidatedText;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use memorysafe_auth::check_reserved;
 use memorysafe_backend::{ImportReport, ScopeSelector};
 use memorysafe_core::{
-    ADMIN_COMPONENT, AuditEvent, AuditFilter, AuditId, AuditRecord, ItemId, Namespace, SubjectId,
+    AuditEvent, AuditFilter, AuditId, AuditRecord, ItemId, Namespace, SubjectId,
 };
 use memorysafe_engine::{MaintainCursor, MaintainReport, PurgeOutcome};
 use serde::{Deserialize, Serialize};
@@ -145,13 +147,15 @@ pub async fn export(
     auth: Auth,
     ValidatedQuery(query): ValidatedQuery<ExportQuery>,
 ) -> Result<Response, ApiError> {
-    for (name, value) in [("subject", &query.subject), ("namespace", &query.namespace)] {
-        if value.as_deref() == Some(ADMIN_COMPONENT) {
-            return Err(ApiError::Forbidden(format!(
-                "'{ADMIN_COMPONENT}' is reserved and cannot be named as a {name}"
-            )));
-        }
-    }
+    // `check_reserved`, not a hand-rolled comparison against
+    // `ADMIN_COMPONENT` alone (the brief's own inline check, and this
+    // route's original implementation): this route has no `Scope` and no
+    // `Authenticated::scope` call to route the check through — export spans
+    // an optional subject/namespace, not a single scope — which is exactly
+    // the adapter shape `check_reserved`'s own doc says it is a free
+    // function for. It also covers `PURGED_COMPONENT` (`_purged`), which the
+    // inline check it replaces did not (fix round 1, Important 2).
+    check_reserved(query.subject.as_deref(), query.namespace.as_deref())?;
     // The tenant comes from the credential alone — nothing in `ExportQuery`
     // can name one, so an export cannot reach outside the caller's own
     // tenant no matter what subject or namespace it asks for.
@@ -189,7 +193,7 @@ pub async fn export(
 pub async fn import(
     State(state): State<AppState>,
     auth: Auth,
-    ndjson: String,
+    ValidatedText(ndjson): ValidatedText,
 ) -> Result<Json<ImportReport>, ApiError> {
     Ok(Json(
         state
@@ -204,11 +208,10 @@ pub async fn purge_subject(
     auth: Auth,
     Path(subject): Path<String>,
 ) -> Result<Json<PurgeOutcome>, ApiError> {
-    if subject == ADMIN_COMPONENT {
-        return Err(ApiError::Forbidden(format!(
-            "'{ADMIN_COMPONENT}' is reserved"
-        )));
-    }
+    // Same reasoning as `export`'s `check_reserved` call above: no `Scope`
+    // exists here to route the check through `Authenticated::scope`, and the
+    // original inline check missed `_purged`.
+    check_reserved(Some(&subject), None)?;
     let subject = SubjectId::new(&subject)?;
     Ok(Json(
         state

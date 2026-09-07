@@ -154,11 +154,44 @@ async fn maintenance_reports_what_it_scanned_and_can_be_resumed() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
-    assert!(reply.body["scanned"].as_u64().is_some());
+    // Fix round 1, Important 4: `.as_u64().is_some()` is satisfied by `0`,
+    // and `reply.body.get("next_cursor").is_some()` is satisfied by `null`
+    // — a handler returning a zeroed `MaintainReport` without ever calling
+    // `Engine::maintain` passed both. Concrete values instead: three items
+    // were remembered above, so a real scan reports `scanned: 3`, and a
+    // three-item scope fits in one `MAINTAIN_BATCH` pass, so `next_cursor`
+    // is genuinely `null`, not merely present.
+    assert_eq!(reply.body["scanned"], json!(3), "{}", reply.text);
     assert_eq!(reply.body["forgotten"], json!(0));
-    // `next_cursor` is null for a scope that fits in one pass; the field must
-    // still be present so a client can loop on it without special-casing.
-    assert!(reply.body.get("next_cursor").is_some());
+    assert_eq!(
+        reply.body["next_cursor"],
+        serde_json::Value::Null,
+        "{}",
+        reply.text
+    );
+
+    // Cursor threading: nothing above ever sends a `cursor`, so
+    // `MaintainBody::cursor` reaching `Engine::maintain` was itself
+    // unexercised — a handler that always passed `None` regardless of the
+    // request body would have passed every assertion above too. An offset
+    // past every item this scope holds must scan nothing; rescanning from
+    // the start would instead report `scanned: 3` a second time.
+    let resumed = send(
+        &h.app,
+        post(
+            "/v1/maintain",
+            Some(&h.key),
+            json!({ "subject": "user-42", "namespace": "agent", "cursor": 3 }),
+        ),
+    )
+    .await;
+    assert_eq!(resumed.status, StatusCode::OK, "{}", resumed.text);
+    assert_eq!(
+        resumed.body["scanned"],
+        json!(0),
+        "an explicit cursor past every item must skip them, not rescan from the start: {}",
+        resumed.text
+    );
 }
 
 #[tokio::test]
@@ -212,6 +245,75 @@ async fn export_can_render_markdown_for_a_person_to_read() {
     assert!(reply.text.contains("the on-call rotation starts Monday"));
 }
 
+/// Fix round 1, Important 5: `ExportQuery::subject` was threaded into
+/// `ScopeSelector` with no test ever setting it — a handler that silently
+/// dropped the query parameter (`subject: None` unconditionally) would have
+/// passed every other test in this file, on the one route that can hand a
+/// caller an entire tenant's corpus at once.
+#[tokio::test]
+async fn export_narrows_to_the_requested_subject_and_excludes_others() {
+    let h = harness();
+    remember(
+        &h,
+        "alpha",
+        "alpha's private memory, narrowed exports must include this",
+    )
+    .await;
+    remember(
+        &h,
+        "bravo",
+        "bravo's private memory, a narrowed export must never include this",
+    )
+    .await;
+
+    let reply = send(&h.app, get("/v1/export?subject=alpha", Some(&h.key))).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert!(reply.text.contains("alpha's private memory"));
+    assert!(
+        !reply.text.contains("bravo's private memory"),
+        "narrowing to subject=alpha still leaked bravo's item: {}",
+        reply.text
+    );
+}
+
+/// Fix round 1, Important 5: `ExportQuery::include_audit` was threaded into
+/// `ScopeSelector` with no test ever setting it — a handler that silently
+/// hardcoded `include_audit: true` would have passed every other test in
+/// this file while handing every caller the tenant's entire audit trail,
+/// `_admin` rows included, on every export.
+#[tokio::test]
+async fn export_omits_audit_records_unless_include_audit_is_requested() {
+    let h = harness();
+    remember(
+        &h,
+        "user-42",
+        "a memory whose own audit trail must not leak by default",
+    )
+    .await;
+
+    let default_export = send(&h.app, get("/v1/export", Some(&h.key))).await;
+    assert_eq!(
+        default_export.status,
+        StatusCode::OK,
+        "{}",
+        default_export.text
+    );
+    assert!(
+        !default_export.text.contains("\"record\":\"audit\""),
+        "a default export (include_audit unset) carried audit records: {}",
+        default_export.text
+    );
+
+    let with_audit = send(&h.app, get("/v1/export?include_audit=true", Some(&h.key))).await;
+    assert_eq!(with_audit.status, StatusCode::OK, "{}", with_audit.text);
+    assert!(
+        with_audit.text.contains("\"record\":\"audit\""),
+        "include_audit=true must actually include audit records, or the two exports \
+         are indistinguishable: {}",
+        with_audit.text
+    );
+}
+
 #[tokio::test]
 async fn an_export_round_trips_through_import() {
     let source = harness();
@@ -246,6 +348,35 @@ async fn an_export_round_trips_through_import() {
     assert_eq!(listed.body["items"].as_array().unwrap().len(), 2);
 }
 
+/// Fix round 1, Important 1: `import`'s bare `String` extractor (before this
+/// fix) rendered an over-the-limit body as axum's own plain-text 413
+/// (`StringRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError)`)
+/// rather than the `Problem` JSON envelope every other failure on this API
+/// returns — and this is not a theoretical edge case: `import`'s own doc
+/// deliberately leaves the 2 MB default body limit undisturbed ("An archive
+/// larger than that is a CLI job, not an HTTP request"), so this is the one
+/// failure mode the route is explicitly designed to produce. Through the
+/// real router this time, not just `ValidatedText`'s own unit test, so this
+/// also proves the route is actually wired to the wrapper.
+#[tokio::test]
+async fn an_oversized_import_is_a_json_problem_not_a_plain_text_413() {
+    let h = harness();
+    // One byte over axum's hardcoded 2 MB default extractor limit.
+    let oversized = vec![b'x'; 2_097_152 + 1];
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/import")
+        .header("authorization", format!("Bearer {}", h.key))
+        .header("content-type", "application/x-ndjson")
+        .body(axum::body::Body::from(oversized))
+        .unwrap();
+    let reply = send(&h.app, request).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text);
+    assert_eq!(reply.body["error"], "validation", "{}", reply.text);
+    assert!(reply.body["message"].is_string());
+}
+
 #[tokio::test]
 async fn purging_a_subject_removes_only_that_subject() {
     let h = harness();
@@ -275,6 +406,45 @@ async fn the_reserved_subject_cannot_be_purged() {
     let h = harness();
     let reply = send(&h.app, delete("/v1/subjects/_admin", Some(&h.key))).await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
+}
+
+/// Fix round 1, Important 2: the brief's own hand-rolled check compared only
+/// against `ADMIN_COMPONENT`, missing `PURGED_COMPONENT` (`_purged`) —
+/// `memorysafe_auth::check_reserved` covers both, and its own doc says it
+/// exists as a free function precisely for adapter paths with no
+/// `Authenticated::scope` to route through, which `export` and
+/// `purge_subject` both are.
+#[tokio::test]
+async fn the_purged_reserved_word_cannot_be_named_as_an_export_subject_or_namespace() {
+    let h = harness();
+    let by_subject = send(&h.app, get("/v1/export?subject=_purged", Some(&h.key))).await;
+    assert_eq!(
+        by_subject.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        by_subject.text
+    );
+
+    let by_namespace = send(
+        &h.app,
+        get("/v1/export?subject=user-42&namespace=_purged", Some(&h.key)),
+    )
+    .await;
+    assert_eq!(
+        by_namespace.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        by_namespace.text
+    );
+}
+
+/// Fix round 1, Important 2: the `_purged` half of the same gap, on the
+/// purge route itself.
+#[tokio::test]
+async fn the_purged_reserved_word_cannot_be_purged_either() {
+    let h = harness();
+    let reply = send(&h.app, delete("/v1/subjects/_purged", Some(&h.key))).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text);
 }
 
 /// The `SubjectPurged` row must name the caller who ordered the erasure, not

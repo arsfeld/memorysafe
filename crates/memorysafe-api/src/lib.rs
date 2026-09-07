@@ -11,11 +11,13 @@ pub mod memories;
 pub mod ops;
 pub mod query;
 pub mod scope;
+pub mod text;
 
 pub use error::{ApiError, Problem};
 pub use json::ValidatedJson;
 pub use query::ValidatedQuery;
 pub use scope::ScopeParams;
+pub use text::ValidatedText;
 
 use crate::auth::Auth;
 use axum::Json;
