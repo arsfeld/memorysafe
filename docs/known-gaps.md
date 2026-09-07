@@ -150,7 +150,19 @@ for the pattern you most recently removed, before committing a fix for anything 
   so the `SQLITE_BUSY_SNAPSHOT` exposure is closed on that path — **by ordering, which no
   test pins**. `TransactionBehavior::Immediate` would make it structural.
 - **The `vectors` table stores scope twice.** `subject`/`namespace` are duplicated from
-  `items` with exactly one reader, `scope_embedder`; `search` filters through the `items`
-  join and never reads them. Schema owner's call; the join cost is unmeasured.
+  `items`, and they now have **three** readers, not the one this entry used to claim:
+  `vectors::scope_embedder` (`SELECT embedder, dim FROM vectors WHERE subject=?1 AND
+  namespace=?2`), the newly-scoped `vectors::delete` (`item_id AND subject AND namespace`),
+  and `purge::subject`'s `DELETE FROM vectors WHERE subject = ?1`. `vectors::search` is
+  still not among them — it filters through the `items` join and never reads these columns,
+  which is why no recall leak or sensitivity-ceiling consequence follows from a divergent
+  row. Nothing in the schema ties either column to the referenced item's scope
+  (`vectors.item_id` has a foreign key; `subject`/`namespace` are plain `TEXT NOT NULL`),
+  and `vectors::insert`'s `ON CONFLICT(item_id) DO UPDATE SET` list omits both, so a
+  divergence cannot self-heal. Every call site passes the item's own scope, so the property
+  holds today **by convention, not by construction**; it is now pinned by
+  `tests::every_vector_rows_scope_columns_agree_with_the_item_it_references` in
+  `memorysafe-backend-sqlite`, whose doc comment carries the full consequence list. Schema
+  owner's call; the join cost is unmeasured.
 - **`Protection::Protected { until }` is constructed nowhere in the suite**, so the
   `protected_until` column is written by no conformance test.
