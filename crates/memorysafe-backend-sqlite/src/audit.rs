@@ -591,4 +591,150 @@ mod tests {
             ids[3],
         );
     }
+
+    /// Clause 2 of `filter.item`'s contract — "ANDs with `events`/`since`/
+    /// `until`/`after`" — had zero coverage before this test: every other
+    /// test in this module sets `item` alone against
+    /// `AuditFilter::default()`, or sets `events`/`since`/`until`/`after`
+    /// without `item`. A predicate that silently stops applying itself
+    /// whenever *any one* of the other fields is also set — e.g. `filter
+    /// .item.as_ref().filter(|_| filter.events.is_empty())`, or the same
+    /// gated on `after`, or on `since`/`until` both being unset — compiles
+    /// and leaves every other test in this file green, because none of them
+    /// combine `item` with a second active predicate.
+    ///
+    /// **Decorrelated deliberately**, to avoid a trap a naive version of
+    /// this test falls into: if item A only ever appeared on rows that also
+    /// satisfy `events`, dropping the item predicate under an
+    /// `events`-gated mutant would still coincidentally return the right
+    /// set, because `events` alone already happens to pick out exactly the
+    /// item-A rows. So: item A appears on both an `events`-matching row
+    /// (`id0`) and a non-matching one (`id2`); item B appears on both an
+    /// `events`-matching row (`id1`) and a non-matching one (`id4`). `id1`
+    /// — item B, event `Admitted`, timestamped inside the `since`/`until`
+    /// window, and older than the `after` cursor — is the trap row: it
+    /// satisfies every predicate in this filter *except* `item`, so it is
+    /// exactly what leaks back in the moment any one of
+    /// `events`/`since`/`until`/`after` silently disables the item
+    /// predicate, regardless of which one does it.
+    #[test]
+    fn filter_item_ands_with_events_since_until_and_after_without_being_bypassed() {
+        let conn = db();
+        let s = scope("s", "n");
+        let item_a = item(&s, "a body");
+        let item_b = item(&s, "b body");
+
+        let ids = [
+            "01ARZ3NDEKTSV4RRFFQ69G5FC0", // id0
+            "01ARZ3NDEKTSV4RRFFQ69G5FC1", // id1 -- the trap row
+            "01ARZ3NDEKTSV4RRFFQ69G5FC2", // id2
+            "01ARZ3NDEKTSV4RRFFQ69G5FC3", // id3 -- the `after` cursor value
+            "01ARZ3NDEKTSV4RRFFQ69G5FC4", // id4
+            "01ARZ3NDEKTSV4RRFFQ69G5FC5", // id5
+        ];
+        let items_for_rows = [
+            &item_a, // id0: item A, matches events, inside window, before cursor
+            &item_b, // id1: item B, matches events, inside window, before cursor -- the trap
+            &item_a, // id2: item A, but wrong event
+            &item_a, // id3: item A, matches events and window, but IS the cursor (excluded)
+            &item_b, // id4: item B, wrong event, outside window, past cursor
+            &item_b, // id5: item B, matches events, but outside window and past cursor
+        ];
+        let events_for_rows = [
+            AuditEvent::Admitted,
+            AuditEvent::Admitted,
+            AuditEvent::Forgotten,
+            AuditEvent::Admitted,
+            AuditEvent::Forgotten,
+            AuditEvent::Admitted,
+        ];
+        let ats = [100, 150, 200, 220, 400, 450];
+
+        for i in 0..ids.len() {
+            let mut rec = record(&s, events_for_rows[i], ats[i]);
+            rec.id = AuditId::parse(ids[i]).unwrap();
+            rec.items = vec![ItemRef::from_item(items_for_rows[i])];
+            insert(&conn, &rec).unwrap();
+        }
+
+        let got: Vec<String> = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(item_a.id.clone()),
+                events: vec![AuditEvent::Admitted],
+                since: Some(OffsetDateTime::from_unix_timestamp(50).unwrap()),
+                until: Some(OffsetDateTime::from_unix_timestamp(250).unwrap()),
+                after: Some(AuditId::parse(ids[3]).unwrap()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id.as_str().to_string())
+        .collect();
+
+        assert_eq!(
+            got,
+            vec![ids[0].to_string()],
+            "item must keep narrowing the result even with events/since/ \
+             until/after all set too -- id1 (item B) matches every other \
+             predicate in this filter and must never appear; got {got:?}"
+        );
+    }
+
+    /// Regression guard against the `LIKE '%...%'` shape the brief
+    /// explicitly warned off: a raw substring match over the `items` column
+    /// can match the wrong *field*, not just the right field at the wrong
+    /// position. This row is inserted directly (bypassing `insert`, which
+    /// can only ever produce a `digest` from a real `ItemRef::from_item`) so
+    /// its `digest` field can be crafted to literally contain a different
+    /// id's string as a substring, while its own `id` field does not equal
+    /// that id. A `LIKE`-based predicate over the raw column text would
+    /// match this row when queried by the *contained* id; `json_extract`
+    /// reaching only `$.id` must not.
+    #[test]
+    fn filter_item_does_not_match_an_id_that_only_appears_inside_a_digest() {
+        let conn = db();
+        let s = scope("s", "n");
+
+        let needle = "01ARZ3NDEKTSV4RRFFQ69G5FD0"; // never any row's own `id` field below
+        let planted_digest = format!("aa{needle}bb"); // contains `needle` as a raw substring
+        let items_json =
+            format!(r#"[{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FD1","digest":"{planted_digest}"}}]"#);
+
+        conn.execute(
+            "INSERT INTO audit (id, at, subject, namespace, event, items, assessment, decision,
+                 actor, policy)
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,?7,NULL)",
+            params![
+                "01ARZ3NDEKTSV4RRFFQ69G5FD2",
+                1_700_000_000_i64,
+                s.subject.as_str(),
+                s.namespace.as_str(),
+                AuditEvent::Admitted.as_str(),
+                items_json,
+                serde_json::to_string(&Actor::system()).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let got = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(ItemId::parse(needle).unwrap()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            got.is_empty(),
+            "the requested id appears only inside another item's digest, \
+             never as any item's own `id` field -- a LIKE-based substring \
+             match over the raw `items` column would incorrectly match this \
+             row; json_extract must not. got {got:?}"
+        );
+    }
 }
