@@ -14,7 +14,21 @@ tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "macros", "sy
 async-trait = "0.1.92"
 thiserror.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `float_roundtrip`: serde_json's DEFAULT float parser is a fast, non-exact
+# `significand as f64` times/divided-by an approximate `POW10` lookup (see
+# serde_json's `de.rs::f64_from_parts`), not a correctly-rounded algorithm.
+# For most decimals it agrees with a correctly-rounded parse, but not always
+# -- e.g. `0.98_f32 as f64` (bits `3fef5c2900000000`) serialises to the
+# exact, correctly shortest-round-tripping string "0.9800000190734863", and
+# the default parser reads that string back as bits `3fef5c2900000001`, one
+# ULP off. This is exactly the shape `audit`'s `decision` column stores
+# (every `Reason.evidence` value that started life as an `f32` policy
+# threshold widened `as f64` by the `features!` macro), so `audit::query`'s
+# `serde_json::from_str::<Decision>` silently moved a bit on every such
+# read. `float_roundtrip` switches deserialization to `lexical`'s exact
+# algorithm, matching `f64::from_str`. See `audit::tests::
+# evidence_shaped_by_f32_widening_survives_the_audit_round_trip_exactly`.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 time.workspace = true
 base64.workspace = true
 lru = "0.16"

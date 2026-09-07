@@ -88,7 +88,7 @@ impl SqliteBackend {
     ///   through the same `items` join `search` does, so it would silently
     ///   *drop* an orphan on export/import rather than failing on it.
     ///
-    /// `PurgeReport::vectors_removed` is this codebase's only other
+    /// `PurgeReport::vectors_removed` is this codebase's only other public
     /// vector-count surface, and it is purge-specific, not a general
     /// observer. This is called directly by D1's eviction tests
     /// (`tests::eviction_out_of_scope_does_not_widow_another_scopes_item`,

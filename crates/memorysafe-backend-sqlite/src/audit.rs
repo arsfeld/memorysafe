@@ -9,6 +9,15 @@
 //! **Every insert here is one half of a pair.** The other half is
 //! `aggregates::increment`, in the same transaction. The rule is stated once,
 //! on `memorysafe_backend::aggregates`, and binds every audit-writing path.
+//!
+//! **`decision`'s `f64` evidence round-trips bit-for-bit.** `insert` stores
+//! `record.decision` as `serde_json::to_string`, and `query` reads it back
+//! with `serde_json::from_str`; both go through this crate's `serde_json`
+//! dependency, which enables the `float_roundtrip` Cargo feature (see this
+//! crate's `Cargo.toml`) precisely because its absence loses 1 ULP on the
+//! bit patterns `f32`-widened evidence produces -- e.g. `0.98_f32 as f64`,
+//! the shape of `NearDuplicate`'s `threshold` evidence. Proven and pinned by
+//! `audit::tests::evidence_shaped_by_f32_widening_survives_the_audit_round_trip_exactly`.
 
 use crate::tenant::SqlResultExt;
 use memorysafe_backend::BackendError;
@@ -735,6 +744,50 @@ mod tests {
              never as any item's own `id` field -- a LIKE-based substring \
              match over the raw `items` column would incorrectly match this \
              row; json_extract must not. got {got:?}"
+        );
+    }
+
+    /// D3 reproduction. `Reason.evidence` values shaped by this codebase's
+    /// actual `f32 -> f64` widening -- every `PolicyConfig` threshold is
+    /// `f32`, and `features!` casts it `as f64` (see
+    /// `memorysafe_policy::admit::decide`'s `NearDuplicate` reason, whose
+    /// `threshold` evidence is `cfg.duplicate_threshold` widened from its
+    /// `f32` default `0.98`) -- do NOT survive this table's `decision`
+    /// column round trip bit-for-bit. A plain decimal literal such as
+    /// `0.1_f64` does NOT reproduce this; only bit patterns that arise from
+    /// widening an `f32` do, because the loss lives in `serde_json`'s
+    /// DEFAULT (non-`float_roundtrip`) float parser -- see `insert`'s and
+    /// `query`'s doc comment for the mechanism -- not in anything this
+    /// crate or `memorysafe-core` does with the bytes.
+    #[test]
+    fn evidence_shaped_by_f32_widening_survives_the_audit_round_trip_exactly() {
+        let conn = db();
+        let s = scope("s", "n");
+        // The exact shape of `NearDuplicate`'s `threshold` evidence:
+        // `BaselineConfig::duplicate_threshold` is `f32` and defaults to
+        // `0.98`; `features!` widens it `as f64`.
+        let widened = 0.98_f32 as f64;
+        let mut evidence = memorysafe_core::FeatureMap::new();
+        evidence.insert("threshold".to_string(), widened);
+
+        let mut rec = record(&s, AuditEvent::Rejected, 1);
+        rec.decision = Some(Decision::reject(
+            PolicyId::new("baseline", "0.1.0"),
+            Reason::new(ReasonCode::NearDuplicate, "near duplicate", evidence),
+        ));
+
+        insert(&conn, &rec).unwrap();
+        let back = query(&conn, &s, &AuditFilter::default()).unwrap();
+        let stored = back[0].decision.as_ref().unwrap().reasons[0].evidence["threshold"];
+
+        assert_eq!(
+            stored.to_bits(),
+            widened.to_bits(),
+            "the audit round trip moved a bit: wrote {:016x} ({}), read back {:016x} ({})",
+            widened.to_bits(),
+            widened,
+            stored.to_bits(),
+            stored,
         );
     }
 }
