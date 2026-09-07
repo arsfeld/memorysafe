@@ -2,6 +2,7 @@ use crate::AuthError;
 use base64::Engine as _;
 use memorysafe_core::TenantId;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Presented form: `msk_<26-char ULID id>_<base64url secret>`.
 pub const KEY_PREFIX: &str = "msk";
@@ -20,10 +21,25 @@ pub struct ApiKeyRecord {
 }
 
 /// The only moment the secret exists. Returned once, then unrecoverable.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GeneratedKey {
     pub secret: String,
     pub record: ApiKeyRecord,
+}
+
+/// Hand-written rather than derived: a derived `Debug` renders `secret` in
+/// full, and this type is what `msafe keys create` and the HTTP admin route
+/// hold. One `tracing::debug!("{key:?}")` at either call site would put a
+/// live API key in a log, against the Global Constraint that secrets are
+/// never logged. The secret is still reachable as `.secret` — deliberately,
+/// because it must be shown exactly once, at creation.
+impl fmt::Debug for GeneratedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GeneratedKey")
+            .field("secret", &"<redacted>")
+            .field("record", &self.record)
+            .finish()
+    }
 }
 
 pub fn generate(tenant: TenantId, label: &str) -> Result<GeneratedKey, AuthError> {
@@ -186,5 +202,38 @@ mod tests {
                 "{bad} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn the_debug_rendering_of_a_generated_key_does_not_leak_the_secret() {
+        let generated = generate(TenantId::new("acme").unwrap(), "laptop").unwrap();
+        let rendered = format!("{generated:?}");
+
+        assert!(
+            !rendered.contains(&generated.secret),
+            "Debug rendered the whole secret: {rendered}"
+        );
+        // The random body alone, without the `msk_<id>_` prefix, must not appear
+        // either -- a partial leak is still a leak.
+        let body = generated.secret.rsplit('_').next().unwrap();
+        assert!(
+            !rendered.contains(body),
+            "Debug rendered the secret's random body: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug did not mark the secret as redacted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_debug_rendering_of_a_generated_key_still_shows_the_record() {
+        let generated = generate(TenantId::new("acme").unwrap(), "laptop").unwrap();
+        let rendered = format!("{generated:?}");
+
+        // Redaction must not cost the diagnostics the type exists to give.
+        assert!(rendered.contains(&generated.record.id), "{rendered}");
+        assert!(rendered.contains("laptop"), "{rendered}");
+        assert!(rendered.contains("acme"), "{rendered}");
     }
 }
