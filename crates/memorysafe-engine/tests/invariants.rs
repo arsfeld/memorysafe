@@ -106,6 +106,45 @@ proptest! {
     }
 
     /// Invariant 3: nothing above the caller's ceiling is ever returned.
+    ///
+    /// **The `Public` arm is one-sided, and the `is_empty` assertion below is
+    /// a tripwire on that, not a leak detector.** `BaselinePolicy` cannot
+    /// classify anything `Public` — for *any* input, not just the bodies
+    /// generated here. `sensitivity::assess` opens with `let mut detected =
+    /// SensitivityLevel::Internal` and every subsequent write to it is a
+    /// `.max(..)`, so the value only ever rises; the closing
+    /// `detected.raised_by(cand.sensitivity_hint)` is itself a `max`, and
+    /// `write.rs` applies `raised_by` a second time. Nothing in that chain
+    /// can lower a level, so the floor is `Internal` by construction.
+    /// `sensitivity::tests::ordinary_text_is_internal` pins the floor itself.
+    ///
+    /// So when `ceiling` is drawn as `0`, a correct recall returns nothing and
+    /// the per-item loop below executes zero times. That arm therefore
+    /// produces no *positive* evidence — it never shows an item being
+    /// returned and correctly admitted — and no assertion can give it any,
+    /// because an item at or below a `Public` ceiling cannot exist to be
+    /// returned. That is a true statement about the domain, not a gap to
+    /// close.
+    ///
+    /// What it is **not** is unfalsifiable. A leak at ceiling `0` already
+    /// fails through the loop: any item that comes back is at least
+    /// `Internal`, and `Internal <= Public` is false. Verified rather than
+    /// assumed — an isolating mutation that widens the ceiling *only* when
+    /// the request asks for `Public`
+    /// (`req.sensitivity_ceiling.max(SensitivityLevel::Internal)` in
+    /// `read.rs`) is killed by this property as it stands, three runs out of
+    /// three, reporting `"Internal leaked past a Public ceiling in
+    /// WorkingSet mode"`.
+    ///
+    /// The `is_empty` assertion earns its place for a different reason: it
+    /// pins the structural claim above. If `BaselinePolicy` ever starts
+    /// emitting `Public` — a new detector arm, a configurable floor — the
+    /// loop would quietly begin passing non-vacuously and nobody would learn
+    /// that this arm's premise had changed. The assertion goes red instead.
+    /// **That failure is the signal to replace this special case with the
+    /// general assertion**, not to delete it: once `Public` items can exist,
+    /// the arm should assert what every other ceiling asserts, and the loop
+    /// below already says it.
     #[test]
     fn the_sensitivity_ceiling_is_never_violated(bodies in bodies(), ceiling in 0i64..5) {
         runtime().block_on(async {
@@ -139,6 +178,22 @@ proptest! {
                         s.item.sensitivity <= level,
                         "{:?} leaked past a {:?} ceiling in {:?} mode",
                         s.item.sensitivity, level, mode
+                    );
+                }
+
+                // The tripwire on the `Public` arm's premise; see this test's
+                // doc comment for why it is not a second leak check. A
+                // failure here means `BaselinePolicy` has started emitting
+                // `Public`, and the fix is to delete this branch so the arm
+                // asserts what the loop above already asserts for every
+                // other ceiling.
+                if level == SensitivityLevel::Public {
+                    prop_assert!(
+                        ws.items.is_empty(),
+                        "a Public ceiling returned {} items in {:?} mode; \
+                         BaselinePolicy's detected level is floored at Internal \
+                         and only ever raised, so nothing should satisfy it",
+                        ws.items.len(), mode
                     );
                 }
             }
