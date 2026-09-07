@@ -39,7 +39,9 @@ async fn seed(e: &Engine) {
         "the deploy key rotates every ninety days",
         "the on-call rotation starts Monday morning",
     ] {
-        e.remember(RememberRequest::new(scope(), body)).await.unwrap();
+        e.remember(RememberRequest::new(scope(), body))
+            .await
+            .unwrap();
     }
 }
 
@@ -69,7 +71,10 @@ async fn every_ndjson_line_is_a_standalone_json_object() {
     let ndjson = e.export_ndjson(&selector(false)).await.unwrap();
     for line in ndjson.lines() {
         let value: serde_json::Value = serde_json::from_str(line).expect("each line parses");
-        assert!(value.get("record").is_some(), "each line names its record type");
+        assert!(
+            value.get("record").is_some(),
+            "each line names its record type"
+        );
     }
 }
 
@@ -81,7 +86,10 @@ async fn the_markdown_view_is_readable_and_contains_the_bodies() {
 
     assert!(md.contains("# MemorySafe export"));
     assert!(md.contains("the production migration runs on Sundays"));
-    assert!(md.contains("acme / user-42 / agent"), "scope must be identifiable");
+    assert!(
+        md.contains("acme / user-42 / agent"),
+        "scope must be identifiable"
+    );
 }
 
 #[tokio::test]
@@ -96,7 +104,14 @@ async fn importing_the_same_stream_twice_changes_nothing_the_second_time() {
 
     assert_eq!(second.items_imported, 0);
     assert_eq!(second.items_skipped_existing, 3);
-    assert_eq!(target.review(&scope(), &Default::default()).await.unwrap().len(), 3);
+    assert_eq!(
+        target
+            .review(&scope(), &Default::default())
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -182,9 +197,9 @@ async fn a_forged_far_future_protection_window_is_clamped_to_the_configured_boun
                  configured bound: {until}"
             );
         }
-        other => panic!(
-            "a claimed Protected window must stay Protected (just clamped), got {other:?}"
-        ),
+        other => {
+            panic!("a claimed Protected window must stay Protected (just clamped), got {other:?}")
+        }
     }
 }
 
@@ -335,8 +350,14 @@ async fn an_import_cannot_use_fresh_detection_to_downgrade_an_already_high_class
 #[tokio::test]
 async fn malformed_ndjson_is_rejected_with_a_useful_error() {
     let e = engine();
-    let err = e.import_ndjson("{not json at all", &tenant()).await.unwrap_err();
-    assert!(err.to_string().contains("line 1"), "the error must name the bad line: {err}");
+    let err = e
+        .import_ndjson("{not json at all", &tenant())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("line 1"),
+        "the error must name the bad line: {err}"
+    );
 }
 
 #[tokio::test]
@@ -353,8 +374,7 @@ async fn the_named_bad_line_is_the_ndjson_lines_own_position_not_serde_jsons_int
     let e = engine();
     let ndjson = format!(
         "{}\n{}\n",
-        r#"{"record":"header","format_version":1,"exported_at":0}"#,
-        "{not json at all"
+        r#"{"record":"header","format_version":1,"exported_at":0}"#, "{not json at all"
     );
     let err = e.import_ndjson(&ndjson, &tenant()).await.unwrap_err();
     assert!(

@@ -1,8 +1,6 @@
 use crate::Engine;
 use crate::error::EngineError;
-use memorysafe_backend::{
-    ExportRecord, ExportStream, ImportReport, ImportStream, ScopeSelector,
-};
+use memorysafe_backend::{ExportRecord, ExportStream, ImportReport, ImportStream, ScopeSelector};
 use memorysafe_core::{Protection, TenantId};
 use time::{Duration, OffsetDateTime};
 
@@ -181,9 +179,8 @@ impl Engine {
             if line.trim().is_empty() {
                 continue;
             }
-            let record: ExportRecord = serde_json::from_str(line).map_err(|e| {
-                EngineError::Validation(format!("line {}: {e}", i + 1))
-            })?;
+            let record: ExportRecord = serde_json::from_str(line)
+                .map_err(|e| EngineError::Validation(format!("line {}: {e}", i + 1)))?;
             stream.push(record);
         }
         self.import(destination, stream).await
@@ -241,10 +238,7 @@ impl Engine {
                     .collect();
                 out.push_str(&format!("- **tags:** {}\n", tags.join(", ")));
             }
-            out.push_str(&format!(
-                "\n{}\n\n",
-                escape_markdown_structure(&item.body)
-            ));
+            out.push_str(&format!("\n{}\n\n", escape_markdown_structure(&item.body)));
         }
 
         Ok(out)
