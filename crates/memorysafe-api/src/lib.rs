@@ -8,6 +8,7 @@ pub mod auth;
 pub mod error;
 pub mod json;
 pub mod memories;
+pub mod ops;
 pub mod query;
 pub mod scope;
 
@@ -47,6 +48,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/memories/{id}/protect", post(memories::protect))
         .route("/v1/forget", post(memories::forget))
+        .route("/v1/audit", get(ops::audit))
+        .route("/v1/maintain", post(ops::maintain))
+        .route("/v1/export", get(ops::export))
+        .route("/v1/import", post(ops::import))
+        .route(
+            "/v1/subjects/{id}",
+            axum::routing::delete(ops::purge_subject),
+        )
         // ADD EVERY NEW `.route(...)` ABOVE THIS LINE, NEVER BELOW IT.
         //
         // `Router::fallback` only covers an unmatched *path*. A matched path

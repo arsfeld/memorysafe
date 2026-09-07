@@ -106,10 +106,29 @@ async fn recall_in_search_mode_is_still_scoped_and_audited() {
     payload["mode"] = json!("search");
     payload["query"] = json!("memory");
     let reply = send(&h.app, post("/v1/recall", Some(&h.key), payload)).await;
-    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
     assert!(
         reply.body["audit_id"].is_string(),
         "search mode skipped the audit"
+    );
+    // `200` + an `audit_id` + correct namespace scoping are all produced by
+    // composition for either `RecallMode`, so none of them alone would catch
+    // `mode` silently failing to thread from the request into
+    // `RecallRequest` (a handler that always used the `WorkingSet` default
+    // would still pass every assertion above). `Search` mode's own selection
+    // reason carries fixed text found nowhere else in `memorysafe-policy`'s
+    // `compose` — `WorkingSet` mode instead picks via replay-due or
+    // MMR-fill reasons, each with their own, different detail text — so this
+    // is a real, observable difference through the HTTP surface, not an
+    // invented one.
+    let items = reply.body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{}", reply.text);
+    assert_eq!(
+        items[0]["reason"]["detail"], "ranked by relevance in search mode",
+        "the selection reason's text is `Search` mode's alone (see \
+         `memorysafe_policy::compose`); its absence means `mode` did not \
+         reach `RecallRequest`: {}",
+        reply.text
     );
 
     let mut elsewhere = json!({ "subject": "user-42", "namespace": "other" });

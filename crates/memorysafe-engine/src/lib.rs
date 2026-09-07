@@ -403,6 +403,39 @@ impl Engine {
         Ok(self.backend.audit(scope, filter).await?)
     }
 
+    /// One page of the audit log, with truncation detected rather than left
+    /// for the caller to infer.
+    ///
+    /// `Backend::audit` returns exactly `min(filter.limit, rows remaining)`,
+    /// so `returned.len() < filter.limit` is *technically* enough to tell
+    /// whether the log is exhausted — but an HTTP or CLI caller should not
+    /// have to reconstruct that from a length, and every adapter that wants
+    /// an explicit `truncated` flag would otherwise reimplement the same
+    /// "ask for one more row than you want" trick with its own local
+    /// variables. Doing it once, here, means deciding whether a page was
+    /// truncated is engine business, not something copy-pasted (with
+    /// variables renamed) into both the HTTP route and the CLI command that
+    /// mirrors it.
+    ///
+    /// `filter.limit` is ignored on input — `requested` is what governs the
+    /// page size, and this asks the backend for `requested.saturating_add(1)`
+    /// regardless of whatever `filter.limit` happened to already hold — so a
+    /// caller passes `requested` once and cannot accidentally fight it by
+    /// also setting `filter.limit` to something else.
+    pub async fn audit_page(
+        &self,
+        scope: &Scope,
+        filter: &AuditFilter,
+        requested: usize,
+    ) -> Result<(Vec<AuditRecord>, bool), EngineError> {
+        let mut probe = filter.clone();
+        probe.limit = requested.saturating_add(1);
+        let mut records = self.backend.audit(scope, &probe).await?;
+        let truncated = records.len() > requested;
+        records.truncate(requested);
+        Ok((records, truncated))
+    }
+
     /// Sets a namespace's capacity ceiling, and **audits the change**.
     ///
     /// A budget is governance state, not a tuning knob: `maintain` reclaims a
