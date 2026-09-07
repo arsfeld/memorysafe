@@ -197,6 +197,32 @@ it a requirement for every future backend.
    identifier anywhere in the suite. Inclusivity now documented; untested.
 4. **`retrieve_candidates`' relevance tie-break** and **`neighbours`' access statistics** —
    both covered crate-locally only.
+5. **`WriteTransaction::is_valid`'s conditions are a contract surface reachable from outside
+   this crate.** Inspected: `is_valid` (`crates/memorysafe-backend/src/write.rs`) rejects a
+   transaction three ways — upsert and merge set together; an upserted item whose `scope`
+   disagrees with the transaction's; the audit's `scope` disagreeing with the transaction's.
+   `conformance/atomicity.rs`'s `an_invalid_transaction_is_rejected_and_writes_nothing` binds
+   every backend: *"A transaction `WriteTransaction::is_valid` rejects must be rejected by the
+   backend too, and must leave the corpus exactly as it was."* Its own doc comment explains why
+   it drives only one of the three through `Backend::apply` — upsert-and-merge, chosen because
+   it is unambiguous, where either scope-disagreement case would weaken "nothing was written"
+   into a search across two scopes — so the other two are exercised only by this crate's own
+   unit tests, which call `is_valid()` directly and never go through the trait. **Not zero, as
+   claimed once already: one of three has a conformance case.**
+
+   The gap: a change that tightens `is_valid` widens what every backend, including ones not yet
+   written, must refuse — and the diff doing it need not touch `conformance/` at all, so nothing
+   routes it to this crate's owner for review.
+
+   > The tell is not which files a diff touches; it is whether the change alters what a
+   > conformant backend must do.
+
+   Caught by accident: another lane routed a proposed fourth condition here on instinct, not
+   because anything flagged it — one lane's instinct is not a mechanism, and a gap entry that
+   omits how it was found invites the next reader to assume a process existed. (What it was
+   investigating, and the near-miss along the way, is recorded under "A grep-shaped read of a
+   document," below.) A fourth condition is in progress, unmerged, on another branch; it adds no
+   symbol this tree has, so it is not named here.
 
 ## From the freeze review — six the frozen suite cannot see
 
@@ -540,6 +566,70 @@ three times in one day. And "Surviving mutants" above's "Masked by a working fir
 enabled — is the same class with its remedy already applied by hand to one case: disable
 `passes` before mutation-testing `filter_sql` *is* "show the instrument can report presence,"
 written before the rule was.
+
+**Another costume of the same class: a fixture that correlates two filter dimensions. Relayed**
+from the SQLite lane, whose reviewer both hit it and fixed it. The first fixture for
+`AuditFilter::item` put item A and the `Admitted` event on the same rows, so the mutant gating
+the `item` predicate on `events.is_empty()` survived: with the two axes moving together, "filter
+by item" and "filter by event" select identical rows, and no input can tell a backend that ANDs
+the two predicates from one that drops either. The committed fixture decorrelates: item A on
+rows both matching and not matching the event filter, item B likewise, plus a trap row satisfying
+every other predicate except `item`. Sits beside `vectors::count`'s "exercised at 0 and at 1 was
+exercise, not coverage" above — both are corpora that exercise a mechanism while structurally
+unable to discriminate one of its failure modes, and the remedy is the same: show the instrument
+can distinguish the axes before trusting what it reports.
+
+**The instruments that check are not exempt.** Several of this class's own members are
+themselves verification procedures — a grep (the too-literal grep, above), a leak-detecting
+counter (`vectors::count`, above), a fixture (the decorrelation trap, just above), a
+pass-counting method, and a SHA map (the durability-hierarchy check, above). That is a pattern
+about verification procedures specifically, not about tooling in general.
+
+**The pass-counting method, concretely, since it is this lane's own. Measured:** summing
+`test result: ok. N passed` lines across a multi-target run is truncation-vulnerable in a shape
+that looks like data — if a run halts, later targets never emit their line, and the sum comes
+back smaller, indistinguishable from a legitimate smaller count. The complete instrument is
+three reads of one log, guards before the number:
+
+    headers == results              no target began without finishing
+    count of `test result: FAILED`  nothing unexpectedly red
+    sum of `N passed`               the count itself
+
+The fault shapes are self-diagnosing:
+
+    started == finished > 0      complete
+    started >  finished > 0      REAL TRUNCATION
+    started == 0, finished > 0   CAPTURE FAULT (split streams, or --quiet)
+    started == 0, finished == 0  nothing ran, or nothing captured
+
+Genuine truncation can only produce `started > finished`, never `started == 0` — the halting
+target has already printed its `Running` line. Shell note: `2>&1 > log` splits the streams;
+`> log 2>&1` combines them — the pipe-eats-the-exit-code trick with the redirection order
+reversed. A zero where a number was expected is the tell.
+
+## A grep-shaped read of a document — a new costume, and the first where the instrument is attention
+
+**Relayed**, from the engine lane, as its own self-diagnosis.
+
+It quoted a sentence from `conformance/atomicity.rs`'s doc comment — *"`is_valid` is exercised
+only by … unit tests … never go through the trait"* — as a present-tense coverage claim. **The
+sentence correcting it was two lines below, in the same block it was quoting from.** It read far
+enough to find something confirming a hypothesis and stopped. (What it was investigating, and
+what the correction actually meant, is recorded under "Gaps that the freeze locks in," above —
+the `WriteTransaction::is_valid` entry.)
+
+**Why this earns its own entry rather than a bullet under "An instrument that produces a wrong
+answer," above:** in every instance there, the faulty instrument was a *tool*, and the artifact
+it read was wrong, stale, or ambiguous. **Here the document was correct and complete**, and the
+tense was legible from context two lines on. **No improvement to the document would have
+prevented it** — which rules out the remedy a reader reaches for first (write clearer docs). The
+remedy is procedural:
+
+> **When a sentence settles a question you came looking to settle, read to the end of the block
+> before acting on it.**
+
+The instrument is the reader's own attention, and it has a bad grep's signature: a confident
+answer to a question narrower than the one that mattered.
 
 ## One process note, because it cost a near-miss at the freeze
 
