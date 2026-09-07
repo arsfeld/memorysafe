@@ -2,6 +2,7 @@
 //! validates everything the policy returns, and applies writes atomically with
 //! an audit record.
 
+pub mod cache;
 pub mod error;
 pub mod gather;
 pub mod maintain;
@@ -11,6 +12,7 @@ pub mod read;
 pub mod validate;
 pub mod write;
 
+pub use cache::{CacheConfig, EngineCache};
 pub use error::EngineError;
 pub use maintain::{MAINTAIN_BATCH, MaintainCursor, MaintainReport};
 pub use mutate::ForgetSelector;
@@ -35,6 +37,7 @@ pub struct EngineConfig {
     pub neighbour_k: usize,
     /// How many items to offer the policy as eviction candidates.
     pub eviction_candidates: usize,
+    pub cache: CacheConfig,
 }
 
 impl EngineConfig {
@@ -51,6 +54,7 @@ impl EngineConfig {
             stance: FailureStance::FailSafe,
             neighbour_k: 16,
             eviction_candidates: 128,
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -63,6 +67,7 @@ pub struct Engine {
     pub(crate) stance: FailureStance,
     pub(crate) neighbour_k: usize,
     pub(crate) eviction_candidates: usize,
+    pub(crate) cache: cache::EngineCache,
 }
 
 impl Engine {
@@ -75,6 +80,25 @@ impl Engine {
             stance: config.stance,
             neighbour_k: config.neighbour_k,
             eviction_candidates: config.eviction_candidates,
+            cache: cache::EngineCache::new(config.cache),
+        }
+    }
+
+    /// Embeds through the content-addressed cache: the same text always
+    /// embeds identically, so a cache hit is free correctness, not a
+    /// staleness risk. A missing or failed embedder must never cost a user
+    /// their memory, so a failure here is folded into `None`, exactly as the
+    /// direct `self.embedder.embed(...).ok()` call it replaces did.
+    pub(crate) async fn embed_cached(&self, text: &str) -> Option<memorysafe_core::Embedding> {
+        if let Some(hit) = self.cache.embedding(text).await {
+            return Some(hit);
+        }
+        match self.embedder.embed(text) {
+            Ok(v) => {
+                self.cache.put_embedding(text, v.clone()).await;
+                Some(v)
+            }
+            Err(_) => None,
         }
     }
 

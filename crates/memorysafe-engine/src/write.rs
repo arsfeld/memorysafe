@@ -65,7 +65,7 @@ impl Engine {
         }
 
         // Embed. A missing or failed model must never cost a user their memory.
-        let embedding = self.embedder.embed(&req.body).ok();
+        let embedding = self.embed_cached(&req.body).await;
         let pending_embedding = embedding.is_none();
 
         let candidate = Candidate {
@@ -214,6 +214,12 @@ impl Engine {
         txn.merge = merge;
 
         let applied = self.backend.apply(txn).await?;
+        // Any write invalidates its scope: `ScopeStats` feeds fragility
+        // scoring, and a stale corpus mean would skew every assessment made
+        // against it. Unconditional — even a replayed idempotent write below
+        // invalidates, which is at worst an unnecessary refetch, never a
+        // correctness gap.
+        self.cache.invalidate_scope(&req.scope).await;
 
         // The backend short-circuited on this request's idempotency key and
         // returned the ORIGINAL `AppliedWrite`, having applied nothing this

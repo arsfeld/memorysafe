@@ -186,6 +186,11 @@ impl Engine {
             let mut txn = WriteTransaction::new(scope.clone(), audit);
             txn.evictions = to_forget;
             self.backend.apply(txn).await?;
+            // Any write invalidates its scope (see `write.rs`'s own call for
+            // the full rationale). `to_release`'s own writes already
+            // invalidate individually through `self.protect` above; this
+            // covers `to_forget`, which does not go through `protect` at all.
+            self.cache.invalidate_scope(scope).await;
         }
 
         // Advance past what survived; forgotten rows AND consolidated
@@ -293,6 +298,224 @@ impl Engine {
         });
 
         self.backend.apply(txn).await?;
+        // Same rationale as the decision-application write above: a merge
+        // changes `item_count`/`total_bytes` for `scope` (one item absorbed
+        // away) exactly as an eviction does.
+        self.cache.invalidate_scope(scope).await;
         Ok(true)
+    }
+}
+
+// Task 37's cache-invalidation ruling: `maintain`'s own decision-application
+// write (the `backend.apply` a few lines above `next_offset`) and
+// `apply_merge`'s write both change item counts and bytes for `scope`, so
+// each must invalidate it exactly as `remember`'s write does. Unit tests, not
+// `tests/maintain.rs` integration tests, because they need `Engine`'s private
+// `cache` field (`pub(crate)`, visible anywhere in this crate) to observe
+// invalidation directly, and `apply_merge` is itself private to this module.
+#[cfg(test)]
+mod cache_invalidation_tests {
+    use super::*;
+    use crate::EngineConfig;
+    use crate::write::RememberRequest;
+    use memorysafe_backend_sqlite::SqliteBackend;
+    use memorysafe_core::{Scope, ScopeStats};
+    use memorysafe_embed::DeterministicEmbedder;
+    use memorysafe_policy::BaselinePolicy;
+    use std::sync::Arc;
+
+    fn engine() -> Engine {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Engine::new(EngineConfig::new(
+            Arc::new(SqliteBackend::open(dir.keep())),
+            Arc::new(DeterministicEmbedder::new(256)),
+            Arc::new(BaselinePolicy::default()),
+        ))
+    }
+
+    fn scope() -> Scope {
+        Scope::new("acme", "user-42", "agent").unwrap()
+    }
+
+    fn sentinel() -> ScopeStats {
+        ScopeStats {
+            item_count: 999_999,
+            ..Default::default()
+        }
+    }
+
+    /// A minimal policy whose `maintain` forces exactly one eviction and
+    /// nothing else — no `Retain` decision, ever, so `to_release` stays empty
+    /// and `released` stays `0`. This matters: an earlier version of this
+    /// test used `BaselinePolicy::default()` throughout and let it choose
+    /// what to do with a second, "healthy" item, which turned out to itself
+    /// release a protection window on that item (`released == 1`). Since
+    /// `protect` invalidates on its own, that masked the very call this test
+    /// exists to check — deleting `maintain`'s own forgotten-items
+    /// invalidation call still passed every test, because `self.protect`'s
+    /// call (triggered by the *other* item) invalidated the same scope first.
+    /// Delegating only `assess`/`admit` to `BaselinePolicy` (needed so the
+    /// seeding `remember` call is admitted normally) and fully owning
+    /// `maintain` closes that gap by construction.
+    struct ForcesOneForgetOnlyPolicy {
+        baseline: BaselinePolicy,
+        target_body: String,
+    }
+
+    impl memorysafe_core::GovernancePolicy for ForcesOneForgetOnlyPolicy {
+        fn id(&self) -> memorysafe_core::PolicyId {
+            memorysafe_core::PolicyId::new("test-forces-one-forget-only", "0.0.1")
+        }
+
+        fn assess(
+            &self,
+            cand: &memorysafe_core::Candidate,
+            ctx: &memorysafe_core::AssessContext,
+        ) -> Result<memorysafe_core::Assessment, memorysafe_core::PolicyError> {
+            self.baseline.assess(cand, ctx)
+        }
+
+        fn admit(
+            &self,
+            assessed: &memorysafe_core::Assessed,
+            ctx: &memorysafe_core::AdmitContext,
+        ) -> Result<memorysafe_core::Decision, memorysafe_core::PolicyError> {
+            self.baseline.admit(assessed, ctx)
+        }
+
+        fn compose(
+            &self,
+            _req: &memorysafe_core::RecallRequest,
+            _candidates: &[memorysafe_core::ScoredCandidate],
+            _ctx: &memorysafe_core::ComposeContext,
+        ) -> Result<memorysafe_core::WorkingSet, memorysafe_core::PolicyError> {
+            unimplemented!("this test never calls compose")
+        }
+
+        fn maintain(
+            &self,
+            ctx: &memorysafe_core::MaintainContext,
+        ) -> Result<Vec<memorysafe_core::Decision>, memorysafe_core::PolicyError> {
+            let target = ctx.batch.iter().find(|c| c.item.body == self.target_body);
+            Ok(match target {
+                Some(t) => vec![memorysafe_core::Decision {
+                    subject: None,
+                    action: memorysafe_core::Action::Reject,
+                    evictions: vec![memorysafe_core::Eviction {
+                        item: t.item.id.clone(),
+                        reason: memorysafe_core::Reason::new(
+                            memorysafe_core::ReasonCode::CapacityPressure,
+                            "forced forget for the cache-invalidation test",
+                            memorysafe_core::features! {},
+                        ),
+                    }],
+                    reasons: vec![],
+                    policy: self.id(),
+                }],
+                None => vec![],
+            })
+        }
+    }
+
+    fn engine_with<P: memorysafe_core::GovernancePolicy + 'static>(policy: P) -> Engine {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Engine::new(EngineConfig::new(
+            Arc::new(SqliteBackend::open(dir.keep())),
+            Arc::new(DeterministicEmbedder::new(256)),
+            Arc::new(policy),
+        ))
+    }
+
+    #[tokio::test]
+    async fn maintain_invalidates_the_scopes_cached_stats_when_it_forgets_something() {
+        let target_body = "a lone item a forced-forget policy will remove";
+        let e = engine_with(ForcesOneForgetOnlyPolicy {
+            baseline: BaselinePolicy::default(),
+            target_body: target_body.into(),
+        });
+        e.remember(RememberRequest::new(scope(), target_body))
+            .await
+            .unwrap();
+
+        e.cache.put_stats(&scope(), sentinel()).await;
+        assert!(
+            e.cache.stats(&scope()).await.is_some(),
+            "premise: cache seeded"
+        );
+
+        let report = e.maintain(&scope(), None).await.unwrap();
+        assert_eq!(report.forgotten, 1, "premise: an actual forget happened");
+        assert_eq!(
+            report.protection_released, 0,
+            "premise: isolate the forgotten-items write from protect's own invalidation"
+        );
+        assert!(
+            e.cache.stats(&scope()).await.is_none(),
+            "maintain must invalidate its scope's cached stats when it forgets something"
+        );
+    }
+
+    /// Negative control: `maintain`'s forgotten-items write is guarded by
+    /// `!to_forget.is_empty() || released > 0`, so a pass that does neither
+    /// never calls `backend.apply` at all and must not invalidate anything —
+    /// pins that the invalidation is tied to an actual write, not
+    /// unconditionally run on every `maintain` call. `BaselinePolicy` here
+    /// (not the forcing policy above) genuinely proposes no eviction and no
+    /// release for one healthy item, which the two explicit `assert_eq!`s
+    /// confirm rather than assume.
+    #[tokio::test]
+    async fn maintain_over_a_healthy_scope_leaves_the_cache_alone() {
+        let e = engine();
+        e.remember(RememberRequest::new(scope(), "a perfectly healthy memory"))
+            .await
+            .unwrap();
+
+        e.cache.put_stats(&scope(), sentinel()).await;
+        let report = e.maintain(&scope(), None).await.unwrap();
+        assert_eq!(report.forgotten, 0);
+        assert_eq!(report.protection_released, 0);
+        assert!(
+            e.cache.stats(&scope()).await.is_some(),
+            "a no-op maintenance pass must not invalidate a scope's cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_merge_invalidates_the_scopes_cached_stats() {
+        let e = engine();
+        let into_id = e
+            .remember(RememberRequest::new(scope(), "target of a merge"))
+            .await
+            .unwrap()
+            .item_id
+            .unwrap();
+        let absorbed_id = e
+            .remember(RememberRequest::new(scope(), "an unrelated absorbed item"))
+            .await
+            .unwrap()
+            .item_id
+            .unwrap();
+        let absorbed_item = e
+            .backend
+            .get(&scope(), &absorbed_id)
+            .await
+            .unwrap()
+            .expect("the absorbed item must exist");
+
+        e.cache.put_stats(&scope(), sentinel()).await;
+        let applied = e
+            .apply_merge(
+                &scope(),
+                &absorbed_item,
+                &into_id,
+                MergeStrategy::AppendAndUnion,
+            )
+            .await
+            .unwrap();
+        assert!(applied, "premise: an actual merge was applied");
+        assert!(
+            e.cache.stats(&scope()).await.is_none(),
+            "apply_merge must invalidate its scope's cached stats"
+        );
     }
 }

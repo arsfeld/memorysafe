@@ -45,11 +45,11 @@ impl Engine {
             .saturating_mul(OVERFETCH)
             .clamp(MIN_CANDIDATES, MAX_CANDIDATES);
 
-        let embedding = req
-            .query
-            .as_deref()
-            .filter(|q| !q.trim().is_empty())
-            .and_then(|q| self.embedder.embed(q).ok());
+        let query_text = req.query.as_deref().filter(|q| !q.trim().is_empty());
+        let embedding = match query_text {
+            Some(q) => self.embed_cached(q).await,
+            None => None,
+        };
 
         if embedding.is_none() && req.query.as_deref().unwrap_or("").trim().is_empty() {
             return Err(EngineError::Validation(

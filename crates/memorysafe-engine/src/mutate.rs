@@ -95,6 +95,10 @@ impl Engine {
         txn.evictions = targets.clone();
 
         let applied = self.backend.apply(txn).await?;
+        // Any write invalidates its scope (see `write.rs`'s own call for the
+        // full rationale): a forget changes `item_count`/`total_bytes` for
+        // `scope` exactly as an admission does.
+        self.cache.invalidate_scope(scope).await;
         Ok(ForgetOutcome {
             forgotten: applied.evicted,
             audit_id: applied.audit_id,
@@ -152,6 +156,9 @@ impl Engine {
         txn.upsert = Some(ItemWrite { item, vector });
 
         let applied = self.backend.apply(txn).await?;
+        // Same rationale as `forget` above: `protect`'s delete-then-reinsert
+        // is a write to `scope`, so its cached stats must not outlive it.
+        self.cache.invalidate_scope(scope).await;
         Ok(WriteOutcome {
             item_id: applied.item_id,
             action: Action::Retain { protection },
@@ -201,8 +208,15 @@ impl Engine {
         tenant: &TenantId,
         subject: &SubjectId,
     ) -> Result<PurgeOutcome, EngineError> {
+        // Computed once, up front, and reused for two purposes below: which
+        // namespace the audit record is filed under (`purge_scope`), and
+        // which namespaces' cached stats to invalidate afterwards. It must be
+        // read here, before the purge — `Backend::purge_subject` erases
+        // exactly the items this list is derived from (see `namespaces_of`),
+        // so asking again afterwards would always answer "none".
+        let namespaces = self.namespaces_of(tenant, subject).await?;
         let audit = AuditRecord::new(
-            self.purge_scope(tenant, subject).await?,
+            Self::purge_scope(tenant, subject, &namespaces),
             AuditEvent::SubjectPurged,
             vec![],
             Actor::system(),
@@ -212,6 +226,24 @@ impl Engine {
             .backend
             .purge_subject(tenant, subject, PurgeCascade::Cascade, audit)
             .await?;
+
+        // Any write invalidates its scope — but a subject spans namespaces
+        // while `invalidate_scope` takes one `Scope`. Every namespace the
+        // subject owned (the list computed above, before the erasure) just
+        // had its items removed, so each is invalidated individually; a
+        // subject owning none (`namespaces` empty) invalidates nothing, which
+        // is correct — no real `Scope` under this subject was ever populated
+        // for a write to have cached stats for.
+        for namespace in &namespaces {
+            self.cache
+                .invalidate_scope(&Scope {
+                    tenant: tenant.clone(),
+                    subject: subject.clone(),
+                    namespace: namespace.clone(),
+                })
+                .await;
+        }
+
         Ok(PurgeOutcome {
             items_removed: report.items_removed,
             audit_rows_removed: report.audit_rows_removed,
@@ -232,37 +264,31 @@ impl Engine {
     /// **The fallback name is a plan-level choice, not a derived one**; a
     /// Task 35 executor may pick differently, but must pick, and must say so
     /// where the record is built.
-    async fn purge_scope(
-        &self,
+    ///
+    /// Takes `namespaces` already computed by the caller (ascending, per
+    /// `namespaces_of`) rather than deriving them itself, so `purge_subject`
+    /// can reuse the same list to invalidate every namespace's cache after
+    /// the purge — the two purposes must see the same list, computed once,
+    /// before the erasure that would otherwise make it unanswerable.
+    fn purge_scope(
         tenant: &TenantId,
         subject: &SubjectId,
-    ) -> Result<Scope, EngineError> {
-        // PLACEHOLDER, not the intended shape. `namespaces_of` learns one
-        // namespace by materialising the subject's entire corpus — item
-        // bodies included — into a `Vec`, in the erasure path. It stands in
-        // for a dedicated namespace query on `Backend` (something of the
-        // shape `namespaces(&self, tenant, subject) -> Vec<Namespace>`),
-        // which does not exist and is out of scope for this task. Do not ship
-        // this as the design; see `namespaces_of` below.
-        let namespace = self
-            .namespaces_of(tenant, subject)
-            .await?
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| {
-                // The constant, not a second copy of the literal: the name is
-                // stored in audit rows that outlive the subject, so two
-                // spellings is one silent divergence away from a compliance
-                // query that finds nothing. See `PURGED_COMPONENT`'s doc for
-                // what reserves it and what does not.
-                memorysafe_core::Namespace::new(memorysafe_core::PURGED_COMPONENT)
-                    .expect("the reserved component is a valid namespace")
-            });
-        Ok(Scope {
+        namespaces: &[memorysafe_core::Namespace],
+    ) -> Scope {
+        let namespace = namespaces.first().cloned().unwrap_or_else(|| {
+            // The constant, not a second copy of the literal: the name is
+            // stored in audit rows that outlive the subject, so two
+            // spellings is one silent divergence away from a compliance
+            // query that finds nothing. See `PURGED_COMPONENT`'s doc for
+            // what reserves it and what does not.
+            memorysafe_core::Namespace::new(memorysafe_core::PURGED_COMPONENT)
+                .expect("the reserved component is a valid namespace")
+        });
+        Scope {
             tenant: tenant.clone(),
             subject: subject.clone(),
             namespace,
-        })
+        }
     }
 
     /// Namespaces the subject owns, ascending. Derived from its items, which
@@ -301,5 +327,173 @@ impl Engine {
         namespaces.sort();
         namespaces.dedup();
         Ok(namespaces)
+    }
+}
+
+// Task 37's cache-invalidation ruling: the brief's literal wiring only
+// invalidates `remember`'s own scope (`write.rs`), but `forget`, `protect`
+// and `purge_subject` all write too, and each would otherwise leave stale
+// `ScopeStats` behind for the policy to read on the next write to that scope.
+// These are unit tests, not `tests/mutate.rs` integration tests, because they
+// need to peek at `Engine`'s private `cache` field directly (`pub(crate)`,
+// visible anywhere in this crate) rather than infer invalidation indirectly.
+#[cfg(test)]
+mod cache_invalidation_tests {
+    use super::*;
+    use crate::EngineConfig;
+    use crate::write::RememberRequest;
+    use memorysafe_backend_sqlite::SqliteBackend;
+    use memorysafe_core::{Namespace, ScopeStats};
+    use memorysafe_embed::DeterministicEmbedder;
+    use memorysafe_policy::BaselinePolicy;
+    use std::sync::Arc;
+
+    fn engine() -> Engine {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Engine::new(EngineConfig::new(
+            Arc::new(SqliteBackend::open(dir.keep())),
+            Arc::new(DeterministicEmbedder::new(256)),
+            Arc::new(BaselinePolicy::default()),
+        ))
+    }
+
+    fn scope() -> Scope {
+        Scope::new("acme", "user-42", "agent").unwrap()
+    }
+
+    // Deliberately not built from the backend's own stats: a sentinel makes
+    // it unmistakable that what disappears is this test's planted cache
+    // entry, not a coincidentally-identical value the backend recomputed.
+    fn sentinel() -> ScopeStats {
+        ScopeStats {
+            item_count: 999_999,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn forget_invalidates_the_scopes_cached_stats() {
+        let e = engine();
+        let id = e
+            .remember(RememberRequest::new(scope(), "a memory to delete"))
+            .await
+            .unwrap()
+            .item_id
+            .unwrap();
+        // `remember` invalidates on admission (see `write.rs`); re-plant a
+        // fresh sentinel afterwards so this test observes `forget`'s own
+        // invalidation, not a leftover from the seeding write above.
+        e.cache.put_stats(&scope(), sentinel()).await;
+        assert!(
+            e.cache.stats(&scope()).await.is_some(),
+            "premise: cache seeded"
+        );
+
+        e.forget(&scope(), ForgetSelector::Ids(vec![id]))
+            .await
+            .unwrap();
+        assert!(
+            e.cache.stats(&scope()).await.is_none(),
+            "forget must invalidate its scope's cached stats"
+        );
+    }
+
+    #[tokio::test]
+    async fn protect_invalidates_the_scopes_cached_stats() {
+        let e = engine();
+        let id = e
+            .remember(RememberRequest::new(scope(), "worth protecting"))
+            .await
+            .unwrap()
+            .item_id
+            .unwrap();
+        e.cache.put_stats(&scope(), sentinel()).await;
+        assert!(
+            e.cache.stats(&scope()).await.is_some(),
+            "premise: cache seeded"
+        );
+
+        e.protect(&scope(), &id, Protection::Pinned).await.unwrap();
+        assert!(
+            e.cache.stats(&scope()).await.is_none(),
+            "protect must invalidate its scope's cached stats"
+        );
+    }
+
+    /// A subject can span several namespaces, each its own `Scope` and its
+    /// own cache entry; `purge_subject` erases every namespace the subject
+    /// owns, so it must invalidate every one of them — not just the single
+    /// namespace its audit record happens to be filed under (see
+    /// `purge_scope`) — and must leave an unrelated subject's cache alone.
+    #[tokio::test]
+    async fn purge_subject_invalidates_every_namespace_it_owned_and_nothing_else() {
+        let e = engine();
+        let tenant = TenantId::new("acme").unwrap();
+        let subject = SubjectId::new("multi-ns-purge").unwrap();
+        let ns_a = Scope {
+            tenant: tenant.clone(),
+            subject: subject.clone(),
+            namespace: Namespace::new("aaa-namespace").unwrap(),
+        };
+        let ns_z = Scope {
+            tenant: tenant.clone(),
+            subject: subject.clone(),
+            namespace: Namespace::new("zzz-namespace").unwrap(),
+        };
+        let unrelated = Scope::new("acme", "someone-else", "agent").unwrap();
+
+        e.remember(RememberRequest::new(ns_a.clone(), "in namespace a"))
+            .await
+            .unwrap();
+        e.remember(RememberRequest::new(ns_z.clone(), "in namespace z"))
+            .await
+            .unwrap();
+        e.remember(RememberRequest::new(
+            unrelated.clone(),
+            "a different subject entirely",
+        ))
+        .await
+        .unwrap();
+
+        e.cache.put_stats(&ns_a, sentinel()).await;
+        e.cache.put_stats(&ns_z, sentinel()).await;
+        e.cache.put_stats(&unrelated, sentinel()).await;
+
+        let report = e.purge_subject(&tenant, &subject).await.unwrap();
+        assert_eq!(report.items_removed, 2, "premise: both namespaces purged");
+
+        assert!(
+            e.cache.stats(&ns_a).await.is_none(),
+            "purge_subject must invalidate every namespace it owned (a)"
+        );
+        assert!(
+            e.cache.stats(&ns_z).await.is_none(),
+            "purge_subject must invalidate every namespace it owned (z)"
+        );
+        assert!(
+            e.cache.stats(&unrelated).await.is_some(),
+            "purge_subject must not invalidate an unrelated subject's cache"
+        );
+    }
+
+    /// Negative control for the fallback path: a subject that owns no items
+    /// has no real namespace to invalidate (`purge_scope` files the record
+    /// under `PURGED_COMPONENT` instead), so there is nothing for this call
+    /// to touch. Mostly guards against a careless rewrite that invalidates
+    /// the fallback scope itself, which no write ever populated.
+    #[tokio::test]
+    async fn purging_an_empty_subject_invalidates_nothing() {
+        let e = engine();
+        let tenant = TenantId::new("acme").unwrap();
+        let subject = SubjectId::new("ghost-purge").unwrap();
+        let unrelated = Scope::new("acme", "someone-else", "agent").unwrap();
+        e.cache.put_stats(&unrelated, sentinel()).await;
+
+        e.purge_subject(&tenant, &subject).await.unwrap();
+
+        assert!(
+            e.cache.stats(&unrelated).await.is_some(),
+            "purging an empty subject must not touch an unrelated scope's cache"
+        );
     }
 }
