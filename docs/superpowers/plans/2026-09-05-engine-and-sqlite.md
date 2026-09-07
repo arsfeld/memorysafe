@@ -14128,7 +14128,7 @@ Add `pub mod cache;` and `pub use cache::{CacheConfig, EngineCache};` to `lib.rs
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 119 tests ok (110 planned + the 9 propagated from Task 35's mutation-testing closures). The brief's literal wiring invalidates only `remember`'s own scope (`write.rs`); the task's own ruling (see its report) found four other write surfaces — `forget`, `protect`, and `purge_subject` in `mutate.rs`, and both the decision-application call and `apply_merge` in `maintain.rs` — that would otherwise leave stale `ScopeStats` behind, and extended invalidation to all of them, each needing its own test. Mutation testing separately found the brief's own five tests never exercise `stats_ttl`'s expiry mechanism at all — every one of them tests only explicit `invalidate_scope`. Eight tests beyond the five mandated in total: four for `mutate.rs`'s three extra write paths (`purge_subject` needed two — one multi-namespace positive case, one empty-subject negative control), three for `maintain.rs`'s two write sites (one of the three a negative control for the guarded write that does neither), and one for the TTL gap.
+Expected: PASS — 121 tests ok (112 planned + the 9 propagated from Task 35's mutation-testing closures). The brief's literal wiring invalidates only `remember`'s own scope (`write.rs`); the task's own ruling (see its report) found four other write surfaces — `forget`, `protect`, and `purge_subject` in `mutate.rs`, and both the decision-application call and `apply_merge` in `maintain.rs` — that would otherwise leave stale `ScopeStats` behind, and extended invalidation to all of them, each needing its own test. Mutation testing separately found the brief's own five tests never exercise `stats_ttl`'s expiry mechanism at all, and — on review — that `embed_cached` (the one mechanism this task places on a production path, called from both `write.rs` and `read.rs`) had no coverage at all: deleting its cache-hit early return, or reverting either call site to the direct embedder call it replaced, passed every test that existed at first submission. Ten tests beyond the five mandated in total: four for `mutate.rs`'s three extra write paths (`purge_subject` needed two — one multi-namespace positive case, one empty-subject negative control), three for `maintain.rs`'s two write sites (one of the three a negative control for the guarded write that does neither), one for the TTL gap, and two (added on review) proving `embed_cached` is actually consulted from both of its production call sites.
 
 - [ ] **Step 5: Commit**
 
@@ -14436,7 +14436,7 @@ Add `pub mod retention;` and
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 124 tests ok (115 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: Task 37's invalidation ruling landed 119, not 111 — see its own Step 4 note — carrying a further +8 into every later count in this plan.)
+Expected: PASS — 126 tests ok (117 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: Task 37 landed 121, not 111 — see its own Step 4 note — carrying a further +10 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -14748,7 +14748,7 @@ Add `pub mod portability;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 131 tests ok (122 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: see Task 37's Step 4 note — its invalidation ruling carries a +8 into every later count in this plan.)
+Expected: PASS — 133 tests ok (124 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -15023,7 +15023,7 @@ Add the invariants job to `.github/workflows/ci.yml`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 136 memorysafe-engine tests (127 planned + the 9 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates. (Re-propagated: see Task 37's Step 4 note — its invalidation ruling carries a +8 into every later count in this plan.)
+Expected: PASS — the whole workspace green: 5 invariants, 138 memorysafe-engine tests (129 planned + the 9 propagated from Task 35's mutation-testing closures), 50 backend conformance tests, and the unit and integration suites of all six crates. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -15397,7 +15397,7 @@ pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine && cargo test --workspace --all-features`
-Expected: PASS — 143 engine tests ok (134 planned + the 9 propagated from Task 35's mutation-testing closures), whole workspace green. (Re-propagated: see Task 37's Step 4 note — its invalidation ruling carries a +8 into every later count in this plan.)
+Expected: PASS — 145 engine tests ok (136 planned + the 9 propagated from Task 35's mutation-testing closures), whole workspace green. (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 

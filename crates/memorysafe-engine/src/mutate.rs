@@ -343,7 +343,7 @@ mod cache_invalidation_tests {
     use crate::EngineConfig;
     use crate::write::RememberRequest;
     use memorysafe_backend_sqlite::SqliteBackend;
-    use memorysafe_core::{Namespace, ScopeStats};
+    use memorysafe_core::{Namespace, PURGED_COMPONENT, ScopeStats};
     use memorysafe_embed::DeterministicEmbedder;
     use memorysafe_policy::BaselinePolicy;
     use std::sync::Arc;
@@ -479,18 +479,35 @@ mod cache_invalidation_tests {
     /// Negative control for the fallback path: a subject that owns no items
     /// has no real namespace to invalidate (`purge_scope` files the record
     /// under `PURGED_COMPONENT` instead), so there is nothing for this call
-    /// to touch. Mostly guards against a careless rewrite that invalidates
-    /// the fallback scope itself, which no write ever populated.
+    /// to touch. Guards against a careless rewrite that invalidates the
+    /// fallback scope itself — which no write ever populated, so nothing
+    /// under it should ever be cached, let alone invalidated. An earlier
+    /// version of this test only cached `unrelated` (a different subject
+    /// entirely), which the invalidation loop cannot reach no matter what it
+    /// does — every `Scope` it builds comes from `tenant`/`subject`, so a
+    /// mutation that invalidated the fallback scope itself would still have
+    /// passed. Seeding the fallback scope directly closes that: this is the
+    /// one `Scope` a careless rewrite could plausibly reach.
     #[tokio::test]
     async fn purging_an_empty_subject_invalidates_nothing() {
         let e = engine();
         let tenant = TenantId::new("acme").unwrap();
         let subject = SubjectId::new("ghost-purge").unwrap();
+        let fallback = Scope {
+            tenant: tenant.clone(),
+            subject: subject.clone(),
+            namespace: Namespace::new(PURGED_COMPONENT).unwrap(),
+        };
         let unrelated = Scope::new("acme", "someone-else", "agent").unwrap();
+        e.cache.put_stats(&fallback, sentinel()).await;
         e.cache.put_stats(&unrelated, sentinel()).await;
 
         e.purge_subject(&tenant, &subject).await.unwrap();
 
+        assert!(
+            e.cache.stats(&fallback).await.is_some(),
+            "purging an empty subject must not invalidate its own fallback scope"
+        );
         assert!(
             e.cache.stats(&unrelated).await.is_some(),
             "purging an empty subject must not touch an unrelated scope's cache"
