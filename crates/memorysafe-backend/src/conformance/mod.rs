@@ -102,6 +102,7 @@ where
         retrieval::recall_updates_access_statistics,
         capacity::capacity_accounting_tracks_items_and_bytes,
         capacity::eviction_releases_capacity,
+        capacity::a_merge_adjusts_capacity_by_the_delta_not_the_new_size,
         capacity::concurrent_admits_do_not_double_count,
         capacity::scope_stats_reflect_the_corpus,
         lifecycle::audit_filter_narrows_by_event_and_time,
