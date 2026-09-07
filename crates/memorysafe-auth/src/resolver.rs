@@ -130,13 +130,73 @@ impl ScopeResolver for FixedScope {
     }
 }
 
+/// Strips a case-insensitive `Bearer` scheme from an `Authorization` value,
+/// still requiring exactly the one space `strip_prefix("Bearer ")` requires.
+///
+/// RFC 7235 auth schemes are case-insensitive, so `bearer <token>` is a legal
+/// credential and refusing it would reject a spec-conformant client for no
+/// reason this crate has a stake in. `"Bearerx"` — no space, a prefix
+/// collision with no scheme boundary — is still refused.
+fn strip_bearer(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(rest)
+}
+
+/// The credential is a bearer API key presented per request.
+#[derive(Clone)]
+pub struct ApiKeyScope {
+    keys: std::sync::Arc<crate::ApiKeyStore>,
+}
+
+impl ApiKeyScope {
+    pub fn new(keys: std::sync::Arc<crate::ApiKeyStore>) -> Self {
+        Self { keys }
+    }
+
+    /// Authenticate the credential on a request, without resolving a scope.
+    ///
+    /// Exposed because `memorysafe-api` needs an `Authenticated` for routes
+    /// that are tenant-scoped rather than scope-scoped — `/v1/whoami` and the
+    /// admin budget/policy/retention routes, which name a tenant and no
+    /// subject at all.
+    pub fn authenticate(&self, headers: &HeaderMap) -> Result<crate::Authenticated, AuthError> {
+        let presented = headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(strip_bearer)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or(AuthError::Missing)?;
+        self.keys.authenticate(presented)
+    }
+}
+
+impl ScopeResolver for ApiKeyScope {
+    fn default_scope(&self) -> Option<Scope> {
+        // Over a keyed transport the scope is a property of the request, not
+        // of the server, so there is nothing concrete to advertise.
+        None
+    }
+
+    fn resolve(&self, headers: &HeaderMap, namespace: Option<&str>) -> Result<Resolved, AuthError> {
+        let auth = self.authenticate(headers)?;
+        let namespace = pick_namespace(namespace, headers, auth.default_namespace())?;
+        Ok(Resolved {
+            scope: auth.scope(namespace.as_str())?,
+            actor: auth.actor(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ApiKeyStore, generate};
     use http::HeaderMap;
     use memorysafe_core::{
         ADMIN_COMPONENT, ActorKind, Namespace, PURGED_COMPONENT, SubjectId, TenantId,
     };
+    use std::sync::Arc;
 
     fn fixed() -> FixedScope {
         FixedScope::new(
@@ -145,6 +205,170 @@ mod tests {
             Namespace::new("coding-agent").unwrap(),
         )
         .expect("an ordinary configuration")
+    }
+
+    fn keyed(label: &str) -> (ApiKeyScope, String, String) {
+        let g = generate(
+            TenantId::new("acme").unwrap(),
+            SubjectId::new("user-42").unwrap(),
+            label,
+        )
+        .unwrap();
+        let key_id = g.record.id.clone();
+        let secret = g.secret.clone();
+        (
+            ApiKeyScope::new(Arc::new(ApiKeyStore::new(vec![g.record]))),
+            secret,
+            key_id,
+        )
+    }
+
+    fn bearer(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {secret}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn an_api_key_supplies_both_tenant_and_subject() {
+        let (source, secret, key_id) = keyed("ci");
+        let r = source
+            .resolve(&bearer(&secret), Some("agent"))
+            .expect("resolve");
+
+        assert_eq!(r.scope.tenant.as_str(), "acme");
+        assert_eq!(r.scope.subject.as_str(), "user-42");
+        assert_eq!(r.scope.namespace.as_str(), "agent");
+        assert_eq!(r.actor.kind, ActorKind::ApiKey);
+        assert_eq!(r.actor.id.as_deref(), Some(key_id.as_str()));
+    }
+
+    #[test]
+    fn a_call_with_no_namespace_anywhere_lands_in_the_fallback() {
+        let (source, secret, _) = keyed("ci");
+        let r = source.resolve(&bearer(&secret), None).expect("resolve");
+        assert_eq!(r.scope.namespace.as_str(), FALLBACK_NAMESPACE);
+    }
+
+    #[test]
+    fn the_namespace_header_supplies_a_default_a_call_can_still_override() {
+        let (source, secret, _) = keyed("ci");
+        let mut headers = bearer(&secret);
+        headers.insert(NAMESPACE_HEADER, "checkout-service".parse().unwrap());
+
+        assert_eq!(
+            source
+                .resolve(&headers, None)
+                .unwrap()
+                .scope
+                .namespace
+                .as_str(),
+            "checkout-service"
+        );
+        assert_eq!(
+            source
+                .resolve(&headers, Some("notes"))
+                .unwrap()
+                .scope
+                .namespace
+                .as_str(),
+            "notes",
+            "the call argument outranks the header"
+        );
+    }
+
+    #[test]
+    fn a_keys_own_default_namespace_outranks_the_fallback_but_not_the_header() {
+        let mut g = generate(
+            TenantId::new("acme").unwrap(),
+            SubjectId::new("user-42").unwrap(),
+            "ci",
+        )
+        .unwrap();
+        g.record.default_namespace = Some(Namespace::new("from-key").unwrap());
+        let secret = g.secret.clone();
+        let source = ApiKeyScope::new(Arc::new(ApiKeyStore::new(vec![g.record])));
+
+        assert_eq!(
+            source
+                .resolve(&bearer(&secret), None)
+                .unwrap()
+                .scope
+                .namespace
+                .as_str(),
+            "from-key"
+        );
+
+        let mut headers = bearer(&secret);
+        headers.insert(NAMESPACE_HEADER, "from-header".parse().unwrap());
+        assert_eq!(
+            source
+                .resolve(&headers, None)
+                .unwrap()
+                .scope
+                .namespace
+                .as_str(),
+            "from-header"
+        );
+    }
+
+    #[test]
+    fn without_a_credential_nothing_resolves() {
+        let (source, secret, _) = keyed("ci");
+
+        assert!(matches!(
+            source.resolve(&HeaderMap::new(), Some("agent")),
+            Err(AuthError::Missing)
+        ));
+
+        let mut bare = HeaderMap::new();
+        bare.insert(http::header::AUTHORIZATION, secret.parse().unwrap());
+        assert!(
+            source.resolve(&bare, Some("agent")).is_err(),
+            "a bare key without the Bearer scheme must be refused"
+        );
+
+        let unknown =
+            bearer("msk_00000000000000000000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(matches!(
+            source.resolve(&unknown, Some("agent")),
+            Err(AuthError::Unknown)
+        ));
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive_but_still_needs_its_space() {
+        let (source, secret, _) = keyed("ci");
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::AUTHORIZATION,
+                format!("{scheme} {secret}").parse().unwrap(),
+            );
+            assert!(
+                source.resolve(&headers, Some("agent")).is_ok(),
+                "scheme '{scheme}' was refused"
+            );
+        }
+
+        let mut glued = HeaderMap::new();
+        glued.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer{secret}").parse().unwrap(),
+        );
+        assert!(source.resolve(&glued, Some("agent")).is_err());
+    }
+
+    #[test]
+    fn an_api_key_source_advertises_no_default_scope() {
+        let (source, _, _) = keyed("ci");
+        assert!(
+            source.default_scope().is_none(),
+            "scope is a property of the request here, not of the server"
+        );
     }
 
     #[test]

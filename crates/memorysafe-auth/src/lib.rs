@@ -9,7 +9,9 @@ mod resolver;
 mod store;
 
 pub use key::{ApiKeyRecord, GeneratedKey, KEY_PREFIX, generate};
-pub use resolver::{FALLBACK_NAMESPACE, FixedScope, NAMESPACE_HEADER, Resolved, ScopeResolver};
+pub use resolver::{
+    ApiKeyScope, FALLBACK_NAMESPACE, FixedScope, NAMESPACE_HEADER, Resolved, ScopeResolver,
+};
 pub use store::{ApiKeyStore, Authenticated, check_reserved};
 
 use memorysafe_core::CoreError;
