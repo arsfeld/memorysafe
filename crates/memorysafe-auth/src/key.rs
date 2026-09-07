@@ -96,14 +96,27 @@ mod tests {
         // plaintext.
         //
         // This used to take its needle from `g.secret.rsplit('_').next()`. The
-        // base64url alphabet (URL_SAFE_NO_PAD) contains `_`, so that grabs
-        // whatever follows the *last* underscore anywhere in the 43-char body,
-        // not the body itself. On the days the body's last `_` falls near its
-        // end, the needle is one or two characters -- too short to mean
-        // anything: it either matches the record by coincidence (the visible
-        // flake) or passes without having checked most of the secret (silent,
-        // ~49% of runs -- see the commit message). Assert against the whole
-        // secret instead: strictly stronger and deterministic either way.
+        // base64url alphabet (URL_SAFE_NO_PAD) contains `_`, so that needle was
+        // whatever followed the *last* underscore anywhere in the 43-char
+        // body -- always a SUFFIX of the body, hence a suffix of the whole
+        // secret. That made the old check *more* sensitive than the one
+        // below, not less: any JSON containing the whole secret necessarily
+        // contains that suffix too, so the old assertion fired in a strict
+        // superset of the cases this one does. (Correction of `ec22ff0`,
+        // which called this replacement "strictly stronger" -- backwards;
+        // see that commit's follow-up for the measurement.) What was wrong
+        // with the old needle was never its sensitivity -- it was that the
+        // needle's length and position were unspecifiable in advance. On the
+        // days the body's last `_` fell near the end, the needle was one or
+        // two characters, too short to mean anything, and matched the
+        // *record* by coincidence: a false failure, not a caught leak, and
+        // indistinguishable from one by reading the test's own name. The
+        // defect was specifiability and false positives, not weak detection.
+        //
+        // The assertions below are deterministic and well-defined -- not
+        // "stronger" than the old needle in the case where nothing leaks --
+        // and the sliding-window assertion at the end recovers partial-leak
+        // sensitivity on purpose, rather than by accident of where `_` lands.
         let g = generate(TenantId::new("acme").unwrap(), "ci").unwrap();
         let json = serde_json::to_string(&g.record).unwrap();
         assert!(
@@ -126,6 +139,25 @@ mod tests {
             !json.contains(body),
             "the record serialised the secret's random body"
         );
+
+        // Neither assertion above catches a leak of a *fragment* of the body:
+        // `&body[..20]` would pass both, exactly the gap the brief named --
+        // "a leak of the secret's prefix or middle would not be caught at
+        // all" -- and that gap survived unfixed until this commit. Slide a
+        // fixed-size window across the body and require that no window
+        // appears in the record. The window size is fixed, not derived from
+        // where any delimiter falls, so this is deterministic; and it is
+        // genuinely more sensitive than both assertions above, recovering on
+        // purpose the kind of partial-leak detection the old `rsplit` needle
+        // only ever had by accident.
+        const WINDOW: usize = 16;
+        for start in 0..=body.len().saturating_sub(WINDOW) {
+            let fragment = &body[start..start + WINDOW];
+            assert!(
+                !json.contains(fragment),
+                "the record serialised a fragment of the secret's random body: {fragment:?}"
+            );
+        }
     }
 
     #[test]
