@@ -536,12 +536,19 @@ pub trait Backend: Send + Sync {
     /// "at least one".
     ///
     /// At least one `Header` must be present, and every `Header` present
-    /// must carry `portability::FORMAT_VERSION`. **This is a contract Task
-    /// 24 must implement — today's code does not enforce it.** The draft
-    /// `import` checks `format_version` only inside the `Header` match arm,
-    /// so a stream that omits a `Header` entirely never reaches that check
-    /// and is accepted with no version check at all, making the format
-    /// version optional by omission.
+    /// must carry `portability::FORMAT_VERSION`. **This was a real gap in an
+    /// earlier draft of `import`, and it is closed now.** That draft checked
+    /// `format_version` only inside the `Header` match arm, so a stream that
+    /// omitted a `Header` entirely never reached that check and was accepted
+    /// with no version check at all — the format version was optional by
+    /// omission. The SQLite backend's `import` now tracks whether a `Header`
+    /// was seen at all and rejects a stream that never carried one, in
+    /// addition to rejecting a `Header` whose `format_version` disagrees.
+    ///
+    /// **Neither half is tested.** No crate-local test and no conformance
+    /// test exercises header presence or version rejection, so this is the
+    /// part still open: the mechanism is real, but nothing in the suite
+    /// would fail if it regressed.
     ///
     /// A stream of a `Header` and nothing else is **valid** and imports
     /// nothing: `export` of an empty tenant produces exactly that, and the

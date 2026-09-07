@@ -57,27 +57,39 @@
 //! exposed to it in the first place — it already opened with `audit::insert`,
 //! itself always a write.
 //!
-//! **The ordering is load-bearing, and nothing in this crate's test suite can
-//! fail if it regresses.** `capacity::adjust` also calls `ensure_row`
-//! internally, so the standalone call `apply` makes first exists *only* to be
-//! the transaction's first statement — deleting it and relying on `adjust`'s
-//! own `ensure_row` (called later, after the eviction loop) compiles, is
-//! functionally identical in every test this crate runs, and reopens exactly
-//! this hazard whenever `txn.evictions` is non-empty. Reaching
-//! `SQLITE_BUSY_SNAPSHOT` needs two live connections racing across processes
-//! (or two `SqliteBackend`s over one root), which nothing in this crate's
-//! single-process suite provokes — the same reason this whole paragraph is
-//! reasoned from the SQLite and rusqlite contracts rather than measured under
-//! contention. Keep `capacity::ensure_row(&tx, &txn.scope)` as `apply`'s first
-//! statement in `lib.rs`, ahead of the eviction loop; do not move it down
-//! "because `adjust` calls it anyway."
+//! **The ordering was load-bearing once. It no longer is: `apply`'s
+//! transaction now opens as `TransactionBehavior::Immediate` (below), which
+//! takes the write lock the moment the transaction opens, before any
+//! statement runs — so which statement comes first no longer decides how the
+//! transaction opened, and the `SQLITE_BUSY_SNAPSHOT` hazard above is closed
+//! by the transaction mode itself, independent of statement order.**
 //!
-//! The residual fix, if this is ever to be closed independent of statement
-//! ordering, is `transaction_with_behavior(TransactionBehavior::Immediate)`,
-//! which takes the write lock up front regardless of what the first statement
-//! turns out to be and puts the wait back under `busy_timeout`. Still queued
-//! rather than done here, for the same reason as before: a behaviour change
-//! that deserves a test able to fail it.
+//! `capacity::ensure_row(&tx, &txn.scope)` stays `apply`'s first statement
+//! anyway. `capacity::adjust` also calls `ensure_row` internally, so the
+//! standalone call was always redundant for its *own* correctness — its job
+//! was, and remains, to go first. With `Immediate` in place that job is no
+//! longer what closes the hazard, so the call is retained as defence in
+//! depth: insurance against a future path that opens `apply`'s transaction as
+//! `DEFERRED` again, at which point statement order would matter exactly as
+//! it used to. Keep `capacity::ensure_row(&tx, &txn.scope)` as `apply`'s
+//! first statement in `lib.rs`, ahead of the eviction loop; do not move it
+//! down "because `adjust` calls it anyway" — not because today's ordering is
+//! load-bearing, but because the call is cheap and a reader who deletes it on
+//! that reasoning may not be the one who later reintroduces a `DEFERRED`
+//! path and reopens the hazard.
+//!
+//! **Done.** Four production call sites now use
+//! `transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)`: in
+//! `portability.rs`, in `purge.rs`, and twice in `lib.rs` (`apply` and
+//! `record_recall`). Regenerate the list rather than trusting this one — line
+//! numbers and call sites both drift:
+//!
+//! ```text
+//! git grep -n "TransactionBehavior::Immediate" -- crates/memorysafe-backend-sqlite/
+//! ```
+//!
+//! `Immediate` takes the write lock up front regardless of what the first
+//! statement turns out to be, and puts the wait back under `busy_timeout`.
 
 use crate::audit::event_from_str;
 use crate::tenant::SqlResultExt;
