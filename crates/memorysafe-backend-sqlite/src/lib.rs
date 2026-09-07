@@ -527,14 +527,13 @@ mod tests {
             .unwrap()
     }
 
-    /// Reads the `vectors` table directly, unjoined to `items` — the only way
-    /// to see a vector row at all rather than a vector row that also happens
-    /// to have a live, in-scope item on the other side of a join. `search`
-    /// cannot substitute for this: it joins `vectors` to `items` on `item_id`
-    /// and filters on the *item's* scope, so it would report zero for a
-    /// vector row orphaned in another scope just as readily as for one that
-    /// was actually deleted.
-    async fn vector_row_count(b: &SqliteBackend, scope: &Scope, id: &ItemId) -> i64 {
+    /// The per-item counterpart to `SqliteBackend::vector_row_count`; see
+    /// that method for why an unjoined read is the only thing that can
+    /// observe this state. `search` cannot substitute for this: it joins
+    /// `vectors` to `items` on `item_id` and filters on the *item's* scope,
+    /// so it would report zero for a vector row orphaned in another scope
+    /// just as readily as for one that was actually deleted.
+    async fn vector_rows_for_item(b: &SqliteBackend, scope: &Scope, id: &ItemId) -> i64 {
         let (subject, namespace, id) = (
             scope.subject.as_str().to_string(),
             scope.namespace.as_str().to_string(),
@@ -804,7 +803,7 @@ mod tests {
     /// row, not merely skip writing a new one. `items::merge` is an
     /// `UPDATE`, so the item row survives and no `ON DELETE CASCADE` fires —
     /// unlike eviction, nothing else in the write path removes a vector left
-    /// behind here. Observed through `vector_row_count`, which reads the
+    /// behind here. Observed through `vector_rows_for_item`, which reads the
     /// `vectors` table directly rather than through `search`'s join to
     /// `items`: a row orphaned by a dropped or swapped scope predicate would
     /// still be invisible to a joined reader.
@@ -825,7 +824,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            vector_row_count(&b, &s, &target.id).await,
+            vector_rows_for_item(&b, &s, &target.id).await,
             1,
             "the premise: the target must already carry a vector row, or the \
              post-merge assertion below would pass vacuously"
@@ -857,7 +856,7 @@ mod tests {
         b.apply(txn).await.unwrap();
 
         assert_eq!(
-            vector_row_count(&b, &s, &target.id).await,
+            vector_rows_for_item(&b, &s, &target.id).await,
             0,
             "the target's stale vector row survived a merge that supplied no \
              new vector"
