@@ -17,6 +17,7 @@ memorysafe-auth = { path = "crates/memorysafe-auth" }
 memorysafe-engine = { path = "crates/memorysafe-engine" }
 memorysafe-mcp = { path = "crates/memorysafe-mcp" }
 memorysafe-api = { path = "crates/memorysafe-api" }
+memorysafe-cli = { path = "crates/memorysafe-cli" }
 rmcp = { version = "3.2.0", default-features = false, features = [
     "server", "macros", "schemars", "transport-io", "transport-streamable-http-server",
 ] }
@@ -111,6 +112,21 @@ tower = { version = "0.5.3", features = ["util"] }
 # tower-http middleware is used.
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
+# `memorysafe-cli` (Task 11), the workspace's composition root: `msafe`'s
+# argument parsing (`derive`) and its `env` fallback for `--tenant`/
+# `--subject`/`--namespace` (`MSAFE_TENANT` etc.), so a flag and its
+# environment variable are declared once, not parsed twice by hand.
+clap = { version = "4.6.6", features = ["derive", "env"] }
+# `msafe.toml` parsing/writing (`memorysafe-cli::config`).
+toml = "1.1.5"
+# `main.rs`'s stderr-only log writer, so a stray log line never corrupts the
+# stdout MCP-over-stdio transport a later task adds under this same binary.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# `memorysafe-cli`'s `tests/memory.rs`: drives the built `msafe` binary as a
+# subprocess rather than calling its internals directly, which is the only
+# way to observe real exit codes and real stdout/stderr framing.
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
