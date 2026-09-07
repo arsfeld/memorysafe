@@ -65,3 +65,37 @@ jobs:
           printf '%s\n' "$out" \
             | grep -Ei '^(reqwest|hyper|hf-hub|ureq|native-tls|rustls) ' && exit 1
           echo "embed reaches no network stack under --all-features"
+  layering:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      # Global Constraints: adapters depend on `memorysafe-engine`, never on a
+      # concrete backend. `memorysafe-cli` is the composition root and is
+      # exempt — it is the one crate allowed to pick a backend.
+      #
+      # This checks the *normal* dependency graph, not the manifest text: a
+      # plain grep of Cargo.toml would show "sqlite present" for every crate
+      # whose tests happen to depend on `memorysafe-backend-sqlite` (a
+      # legitimate dev-dependency) and prove nothing about whether the
+      # library code itself can reach a concrete backend.
+      #
+      # Capture first, same reasoning as the purity job above: piping
+      # `cargo tree` straight into `grep` throws its exit status away and can
+      # report a pass the check never performed.
+      - name: memorysafe-mcp and memorysafe-api must not reach past the engine into a backend
+        run: |
+          for c in memorysafe-mcp memorysafe-api; do
+            out=$(cargo tree -p "$c" --edges normal --prefix none) \
+              || { echo "cargo tree failed for $c"; exit 1; }
+            printf '%s\n' "$out" \
+              | grep -Ei '^(memorysafe-backend-sqlite|rusqlite|sqlx) ' && exit 1
+            echo "$c is backend-free"
+          done
+      - name: memorysafe-auth must stay transport free
+        run: |
+          out=$(cargo tree -p memorysafe-auth --edges normal --prefix none) \
+            || { echo "cargo tree failed for memorysafe-auth"; exit 1; }
+          printf '%s\n' "$out" \
+            | grep -Ei '^(tokio|axum|rmcp|rusqlite) ' && exit 1
+          echo "memorysafe-auth is transport free"

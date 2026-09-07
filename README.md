@@ -79,22 +79,43 @@ memorysafe/
     memorysafe-embed/           # Int8 quantization, DeterministicEmbedder, model2vec integration
     memorysafe-backend/         # Backend trait contract and reusable conformance suite
     memorysafe-backend-sqlite/  # Single-tenant SQLite backend with WAL mode and atomic writes
-    memorysafe-policy/          # [In Progress] Baseline governance policy implementation
-    memorysafe-engine/          # [In Progress] Pipeline orchestrator (remember/recall/maintain)
-    memorysafe-mcp/             # [Planned] Model Context Protocol server (stdio & streamable HTTP)
-    memorysafe-api/             # [Planned] REST API (axum)
-    memorysafe-cli/             # [Planned] `msafe` command-line tool
-    memorysafe-shadow/          # [Planned] Policy replay and shadow evaluation harness
+    memorysafe-policy/          # Baseline governance policy implementation
+    memorysafe-auth/            # Tenant-scoped API keys for the network adapters
+    memorysafe-engine/          # Pipeline orchestrator (remember/recall/maintain)
+    memorysafe-mcp/             # Model Context Protocol server (stdio & streamable HTTP)
+    memorysafe-api/             # REST API (axum)
+    memorysafe-cli/             # `msafe` command-line tool
+    memorysafe-shadow/          # Policy replay and shadow evaluation harness
 ```
 
 ### Crate Status
 
 | Crate | Purpose | Status |
 |---|---|---|
-| [`memorysafe-core`](crates/memorysafe-core) | Core domain types (`Scope`, `MemoryItem`, `Assessment`, `Decision`, `AuditRecord`, `GovernancePolicy`). Zero I/O dependencies. | Complete (77 tests) |
-| [`memorysafe-embed`](crates/memorysafe-embed) | Vector quantization (int8 SIMD), deterministic test embedder, optional static model embeddings (`model2vec-rs`). | Complete (14 tests) |
-| [`memorysafe-backend`](crates/memorysafe-backend) | Unified `Backend` trait (CRUD, hybrid search, capacity, audit, export/import, purge) + test conformance suite. | Complete |
-| [`memorysafe-backend-sqlite`](crates/memorysafe-backend-sqlite) | Single-tenant SQLite storage engine, connection pooling, and atomic transaction execution. | Active (Persistence, isolation, & atomicity conformance passing) |
+| [`memorysafe-core`](crates/memorysafe-core) | Core domain types (`Scope`, `MemoryItem`, `Assessment`, `Decision`, `AuditRecord`, `GovernancePolicy`). Zero I/O dependencies. | done |
+| [`memorysafe-embed`](crates/memorysafe-embed) | Vector quantization (int8 SIMD), deterministic test embedder, optional static model embeddings (`model2vec-rs`). | done |
+| [`memorysafe-backend`](crates/memorysafe-backend) | Unified `Backend` trait (CRUD, hybrid search, capacity, audit, export/import, purge) + test conformance suite. | done |
+| [`memorysafe-backend-sqlite`](crates/memorysafe-backend-sqlite) | Single-tenant SQLite storage engine, connection pooling, and atomic transaction execution. | done |
+| [`memorysafe-policy`](crates/memorysafe-policy) | `BaselinePolicy` — the governance decisions: admission, eviction, working-set composition, sensitivity detection. Zero I/O dependencies. | done |
+| [`memorysafe-auth`](crates/memorysafe-auth) | Tenant-scoped API keys: generation, hashing, and the reserved-scope check every network adapter routes through. | done |
+| [`memorysafe-engine`](crates/memorysafe-engine) | Pipeline orchestrator — assess, admit, compose the working set, maintain, audit — over the abstract `Backend` trait. | done |
+| [`memorysafe-mcp`](crates/memorysafe-mcp) | Model Context Protocol server: five tools, two audit/stats resources per scope, stdio and streamable HTTP transports. | done |
+| [`memorysafe-api`](crates/memorysafe-api) | The HTTP surface: memory, operational, and per-tenant admin routes over `Authorization: Bearer`. | done |
+| [`memorysafe-cli`](crates/memorysafe-cli) | `msafe` — configuration, the memory/curation/portability commands, and the composition root that picks a concrete backend. | done |
+| [`memorysafe-shadow`](crates/memorysafe-shadow) | Shadow evaluation: archive replay, trace diffing, and the golden fixtures pinning `BaselinePolicy`'s decisions. | done |
+
+---
+
+## Using it
+
+See [`docs/adapters.md`](docs/adapters.md) for configuration, the CLI, the MCP
+server, and the HTTP API.
+
+```sh
+cargo install --path crates/memorysafe-cli
+msafe remember "the production migration runs on Sundays"
+msafe recall "when does the migration run"
+```
 
 ---
 
@@ -188,8 +209,32 @@ cargo build --workspace
 Run the full workspace test suite, including pure domain tests and SQLite backend conformance tests:
 
 ```bash
-cargo test
+cargo test --workspace --all-features
 ```
+
+On some machines `--all-features` pulls `model2vec-rs`/`tokenizers` into
+targets that fail to load `libstdc++.so.6` at link time — a **link** failure,
+not a test failure, so the affected targets print no `test result:` line at
+all (no FAILED, either) and the run can still exit `0`. Point
+`LD_LIBRARY_PATH` at a gcc lib directory to avoid it:
+
+```bash
+LD_LIBRARY_PATH=$(ls -d /nix/store/*gcc-15.3.0-lib/lib | head -1) \
+  cargo test --workspace --all-features --no-fail-fast
+```
+
+Never judge a run by its exit code or by grepping for FAILED. Verify every
+target actually reported a result by comparing how many started against how
+many finished:
+
+```bash
+grep -c '^running ' <log>   # must equal
+grep -c '^test result:' <log>
+```
+
+A mismatch means some targets were silently skipped, not silently passing.
+CI's `ubuntu-latest` runners are unaffected by the `libstdc++` issue, so the
+`LD_LIBRARY_PATH` workaround is a local-dev concern only.
 
 ### Run Conformance Suite Only
 
