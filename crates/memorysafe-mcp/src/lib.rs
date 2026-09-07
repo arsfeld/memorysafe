@@ -113,15 +113,21 @@ impl ServerHandler for MemorySafeServer {
     ) -> Result<ReadResourceResponse, ErrorData> {
         let parsed = resources::parse_uri(&request.uri)?;
 
-        // The URI names a scope; the transport decides which scopes this caller
-        // may name. Resolving through the same path the tools use means a
-        // resource URI can never reach further than a tool call could.
+        // The URI names a scope; the credential decides which scope this
+        // caller may name. Resolving through the same path the tools use
+        // means a resource URI can never reach further than a tool call could.
+        // The URI also carries a tenant and subject, and neither is
+        // caller-supplied scope. Both are compared, not trusted: without the
+        // subject comparison a caller could read another subject's audit
+        // trail through a URI while every tool-level check still held.
         let resolved = crate::scope::resolve_call(
             self.resolver.as_ref(),
             &context.extensions,
             Some(parsed.namespace),
         )?;
-        if resolved.scope.tenant.as_str() != parsed.tenant {
+        if resolved.scope.tenant.as_str() != parsed.tenant
+            || resolved.scope.subject.as_str() != parsed.subject
+        {
             return Err(ErrorData::resource_not_found(
                 format!("no such resource: {}", request.uri),
                 None,

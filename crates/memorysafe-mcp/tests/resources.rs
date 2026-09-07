@@ -275,6 +275,38 @@ async fn a_resource_in_another_tenant_is_refused_over_stdio() {
 }
 
 #[tokio::test]
+async fn a_resource_uri_naming_another_subject_is_not_found() {
+    // The URI grammar still carries a subject, because it identifies a
+    // resource. That does not make caller-supplied scope: it must be compared
+    // against the credential's subject just as the tenant is.
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
+
+    let mine = client
+        .read_resource(ReadResourceRequestParams::new(
+            "memorysafe://acme/user-42/coding-agent/audit",
+        ))
+        .await;
+    assert!(mine.is_ok(), "a caller must still read their own audit");
+
+    for uri in [
+        "memorysafe://acme/someone-else/coding-agent/audit",
+        "memorysafe://acme/someone-else/coding-agent/stats",
+        "memorysafe://globex/user-42/coding-agent/audit",
+    ] {
+        let err = client
+            .read_resource(ReadResourceRequestParams::new(uri))
+            .await
+            .expect_err("reading another scope's resource must fail");
+        assert!(
+            format!("{err:?}").contains("no such resource"),
+            "{uri} was refused with the wrong error: {err:?}"
+        );
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn an_unknown_resource_uri_is_an_error_not_an_empty_document() {
     let (eng, _dir) = engine();
     let client = connect(eng).await;
