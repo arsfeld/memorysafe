@@ -243,6 +243,32 @@ async fn export_can_render_markdown_for_a_person_to_read() {
     assert_eq!(reply.status, StatusCode::OK);
     assert!(reply.text.contains("# MemorySafe export"));
     assert!(reply.text.contains("the on-call rotation starts Monday"));
+
+    // C2 (final review): `format=markdown` used to call `Engine::export_markdown`
+    // directly, which writes no audit row — a key holder could read the
+    // tenant's entire corpus, body and all, with no trace of having done so.
+    // `docs/known-gaps.md` accepted deferring `Engine::export`'s own missing
+    // audit record only on the explicit condition that Plan 3 expose neither
+    // export surface without one; this asserts the condition actually holds
+    // for markdown, the same way `export_returns_ndjson_and_records_who_asked`
+    // (above) asserts it for ndjson.
+    let rows = h
+        .engine
+        .audit(
+            &memorysafe_core::Scope::admin(&memorysafe_core::TenantId::new("acme").unwrap()),
+            &memorysafe_core::AuditFilter {
+                events: vec![memorysafe_core::AuditEvent::Exported],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a markdown export must write exactly one Exported audit row"
+    );
+    assert_eq!(rows[0].actor.kind, memorysafe_core::ActorKind::ApiKey);
 }
 
 /// Fix round 1, Important 5: `ExportQuery::subject` was threaded into

@@ -4,8 +4,8 @@ use memorysafe_backend::{
     ExportRecord, ExportStream, ImportReport, ImportStream, ScopeSelector, WriteTransaction,
 };
 use memorysafe_core::{
-    ADMIN_COMPONENT, Actor, AuditEvent, AuditRecord, ItemRef, Namespace, Protection, Scope,
-    SubjectId, TenantId,
+    ADMIN_COMPONENT, Actor, AuditEvent, AuditId, AuditRecord, ItemId, ItemRef, Namespace,
+    Protection, Scope, SubjectId, TenantId,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -140,23 +140,34 @@ impl Engine {
     /// an import that happened with no record of itself. Closing that is a
     /// `Backend` signature change, which belongs with the next contract batch.
     ///
-    /// **Audit rows in the *stream* are not part of either defence.** This function maps
-    /// only `ExportRecord::Item`; `ExportRecord::Header` and
-    /// `ExportRecord::Audit` pass through the `other => other` arm
-    /// untouched. That asymmetry — items re-assessed, audit rows trusted
-    /// outright — is real, and it is **unexamined, not deliberate**: nothing
-    /// in this task's design considered whether an import stream's audit
-    /// rows should be trusted before storing them. A crafted stream can
-    /// inject arbitrary audit history into the destination tenant,
-    /// including a fabricated `SubjectPurged` row manufacturing evidence
-    /// that an erasure occurred that never did, and `Reason::detail` (a free
-    /// `String` reachable through `Decision::reasons`, itself embedded in
-    /// `AuditRecord`) is unconstrained text an attacker-controlled import
-    /// could use to smuggle an item body into an audit row — a route around
-    /// the "audit rows never contain item bodies" constraint that nothing
-    /// here validates against. Whether audit content should be validated on
-    /// import is a design decision beyond this task's scope; it is recorded
-    /// here rather than fixed.
+    /// **Structure is re-validated; content is not.** `Scope`'s and
+    /// `ItemId`'s/`AuditId`'s `Deserialize` impls route through a bare inner
+    /// `String`, never through `Scope::new`/`ItemId::parse`/`AuditId::parse`
+    /// (see `memorysafe_core::ids`'s own doc on why `validate_component` runs
+    /// only in `::new`) — so a caller-supplied stream can carry a
+    /// structurally illegal tenant/subject/namespace, or an item or audit id
+    /// that is not a well-formed ULID, neither of which this crate's own
+    /// constructors could ever produce. Both are re-checked here, per
+    /// record, for both `ExportRecord::Item` and `ExportRecord::Audit`
+    /// (`ExportRecord::Header` carries neither and is unaffected), and the
+    /// whole stream is rejected — before anything is written — on the first
+    /// failure. Left unchecked, such a row is not merely malformed: once
+    /// persisted, `row_to_item`/audit's own scope reconstruction rebuilds the
+    /// same `Scope` through `Scope::new` on every read, so a row with an
+    /// illegal namespace becomes permanently unreachable by `get`, `review`,
+    /// `export`, and `purge_subject` alike — there is no path back through
+    /// the product once it lands.
+    ///
+    /// **Audit *content* is a narrower, still-open gap, not the one this
+    /// re-validation closes.** A structurally well-formed `AuditId` — a
+    /// legal ULID an attacker minted for the occasion — still carries
+    /// whatever `event`, `actor`, and `decision` the stream claims: nothing
+    /// here checks that a `SubjectPurged` row's actor is who it says, or that
+    /// `Reason::detail` (free text reachable through `Decision::reasons`,
+    /// itself embedded in `AuditRecord`) does not smuggle an item body into
+    /// an audit row. That trust question predates this validation and is
+    /// unrelated to it; it is tracked in `docs/known-gaps.md`, not fixed
+    /// here.
     pub async fn import(
         &self,
         destination: &TenantId,
@@ -183,33 +194,74 @@ impl Engine {
 
         let reassessed: ImportStream = stream
             .into_iter()
-            .map(|record| match record {
-                ExportRecord::Item { mut item, vector } => {
-                    let candidate = memorysafe_core::Candidate {
-                        body: item.body.clone(),
-                        kind: item.kind.clone(),
-                        tags: item.tags.clone(),
-                        attrs: item.attrs.clone(),
-                        sensitivity_hint: None,
-                        embedding: None,
-                        byte_size: item.byte_size(),
-                    };
-                    let detected = memorysafe_policy::sensitivity::assess(&candidate, &cfg).level;
-                    item.sensitivity = item.sensitivity.max(detected);
-                    item.protection = match item.protection {
-                        Protection::Pinned => Protection::Normal,
-                        Protection::Protected { until } if until > max_protected_until => {
-                            Protection::Protected {
-                                until: max_protected_until,
+            .map(|record| -> Result<ExportRecord, EngineError> {
+                match record {
+                    ExportRecord::Item { mut item, vector } => {
+                        Scope::new(
+                            item.scope.tenant.as_str(),
+                            item.scope.subject.as_str(),
+                            item.scope.namespace.as_str(),
+                        )
+                        .map_err(|e| {
+                            EngineError::Validation(format!(
+                                "import item {} names a structurally invalid scope: {e}",
+                                item.id
+                            ))
+                        })?;
+                        ItemId::parse(item.id.as_str()).map_err(|e| {
+                            EngineError::Validation(format!(
+                                "import item has a structurally invalid id {}: {e}",
+                                item.id
+                            ))
+                        })?;
+
+                        let candidate = memorysafe_core::Candidate {
+                            body: item.body.clone(),
+                            kind: item.kind.clone(),
+                            tags: item.tags.clone(),
+                            attrs: item.attrs.clone(),
+                            sensitivity_hint: None,
+                            embedding: None,
+                            byte_size: item.byte_size(),
+                        };
+                        let detected =
+                            memorysafe_policy::sensitivity::assess(&candidate, &cfg).level;
+                        item.sensitivity = item.sensitivity.max(detected);
+                        item.protection = match item.protection {
+                            Protection::Pinned => Protection::Normal,
+                            Protection::Protected { until } if until > max_protected_until => {
+                                Protection::Protected {
+                                    until: max_protected_until,
+                                }
                             }
-                        }
-                        other => other,
-                    };
-                    ExportRecord::Item { item, vector }
+                            other => other,
+                        };
+                        Ok(ExportRecord::Item { item, vector })
+                    }
+                    ExportRecord::Audit { audit } => {
+                        Scope::new(
+                            audit.scope.tenant.as_str(),
+                            audit.scope.subject.as_str(),
+                            audit.scope.namespace.as_str(),
+                        )
+                        .map_err(|e| {
+                            EngineError::Validation(format!(
+                                "import audit row {} names a structurally invalid scope: {e}",
+                                audit.id
+                            ))
+                        })?;
+                        AuditId::parse(audit.id.as_str()).map_err(|e| {
+                            EngineError::Validation(format!(
+                                "import audit row has a structurally invalid id {}: {e}",
+                                audit.id
+                            ))
+                        })?;
+                        Ok(ExportRecord::Audit { audit })
+                    }
+                    other => Ok(other),
                 }
-                other => other,
             })
-            .collect();
+            .collect::<Result<ImportStream, EngineError>>()?;
 
         // Read off the reassessed stream, before it is moved into the backend
         // — and from the *reassessed* stream rather than the caller's, so the

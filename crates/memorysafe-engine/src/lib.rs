@@ -187,6 +187,15 @@ impl Engine {
     /// the new policy is installed, so a crash between the two leaves the
     /// audited transition ahead of the registry rather than the reverse — the
     /// same ordering `set_budget` documents for its own two-transaction gap.
+    ///
+    /// **Not persisted.** Unlike `set_budget`, which writes through to the
+    /// backend, this is held only in `self.policies`, an in-memory
+    /// `RwLock<HashMap<..>>`. The audit row is real and the change is real
+    /// until the process restarts, at which point `tenant` silently reverts
+    /// to `default_policy` with no further record — the audited transition
+    /// outlives the state it describes. Persisting this registry is out of
+    /// scope here; this comment states the current behaviour so a caller does
+    /// not assume parity with `set_budget`.
     pub async fn set_tenant_policy_config(
         &self,
         tenant: &TenantId,
@@ -236,6 +245,16 @@ impl Engine {
 
     /// Replaces `tenant`'s audit-retention profile, and audits the change
     /// under the tenant's reserved admin scope.
+    ///
+    /// **Not persisted**, for the same reason `set_tenant_policy_config`
+    /// above is not: `self.retentions` is an in-memory `RwLock<HashMap<..>>`,
+    /// so this reverts to `default_retention` on restart with no further
+    /// record. The sharp edge is real: an operator who sets `hipaa_retain` or
+    /// `forensic` (`PurgeCascade::Preserve`) reverts to whatever the default
+    /// profile is, and the next `purge_subject` call after a restart deletes
+    /// audit rows the operator configured to survive — while the
+    /// `PolicyChanged` row already on file still asserts the change took
+    /// effect.
     pub async fn set_tenant_retention(
         &self,
         tenant: &TenantId,
@@ -293,6 +312,44 @@ impl Engine {
         )
         .await?;
         Ok(ndjson)
+    }
+
+    /// `Engine::export_markdown` (`portability.rs`) with the export itself
+    /// audited as a governance event, naming the actor who asked for it —
+    /// `export_ndjson_as`'s sibling, for the same reason. Before this
+    /// existed, `format=markdown` was the one export surface that left no
+    /// trace of itself: `docs/known-gaps.md` accepted deferring
+    /// `Engine::export`'s missing audit record *on the explicit condition
+    /// that Plan 3 expose neither surface without a ceiling and a record*,
+    /// and routing the HTTP `markdown` arm through `export_markdown`
+    /// directly (rather than through this method) would have broken that
+    /// condition: a key holder could read the tenant's entire corpus, body
+    /// and all, by appending `&format=markdown` to the one route that did
+    /// audit itself.
+    pub async fn export_markdown_as(
+        &self,
+        sel: &ScopeSelector,
+        actor: &Actor,
+    ) -> Result<String, EngineError> {
+        let markdown = self.export_markdown(sel).await?;
+        self.record_admin_event(
+            &sel.tenant,
+            AuditEvent::Exported,
+            actor,
+            Reason::new(
+                ReasonCode::PolicyInvalid,
+                &format!(
+                    "exported (markdown) subject={} namespace={} include_audit={}",
+                    sel.subject.as_ref().map_or("*", |s| s.as_str()),
+                    sel.namespace.as_ref().map_or("*", |n| n.as_str()),
+                    sel.include_audit
+                ),
+                features! {},
+            ),
+            self.policy_for(&sel.tenant).id(),
+        )
+        .await?;
+        Ok(markdown)
     }
 
     /// `Engine::import_ndjson` (`portability.rs`) with the `Imported` row

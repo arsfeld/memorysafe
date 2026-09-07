@@ -94,9 +94,21 @@ pub async fn recall(
             max_tokens: args.max_tokens.or(defaults.max_tokens),
             max_items: args.max_items.or(defaults.max_items),
         },
+        // Fail closed, matching `memorysafe_backend::query::HardFilters`'s own
+        // documented default for this exact field and both network adapters'
+        // identical default (`memorysafe-mcp`'s `tools_write.rs`,
+        // `memorysafe-api`'s `memories.rs`): the cost of guessing too narrow
+        // (a visible, reported annoyance a caller fixes by passing the
+        // argument) is not symmetric with the cost of guessing too wide (a
+        // silent over-disclosure nobody notices). A local operator who trusts
+        // the machine and owns the database file can still ask for everything
+        // with `--sensitivity-ceiling restricted`; a coding-agent harness
+        // that shells out to `msafe recall` with no override should not get
+        // every credential in scope by default, where the MCP path withholds
+        // them.
         sensitivity_ceiling: args
             .sensitivity_ceiling
-            .unwrap_or(SensitivityLevel::Restricted),
+            .unwrap_or(SensitivityLevel::Internal),
     };
 
     let ws = engine.recall(request).await?;

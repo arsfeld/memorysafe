@@ -57,6 +57,11 @@ exits `0`: governance working is not a failure.
 tenant, not to a subject or namespace — so neither needs `--subject` or
 `--namespace`.
 
+`msafe recall`'s `--sensitivity-ceiling` defaults to `internal` — the same
+fail-closed default as MCP's `memory_recall` and `POST /v1/recall`, for the
+same reason. Pass `--sensitivity-ceiling restricted` explicitly to see
+everything.
+
 Item paging (`review`) and audit paging (`audit`) both echo the *effective*
 limit, not the raw value requested: item pages are clamped to
 `memorysafe_backend::MAX_PAGE_LIMIT` and audit pages to
@@ -123,6 +128,20 @@ GET|PUT /v1/admin/tenants/{id}/retention
 
 `POST /v1/recall` defaults `sensitivity_ceiling` to `internal` — the same
 fail-closed default as MCP's `memory_recall`, and for the same reason.
+
+**Budgets persist; policy and retention do not.** `PUT
+/v1/admin/tenants/{id}/budgets` writes through to the backend and survives a
+restart. `PUT /v1/admin/tenants/{id}/policy` and `/retention` are held only
+in an in-memory registry (`Engine`'s `policies`/`retentions` fields) — the
+call returns `200` with an audit id, and the change is real until the process
+restarts, at which point it silently reverts to the engine's configured
+default with no further record. Concretely: an operator who sets retention to
+`hipaa_retain` or `forensic` (`PurgeCascade::Preserve`, so a `purge_subject`
+call is meant to leave audit rows in place) reverts to whatever the default
+profile is on restart, and the next `purge_subject` deletes those rows — with
+a `PolicyChanged` row already on file asserting the change took effect.
+Persisting these two is out of scope for now; this is a statement of current
+behaviour, not a plan to fix it.
 
 Errors carry a uniform body:
 

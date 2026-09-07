@@ -177,7 +177,15 @@ pub async fn export(
             Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response())
         }
         Some("markdown") => {
-            let body = state.engine.export_markdown(&selector).await?;
+            // Audited, same as the ndjson arm above: `docs/known-gaps.md`
+            // accepted deferring `Engine::export`'s missing audit record on
+            // the explicit condition that Plan 3 expose neither surface
+            // without a ceiling and a record. `export_markdown_as` mirrors
+            // `export_ndjson_as` so this arm meets that condition too.
+            let body = state
+                .engine
+                .export_markdown_as(&selector, &auth.actor())
+                .await?;
             Ok((
                 [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
                 body,

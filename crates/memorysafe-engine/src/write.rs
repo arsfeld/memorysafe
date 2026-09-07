@@ -150,7 +150,19 @@ impl Engine {
                 .await;
         }
 
-        let now = OffsetDateTime::now_utc();
+        // `admit_ctx.now`, not a fresh `OffsetDateTime::now_utc()` sample.
+        // `admit::decide` computed `Protection::Protected { until }` (when it
+        // did) as `admit_ctx.now + Duration::days(window)`; re-sampling the
+        // clock here would make `created_at` a second, independently-sampled
+        // instant, so `until - created_at` would equal `Duration::days(N)`
+        // only when both reads land in the same wall-clock second — a ~1-in-
+        // -a-few-thousand flake on ordinary hardware, worse under load. Using
+        // the same reading `admit_ctx` already carries makes the identity
+        // exact on every run, which `write.rs`'s own comment two lines below
+        // already states as the rule for this value: "the item and its own
+        // audit row must agree on when this happened" applies one level up,
+        // to `admit_ctx` and the item, not just to the item and its audit row.
+        let now = admit_ctx.now;
         let vector = embedding.as_ref().map(QuantizedVector::from_embedding);
 
         let (item, merge) = match &decision.action {

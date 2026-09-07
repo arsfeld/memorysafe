@@ -237,6 +237,67 @@ fn review_echoes_the_effective_limit_not_the_raw_request() {
     );
 }
 
+// I2 (final review, controller ruling): `RecallArgs::sensitivity_ceiling`
+// used to default to `SensitivityLevel::Restricted` (excludes nothing) while
+// both network adapters (`memorysafe-mcp`'s `tools_write.rs`,
+// `memorysafe-api`'s `memories.rs`) default to `Internal` (fail closed), each
+// with a paragraph of justification the CLI site had none of — and nothing
+// pinned it: reverting the token to `Restricted` failed zero tests. Ruled for
+// consistency with the network adapters rather than for the "a local operator
+// owns the machine" argument: `docs/adapters.md` lists `msafe recall` first
+// among the ways in, and an agent harness shelling out to it with no override
+// should not see every credential in scope where the MCP/HTTP path withholds
+// them.
+#[test]
+fn recall_with_no_ceiling_defaults_to_internal_and_withholds_a_restricted_memory() {
+    let dir = workspace();
+    msafe(dir.path())
+        .args([
+            "remember",
+            "the vault unlock phrase is centipede-umbrella-forty",
+            "--sensitivity",
+            "restricted",
+        ])
+        .assert()
+        .success();
+
+    let output = msafe(dir.path())
+        .args(["--json", "recall", "vault unlock phrase"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a recall that excludes everything by ceiling is still a successful \
+         governance decision, not an error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !text.contains("centipede-umbrella-forty"),
+        "msafe recall's default sensitivity_ceiling let a Restricted memory \
+         through with no --sensitivity-ceiling override; the CLI default must \
+         fail closed to Internal, matching both network adapters: {text}"
+    );
+
+    // The explicit escape hatch this ruling names still works: an operator
+    // who wants everything can ask for it.
+    let widened = msafe(dir.path())
+        .args([
+            "--json",
+            "recall",
+            "vault unlock phrase",
+            "--sensitivity-ceiling",
+            "restricted",
+        ])
+        .output()
+        .unwrap();
+    let widened_text = String::from_utf8_lossy(&widened.stdout);
+    assert!(
+        widened_text.contains("centipede-umbrella-forty"),
+        "an explicit --sensitivity-ceiling restricted must still see it: {widened_text}"
+    );
+}
+
 #[test]
 fn two_namespaces_do_not_see_each_other() {
     let dir = workspace();
