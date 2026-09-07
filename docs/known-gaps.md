@@ -1,7 +1,11 @@
 # Known gaps at the conformance freeze
 
 State at `6e75fe4`, after the SQLite backend passed the fifty-test suite and the suite was
-frozen at `8187bd9`. Every line was verified by running something, not by reading.
+frozen at `8187bd9` — both tree claims, not diffs: `6e75fe4`'s own diff touches only
+`scripts/README.md`, unrelated to either claim; check the state instead with
+`git show <sha>:crates/memorysafe-backend-sqlite/tests/conformance.rs`, whose doc comment reads
+"the suite is frozen as of this task" at both commits. Every line was verified by running
+something, not by reading.
 
 **Why this file exists.** These were tracked in a cross-session conversation and a
 git-ignored workspace. Both are `/tmp` with extra steps — the same failure as the audit
@@ -99,12 +103,12 @@ it** — one grep, at the one moment someone is guaranteed to already be looking
 name. Nothing else in the process ever revisits a comment that names a task, which is exactly
 why this class stays quiet.
 
-**A third instance shows the same class failing the other way.** This file's own "Elsewhere"
-section named `TransactionBehavior::Immediate` as the pending upgrade from an ordering-based
-closure to a structural one; the fix landed and the entry kept naming it pending until this
-pass corrected it (see "Elsewhere," below) — same remedy, now shown to fail whichever direction
-a deferral ages. A sibling instance lives in `aggregates.rs`'s module doc, in another lane's
-crate — not this file's to fix, but the same class once more.
+**A third instance shows the same class failing the other way. Measured** (see "Elsewhere,"
+below, for the grep): this file's own "Elsewhere" section named `TransactionBehavior::Immediate`
+as the pending upgrade from an ordering-based closure to a structural one; the fix landed and
+the entry kept naming it pending until this pass corrected it — same remedy, now shown to fail
+whichever direction a deferral ages. **Inspected:** a sibling instance lives in `aggregates.rs`'s
+module doc, in another lane's crate — not this file's to fix, but the same class once more.
 
 ## The freeze, and what it costs to change
 
