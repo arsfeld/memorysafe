@@ -94,12 +94,37 @@ mod tests {
         // The record is what gets written to msafe.toml. If the secret survives
         // serialization, every operator's config file is a credential store in
         // plaintext.
+        //
+        // This used to take its needle from `g.secret.rsplit('_').next()`. The
+        // base64url alphabet (URL_SAFE_NO_PAD) contains `_`, so that grabs
+        // whatever follows the *last* underscore anywhere in the 43-char body,
+        // not the body itself. On the days the body's last `_` falls near its
+        // end, the needle is one or two characters -- too short to mean
+        // anything: it either matches the record by coincidence (the visible
+        // flake) or passes without having checked most of the secret (silent,
+        // ~49% of runs -- see the commit message). Assert against the whole
+        // secret instead: strictly stronger and deterministic either way.
         let g = generate(TenantId::new("acme").unwrap(), "ci").unwrap();
         let json = serde_json::to_string(&g.record).unwrap();
-        let secret_tail = g.secret.rsplit('_').next().unwrap();
         assert!(
-            !json.contains(secret_tail),
+            !json.contains(&g.secret),
             "the record serialised the secret"
+        );
+
+        // A real leak might carry only the random body, not the whole
+        // "msk_<id>_<body>" string. Split off the two known prefix segments by
+        // position (`splitn`, keep the third field) rather than by searching
+        // for a delimiter that also occurs inside the body -- that search is
+        // exactly the bug above. This gives an independent needle that can
+        // neither flake nor pass hollowly.
+        let body = g
+            .secret
+            .splitn(3, '_')
+            .nth(2)
+            .expect("secret is prefix_id_body");
+        assert!(
+            !json.contains(body),
+            "the record serialised the secret's random body"
         );
     }
 
