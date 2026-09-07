@@ -16,7 +16,33 @@ memorysafe-policy = { path = "crates/memorysafe-policy" }
 memorysafe-auth = { path = "crates/memorysafe-auth" }
 memorysafe-engine = { path = "crates/memorysafe-engine" }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# `float_roundtrip`: serde_json's DEFAULT float parser is a fast, non-exact
+# `significand as f64` times/divided-by an approximate `POW10` lookup (see
+# serde_json's `de.rs::f64_from_parts`), not a correctly-rounded algorithm.
+# For most decimals it agrees with a correctly-rounded parse, but not always
+# -- e.g. `0.98_f32 as f64` (bits `3fef5c2900000000`) serialises to the
+# exact, correctly shortest-round-tripping string "0.9800000190734863", and
+# the default parser reads that string back as bits `3fef5c2900000001`, one
+# ULP off. This is exactly the shape `memorysafe_core::FeatureMap` values
+# have wherever a `Reason.evidence` number started life as an `f32` policy
+# threshold widened `as f64` by the `features!` macro -- e.g. `NearDuplicate`'s
+# `threshold` evidence -- so any exact `f64` round-trip through JSON,
+# anywhere in this workspace, silently moved a bit without this feature.
+#
+# Set here, not on a single crate's dependency: the parser must not vary by
+# build scope. `memorysafe-core` owns the wire-format tests over `Decision`
+# and `FeatureMap` that this shape actually hits, and by this workspace's
+# Global Constraints `memorysafe-core` must not depend on any backend crate
+# (a CI purity job builds it in isolation) -- so it cannot inherit the
+# feature from `memorysafe-backend-sqlite`. A crate-level override there
+# unified into a full `cargo test --workspace` run but silently reverted to
+# the inexact parser under `cargo test -p memorysafe-core` or the purity
+# job's isolated build, which is worse than the original defect: the
+# original was consistently wrong, that half-fix was inconsistently right.
+# See `memorysafe-backend-sqlite::audit`'s module doc and
+# `audit::tests::evidence_shaped_by_f32_widening_survives_the_audit_round_trip_exactly`
+# for the reproduction this closes.
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 thiserror = "2.0.20"
 ulid = { version = "3.0.0", features = ["serde"] }
 time = { version = "0.3.55", features = ["serde", "macros"] }

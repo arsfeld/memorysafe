@@ -12,11 +12,16 @@
 //!
 //! **`decision`'s `f64` evidence round-trips bit-for-bit.** `insert` stores
 //! `record.decision` as `serde_json::to_string`, and `query` reads it back
-//! with `serde_json::from_str`; both go through this crate's `serde_json`
-//! dependency, which enables the `float_roundtrip` Cargo feature (see this
-//! crate's `Cargo.toml`) precisely because its absence loses 1 ULP on the
-//! bit patterns `f32`-widened evidence produces -- e.g. `0.98_f32 as f64`,
-//! the shape of `NearDuplicate`'s `threshold` evidence. Proven and pinned by
+//! with `serde_json::from_str`. Its absence loses 1 ULP on the bit patterns
+//! `f32`-widened evidence produces -- e.g. `0.98_f32 as f64`, the shape of
+//! `NearDuplicate`'s `threshold` evidence -- so this depends on the
+//! `float_roundtrip` Cargo feature being enabled on `serde_json`. That is
+//! set on the **workspace** dependency (root `Cargo.toml`), not here: the
+//! parser must not vary by build scope, and `memorysafe-core` -- which owns
+//! `Decision`/`FeatureMap` and cannot depend on this or any backend crate --
+//! needs the same exact parser under `cargo test -p memorysafe-core` and
+//! the purity job's isolated build, not only inside a full workspace build
+//! that happens to unify the feature in from here. Proven and pinned by
 //! `audit::tests::evidence_shaped_by_f32_widening_survives_the_audit_round_trip_exactly`.
 
 use crate::tenant::SqlResultExt;
