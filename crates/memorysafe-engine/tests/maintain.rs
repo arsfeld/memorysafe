@@ -183,11 +183,18 @@ impl memorysafe_core::GovernancePolicy for MergesNamedPolicy {
 
     fn compose(
         &self,
-        _req: &memorysafe_core::RecallRequest,
-        _candidates: &[memorysafe_core::ScoredCandidate],
-        _ctx: &memorysafe_core::ComposeContext,
+        req: &memorysafe_core::RecallRequest,
+        candidates: &[memorysafe_core::ScoredCandidate],
+        ctx: &memorysafe_core::ComposeContext,
     ) -> Result<memorysafe_core::WorkingSet, memorysafe_core::PolicyError> {
-        unimplemented!("maintain tests never call compose")
+        // Delegated, not `unimplemented!`, because the pending-embedding
+        // merge test below calls `engine.recall(...)` (to prove vector-row
+        // presence/absence) through an engine governed by this policy, and
+        // `recall` calls `policy.compose`. A panicking stub there would still
+        // "pass" via the engine's caught-panic policy-failure fallback, but
+        // silently — and would couple that test to `FailureStance::FailSafe`
+        // without saying so.
+        self.baseline.compose(req, candidates, ctx)
     }
 
     fn maintain(
@@ -551,6 +558,18 @@ async fn maintenance_ignores_a_merge_into_a_nonexistent_target() {
 /// skips re-embedding entirely (rather than merely discarding the result) is
 /// caught directly — the same technique `protect_embedder_reach.rs` uses for
 /// `Engine::protect`'s own re-embed step, applied here to the merge arm's.
+///
+/// **Deliberately has no failure mode**, unlike its namesakes in
+/// `protect_embedder_reach.rs` / `read_embedder_reach.rs`. Its content
+/// blindness is exactly why: any failure-switch test built on it would need
+/// to seed two genuinely distinct items and then fail one specific re-embed,
+/// but seeding through `remember()` under a content-blind embedder makes
+/// every candidate a perfect vector near-duplicate of every other at
+/// ADMISSION time (see `maintenance_merge_reembeds_the_targets_content`'s own
+/// comment), auto-merging the seeds before a forced maintenance merge ever
+/// runs. `FlakyDeterministicEmbedder`, below, is the double built for that
+/// failure-mode test instead — it wraps a real, content-sensitive embedder so
+/// admission-time vectors stay genuinely distinct.
 struct SpyEmbedder {
     dim: u16,
     id: memorysafe_core::EmbedderId,
@@ -649,6 +668,173 @@ async fn maintenance_merge_reembeds_the_targets_content() {
         spy.calls() > calls_before_maintain,
         "the merge must re-embed the merged content rather than leaving the \
          target's vector stale"
+    );
+}
+
+// --- Fix round 1 on the mergewrite review: `apply_merge`'s own
+// `pending_embedding = vector.is_none()` derivation had zero coverage ------
+//
+// Hardcoding `false` at that line left the entire workspace suite green: no
+// test anywhere drove `Engine::maintain` with a failing embedder (this
+// file's own `SpyEmbedder`, above, had no failure mode at all before this
+// fix), and every OTHER test exercising a failed re-embed (`embedding_fallback.rs`,
+// `protect_embedder_reach.rs`, `merge_pending_embedding.rs`) only ever calls
+// `remember`, never `maintain`. `apply_merge` is also the one path a real
+// deployment can actually reach with this combination — a shipped policy has
+// no way to make `remember` itself decide `Action::Merge` while that same
+// call's own embed is failing (see `merge_pending_embedding.rs`'s module
+// doc), so this is the sole place the commit's guarantee is enforced in
+// practice.
+
+/// Wraps a real `DeterministicEmbedder` rather than reusing the content-blind
+/// `SpyEmbedder` above. `SpyEmbedder` returns the identical vector for any
+/// text, which (per `maintenance_merge_reembeds_the_targets_content`'s own
+/// comment) would make the two seed items look like perfect near-duplicates
+/// at ADMISSION time and auto-merge before `maintain` ever ran — defeating
+/// the premise of having two distinct items for a forced merge to fold
+/// together. Wrapping the real, content-sensitive embedder instead keeps
+/// admission-time vectors genuinely distinct, and `set_failing` fails only
+/// the specific call(s) made while it is toggled on — the merge's own
+/// re-embed — while every other call, including the reachability probe at
+/// the end of the test below, still goes through the real embedder. That
+/// matters beyond realism: `retrieve::candidates` gates its vector arm on
+/// `scope_embedder` matching the *query's* embedder id and dimension against
+/// what is actually stored (`memorysafe-backend-sqlite/src/retrieve.rs`), so
+/// a probe embedded by a different model than the one that wrote the scope's
+/// vectors would silently skip the vector arm entirely — passing the test
+/// for the wrong reason regardless of whether a stale row survived.
+struct FlakyDeterministicEmbedder {
+    inner: DeterministicEmbedder,
+    fail: AtomicBool,
+}
+
+impl FlakyDeterministicEmbedder {
+    fn new(dim: u16) -> Self {
+        Self {
+            inner: DeterministicEmbedder::new(dim),
+            fail: AtomicBool::new(false),
+        }
+    }
+
+    fn set_failing(&self, fail: bool) {
+        self.fail.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl memorysafe_embed::Embedder for FlakyDeterministicEmbedder {
+    fn id(&self) -> memorysafe_core::EmbedderId {
+        self.inner.id()
+    }
+
+    fn dim(&self) -> u16 {
+        self.inner.dim()
+    }
+
+    fn embed(
+        &self,
+        text: &str,
+    ) -> Result<memorysafe_core::Embedding, memorysafe_embed::EmbedError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(memorysafe_embed::EmbedError::Unavailable(
+                "forced failure for a test double".into(),
+            ));
+        }
+        self.inner.embed(text)
+    }
+}
+
+/// The direct regression test for the Critical finding: a maintenance merge
+/// whose re-embed fails must leave the target `pending_embedding: true` with
+/// no surviving row in the `vectors` table — not just unembedded.
+///
+/// Uses `MergeStrategy::ReplaceBody`, not `AppendAndUnion`: the merged body
+/// must stop containing `into_body`'s own words entirely, or a keyword-search
+/// match on them would be ambiguous between "a stale vector row survived"
+/// and "the current body still happens to contain these words." With
+/// `ReplaceBody`, the post-merge stored body is exactly `absorbed_body`
+/// (`"the cat sat on the mat"`), which shares zero tokens with `into_body`
+/// (`"a completely unrelated fact about river deltas"` — the same pairing
+/// `maintenance_merge_reembeds_the_targets_content` already established is
+/// unrelated enough not to merge on its own at admission time). So a recall
+/// query built from `into_body`'s own text can only be found through a
+/// vector row representing that pre-merge content — which must not exist
+/// after a failed re-embed.
+#[tokio::test]
+async fn maintenance_merge_with_a_failed_reembed_marks_the_target_pending_with_no_vector_row() {
+    let into_body = "a completely unrelated fact about river deltas";
+    let absorbed_body = "the cat sat on the mat";
+
+    let flaky = Arc::new(FlakyDeterministicEmbedder::new(256));
+    let e = Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(
+            tempfile::tempdir().expect("tempdir").keep(),
+        )),
+        flaky.clone(),
+        Arc::new(MergesNamedPolicy {
+            baseline: BaselinePolicy::default(),
+            absorbed_body: absorbed_body.into(),
+            into_body: into_body.into(),
+            strategy: memorysafe_core::MergeStrategy::ReplaceBody,
+        }),
+    ));
+
+    let into_id = e
+        .remember(RememberRequest::new(scope(), into_body))
+        .await
+        .unwrap()
+        .item_id
+        .unwrap();
+    e.remember(RememberRequest::new(scope(), absorbed_body))
+        .await
+        .unwrap();
+    let seeded = e.review(&scope(), &Default::default()).await.unwrap();
+    assert_eq!(
+        seeded.len(),
+        2,
+        "premise: two distinct items were seeded, neither auto-merged into \
+         the other at admission time"
+    );
+    assert!(
+        !seeded
+            .iter()
+            .find(|i| i.id == into_id)
+            .unwrap()
+            .pending_embedding,
+        "premise: the seeding remember succeeded and is not pending"
+    );
+
+    flaky.set_failing(true);
+    let report = e.maintain(&scope(), None).await.unwrap();
+    assert_eq!(
+        report.consolidated, 1,
+        "premise: the forced merge was applied"
+    );
+
+    let stored = e.review(&scope(), &Default::default()).await.unwrap();
+    let merged = stored.iter().find(|i| i.id == into_id).unwrap();
+    assert_eq!(
+        merged.body, absorbed_body,
+        "premise: ReplaceBody means into_body's own words are gone from \
+         storage entirely"
+    );
+    assert!(
+        merged.pending_embedding,
+        "a maintenance merge whose re-embed failed must leave the target \
+         marked pending_embedding — hardcoding `false` at apply_merge's own \
+         derivation must fail exactly this assertion"
+    );
+
+    // With the embedder working again, a query built from `into_body`'s own
+    // (now-erased-from-storage) text can only be found through a vector row
+    // still representing that pre-merge content.
+    flaky.set_failing(false);
+    let ws = e.recall(recall_req(into_body, scope())).await.unwrap();
+    assert!(
+        ws.items.is_empty(),
+        "a maintenance merge whose re-embed failed must leave no row in the \
+         vectors table — found via a query built from the pre-merge body's \
+         own words, which no longer appear anywhere in the current stored \
+         body, so a surviving stale vector row is the only explanation"
     );
 }
 

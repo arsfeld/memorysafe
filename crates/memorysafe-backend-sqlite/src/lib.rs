@@ -657,8 +657,10 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: new_body.len() as u64,
-            // This test is about capacity accounting, not embedding state.
-            pending_embedding: false,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // biconditional, now enforced by `is_valid()` — not a judgement
+            // about this test's subject (capacity accounting).
+            pending_embedding: true,
         });
         assert!(txn.is_valid(), "the premise: this transaction is valid");
 
@@ -738,9 +740,11 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: new_body.len() as u64,
-            // This test is about the stale post-merge `byte_size` column, not
-            // embedding state.
-            pending_embedding: false,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // biconditional, now enforced by `is_valid()` — not a judgement
+            // about this test's subject (the stale post-merge `byte_size`
+            // column).
+            pending_embedding: true,
         });
         b.apply(txn).await.unwrap();
 
@@ -798,9 +802,10 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: 11,
-            // This test is about the cross-scope merge-target check, not
-            // embedding state.
-            pending_embedding: false,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // biconditional, now enforced by `is_valid()` — not a judgement
+            // about this test's subject (the cross-scope merge-target check).
+            pending_embedding: true,
         });
         assert!(txn.is_valid(), "the premise: this transaction is valid");
 

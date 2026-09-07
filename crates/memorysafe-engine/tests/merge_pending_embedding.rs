@@ -144,11 +144,20 @@ impl memorysafe_core::GovernancePolicy for MergesIntoLaterTargetPolicy {
 
     fn compose(
         &self,
-        _req: &RecallRequest,
-        _candidates: &[ScoredCandidate],
-        _ctx: &ComposeContext,
+        req: &RecallRequest,
+        candidates: &[ScoredCandidate],
+        ctx: &ComposeContext,
     ) -> Result<WorkingSet, PolicyError> {
-        unimplemented!("remember() never calls compose")
+        // Unlike `merge_target_check.rs`'s otherwise-identical
+        // `MergeIntoNothingPolicy`, this file's own tests call
+        // `engine.recall(...)` (to prove vector-row presence/absence), and
+        // `recall` calls `policy.compose`. Delegating here — exactly as
+        // `assess`/`admit` already do — means those `recall` calls exercise
+        // `BaselinePolicy`'s real composition instead of silently routing
+        // through the engine's caught-panic policy-failure fallback, which
+        // would also make every such assertion depend on `FailureStance`
+        // being `FailSafe` without saying so.
+        self.baseline.compose(req, candidates, ctx)
     }
 
     fn maintain(&self, _ctx: &MaintainContext) -> Result<Vec<Decision>, PolicyError> {

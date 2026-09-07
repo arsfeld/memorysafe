@@ -476,9 +476,10 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: 11,
-            // This test is about `is_valid()`'s shape check, not embedding
-            // state.
-            pending_embedding: false,
+            // Paired with `vector: None`: `is_valid()` now enforces
+            // `MergeWrite::pending_embedding`'s biconditional, so this must
+            // be `true` regardless of what this test is about.
+            pending_embedding: true,
         });
         assert!(txn.is_valid());
     }

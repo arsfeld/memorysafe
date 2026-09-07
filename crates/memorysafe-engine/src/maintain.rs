@@ -274,7 +274,16 @@ impl Engine {
             MergeStrategy::ReplaceBody => absorbed.body.clone(),
         };
         // A missing or failed embedder must never cost a user their memory:
-        // leave `into`'s existing vector row alone rather than fail the merge.
+        // the merge itself still proceeds and the content is still stored.
+        // What it costs is reach, not memory — `into`'s existing vector row
+        // is dropped (see the conditional deletion in
+        // `memorysafe-backend-sqlite`'s `lib.rs` `apply`, keyed on exactly
+        // this `vector` being `None`) rather than left stale under the
+        // *pre-merge* body, and the item is marked `pending_embedding` below
+        // so a future backfill can repair it. Losing vector-search
+        // reachability until then is the deliberate trade; losing the
+        // memory, or leaving it silently unfindable by either mechanism
+        // forever, is not.
         let vector = self
             .embedder
             .embed(&merged_body)

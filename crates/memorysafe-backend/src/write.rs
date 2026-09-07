@@ -61,8 +61,10 @@ impl WriteTransaction {
         }
     }
 
-    /// A transaction is invalid if it both inserts and merges, or if its
-    /// scope-bearing fields disagree about which scope this write belongs to.
+    /// A transaction is invalid if it both inserts and merges, if its
+    /// scope-bearing fields disagree about which scope this write belongs to,
+    /// or if a `merge` carries a `pending_embedding` that disagrees with its
+    /// own `vector`.
     ///
     /// `scope`, the upserted item's own `scope`, and `audit.scope` are three
     /// independently-settable public fields, and a real backend reads
@@ -74,12 +76,26 @@ impl WriteTransaction {
     /// this product sells would point somewhere else. `MergeWrite` carries
     /// no scope of its own, so there is nothing to check there; a merge is
     /// always addressed by `scope`.
+    ///
+    /// **The `pending_embedding`/`vector` check makes `MergeWrite::pending_embedding`'s
+    /// own doc — "true exactly when `vector` is `None`" — enforced here
+    /// rather than merely documented and hoped for at each construction
+    /// site.** Every real caller already builds the two from the same
+    /// `Option`, so this can only ever reject a hand-built (almost always
+    /// test) transaction that got the pairing wrong — exactly the shape of
+    /// mistake this check exists to catch before it reaches a backend that
+    /// trusts the pairing to key its vector-row deletion.
     pub fn is_valid(&self) -> bool {
         if self.upsert.is_some() && self.merge.is_some() {
             return false;
         }
         if let Some(w) = &self.upsert
             && w.item.scope != self.scope
+        {
+            return false;
+        }
+        if let Some(m) = &self.merge
+            && m.pending_embedding != m.vector.is_none()
         {
             return false;
         }
@@ -218,9 +234,11 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: 6,
-            // This test is about mutual exclusivity with `upsert`, not about
-            // embedding state.
-            pending_embedding: false,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // own biconditional — not a judgement about this test's subject
+            // (mutual exclusivity with `upsert`), but a fixed requirement of
+            // any `vector: None` literal now that `is_valid` enforces it.
+            pending_embedding: true,
         });
         assert!(txn.is_valid());
         txn.upsert = Some(ItemWrite {
