@@ -49,6 +49,25 @@ pub fn delete(conn: &Connection, id: &ItemId) -> Result<(), BackendError> {
     Ok(())
 }
 
+/// The number of `vectors` rows stored for `scope`, read from this table's
+/// **own** `subject`/`namespace` columns — no join to `items`.
+///
+/// This is the low-level half of
+/// [`crate::SqliteBackend::vector_row_count`], the public accessor built on
+/// it; see that method's doc for why an unjoined, table-own count is the
+/// thing worth exposing at all rather than a count derived from `search` or
+/// `scope_embedder`.
+pub fn count(conn: &Connection, scope: &Scope) -> Result<u64, BackendError> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM vectors WHERE subject=?1 AND namespace=?2",
+            params![scope.subject.as_str(), scope.namespace.as_str()],
+            |r| r.get(0),
+        )
+        .sql()?;
+    Ok(n as u64)
+}
+
 /// Which embedder this scope's vectors were produced by. `None` when the scope
 /// holds no vectors yet. Comparing across models yields silently meaningless
 /// similarities, so every search gates on this.
