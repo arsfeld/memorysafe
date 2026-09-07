@@ -280,6 +280,12 @@ impl Engine {
             .embed(&merged_body)
             .ok()
             .map(|e| QuantizedVector::from_embedding(&e));
+        // Mirrors `remember`'s own rule (`write.rs`: `pending_embedding =
+        // embedding.is_none()`), derived from this call's `vector` rather
+        // than re-deriving it: `MergeWrite::pending_embedding` and
+        // `MergeWrite::vector` must agree, by construction, everywhere a
+        // `MergeWrite` is built — see that field's own doc for why.
+        let pending_embedding = vector.is_none();
         let byte_size = merged_body.len() as u64;
 
         let refs = vec![ItemRef::from_item(absorbed), ItemRef::from_item(&target)];
@@ -299,6 +305,7 @@ impl Engine {
             attrs: absorbed.attrs.clone(),
             vector,
             byte_size,
+            pending_embedding,
         });
 
         self.backend.apply(txn).await?;

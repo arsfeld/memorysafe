@@ -243,10 +243,32 @@ impl Backend for SqliteBackend {
                 }
 
                 if let Some(m) = &txn.merge {
-                    let diff =
-                        items::merge(&tx, &txn.scope, &m.target, &m.body, &m.tags, &m.attrs)?;
+                    let diff = items::merge(
+                        &tx,
+                        &txn.scope,
+                        &m.target,
+                        &m.body,
+                        &m.tags,
+                        &m.attrs,
+                        m.pending_embedding,
+                    )?;
+                    // A pending-embedding item and a vector row are mutually
+                    // exclusive: `m.pending_embedding` is `m.vector.is_none()`
+                    // by construction (see `MergeWrite::pending_embedding`'s
+                    // own doc), so the branch below on `m.vector` already
+                    // decides both facts at once. Written as this guard
+                    // — insert on `Some`, delete on `None` — rather than an
+                    // unconditional delete ahead of a conditional insert, so
+                    // it reads as enforcing the invariant rather than as an
+                    // incidental cleanup someone could "simplify" away. A
+                    // merge replaces the target's body wholesale
+                    // (`items::merge`), so a stale vector row here would keep
+                    // the item recallable by vector search under exactly the
+                    // pre-merge content the merge just removed.
                     if let Some(v) = &m.vector {
                         vectors::insert(&tx, &m.target, &txn.scope, v)?;
+                    } else {
+                        vectors::delete(&tx, &m.target)?;
                     }
                     delta_bytes += diff;
                     item_id = Some(m.target.clone());
@@ -635,6 +657,8 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: new_body.len() as u64,
+            // This test is about capacity accounting, not embedding state.
+            pending_embedding: false,
         });
         assert!(txn.is_valid(), "the premise: this transaction is valid");
 
@@ -714,6 +738,9 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: new_body.len() as u64,
+            // This test is about the stale post-merge `byte_size` column, not
+            // embedding state.
+            pending_embedding: false,
         });
         b.apply(txn).await.unwrap();
 
@@ -771,6 +798,9 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: 11,
+            // This test is about the cross-scope merge-target check, not
+            // embedding state.
+            pending_embedding: false,
         });
         assert!(txn.is_valid(), "the premise: this transaction is valid");
 

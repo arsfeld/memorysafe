@@ -188,6 +188,12 @@ impl Engine {
                     attrs: req.attrs.clone(),
                     vector: vector.clone(),
                     byte_size: req.body.len() as u64,
+                    // Same `pending_embedding` this write already computed
+                    // for the `Retain` arm above, from the same `embedding`
+                    // — a merge target whose re-embed just failed needs the
+                    // backfill job to find it exactly as a freshly admitted
+                    // item does.
+                    pending_embedding,
                 }),
             ),
         };

@@ -22,6 +22,16 @@ pub struct MergeWrite {
     pub attrs: BTreeMap<String, serde_json::Value>,
     pub vector: Option<QuantizedVector>,
     pub byte_size: u64,
+    /// Mirrors `MemoryItem::pending_embedding`'s own rule
+    /// (`write.rs`: `pending_embedding = embedding.is_none()`): true exactly
+    /// when `vector` is `None`. The two are one fact, not two independently
+    /// settable ones — a backend applying this write must keep the target's
+    /// `pending_embedding` column and its `vectors` row in that same
+    /// agreement (delete the row when this is true, write it when it is
+    /// not), or a merge that drops content while its re-embed fails leaves
+    /// the item recallable by vector search under exactly the body the merge
+    /// just removed.
+    pub pending_embedding: bool,
 }
 
 /// One atomic unit of change. Item write, evictions, and the audit record
@@ -208,6 +218,9 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: 6,
+            // This test is about mutual exclusivity with `upsert`, not about
+            // embedding state.
+            pending_embedding: false,
         });
         assert!(txn.is_valid());
         txn.upsert = Some(ItemWrite {

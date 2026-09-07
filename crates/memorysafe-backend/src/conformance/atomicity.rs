@@ -62,6 +62,9 @@ pub async fn a_failed_transaction_leaves_no_trace<F: BackendFactory>(factory: &F
         attrs: Default::default(),
         vector: None,
         byte_size: 11,
+        // This test is about a failed transaction leaving no trace, not
+        // embedding state.
+        pending_embedding: false,
     });
     txn.evictions = vec![existing.id.clone()];
 
@@ -169,6 +172,9 @@ pub async fn an_invalid_transaction_is_rejected_and_writes_nothing<F: BackendFac
         attrs: Default::default(),
         vector: None,
         byte_size: 41,
+        // This test is about `is_valid()` rejecting an invalid transaction
+        // shape, not embedding state.
+        pending_embedding: false,
     });
     txn.evictions = vec![bystander.id.clone()];
     assert!(

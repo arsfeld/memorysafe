@@ -476,6 +476,9 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: 11,
+            // This test is about `is_valid()`'s shape check, not embedding
+            // state.
+            pending_embedding: false,
         });
         assert!(txn.is_valid());
     }

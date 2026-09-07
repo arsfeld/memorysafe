@@ -276,6 +276,7 @@ pub fn merge(
     body: &str,
     tags: &[String],
     attrs: &std::collections::BTreeMap<String, serde_json::Value>,
+    pending_embedding: bool,
 ) -> Result<i64, BackendError> {
     let Some(existing) = get(conn, scope, target)? else {
         return Err(BackendError::MergeTargetMissing(target.clone()));
@@ -297,10 +298,12 @@ pub fn merge(
     updated.body = body.to_string();
     updated.tags = merged_tags;
     updated.attrs = merged_attrs;
+    updated.pending_embedding = pending_embedding;
     let after = updated.byte_size() as i64;
 
     conn.execute(
-        "UPDATE items SET body = ?4, tags = ?5, attrs = ?6, byte_size = ?7
+        "UPDATE items SET body = ?4, tags = ?5, attrs = ?6, byte_size = ?7,
+             pending_embedding = ?8
          WHERE id = ?1 AND subject = ?2 AND namespace = ?3",
         params![
             target.as_str(),
@@ -310,6 +313,7 @@ pub fn merge(
             serde_json::to_string(&updated.tags).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&updated.attrs).unwrap_or_else(|_| "{}".into()),
             after,
+            i64::from(updated.pending_embedding),
         ],
     )
     .sql()?;
@@ -612,7 +616,16 @@ mod tests {
         let mut new_attrs = BTreeMap::new();
         new_attrs.insert("k-new".to_string(), serde_json::Value::String("new".into()));
 
-        let delta = merge(&conn, &s, &existing.id, new_body, &new_tags, &new_attrs).unwrap();
+        let delta = merge(
+            &conn,
+            &s,
+            &existing.id,
+            new_body,
+            &new_tags,
+            &new_attrs,
+            false,
+        )
+        .unwrap();
 
         let stored = get(&conn, &s, &existing.id)
             .unwrap()
@@ -672,6 +685,64 @@ mod tests {
         );
     }
 
+    /// `merge`'s own `UPDATE` did not touch `pending_embedding` until this
+    /// test's premise: `insert` writes the column (see
+    /// `every_column_survives_a_round_trip_including_the_ones_with_defaults`
+    /// above) but `merge` skipped it entirely, so a merge whose re-embed
+    /// failed had nowhere to record that fact — the flag stayed at whatever
+    /// the target's *pre-merge* value happened to be, forever, no matter what
+    /// `merge`'s caller passed. Both directions are exercised, mirroring
+    /// `MergeWrite::pending_embedding`'s own doc: a merge can both set the
+    /// flag (target was clean, re-embed failed) and clear a stale one
+    /// (target was pending, re-embed succeeded) — either direction being
+    /// silently ignored would still leave every other assertion in this
+    /// module passing.
+    #[test]
+    fn merge_persists_the_pending_embedding_flag_in_both_directions() {
+        let conn = db();
+        let s = scope("s", "n");
+
+        let mut clean = item(&s, "a clean target");
+        clean.pending_embedding = false;
+        insert(&conn, &clean).unwrap();
+        merge(
+            &conn,
+            &s,
+            &clean.id,
+            "new body",
+            &[],
+            &BTreeMap::new(),
+            true,
+        )
+        .unwrap();
+        let after_set = get(&conn, &s, &clean.id).unwrap().unwrap();
+        assert!(
+            after_set.pending_embedding,
+            "merge must be able to SET pending_embedding, not just leave it \
+             at the target's pre-merge value"
+        );
+
+        let mut stale = item(&s, "a stale target");
+        stale.pending_embedding = true;
+        insert(&conn, &stale).unwrap();
+        merge(
+            &conn,
+            &s,
+            &stale.id,
+            "new body",
+            &[],
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        let after_clear = get(&conn, &s, &stale.id).unwrap().unwrap();
+        assert!(
+            !after_clear.pending_embedding,
+            "merge must be able to CLEAR a stale pending_embedding, not just \
+             leave it at the target's pre-merge value"
+        );
+    }
+
     /// A merge whose supplied tag already exists on the target must not
     /// create a duplicate.
     #[test]
@@ -689,6 +760,7 @@ mod tests {
             "body",
             &["shared".to_string()],
             &BTreeMap::new(),
+            false,
         )
         .unwrap();
 
@@ -707,7 +779,16 @@ mod tests {
         insert(&conn, &existing).unwrap();
         let before = existing.byte_size() as i64;
 
-        let delta = merge(&conn, &s, &existing.id, "short", &[], &BTreeMap::new()).unwrap();
+        let delta = merge(
+            &conn,
+            &s,
+            &existing.id,
+            "short",
+            &[],
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
         let stored = get(&conn, &s, &existing.id).unwrap().unwrap();
         let after = stored.byte_size() as i64;
 
@@ -734,6 +815,7 @@ mod tests {
             "stolen body",
             &[],
             &BTreeMap::new(),
+            false,
         )
         .unwrap_err();
         assert!(
@@ -759,7 +841,7 @@ mod tests {
         let conn = db();
         let s = scope("s", "n");
         let ghost = ItemId::new();
-        let err = merge(&conn, &s, &ghost, "body", &[], &BTreeMap::new()).unwrap_err();
+        let err = merge(&conn, &s, &ghost, "body", &[], &BTreeMap::new(), false).unwrap_err();
         assert!(matches!(&err, BackendError::MergeTargetMissing(id) if *id == ghost));
     }
 }
