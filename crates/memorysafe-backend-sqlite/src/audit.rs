@@ -104,6 +104,32 @@ pub fn query(
             args.push(Box::new(n.to_string()));
         }
     }
+    // `filter.item`, when set, narrows to records whose `items` column (a
+    // JSON array of `ItemRef { id, digest }` objects — see the module doc)
+    // contains an element whose `id` matches. This must stay a SQL predicate
+    // ANDed in here, before `ORDER BY ... LIMIT` is appended below, rather
+    // than a Rust-side filter applied to the fetched rows: `limit` is
+    // documented on `AuditFilter` as `min(limit, rows matching the WHOLE
+    // filter)`, and a caller relies on `returned.len() < limit` as the only
+    // signal the log is exhausted (there is deliberately no `truncated`
+    // flag). Filtering after an item-blind `LIMIT` would satisfy a
+    // `len()`-only test while quietly returning fewer than `min(limit,
+    // matching)` rows.
+    //
+    // Matches the parsed `id` field specifically via `json_extract`, not a
+    // `LIKE` over the raw column: an `ItemId` is a 26-character ULID and a
+    // `digest` is BLAKE3 hex, so a substring match could in principle match
+    // the wrong field, or a prefix of a longer id. Follows the
+    // `json_each`-over-a-JSON-array precedent in `retrieve.rs`'s
+    // `filter_sql`, adapted for an array of objects rather than of strings.
+    if let Some(item_id) = &filter.item {
+        args.push(Box::new(item_id.as_str().to_string()));
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM json_each(items) \
+               WHERE json_extract(json_each.value, '$.id') = ?{})",
+            args.len()
+        ));
+    }
     if let Some(since) = filter.since {
         args.push(Box::new(since.unix_timestamp()));
         sql.push_str(&format!(" AND at >= ?{}", args.len()));
@@ -424,5 +450,145 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(query(&conn, &s, &capped).unwrap().len(), 1);
+    }
+
+    /// `filter.item` narrows to records whose `items` column references that
+    /// `ItemId`, and only those. Two records, each referencing a distinct
+    /// item, plus a third record referencing no item at all (an eviction,
+    /// the same shape `record`/`insert` produce when `items` is left `vec![]`)
+    /// — asserted in both directions, on the exact id returned rather than a
+    /// count, so a backend that ignores `filter.item` (returns all three) or
+    /// one that treats `item: Some(_)` as merely "items is non-empty"
+    /// (returns the item-referencing pair but not the phantom) both fail
+    /// here.
+    #[test]
+    fn filter_item_narrows_to_records_referencing_that_item() {
+        let conn = db();
+        let s = scope("s", "n");
+        let item_a = item(&s, "a body");
+        let item_b = item(&s, "b body");
+
+        let mut rec_a = record(&s, AuditEvent::Admitted, 100);
+        rec_a.items = vec![ItemRef::from_item(&item_a)];
+        insert(&conn, &rec_a).unwrap();
+
+        let mut rec_b = record(&s, AuditEvent::Admitted, 200);
+        rec_b.items = vec![ItemRef::from_item(&item_b)];
+        insert(&conn, &rec_b).unwrap();
+
+        // A phantom eviction: no item reference at all.
+        let phantom = record(&s, AuditEvent::Forgotten, 300);
+        insert(&conn, &phantom).unwrap();
+
+        let for_a = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(item_a.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            for_a.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![rec_a.id.clone()],
+            "filtering by item A's id must return exactly A's record, not B's \
+             or the phantom's"
+        );
+
+        let for_b = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(item_b.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            for_b.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![rec_b.id.clone()],
+            "filtering by item B's id must return exactly B's record, not A's \
+             or the phantom's"
+        );
+    }
+
+    /// The residual left open by the conformance suite: it only ever queries
+    /// `item` against `AuditFilter::default()`, whose `limit` is 100, so it
+    /// never combines `item` with a constraining `limit` and — since nothing
+    /// implemented the field before this change — could not have. Per
+    /// `Backend::audit`'s contract, `item` is applied BEFORE `limit`, so
+    /// `limit` means `min(limit, rows matching the WHOLE filter)`.
+    ///
+    /// A backend that filters a fetched page in Rust *after* an
+    /// item-blind `SQL LIMIT` would satisfy `filter_item_narrows_to_records_
+    /// referencing_that_item` above (that test's `limit` is the default 100,
+    /// comfortably wider than its three-row corpus) while still breaking the
+    /// contract here: `AuditFilter::limit`'s doc makes `returned.len() <
+    /// limit` the *only* signal the log is exhausted, so a caller fed a short
+    /// page for the wrong reason wrongly concludes it reached the end.
+    ///
+    /// The corpus interleaves matching and non-matching rows by id
+    /// (newest-first is the row order) so that the newest `limit` rows,
+    /// taken WITHOUT the item predicate, are *not* the same set as the
+    /// newest `limit` rows that reference item A: id5/id3/id1 (the three
+    /// newest, unfiltered) reference item B, while item A is on id4/id2/id0.
+    /// A page-then-filter backend intersects those two sets and returns only
+    /// id4 (one row); the correct SQL-first ordering returns id4, id2, id0
+    /// (three rows) — `min(limit=3, matching=3)`.
+    #[test]
+    fn filter_item_is_applied_before_limit_not_after() {
+        let conn = db();
+        let s = scope("s", "n");
+        let item_a = item(&s, "a body");
+        let item_b = item(&s, "b body");
+
+        let ids = [
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0", // oldest
+            "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB3",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB4",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB5", // newest
+        ];
+        // Even indices (0, 2, 4) reference item A; odd indices (1, 3, 5)
+        // reference item B. Three rows match `item: Some(item_a)`.
+        for (i, id) in ids.iter().enumerate() {
+            let mut rec = record(&s, AuditEvent::Admitted, 100 + i as i64);
+            rec.id = AuditId::parse(id).unwrap();
+            rec.items = vec![ItemRef::from_item(if i % 2 == 0 {
+                &item_a
+            } else {
+                &item_b
+            })];
+            insert(&conn, &rec).unwrap();
+        }
+
+        let got: Vec<String> = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(item_a.id.clone()),
+                limit: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id.as_str().to_string())
+        .collect();
+
+        assert_eq!(
+            got,
+            vec![ids[4].to_string(), ids[2].to_string(), ids[0].to_string()],
+            "limit=3 with item=A must return all three item-A rows \
+             (min(limit, matching) = 3), newest first — a backend that cuts \
+             the SQL LIMIT before filtering by item would instead intersect \
+             the newest 3 rows overall ({}, {}, {}, only one of which is \
+             item A) with the item filter and return just one row",
+            ids[5],
+            ids[4],
+            ids[3],
+        );
     }
 }
