@@ -18,6 +18,7 @@ memorysafe-engine = { path = "crates/memorysafe-engine" }
 memorysafe-mcp = { path = "crates/memorysafe-mcp" }
 memorysafe-api = { path = "crates/memorysafe-api" }
 memorysafe-cli = { path = "crates/memorysafe-cli" }
+memorysafe-shadow = { path = "crates/memorysafe-shadow" }
 rmcp = { version = "3.2.0", default-features = false, features = [
     "server", "macros", "schemars", "transport-io", "transport-streamable-http-server",
 ] }

@@ -1450,6 +1450,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "memorysafe-shadow"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "memorysafe-backend",
+ "memorysafe-backend-sqlite",
+ "memorysafe-core",
+ "memorysafe-embed",
+ "memorysafe-engine",
+ "memorysafe-policy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
