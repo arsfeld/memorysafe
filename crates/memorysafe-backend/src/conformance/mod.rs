@@ -90,6 +90,7 @@ where
         atomicity::idempotency_keys_do_not_collide_across_subjects,
         retrieval::sensitivity_ceiling_is_enforced_in_the_query,
         retrieval::tag_and_kind_filters_narrow_results,
+        retrieval::occurrence_time_bounds_are_inclusive_and_exclude_undated_items,
         retrieval::vector_search_ranks_by_similarity,
         retrieval::keyword_search_finds_exact_terms,
         retrieval::keyword_search_escapes_user_input,

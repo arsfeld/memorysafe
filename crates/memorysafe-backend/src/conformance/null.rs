@@ -387,6 +387,7 @@ async fn run_census() -> Vec<(&'static str, Verdict)> {
         super::atomicity::idempotency_keys_do_not_collide_across_subjects,
         super::retrieval::sensitivity_ceiling_is_enforced_in_the_query,
         super::retrieval::tag_and_kind_filters_narrow_results,
+        super::retrieval::occurrence_time_bounds_are_inclusive_and_exclude_undated_items,
         super::retrieval::vector_search_ranks_by_similarity,
         super::retrieval::keyword_search_finds_exact_terms,
         super::retrieval::keyword_search_escapes_user_input,
@@ -612,6 +613,11 @@ struct Tolerance {
 /// the fifty-third, `atomicity::idempotency_keys_do_not_collide_across_subjects`:
 /// it fails on its first presence assertion, since `NullBackend::list` always
 /// returns an empty vec and can never contain the item an "admit" just wrote.
+/// Nor is the fifty-fourth,
+/// `retrieval::occurrence_time_bounds_are_inclusive_and_exclude_undated_items`:
+/// it fails on its first inclusive-bound assertion, since
+/// `NullBackend::retrieve_candidates` always returns an empty vec and none of
+/// the dated items it expects back ever appear.
 /// The census figures above are left at the reading they were taken at rather
 /// than adjusted by arithmetic; retake them to update them.
 ///
@@ -802,7 +808,7 @@ async fn the_census_measures_every_test_the_suite_runs() {
     );
     assert_eq!(
         suite.len(),
-        53,
+        54,
         "the suite's size changed; update the census record"
     );
 }
