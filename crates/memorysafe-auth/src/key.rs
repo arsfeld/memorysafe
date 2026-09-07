@@ -213,13 +213,35 @@ mod tests {
             !rendered.contains(&generated.secret),
             "Debug rendered the whole secret: {rendered}"
         );
-        // The random body alone, without the `msk_<id>_` prefix, must not appear
-        // either -- a partial leak is still a leak.
-        let body = generated.secret.rsplit('_').next().unwrap();
+
+        // Extract the random body by position rather than by searching for a
+        // delimiter, since `_` also occurs inside the base64url body itself.
+        // Split off the two known prefix segments (prefix and id) by position
+        // to get the third field deterministically.
+        let body = generated
+            .secret
+            .splitn(3, '_')
+            .nth(2)
+            .expect("secret is prefix_id_body");
         assert!(
             !rendered.contains(body),
             "Debug rendered the secret's random body: {rendered}"
         );
+
+        // Neither assertion above catches a leak of a *fragment* of the body.
+        // Slide a fixed-size window across the body and require that no window
+        // appears in the rendered output. The window size is deterministic,
+        // not derived from delimiter positions, so this genuinely catches
+        // partial leaks.
+        const WINDOW: usize = 16;
+        for start in 0..=body.len().saturating_sub(WINDOW) {
+            let fragment = &body[start..start + WINDOW];
+            assert!(
+                !rendered.contains(fragment),
+                "Debug rendered a fragment of the secret's random body: {fragment:?}"
+            );
+        }
+
         assert!(
             rendered.contains("<redacted>"),
             "Debug did not mark the secret as redacted: {rendered}"
