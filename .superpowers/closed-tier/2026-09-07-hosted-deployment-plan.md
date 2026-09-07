@@ -2124,3 +2124,15 @@ git add -A && git commit -m "test(server): end-to-end smoke, plus the runbook an
 
 1. **Plan 2's conformance count is 55, not 49.** Its goal statement and task acceptance criteria say "frozen 49-test conformance suite" with a table of 5/6/13/4/21. The authoritative `run!` in `vendor/memorysafe/crates/memorysafe-backend/src/conformance/mod.rs` runs 55 — isolation 5, atomicity 8, retrieval 14, capacity 5, lifecycle 23. Fix Plan 2 before implementing it, per its own instruction to recount rather than adjust by a difference.
 2. **Add a `LICENSE` file to the open repository.** The README carries an Apache-2.0 badge and no license file exists.
+3. **A hard blocker for Plan 2, discovered while building Task 11 and verified independently twice.** `memorysafe-backend-postgres` cannot use sqlx's `json` feature in this workspace as it currently stands, and it needs that feature — `MemoryItem.attrs` is a `BTreeMap<String, serde_json::Value>`.
+
+   The collision, with the exact ranges: sqlx's `json` and `macros` features carry **weak** references (`sqlx-sqlite?/json`, `sqlx-sqlite?/offline`), and Cargo resolves a version for that optional dependency *even though the feature is never activated* — the pre-change lock file already carried `sqlx-sqlite` with no `sqlite` feature ever enabled. `sqlx-sqlite` requires `libsqlite3-sys >=0.30.1,<0.38.0`. Meanwhile `memorysafe-backend-sqlite`'s `rusqlite` with `features = ["bundled"]` requires `libsqlite3-sys ^0.38.1`. The ranges are disjoint by construction, so **no pin and no `[patch]` table can satisfy both**, and `libsqlite3-sys` uses `links`, which makes the conflict unconditional rather than a duplicate-version warning.
+
+   Task 11 defused it by dropping `json` and `macros` from sqlx's feature list, which is sound only while nothing needs them. But `memorysafe-cloud-control`'s dev-dependency on `memorysafe-backend-sqlite` is now permanent — `test_support::sqlite_engine()` depends on it and later tasks keep using it — so the conflict returns the moment Plan 2's crate lands in this workspace.
+
+   Plan 2 must choose one before writing a line of `PostgresBackend`:
+   - drop the SQLite-backed test engine from this workspace (costs the cheapest real `Engine` available to control-plane tests);
+   - change the vendor-side `rusqlite` feature choice so `bundled` is not forced (an open-repo change, with its own review);
+   - or split `memorysafe-backend-postgres` into its own workspace so the two never resolve together.
+
+   This is a design decision with real trade-offs, not a dependency bump. Deciding it late means discovering it after the backend is written.
