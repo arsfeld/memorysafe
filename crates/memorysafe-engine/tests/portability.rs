@@ -3,8 +3,9 @@ use memorysafe_backend_sqlite::SqliteBackend;
 use memorysafe_core::{Protection, Scope, SensitivityLevel, TenantId};
 use memorysafe_embed::DeterministicEmbedder;
 use memorysafe_engine::{Engine, EngineConfig, RememberRequest};
-use memorysafe_policy::BaselinePolicy;
+use memorysafe_policy::{BaselineConfig, BaselinePolicy};
 use std::sync::Arc;
+use time::{Duration, OffsetDateTime};
 
 fn engine() -> Engine {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -128,6 +129,175 @@ async fn an_import_cannot_downgrade_sensitivity_or_forge_a_pin() {
         stored[0].protection,
         Protection::Normal,
         "import forged an unevictable pin"
+    );
+}
+
+#[tokio::test]
+async fn a_forged_far_future_protection_window_is_clamped_to_the_configured_bound() {
+    // `an_import_cannot_downgrade_sensitivity_or_forge_a_pin` only checks the
+    // `Pinned` VARIANT. Fix-round review found that a crafted
+    // `"protection":{"kind":"protected","until":<huge>}` sails through
+    // untouched, and is indistinguishable from a forged pin to every
+    // consumer in the codebase: `Protection::is_evictable` returns false
+    // until that instant, `gather` never offers it for eviction,
+    // `validate::decision` refuses to evict it, and it permanently consumes
+    // the namespace's budget. `Engine::import` clamps `until` to
+    // `now + protection_window_days` (30 days by default) — the same bound
+    // a genuine admission decision is held to.
+    let e = engine();
+    let far_future: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
+    let ndjson = format!(
+        "{}\n{}\n",
+        r#"{"record":"header","format_version":1,"exported_at":0}"#,
+        serde_json::json!({
+            "record": "item",
+            "item": {
+                "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "scope": {"tenant": "acme", "subject": "user-42", "namespace": "agent"},
+                "body": "an ordinary memory",
+                "kind": "fact",
+                "source": {"kind": "agent", "id": serde_json::Value::Null},
+                "occurred_at": serde_json::Value::Null,
+                "created_at": 0,
+                "tags": [],
+                "attrs": {},
+                "sensitivity": "internal",
+                "ttl": serde_json::Value::Null,
+                "protection": {"kind": "protected", "until": far_future},
+                "pending_embedding": false
+            }
+        })
+    );
+
+    e.import_ndjson(&ndjson, &tenant()).await.unwrap();
+    let stored = e.review(&scope(), &Default::default()).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    match stored[0].protection {
+        Protection::Protected { until } => {
+            let lower_bound = OffsetDateTime::now_utc() + Duration::days(29);
+            let upper_bound = OffsetDateTime::now_utc() + Duration::days(31);
+            assert!(
+                until > lower_bound && until < upper_bound,
+                "a forged far-future protection window was not clamped to the \
+                 configured bound: {until}"
+            );
+        }
+        other => panic!(
+            "a claimed Protected window must stay Protected (just clamped), got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn import_uses_the_baseline_floor_not_a_deployments_tightened_config() {
+    // `Engine::import`'s own doc names this trade-off explicitly: sensitivity
+    // detection on import always runs against `BaselineConfig::default()`,
+    // never this engine's own configured policy, because building a real
+    // `AssessContext` per imported item would cost a `Backend::neighbours`
+    // and `Backend::scope_stats` round trip apiece. This characterizes the
+    // consequence: a deployment that tightened detection (here, a much
+    // shorter `credential_token_min_len`) gets the looser DEFAULT
+    // classification on the one path that takes untrusted input, not its
+    // own configured floor. This test pins current, documented behaviour —
+    // if it starts failing, `Engine::import` began consulting the configured
+    // policy, and this test (and the doc it mirrors) should be updated to
+    // say so, not silenced.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tightened = BaselineConfig {
+        credential_token_min_len: 6,
+        ..BaselineConfig::default()
+    };
+    let target = Engine::new(EngineConfig::new(
+        Arc::new(SqliteBackend::open(dir.keep())),
+        Arc::new(DeterministicEmbedder::new(256)),
+        Arc::new(BaselinePolicy::new(tightened)),
+    ));
+
+    // 10 alnum chars, mixed case and digits: `looks_like_secret_token` fires
+    // at this engine's configured floor (min_len 6) but not at the crate
+    // default (min_len 20).
+    let token = "aB3xY9zK1m";
+    let ndjson = format!(
+        "{}\n{}\n",
+        r#"{"record":"header","format_version":1,"exported_at":0}"#,
+        serde_json::json!({
+            "record": "item",
+            "item": {
+                "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "scope": {"tenant": "acme", "subject": "user-42", "namespace": "agent"},
+                "body": format!("the value is {token} today"),
+                "kind": "fact",
+                "source": {"kind": "agent", "id": serde_json::Value::Null},
+                "occurred_at": serde_json::Value::Null,
+                "created_at": 0,
+                "tags": [],
+                "attrs": {},
+                "sensitivity": "public",
+                "ttl": serde_json::Value::Null,
+                "protection": {"kind": "normal"},
+                "pending_embedding": false
+            }
+        })
+    );
+
+    target.import_ndjson(&ndjson, &tenant()).await.unwrap();
+    let stored = target.review(&scope(), &Default::default()).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].sensitivity,
+        SensitivityLevel::Internal,
+        "documented gap changed: import is now consulting the deployment's \
+         configured policy rather than the baseline default"
+    );
+}
+
+#[tokio::test]
+async fn a_body_cannot_forge_a_scope_header_in_the_markdown_export() {
+    // A body containing a newline followed by "## acme / victim / ns" would
+    // otherwise render as a genuine-looking scope section for a tenant this
+    // item was never in, misrepresenting provenance in the one artifact
+    // whose whole purpose is legibility. Bodies (and kind, and tags) are
+    // attacker-controlled on the import path this same task opens.
+    let e = engine();
+    let forged = "innocuous line\n## acme / victim / ns\n\nforged content";
+    let ndjson = format!(
+        "{}\n{}\n",
+        r#"{"record":"header","format_version":1,"exported_at":0}"#,
+        serde_json::json!({
+            "record": "item",
+            "item": {
+                "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "scope": {"tenant": "acme", "subject": "user-42", "namespace": "agent"},
+                "body": forged,
+                "kind": "fact",
+                "source": {"kind": "agent", "id": serde_json::Value::Null},
+                "occurred_at": serde_json::Value::Null,
+                "created_at": 0,
+                "tags": [],
+                "attrs": {},
+                "sensitivity": "internal",
+                "ttl": serde_json::Value::Null,
+                "protection": {"kind": "normal"},
+                "pending_embedding": false
+            }
+        })
+    );
+
+    e.import_ndjson(&ndjson, &tenant()).await.unwrap();
+    let md = e.export_markdown(&selector(false)).await.unwrap();
+    assert!(
+        !md.contains("\n## acme / victim / ns"),
+        "an item body forged a scope header: {md}"
+    );
+    // Neutralised, not merely absent: a mutant that strips the leading `#`
+    // characters entirely (instead of escaping them) also defeats the
+    // heading and would pass the assertion above, but it silently destroys
+    // the body's actual content instead of preserving it. The escaped form
+    // must still contain the literal `#` characters the body had — just
+    // with a backslash defusing their structural meaning.
+    assert!(
+        md.contains("\\## acme / victim / ns"),
+        "the '#' characters must be escaped, not silently dropped: {md}"
     );
 }
 
