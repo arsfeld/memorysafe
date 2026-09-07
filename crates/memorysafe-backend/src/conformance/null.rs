@@ -388,11 +388,14 @@ async fn run_census() -> Vec<(&'static str, Verdict)> {
         super::atomicity::admit_evict_and_audit_commit_together,
         super::atomicity::a_failed_transaction_leaves_no_trace,
         super::atomicity::an_invalid_transaction_is_rejected_and_writes_nothing,
+        super::atomicity::every_is_valid_rejection_is_rejected_by_the_backend,
         super::atomicity::every_mutation_writes_exactly_one_audit_record,
         super::atomicity::idempotent_writes_replay_the_original_outcome,
         super::atomicity::idempotency_conflict_on_different_payload,
+        super::atomicity::idempotency_keys_do_not_collide_across_subjects,
         super::retrieval::sensitivity_ceiling_is_enforced_in_the_query,
         super::retrieval::tag_and_kind_filters_narrow_results,
+        super::retrieval::occurrence_time_bounds_are_inclusive_and_exclude_undated_items,
         super::retrieval::vector_search_ranks_by_similarity,
         super::retrieval::keyword_search_finds_exact_terms,
         super::retrieval::keyword_search_escapes_user_input,
@@ -406,9 +409,11 @@ async fn run_census() -> Vec<(&'static str, Verdict)> {
         super::retrieval::recall_updates_access_statistics,
         super::capacity::capacity_accounting_tracks_items_and_bytes,
         super::capacity::eviction_releases_capacity,
+        super::capacity::a_merge_adjusts_capacity_by_the_delta_not_the_new_size,
         super::capacity::concurrent_admits_do_not_double_count,
         super::capacity::scope_stats_reflect_the_corpus,
         super::lifecycle::audit_filter_narrows_by_event_and_time,
+        super::lifecycle::audit_filter_narrows_by_item,
         super::lifecycle::audit_returns_min_of_the_limit_and_the_rows_that_remain,
         super::lifecycle::audit_pages_by_the_after_cursor_without_repeating_a_row,
         super::lifecycle::audit_since_and_until_include_a_record_on_the_boundary,
@@ -602,13 +607,33 @@ struct Tolerance {
 /// assertion, 4 by panicking on an empty vec or a `None`, all of which are the
 /// right outcome.
 ///
-/// The suite has since reached 50. The fiftieth,
+/// The suite has since reached 51. The fiftieth,
 /// `lifecycle::every_audit_writing_path_increments_the_aggregates`, was added
 /// after this census was taken and is **not** among the survivors: it fails
 /// against the null backend on its first delta assertion, since
-/// `audit_aggregates` returns an empty vec and the count never rises. The
-/// census figures above are left at the reading they were taken at rather than
-/// adjusted by arithmetic; retake them to update them.
+/// `audit_aggregates` returns an empty vec and the count never rises. Nor is
+/// the fifty-first, `lifecycle::audit_filter_narrows_by_item`: it fails on its
+/// first echo-rule assertion, since `NullBackend::apply` returns a fixed nil
+/// `AuditId` rather than the one its transaction carried. Nor is the
+/// fifty-second, `capacity::a_merge_adjusts_capacity_by_the_delta_not_the_new_size`:
+/// it fails on its very first substantive assertion, `used_items == 2` after
+/// two admits, since `NullBackend::capacity_state` always reports zero. Nor is
+/// the fifty-third, `atomicity::idempotency_keys_do_not_collide_across_subjects`:
+/// it fails on its first presence assertion, since `NullBackend::list` always
+/// returns an empty vec and can never contain the item an "admit" just wrote.
+/// Nor is the fifty-fourth,
+/// `retrieval::occurrence_time_bounds_are_inclusive_and_exclude_undated_items`:
+/// it fails on its first inclusive-bound assertion, since
+/// `NullBackend::retrieve_candidates` always returns an empty vec and none of
+/// the dated items it expects back ever appear.
+/// Nor is the fifty-fifth,
+/// `atomicity::every_is_valid_rejection_is_rejected_by_the_backend`: it fails
+/// on its first case's own non-vacuity guard, "the corpus must exist before a
+/// 'nothing changed' comparison means anything", since `NullBackend::list`
+/// always returns an empty vec even after the seeding `apply` call the case
+/// makes just before reading it.
+/// The census figures above are left at the reading they were taken at rather
+/// than adjusted by arithmetic; retake them to update them.
 ///
 /// Both survivors are *absence-shaped*: each asserts that something is not
 /// there, which an empty result satisfies for free. Neither is vacuous,
@@ -797,7 +822,7 @@ async fn the_census_measures_every_test_the_suite_runs() {
     );
     assert_eq!(
         suite.len(),
-        50,
+        55,
         "the suite's size changed; update the census record"
     );
 }

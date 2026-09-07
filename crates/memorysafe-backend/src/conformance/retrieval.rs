@@ -201,6 +201,223 @@ pub async fn tag_and_kind_filters_narrow_results<F: BackendFactory>(factory: &F)
     );
 }
 
+/// `HardFilters::{occurred_after, occurred_before}` — both bounds inclusive,
+/// composed as a closed interval, and an item with no `occurred_at` matching
+/// neither bound.
+///
+/// `HardFilters::occurred_after`'s doc comment (`query.rs`) is the contract
+/// this test pins, and it names the trap directly: `conformance::fx::item`
+/// pins `occurred_at: None`, so under any time filter the entire standard
+/// fixture corpus disappears, and an empty-result assertion would pass
+/// without the filter doing anything. Every dated item here has its
+/// `occurred_at` set explicitly, and one item is left `None` on purpose —
+/// arm 5 below is exactly the check that its exclusion is the filter's doing
+/// and not a corpus that silently failed to store it.
+///
+/// Five arms, each pinned to a specific mutant named in `known-gaps.md`'s
+/// "Five filter boundaries":
+///
+/// 1. **`occurred_after` is inclusive.** `occurred_after = Some(t2)` must
+///    still return the item dated exactly `t2`. Kills `>=` → `>`.
+/// 2. **`occurred_before` is inclusive.** `occurred_before = Some(t2)` must
+///    still return the item dated exactly `t2`. Kills `<=` → `<`.
+/// 3. **Each bound actually excludes.** The `t1` item is absent under
+///    `occurred_after = Some(t2)`; the `t3` item is absent under
+///    `occurred_before = Some(t2)`. Without this, a filter that returns
+///    everything would still pass arms 1 and 2.
+/// 4. **The two bounds compose as a closed interval, and are not
+///    interchangeable.** `[t1, t3]` returns all three dated items; the
+///    degenerate window `[t2, t2]` returns exactly the `t2` item — but a
+///    degenerate window alone cannot catch `occurred_after` and
+///    `occurred_before` being swapped, since both orders agree when the two
+///    bounds are equal (this is the same gap `known-gaps.md` records for
+///    `AuditAggregateFilter`'s `since: Some(1), until: Some(1))` test). The
+///    asymmetric window `[t1, t2]` is the arm that actually catches a swap:
+///    it must return `t1` and `t2` but not `t3`.
+/// 5. **The undated item is excluded by either bound alone, and returned
+///    when neither is set.** The second half is load-bearing on its own:
+///    without it, an item that simply failed to store would look
+///    indistinguishable from correct exclusion.
+pub async fn occurrence_time_bounds_are_inclusive_and_exclude_undated_items<F: BackendFactory>(
+    factory: &F,
+) {
+    use memorysafe_core::ItemId;
+    use std::collections::BTreeSet;
+
+    async fn hit_ids<B: Backend>(
+        backend: &B,
+        scope: &Scope,
+        filters: HardFilters,
+    ) -> BTreeSet<ItemId> {
+        backend
+            .retrieve_candidates(scope, &query("chronology marker", filters))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|h| h.item.id)
+            .collect()
+    }
+
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // Whole seconds, 1000s apart: SQLite stores `occurred_at` as Unix
+    // seconds, and this margin makes the truncation irrelevant rather than
+    // merely survivable.
+    let t1 = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_000);
+    let t2 = OffsetDateTime::UNIX_EPOCH + Duration::seconds(2_000);
+    let t3 = OffsetDateTime::UNIX_EPOCH + Duration::seconds(3_000);
+
+    let mut at_t1 = fx::item_with(
+        &scope,
+        "chronology marker one",
+        "fact",
+        &[],
+        SensitivityLevel::Internal,
+    );
+    at_t1.occurred_at = Some(t1);
+    let mut at_t2 = fx::item_with(
+        &scope,
+        "chronology marker two",
+        "fact",
+        &[],
+        SensitivityLevel::Internal,
+    );
+    at_t2.occurred_at = Some(t2);
+    let mut at_t3 = fx::item_with(
+        &scope,
+        "chronology marker three",
+        "fact",
+        &[],
+        SensitivityLevel::Internal,
+    );
+    at_t3.occurred_at = Some(t3);
+    // Left `None`: `fx::item_with` does not set `occurred_at`, so this is the
+    // fixture default. Present in the corpus solely to pin arm 5.
+    let undated = fx::item_with(
+        &scope,
+        "chronology marker undated",
+        "fact",
+        &[],
+        SensitivityLevel::Internal,
+    );
+
+    let id1 = at_t1.id.clone();
+    let id2 = at_t2.id.clone();
+    let id3 = at_t3.id.clone();
+    let id_undated = undated.id.clone();
+
+    for item in [at_t1, at_t2, at_t3, undated] {
+        backend
+            .apply(fx::admit_txn_embedded(&scope, item))
+            .await
+            .unwrap();
+    }
+
+    // Arms 1 and 3: inclusive lower bound, and it excludes below it.
+    let after_t2 = hit_ids(
+        &backend,
+        &scope,
+        HardFilters {
+            occurred_after: Some(t2),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        after_t2,
+        BTreeSet::from([id2.clone(), id3.clone()]),
+        "occurred_after must be inclusive (the t2 item must match) and must \
+         exclude the t1 item and the undated item"
+    );
+
+    // Arms 2 and 3: inclusive upper bound, and it excludes above it.
+    let before_t2 = hit_ids(
+        &backend,
+        &scope,
+        HardFilters {
+            occurred_before: Some(t2),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        before_t2,
+        BTreeSet::from([id1.clone(), id2.clone()]),
+        "occurred_before must be inclusive (the t2 item must match) and must \
+         exclude the t3 item and the undated item"
+    );
+
+    // Arm 4, closed interval: both bounds together admit every dated item in
+    // range.
+    let closed_t1_t3 = hit_ids(
+        &backend,
+        &scope,
+        HardFilters {
+            occurred_after: Some(t1),
+            occurred_before: Some(t3),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        closed_t1_t3,
+        BTreeSet::from([id1.clone(), id2.clone(), id3.clone()]),
+        "a [t1, t3] window must return all three dated items"
+    );
+
+    // Arm 4, degenerate window: both bounds equal.
+    let degenerate_t2 = hit_ids(
+        &backend,
+        &scope,
+        HardFilters {
+            occurred_after: Some(t2),
+            occurred_before: Some(t2),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        degenerate_t2,
+        BTreeSet::from([id2.clone()]),
+        "a degenerate [t2, t2] window must return exactly the t2 item"
+    );
+
+    // Arm 4, asymmetric window: the case a degenerate window cannot catch. If
+    // occurred_after and occurred_before were swapped internally, this would
+    // compute "occurred_at >= t2 AND occurred_at <= t1" with t1 < t2 — an
+    // empty, inverted window — rather than [t1, t2].
+    let asymmetric_t1_t2 = hit_ids(
+        &backend,
+        &scope,
+        HardFilters {
+            occurred_after: Some(t1),
+            occurred_before: Some(t2),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        asymmetric_t1_t2,
+        BTreeSet::from([id1.clone(), id2.clone()]),
+        "an asymmetric [t1, t2] window must return t1 and t2 but not t3 -- \
+         the arm that catches occurred_after and occurred_before swapped, \
+         which a degenerate window cannot"
+    );
+
+    // Arm 5, second half: with neither bound set, the undated item must
+    // still come back. Without this, an item that simply failed to store
+    // would look identical to correct exclusion.
+    let unfiltered = hit_ids(&backend, &scope, HardFilters::default()).await;
+    assert_eq!(
+        unfiltered,
+        BTreeSet::from([id1.clone(), id2.clone(), id3.clone(), id_undated.clone()]),
+        "with neither bound set, the undated item must still be retrievable -- \
+         proving its earlier absence was the filter excluding it, not a \
+         corpus item that failed to store"
+    );
+}
+
 pub async fn vector_search_ranks_by_similarity<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
     let scope = Scope::new("t", "s", "n").unwrap();

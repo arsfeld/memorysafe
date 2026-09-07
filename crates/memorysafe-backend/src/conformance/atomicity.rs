@@ -1,6 +1,6 @@
 use super::{BackendFactory, fx};
 use crate::{Backend, BackendError, Page};
-use memorysafe_core::{AuditFilter, ItemId, Scope};
+use memorysafe_core::{AuditFilter, ItemId, MemoryItem, Scope};
 
 /// The item insert, the evictions, and the audit row must land together.
 pub async fn admit_evict_and_audit_commit_together<F: BackendFactory>(factory: &F) {
@@ -231,6 +231,197 @@ pub async fn an_invalid_transaction_is_rejected_and_writes_nothing<F: BackendFac
     );
 }
 
+/// The other two of `WriteTransaction::is_valid`'s three rejection
+/// conditions must also be rejected at the `Backend::apply` seam, with the
+/// corpus left exactly as it was — the same obligation
+/// `an_invalid_transaction_is_rejected_and_writes_nothing` states and, for
+/// the third condition, drives through the trait above.
+///
+/// **Condition 1 — `upsert` and `merge` set together — has its own test
+/// above and is not repeated here.** It carries a three-axis "nothing
+/// changed" assertion (a new item, a rewritten merge body, an eviction) that
+/// folding it into this test would lose, and rewriting a passing,
+/// frozen-suite test is out of scope.
+///
+/// **One contract, enumerated over its remaining cases — not one test per
+/// case.** The obligation is a single sentence; splitting it into one test
+/// per condition would fragment that sentence into three and let a future
+/// backend satisfy some of them while failing the obligation, with the suite
+/// reporting mostly-green. `cases` below is where a further condition is
+/// added, not a new test kept in sync with this one by hand.
+///
+/// **Each case's wrong scope differs from the right one in exactly one
+/// component** — the suite's established rule for a scope-shaped predicate
+/// (`isolation::retrieval_never_crosses_a_scope_boundary` and `write.rs`'s
+/// own unit tests use the same one): changing two components at once
+/// certifies a backend that checks only one of them. Condition 2 (the
+/// upserted item's own scope) varies **subject**; condition 3 (the audit
+/// record's scope) varies **namespace** — between the two, a backend that
+/// checks only one component of a disagreeing scope is caught by whichever
+/// case exercises the other.
+///
+/// **Each case also checks the scope it disagrees on, not just the home
+/// scope**, because that is the one distinctive way this pair of conditions
+/// can fail silently: `WriteTransaction::is_valid`'s own doc says a real
+/// backend reads the item row's scope from the item itself and the audit
+/// row's scope from the audit record, so a backend that skips the check may
+/// file the offending row under the *disagreeing* scope rather than the
+/// transaction's nominal one — invisible to a comparison that only reads the
+/// home scope back.
+///
+/// **Non-vacuous.** Each case seeds a survivor item, reads the corpus and
+/// the audit count as a baseline immediately before the failing call, and
+/// asserts that baseline is non-empty before trusting any "nothing changed"
+/// comparison against it. Each case also asserts `!txn.is_valid()` first, so
+/// if a future change makes that case's transaction valid, the case fails
+/// loudly rather than silently asserting nothing.
+pub async fn every_is_valid_rejection_is_rejected_by_the_backend<F: BackendFactory>(factory: &F) {
+    use crate::write::WriteTransaction;
+
+    /// Which row a naive backend would misfile under the disagreeing scope,
+    /// for the corresponding case below.
+    enum Leak {
+        /// Condition 2: the upserted item's own scope disagrees. A backend
+        /// that skips the check may still write the item row, keyed on the
+        /// item's own (wrong) scope.
+        Item,
+        /// Condition 3: the audit record's scope disagrees. A backend that
+        /// skips the check may still write the audit row, keyed on the
+        /// audit record's own (wrong) scope.
+        Audit,
+    }
+
+    struct Case {
+        condition: &'static str,
+        /// The one scope this case disagrees with the home scope on,
+        /// differing in exactly one component.
+        foreign: fn() -> Scope,
+        /// Builds an otherwise-valid transaction that violates exactly this
+        /// condition, and the item it upserts.
+        build: fn(&Scope, &Scope) -> (WriteTransaction, MemoryItem),
+        leak: Leak,
+    }
+
+    let cases: [Case; 2] = [
+        Case {
+            condition: "an upserted item whose scope disagrees with the \
+                        transaction's scope (subject)",
+            foreign: || Scope::new("t", "other-subject", "n").unwrap(),
+            build: |scope, foreign| {
+                let newcomer = fx::item(foreign, "must never be written");
+                let txn = fx::admit_txn(scope, newcomer.clone(), None);
+                (txn, newcomer)
+            },
+            leak: Leak::Item,
+        },
+        Case {
+            condition: "the audit record's scope disagreeing with the \
+                        transaction's scope (namespace)",
+            foreign: || Scope::new("t", "s", "other-ns").unwrap(),
+            build: |scope, foreign| {
+                let newcomer = fx::item(scope, "must never be written");
+                let mut txn = fx::admit_txn(scope, newcomer.clone(), None);
+                txn.audit.scope = foreign.clone();
+                (txn, newcomer)
+            },
+            leak: Leak::Audit,
+        },
+    ];
+
+    for case in &cases {
+        let backend = factory.create().await;
+        let scope = Scope::new("t", "s", "n").unwrap();
+        let foreign = (case.foreign)();
+
+        let survivor = fx::item(&scope, "must survive untouched");
+        backend
+            .apply(fx::admit_txn(&scope, survivor.clone(), None))
+            .await
+            .unwrap();
+
+        let before = backend.list(&scope, &Page::default()).await.unwrap();
+        assert!(
+            !before.is_empty(),
+            "{}: the corpus must exist before a 'nothing changed' comparison \
+             means anything",
+            case.condition,
+        );
+        let audit_before = backend
+            .audit(&scope, &AuditFilter::default())
+            .await
+            .unwrap()
+            .len();
+
+        let (txn, newcomer) = (case.build)(&scope, &foreign);
+        assert!(
+            !txn.is_valid(),
+            "{}: the premise of this case -- the transaction it submits must \
+             be one `WriteTransaction::is_valid` rejects",
+            case.condition,
+        );
+
+        let err = backend.apply(txn).await.expect_err(&format!(
+            "{}: an invalid transaction must be refused, not applied",
+            case.condition,
+        ));
+        assert!(
+            matches!(err, BackendError::InvalidTransaction(_)),
+            "{}: an invalid transaction must be refused as invalid, not \
+             applied and not refused for some incidental reason: got {err:?}",
+            case.condition,
+        );
+
+        assert!(
+            backend.get(&scope, &newcomer.id).await.unwrap().is_none(),
+            "{}: a rejected transaction still inserted its item under the \
+             transaction's own scope -- the contract requires both \
+             rejection and an untouched corpus",
+            case.condition,
+        );
+        match case.leak {
+            Leak::Item => assert!(
+                backend.get(&foreign, &newcomer.id).await.unwrap().is_none(),
+                "{}: a rejected transaction still inserted its item, filed \
+                 under the scope it disagreed on -- the contract requires \
+                 both rejection and an untouched corpus, in every scope the \
+                 transaction named",
+                case.condition,
+            ),
+            Leak::Audit => assert!(
+                backend
+                    .audit(&foreign, &AuditFilter::default())
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{}: a rejected transaction still wrote an audit row, filed \
+                 under the scope it disagreed on -- the contract requires \
+                 both rejection and an untouched corpus, in every scope the \
+                 transaction named",
+                case.condition,
+            ),
+        }
+
+        let after = backend.list(&scope, &Page::default()).await.unwrap();
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "{}: the corpus changed size across a rejected transaction -- \
+             the contract requires both rejection and an untouched corpus",
+            case.condition,
+        );
+        assert_eq!(
+            backend
+                .audit(&scope, &AuditFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            audit_before,
+            "{}: a rejected transaction still wrote its audit row",
+            case.condition,
+        );
+    }
+}
+
 /// Invariant 4 from the spec, at the backend level.
 pub async fn every_mutation_writes_exactly_one_audit_record<F: BackendFactory>(factory: &F) {
     let backend = factory.create().await;
@@ -327,5 +518,148 @@ pub async fn idempotency_conflict_on_different_payload<F: BackendFactory>(factor
     assert!(
         matches!(err, BackendError::IdempotencyConflict),
         "got {err:?}"
+    );
+}
+
+/// An idempotency key is scoped to the transaction's `Scope`, not global —
+/// see the requirement stated on [`crate::Backend::apply`].
+///
+/// **The implementation this rejects:** one whose idempotency table is keyed
+/// on `idempotency_key` alone, ignoring `Scope`. Such a backend passes both
+/// `idempotent_writes_replay_the_original_outcome` and
+/// `idempotency_conflict_on_different_payload` above — each uses exactly one
+/// scope, `("t", "s", "n")` — while silently serving one subject's write back
+/// as another subject's replay, or refusing a second subject's legitimate
+/// write as a conflict with the first's.
+///
+/// **Two axes, checked independently, because the contract names the whole
+/// `Scope`.** `known-gaps.md` ranks this gap by subject, but a backend keyed
+/// on `(tenant, subject, key)` — forgetting namespace — would still pass a
+/// subjects-only version of this test. Same trap as the item filter's
+/// one-directional case: a test that varies only one component of `Scope`
+/// proves nothing about the components it holds fixed.
+///
+/// 1. **Subject axis.** Same tenant, same namespace, two subjects. Admitting
+///    under subject B with subject A's exact key string and a *different*
+///    payload must succeed as an independent write — not
+///    `IdempotencyConflict`, which is the reaction a bare-key backend would
+///    have — and `replayed` must be `false`.
+/// 2. **Namespace axis.** Same tenant, same subject, two namespaces, one
+///    shared key. Same shape, same assertions.
+///
+/// Each axis also asserts both items are visible **only** in their own
+/// scope, on ids rather than lengths, so a backend that let the second write
+/// land inside the first write's scope — rather than genuinely treating them
+/// as independent — is still caught.
+///
+/// **Not vacuous.** A backend with idempotency disabled entirely would also
+/// let every cross-scope write through, so a final arm reuses the subject
+/// axis's own scope A and repeats
+/// `idempotency_conflict_on_different_payload`'s shape there: same key,
+/// different payload, same scope, must still raise `IdempotencyConflict`.
+/// Without this arm nothing distinguishes "correctly scoped" from "not
+/// enforced at all".
+pub async fn idempotency_keys_do_not_collide_across_subjects<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+
+    // --- Subject axis: same tenant, same namespace, two subjects. ---
+    let scope_a = Scope::new("t", "subject-a", "n").unwrap();
+    let scope_b = Scope::new("t", "subject-b", "n").unwrap();
+
+    let item_a = fx::item(&scope_a, "subject a's payload");
+    let mut txn_a = fx::admit_txn(&scope_a, item_a.clone(), None);
+    txn_a.idempotency_key = Some("shared-key".into());
+    txn_a.payload_digest = Some(item_a.digest());
+    let applied_a = backend.apply(txn_a).await.unwrap();
+    assert!(!applied_a.replayed);
+
+    let item_b = fx::item(&scope_b, "subject b's completely different payload");
+    let mut txn_b = fx::admit_txn(&scope_b, item_b.clone(), None);
+    txn_b.idempotency_key = Some("shared-key".into());
+    txn_b.payload_digest = Some(item_b.digest());
+    let applied_b = backend.apply(txn_b).await.expect(
+        "a backend keyed on the bare idempotency key raises IdempotencyConflict \
+         here; the key must be scoped to the subject",
+    );
+    assert!(
+        !applied_b.replayed,
+        "subject b's write was treated as a replay of subject a's"
+    );
+
+    let list_a = backend.list(&scope_a, &Page::default()).await.unwrap();
+    assert!(
+        list_a.iter().any(|i| i.id == item_a.id),
+        "subject a's item is missing from its own scope"
+    );
+    assert!(
+        !list_a.iter().any(|i| i.id == item_b.id),
+        "subject b's item leaked into subject a's scope"
+    );
+
+    let list_b = backend.list(&scope_b, &Page::default()).await.unwrap();
+    assert!(
+        list_b.iter().any(|i| i.id == item_b.id),
+        "subject b's item is missing from its own scope"
+    );
+    assert!(
+        !list_b.iter().any(|i| i.id == item_a.id),
+        "subject a's item leaked into subject b's scope"
+    );
+
+    // --- Namespace axis: same tenant, same subject, two namespaces. ---
+    let scope_c = Scope::new("t", "subject-c", "ns-1").unwrap();
+    let scope_d = Scope::new("t", "subject-c", "ns-2").unwrap();
+
+    let item_c = fx::item(&scope_c, "namespace one's payload");
+    let mut txn_c = fx::admit_txn(&scope_c, item_c.clone(), None);
+    txn_c.idempotency_key = Some("shared-key".into());
+    txn_c.payload_digest = Some(item_c.digest());
+    let applied_c = backend.apply(txn_c).await.unwrap();
+    assert!(!applied_c.replayed);
+
+    let item_d = fx::item(&scope_d, "namespace two's completely different payload");
+    let mut txn_d = fx::admit_txn(&scope_d, item_d.clone(), None);
+    txn_d.idempotency_key = Some("shared-key".into());
+    txn_d.payload_digest = Some(item_d.digest());
+    let applied_d = backend.apply(txn_d).await.expect(
+        "a backend keyed on (tenant, subject, key) -- forgetting namespace -- \
+         raises IdempotencyConflict here",
+    );
+    assert!(
+        !applied_d.replayed,
+        "namespace two's write was treated as a replay of namespace one's"
+    );
+
+    let list_c = backend.list(&scope_c, &Page::default()).await.unwrap();
+    assert!(
+        list_c.iter().any(|i| i.id == item_c.id),
+        "namespace one's item is missing from its own scope"
+    );
+    assert!(
+        !list_c.iter().any(|i| i.id == item_d.id),
+        "namespace two's item leaked into namespace one's scope"
+    );
+
+    let list_d = backend.list(&scope_d, &Page::default()).await.unwrap();
+    assert!(
+        list_d.iter().any(|i| i.id == item_d.id),
+        "namespace two's item is missing from its own scope"
+    );
+    assert!(
+        !list_d.iter().any(|i| i.id == item_c.id),
+        "namespace one's item leaked into namespace two's scope"
+    );
+
+    // --- Not vacuous: within one scope, the same key still conflicts. ---
+    let other = fx::item(&scope_a, "a third, conflicting payload");
+    let mut conflicting = fx::admit_txn(&scope_a, other.clone(), None);
+    conflicting.idempotency_key = Some("shared-key".into());
+    conflicting.payload_digest = Some(other.digest());
+    let err = backend.apply(conflicting).await.unwrap_err();
+    assert!(
+        matches!(err, BackendError::IdempotencyConflict),
+        "a same-scope, same-key, different-payload write must still conflict \
+         -- otherwise a backend with idempotency disabled entirely would pass \
+         this test too: got {err:?}"
     );
 }

@@ -2,7 +2,7 @@ use super::{BackendFactory, fx};
 use crate::portability::{ExportRecord, ImportStream, ScopeSelector};
 use crate::{AuditAggregateFilter, Backend, BackendError, Page};
 use memorysafe_core::{
-    Actor, ActorKind, AuditEvent, AuditFilter, AuditId, AuditRecord, PurgeCascade, Scope,
+    Actor, ActorKind, AuditEvent, AuditFilter, AuditId, AuditRecord, ItemId, PurgeCascade, Scope,
     SubjectId, TenantId,
 };
 use std::collections::BTreeSet;
@@ -11,17 +11,18 @@ use time::{Duration, OffsetDateTime};
 /// Exercises four of the eight axes `AuditFilter` can narrow on: `events`, the
 /// `since`/`until` time window, and `limit` — including the newest-first
 /// ordering `limit` depends on. `after` has its own test
-/// (`audit_pages_by_the_after_cursor_without_repeating_a_row`).
+/// (`audit_pages_by_the_after_cursor_without_repeating_a_row`), and `item` has
+/// its own (`audit_filter_narrows_by_item`, immediately below).
 ///
-/// **`item`, `subject` and `namespace` are narrowed on by nothing in this
-/// suite**, and this sentence said "every axis" until that was checked against
-/// the struct. `subject` is the consequential one: `AuditFilter::subject`'s own
-/// doc calls "produce every audit row for subject X" THE compliance query and
-/// says it is inexpressible without the field — yet `Backend::audit`'s doc,
-/// which is what binds implementers, says nothing about any of the three, and
-/// no test here would catch a backend that ignores them. Closing it needs a
-/// contract sentence on the trait (they narrow *within* the scope and may never
-/// widen past it) before a test can assert anything.
+/// **`subject` and `namespace` are narrowed on by nothing in this suite**, and
+/// this sentence said "every axis" until that was checked against the struct.
+/// `subject` is the consequential one: `AuditFilter::subject`'s own doc calls
+/// "produce every audit row for subject X" THE compliance query and says it is
+/// inexpressible without the field — yet `Backend::audit`'s doc, which is what
+/// binds implementers, says nothing about either, and no test here would catch
+/// a backend that ignores them. Closing it needs a contract sentence on the
+/// trait (they narrow *within* the scope and may never widen past it) before a
+/// test can assert anything.
 ///
 /// An earlier draft of this test had defects, fixed here:
 ///
@@ -215,6 +216,152 @@ pub async fn audit_filter_narrows_by_event_and_time<F: BackendFactory>(factory: 
         limited_ids,
         vec![audit_ids[3].clone(), audit_ids[2].clone()],
         "audit must come back newest first by write order (AuditId), not by the business `at` field: the eviction, then the third admit"
+    );
+}
+
+/// `AuditFilter::item` narrows the returned records to those referencing a
+/// given item. See `Backend::audit`'s doc for the contract this pins: it ANDs
+/// with the other predicates and is applied before `limit`.
+///
+/// **Recorded in `docs/known-gaps.md` as the gap this test closes**: the
+/// field is documented on the struct as load-bearing, but until now no test
+/// set it and `Backend::audit`'s own doc said nothing about it — so a backend
+/// whose query builder emits predicates for `events`, `since`, `until` and
+/// `after` and never mentions `filter.item` passed the whole suite while
+/// silently returning every row in the scope to a caller who asked for one
+/// item's history.
+///
+/// **Both directions, on ids, not `len()`.** Two items are admitted in the
+/// same scope, each with its own pinned `AuditId`. Filtering by item A's id
+/// must produce A's record and must not produce B's; filtering by item B's id
+/// is the mirror. A `len()`-only check is satisfied by a backend that always
+/// returns one constant record, or by one that narrows correctly only when
+/// the corpus happens to be a single row — asserting the exact id set rules
+/// both out, and doing it in both directions rules out a backend that special
+/// -cases whichever id was asked first.
+///
+/// **The item-less arm.** A third record — an eviction of an id that was
+/// never admitted, whose audit record's `items` is empty by construction
+/// (`fx::evict_txn`) — is written alongside the two items and asserted
+/// excluded from *both* directional queries. This is what separates "filters
+/// correctly by item" from "returns every record that references any item at
+/// all": a backend that treats `item: Some(_)` as merely "items is
+/// non-empty" would pass every assertion above and only fail here. The
+/// evicted id is never admitted (`a_phantom_eviction_is_not_reported_as_evicted`
+/// establishes this is accepted, not an error) precisely so this record's own
+/// audit id is the only one this test needs to pin — an admit-then-evict
+/// shape would mint a second, unpinned `AuditId` for the admit, which would
+/// itself reference an item and pollute the very sets being asserted on.
+///
+/// **It passes vacuously if** the item-less record is omitted, or if either
+/// direction is checked by `len()` alone rather than by the specific ids
+/// present and absent.
+pub async fn audit_filter_narrows_by_item<F: BackendFactory>(factory: &F) {
+    let backend = factory.create().await;
+    let scope = Scope::new("t", "s", "n").unwrap();
+
+    // Pinned, not minted — the echo rule this suite writes every id
+    // assertion against. Three of `AUDIT_ORDER_ULIDS`' four literals; this
+    // test does not depend on their relative order, only on their being
+    // distinct.
+    let audit_ids: Vec<AuditId> = fx::AUDIT_ORDER_ULIDS
+        .iter()
+        .take(3)
+        .map(|u| AuditId::parse(u).expect("literal must be a canonical ULID"))
+        .collect();
+
+    let item_a = fx::item(&scope, "memory about item A");
+    let item_b = fx::item(&scope, "memory about item B");
+
+    let mut txn_a = fx::admit_txn(&scope, item_a.clone(), None);
+    txn_a.audit.id = audit_ids[0].clone();
+    let applied_a = backend.apply(txn_a).await.unwrap();
+    assert_eq!(
+        applied_a.audit_id, audit_ids[0],
+        "apply must persist and return the AuditId it was given — the echo \
+         rule on `Backend`. Every id assertion below is written against the \
+         ids this test supplied, so a minted id makes them unreadable"
+    );
+
+    let mut txn_b = fx::admit_txn(&scope, item_b.clone(), None);
+    txn_b.audit.id = audit_ids[1].clone();
+    let applied_b = backend.apply(txn_b).await.unwrap();
+    assert_eq!(
+        applied_b.audit_id, audit_ids[1],
+        "apply must persist and return the AuditId it was given (echo rule)"
+    );
+
+    // A phantom eviction: the id was never admitted, so this is the only
+    // audit record it produces. `fx::evict_txn` builds its `Forgotten` audit
+    // record with `items: vec![]` regardless of what is evicted, which is
+    // exactly the "references no item" record the filter must exclude — the
+    // same shape `audit_filter_narrows_by_event_and_time` uses for its own
+    // eviction.
+    let mut evict = fx::evict_txn(&scope, vec![ItemId::new()]);
+    evict.audit.id = audit_ids[2].clone();
+    let applied_evict = backend.apply(evict).await.unwrap();
+    assert_eq!(
+        applied_evict.audit_id, audit_ids[2],
+        "apply must persist and return the AuditId it was given (echo rule)"
+    );
+
+    // Direction 1: item A. Must contain A's record and must not contain B's
+    // or the item-less eviction's.
+    let for_a = backend
+        .audit(
+            &scope,
+            &AuditFilter {
+                item: Some(item_a.id.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let for_a_ids: BTreeSet<_> = for_a.iter().map(|r| r.id.clone()).collect();
+    assert!(
+        for_a_ids.contains(&audit_ids[0]),
+        "filtering by item A's id must return item A's own admit record; got {for_a_ids:?}"
+    );
+    assert!(
+        !for_a_ids.contains(&audit_ids[1]),
+        "filtering by item A's id also returned item B's admit record — the \
+         filter is not narrowing by item; got {for_a_ids:?}"
+    );
+    assert!(
+        !for_a_ids.contains(&audit_ids[2]),
+        "filtering by item A's id returned the item-less eviction record — a \
+         backend that returns every record referencing any item at all, \
+         rather than the one requested, passes a one-directional len() check \
+         but fails here; got {for_a_ids:?}"
+    );
+
+    // Direction 2: item B, the mirror. Needed because a backend that always
+    // returns whichever record matches the first id it ever sees, or one
+    // that only narrows correctly on a single-row corpus, can still pass
+    // direction 1 alone.
+    let for_b = backend
+        .audit(
+            &scope,
+            &AuditFilter {
+                item: Some(item_b.id.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let for_b_ids: BTreeSet<_> = for_b.iter().map(|r| r.id.clone()).collect();
+    assert!(
+        for_b_ids.contains(&audit_ids[1]),
+        "filtering by item B's id must return item B's own admit record; got {for_b_ids:?}"
+    );
+    assert!(
+        !for_b_ids.contains(&audit_ids[0]),
+        "filtering by item B's id also returned item A's admit record — the \
+         filter is not narrowing by item; got {for_b_ids:?}"
+    );
+    assert!(
+        !for_b_ids.contains(&audit_ids[2]),
+        "filtering by item B's id returned the item-less eviction record; got {for_b_ids:?}"
     );
 }
 
@@ -2918,4 +3065,228 @@ pub async fn every_audit_writing_path_increments_the_aggregates<F: BackendFactor
          not increment holds detail rows with no summary — and loses the \
          history entirely at its first cascading purge"
     );
+}
+
+/// Mutation-testing `audit_filter_narrows_by_item` against a boundary this
+/// task cannot cross: `crates/memorysafe-backend-sqlite/` is out of bounds,
+/// and it is currently the *only* real `Backend` — which means the only
+/// mutant reachable through a real backend is "ignore `filter.item`
+/// entirely", because that is the one thing SQLite actually does. Verified
+/// separately (see the task report): running the conformance suite against
+/// SQLite fails inside this test with every one of the three pinned ids
+/// present, i.e. it returns the whole scope regardless of `item` — the
+/// **absent** mutant, which this project's own rule
+/// (`docs/known-gaps.md`) calls the *weaker* of the two probes.
+///
+/// The stronger one — a backend that discriminates on `item` but gets the
+/// comparison **wrong**, rather than not making it at all — has no real
+/// implementation to observe, since none exists yet. This module builds the
+/// smallest possible stand-in: a `Backend` whose `audit` inverts the match
+/// (`items.iter().any(id) == false` selects the row, instead of `true`), and
+/// runs `audit_filter_narrows_by_item` against it directly, bypassing
+/// `run_conformance_suite` and every other `Backend` method the test does
+/// not call.
+#[cfg(test)]
+mod mutation_probe {
+    use super::*;
+    use crate::{AppliedWrite, PurgeReport, WriteTransaction};
+    use memorysafe_core::{
+        Budget, CapacityState, Embedding, MemoryItem, ScopeStats, ScoredCandidate,
+    };
+    use std::sync::Mutex;
+
+    /// Stores every audit record it is handed and, on `audit`, applies
+    /// `filter.item` **backwards**: a record is returned when it does *not*
+    /// reference the requested item, and excluded when it does. This is
+    /// deliberately not "ignore `item`" (that is SQLite's bug, already
+    /// exercised above) — it is a backend that read the field and used it
+    /// wrong, which is the failure mode this test's *presence* assertions
+    /// exist to catch and its *exclusion* assertions alone would not.
+    ///
+    /// Only `apply` and `audit` do real work: `audit_filter_narrows_by_item`
+    /// calls nothing else on `Backend`, so every other method is
+    /// `unimplemented!()` and would panic with an unambiguous message if
+    /// that stopped being true.
+    #[derive(Default)]
+    struct InvertedItemFilterBackend {
+        records: Mutex<Vec<AuditRecord>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for InvertedItemFilterBackend {
+        async fn retrieve_candidates(
+            &self,
+            _scope: &Scope,
+            _query: &crate::CandidateQuery,
+        ) -> Result<Vec<ScoredCandidate>, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls retrieve_candidates")
+        }
+
+        async fn neighbours(
+            &self,
+            _scope: &Scope,
+            _embedding: &Embedding,
+            _k: usize,
+        ) -> Result<Vec<ScoredCandidate>, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls neighbours")
+        }
+
+        async fn capacity_state(&self, _scope: &Scope) -> Result<CapacityState, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls capacity_state")
+        }
+
+        async fn scope_stats(&self, _scope: &Scope) -> Result<ScopeStats, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls scope_stats")
+        }
+
+        async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError> {
+            let id = txn.audit.id.clone();
+            let item_id = txn.upsert.as_ref().map(|u| u.item.id.clone());
+            self.records.lock().unwrap().push(txn.audit);
+            Ok(AppliedWrite {
+                item_id,
+                audit_id: id,
+                evicted: vec![],
+                replayed: false,
+                replayed_outcome: None,
+            })
+        }
+
+        async fn record_recall(&self, _record: AuditRecord) -> Result<AuditId, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls record_recall")
+        }
+
+        async fn get(
+            &self,
+            _scope: &Scope,
+            _id: &ItemId,
+        ) -> Result<Option<MemoryItem>, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls get")
+        }
+
+        async fn list(
+            &self,
+            _scope: &Scope,
+            _page: &Page,
+        ) -> Result<Vec<MemoryItem>, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls list")
+        }
+
+        async fn audit(
+            &self,
+            _scope: &Scope,
+            filter: &AuditFilter,
+        ) -> Result<Vec<AuditRecord>, BackendError> {
+            let records = self.records.lock().unwrap();
+            Ok(records
+                .iter()
+                .filter(|r| match &filter.item {
+                    // Inverted: a record matches when it does NOT reference
+                    // the requested item. An item-less record (the
+                    // eviction) vacuously "does not reference" anything, so
+                    // it inverts to a match for every `item` — which is
+                    // itself the informative part: this mutant fails the
+                    // test's item-less exclusion arm too, for a different
+                    // reason than SQLite does.
+                    Some(id) => !r.items.iter().any(|i| i.id() == id),
+                    None => true,
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn purge_subject(
+            &self,
+            _tenant: &TenantId,
+            _subject: &SubjectId,
+            _cascade: PurgeCascade,
+            _audit: AuditRecord,
+        ) -> Result<PurgeReport, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls purge_subject")
+        }
+
+        async fn audit_aggregates(
+            &self,
+            _tenant: &TenantId,
+            _filter: &AuditAggregateFilter,
+        ) -> Result<Vec<crate::AuditAggregate>, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls audit_aggregates")
+        }
+
+        async fn export(&self, _sel: &ScopeSelector) -> Result<crate::ExportStream, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls export")
+        }
+
+        async fn import(
+            &self,
+            _destination: &TenantId,
+            _stream: ImportStream,
+        ) -> Result<crate::ImportReport, BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls import")
+        }
+
+        async fn set_budget(&self, _scope: &Scope, _budget: Budget) -> Result<(), BackendError> {
+            unimplemented!("audit_filter_narrows_by_item never calls set_budget")
+        }
+    }
+
+    struct InvertedItemFilterFactory;
+
+    impl BackendFactory for InvertedItemFilterFactory {
+        type B = InvertedItemFilterBackend;
+        fn create(&self) -> impl std::future::Future<Output = Self::B> + Send {
+            std::future::ready(InvertedItemFilterBackend::default())
+        }
+    }
+
+    fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = err.downcast_ref::<&str>() {
+            (*s).to_owned()
+        } else if let Some(s) = err.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "panicked with a non-string payload".to_owned()
+        }
+    }
+
+    /// The mutant this project's rule ranks as the informative one: `item`
+    /// is read and compared, and the comparison is backwards. Distinct from
+    /// the SQLite run (see the module doc above and the task report), which
+    /// only ever exercises "ignores `item`".
+    ///
+    /// **What would make this probe worthless:** if it failed on the same
+    /// assertion the SQLite run does (an exclusion check — "also returned
+    /// item B's record"), it would show nothing this suite did not already
+    /// know. It must fail on a *presence* check instead — "must return item
+    /// A's own admit record" — because that is the assertion an
+    /// exclusion-only test could never write, and it is the one a backend
+    /// that merely returns *too much* (SQLite's bug) cannot fail, since
+    /// "too much" still contains the right row.
+    #[tokio::test]
+    async fn audit_filter_narrows_by_item_fails_informatively_on_a_wrong_value_mutant() {
+        let handle = tokio::spawn(async {
+            super::audit_filter_narrows_by_item(&InvertedItemFilterFactory).await;
+        });
+        let outcome = handle
+            .await
+            .expect_err("a backend that inverts the item comparison must fail this test");
+        let message = panic_message(outcome.into_panic());
+        // Coupled by literal substring to the panic messages in
+        // `audit_filter_narrows_by_item` above — if those messages are
+        // reworded, update the strings below in lockstep or this probe can
+        // silently stop verifying anything, or fail for an unrelated reason.
+        assert!(
+            message.contains("must return item A's own admit record"),
+            "expected the wrong-value mutant to fail on the presence check for \
+             item A's record — the assertion an exclusion-only test could never \
+             write — but it failed with a different message: {message}"
+        );
+        assert!(
+            !message.contains("also returned item B's admit record")
+                && !message.contains("returned the item-less eviction record"),
+            "the wrong-value mutant failed on the same exclusion assertion the \
+             absent-filter (SQLite) mutant fails on, which would mean this probe \
+             adds nothing beyond the measured SQLite run: {message}"
+        );
+    }
 }

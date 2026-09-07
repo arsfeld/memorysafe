@@ -1,17 +1,179 @@
 # Known gaps at the conformance freeze
 
-State at `bc3de76`, after the SQLite backend passed the fifty-test suite and the suite was
-frozen at `2d5701c`. Every line was verified by running something, not by reading.
+State at `6e75fe4`, after the SQLite backend passed the fifty-test suite and the suite was
+frozen at `8187bd9` — both tree claims, not diffs: `6e75fe4`'s own diff touches only
+`scripts/README.md`, unrelated to either claim; check the state instead with
+`git show <sha>:crates/memorysafe-backend-sqlite/tests/conformance.rs`, whose doc comment reads
+"the suite is frozen as of this task" at both commits. Every line was verified by running
+something, not by reading.
 
 **Why this file exists.** These were tracked in a cross-session conversation and a
 git-ignored workspace. Both are `/tmp` with extra steps — the same failure as the audit
 tools recovered from a dead session this week. **A number that lives in a conversation dies
 with it.**
 
+## Reach for this before either citation convention below: a durability hierarchy
+
+The two conventions below are both about citing things: **provenance marks**
+(`measured`/`inspected`/`relayed`) say *how* a claim was established; **commit-anchoring**, with
+its tree-vs-diff distinction, says *where in history* to check it. A third fact outranks both,
+and it was discovered by watching this file's own conventions fail, not by arguing about them.
+It goes here, before the conventions it qualifies, because it says what to reach for first.
+
+**The same day exercised all three durability levels a claim in this file can have, in
+descending order of how well each survived:**
+
+1. **A deferral naming a future task.** This file already carries that failure mode further
+   down — see "The quietest sub-case," below, and its counterpart correction for
+   `TransactionBehavior::Immediate` under "Elsewhere" — so it is not restated here. It rots
+   silently, exactly when the named task closes, because nothing revisits a comment that names a
+   task once the task is done.
+2. **A commit anchor**, adopted by this file specifically so a claim could be true "from any
+   branch at any time" instead of depending on a task staying open.
+3. **The commit anchor died too.** A repository-wide identity-only `git filter-branch` rewrote
+   every SHA in the repository, including every one this file cites, and a subsequent `gc`
+   pruned the pre-rewrite objects the old SHAs pointed to — the anchor namespace itself rewritten
+   underneath the citations resting on it.
+
+**Commit-anchoring beats task-naming and is still not immune.** Say that plainly: a convention
+this file recommends failed, once, in front of the people relying on it, and a file that only
+recommends a convention is less useful than one that also states the convention's ceiling.
+
+**The finding, which is the point:**
+
+> The only citation that survived untouched was the grep — because it regenerates rather than
+> refers.
+
+A SHA, a task number, a line number and a file path all *refer* to where a finding was found; a
+grep *re-derives* it, against whatever the tree currently is. Every `grep -rn ...` command
+already given in this file (for `forget_tenant`, for `TransactionBehavior::Immediate`, for the
+`vectors` readers) survived the rewrite untouched, needing no repair, because none of them name a
+commit. **When both are available, give the command and the anchor** — the anchor for
+provenance, the command so a reader can still get there when the anchor dies.
+
+**A second finding, from the same incident, and it belongs with the first because it is also
+about the gap between what a convention promises and what it can enforce.** A "do not run
+`git gc`" instruction was issued while the rewrite was still being verified, and it was never
+enforceable: `gc.auto` fires from ordinary git commands, not only an explicit `git gc`, and a
+rewrite across 265 commits blows straight past the loose-object threshold. The collection was
+going to happen on somebody's next `git status`, instruction or not. What actually preserved the
+evidence was copying it out of the repository, onto something the rewrite could not reach.
+
+> An instruction that depends on a side effect nobody controls is a wish.
+
+**A request and a copy are different kinds of thing**, and this is where that belongs: a
+durability claim about anything in this repository should say which kind it is relying on.
+
+**Measured** — the rewrite, the prune, and the surviving citations were each checked by running
+something, not by reading. The seven SHAs currently cited in this file were verified to resolve
+*after* the prune, which is a stronger statement than resolving before it: the collection removed
+everything unreachable, so anything still resolving is necessarily reachable from a live ref, not
+merely not-yet-collected. Re-run for this entry, one at a time rather than trusting the earlier
+count: `git cat-file -t <sha>` on each of `49fca6d`, `667909d`, `6e75fe4`, `8187bd9`, `8dd7ee6`,
+`c3e0d01`, `ce1af6b` — all seven print `commit`.
+
+## A mark this file needs on itself: measured, inspected, or relayed
+
+This file opens by claiming *every line was verified by running something, not by reading* —
+that standard is **measured**, and it held for every measured line. It did not hold for one:
+"Elsewhere"'s claim that the `vectors` table's `subject`/`namespace` columns have "exactly one
+reader, `scope_embedder`." Nobody ran anything to produce that count; someone read the code
+and counted. Nothing on the page distinguished it from the measured lines around it, so a
+later reader took it as established and built an analysis on it — reasonably, since nothing
+said not to. (The count is corrected under "Elsewhere" below; why it happened is in "An
+instrument that produces a wrong answer," below.)
+
+**The remedy, and it costs one word per claim:**
+
+- **measured** — a command was run and its output read. Give the command where it's short.
+- **inspected** — code was read and counted, traced, or concluded. Nothing was run.
+- **relayed** — someone else reported it, unconfirmed independently.
+
+They decay differently, which is the whole reason to keep them apart. A **measured** number
+goes *stale* — true when taken, overtaken by a later commit; it has a commit it was true at,
+and a reader can re-run it. An **inspected** count can be *wrong the day it is written*:
+"exactly one reader" was wrong from the start, since `purge::subject`'s
+`DELETE FROM vectors WHERE subject = ?1` predates that entry entirely — there was never a
+commit at which it held. A stale measurement and a false inspection look identical on the page
+and need opposite responses: re-run the first, distrust the second. This is the same
+verified/relayed/predicted discipline already required of task reports, applied to this file —
+which had no way to carry a claim that was read rather than run, because its own opening line
+asserted that everything in it was run.
+
+**A second axis: where a claim was true, not only how it was established.** Three lanes work
+three branches at once; a claim about another lane's code is true on the branch that wrote it
+and can become false at the merge, and nothing checks that automatically, because each branch
+reviews green against its own tree. Prefer wording true in both states; where that's
+impossible, name the commit. Durable: "As of `667909d`, the unscoped `vectors::delete` call in
+the eviction loop was retired." Branch-dependent, therefore wrong on some branch: "There is no
+`vectors::delete`" — the function is `vectors.rs`'s `pub fn delete`, still present on the
+branch this file ships from, and absent at `49fca6d` (a tree claim — check with
+`git show 49fca6d:crates/memorysafe-backend-sqlite/src/vectors.rs`). Either present-tense form
+is false somewhere.
+
+**The quietest sub-case: a comment naming a future task as its remedy.** That deferral goes
+stale exactly when the named task *succeeds* — worse than a branch merge, because a merge is
+at least an event somebody attends, and a task closing is not. Two on this branch, and they
+fail in opposite directions:
+
+- `Backend::import`'s doc names Task 24 as what "must implement" `Header`/`format_version`
+  enforcement: "today's code does not enforce it." **Inspected, and false:** Task 24 shipped
+  and did implement it — `portability::import` (the SQLite crate) sets `saw_header` in the
+  `Header` match arm, checks it after the loop
+  (`MalformedImport("import stream carries no Header record")`), and compares
+  `format_version` inside that same arm. The doc has been wrong since the task that would have
+  falsified it closed.
+- `PURGED_COMPONENT`'s doc names Plan 3 Task 1 as the remedy that enforces the `_purged`
+  reservation; that task shipped covering `_admin` only. **Inspected, and true:** the doc is
+  right and the work is undone. `memorysafe-auth/src/store.rs` imports `ADMIN_COMPONENT`, not
+  `PURGED_COMPONENT` — the string appears nowhere in the file — and its guard is
+  `subject == ADMIN_COMPONENT || namespace == ADMIN_COMPONENT`; both its tests exercise
+  `ADMIN_COMPONENT` only. `PURGED_COMPONENT` is a legal component: a leading `_` passes
+  `validate_component`, which rejects only a leading `.`.
+
+The second is the better exhibit, because it wrote its own falsifiability in. From
+`PURGED_COMPONENT`'s doc in `memorysafe-core`'s `ids.rs`, verbatim:
+
+> **What enforces it, named rather than gestured at:** Plan 3's adapter deliverable —
+> `docs/superpowers/plans/2026-09-05-adapters-and-shadow.md`, Task 1 ("Core — the reserved
+> admin scope; `memorysafe-auth`"), whose Global Constraints already state that a
+> caller-supplied **subject or namespace** equal to `_admin` is rejected before the scope
+> reaches the engine. `_purged` belongs in that same check, on the same two component kinds. A
+> reader can go to that task and see whether it covers `_purged` alongside `_admin`; **a
+> deferral that named no referent could never be found unfulfilled.**
+
+It named the file, the task, and the exact check, and predicted the mechanism by which someone
+would catch it later — then Task 1 shipped covering `_admin` only, and the check its own
+author invited is exactly the one that found it. One more nuance, stated as a predictor rather
+than an explanation, because the same doc argues it: `_purged` is *not* deferrable for the same
+reason `_admin` is. `_admin` guards an authorisation risk that exists only at the adapter;
+`_purged` guards a collision risk already live in Plan 1 — a trusted caller can innocently name
+a namespace `_purged`, after which ordinary audit rows sit alongside purge records — tolerated
+only because the collision is recoverable. The deferral was documented, at the time it was
+written, as the *weaker* of two obligations travelling together, which generalises: **a
+deferral documented as the lesser case is the one closed last, and therefore the one most
+likely to rot.** When two obligations are deferred together and one is described as the
+weaker, that is the one to check first.
+
+Both examples were unverified in opposite directions, which is why the pair is worth keeping
+rather than either alone: from outside, you cannot tell which way a stale deferral has failed.
+One reads as outstanding work that is already done; the other as finished work that is still
+outstanding. The cheap remedy: **closing a task includes grepping for deferrals that name
+it** — one grep, at the one moment someone is guaranteed to already be looking at that task's
+name. Nothing else in the process ever revisits a comment that names a task, which is exactly
+why this class stays quiet.
+
+**A third instance shows the same class failing the other way. Measured** (see "Elsewhere,"
+below, for the grep): this file's own "Elsewhere" section named `TransactionBehavior::Immediate`
+as the pending upgrade from an ordering-based closure to a structural one; the fix landed and
+the entry kept naming it pending until this pass corrected it — same remedy, now shown to fail
+whichever direction a deferral ages. **Inspected:** a sibling instance lives in `aggregates.rs`'s
+module doc, in another lane's crate — not this file's to fix, but the same class once more.
+
 ## The freeze, and what it costs to change
 
-`git diff crates/memorysafe-backend/src/conformance/` between `520fda7` (where the SQLite
-crate began) and `2d5701c` is **two files, zero non-comment lines** — both documentation.
+`git diff crates/memorysafe-backend/src/conformance/` between `ce1af6b` (where the SQLite
+crate began) and `8187bd9` is **two files, zero non-comment lines** — both documentation.
 The backend was implemented against a stationary target, which is what makes "it passes the
 suite" mean anything. Checkable by anyone holding the two SHAs.
 
@@ -35,6 +197,32 @@ it a requirement for every future backend.
    identifier anywhere in the suite. Inclusivity now documented; untested.
 4. **`retrieve_candidates`' relevance tie-break** and **`neighbours`' access statistics** —
    both covered crate-locally only.
+5. **`WriteTransaction::is_valid`'s conditions are a contract surface reachable from outside
+   this crate.** Inspected: `is_valid` (`crates/memorysafe-backend/src/write.rs`) rejects a
+   transaction three ways — upsert and merge set together; an upserted item whose `scope`
+   disagrees with the transaction's; the audit's `scope` disagreeing with the transaction's.
+   `conformance/atomicity.rs`'s `an_invalid_transaction_is_rejected_and_writes_nothing` binds
+   every backend: *"A transaction `WriteTransaction::is_valid` rejects must be rejected by the
+   backend too, and must leave the corpus exactly as it was."* Its own doc comment explains why
+   it drives only one of the three through `Backend::apply` — upsert-and-merge, chosen because
+   it is unambiguous, where either scope-disagreement case would weaken "nothing was written"
+   into a search across two scopes — so the other two are exercised only by this crate's own
+   unit tests, which call `is_valid()` directly and never go through the trait. **Not zero, as
+   claimed once already: one of three has a conformance case.**
+
+   The gap: a change that tightens `is_valid` widens what every backend, including ones not yet
+   written, must refuse — and the diff doing it need not touch `conformance/` at all, so nothing
+   routes it to this crate's owner for review.
+
+   > The tell is not which files a diff touches; it is whether the change alters what a
+   > conformant backend must do.
+
+   Caught by accident: another lane routed a proposed fourth condition here on instinct, not
+   because anything flagged it — one lane's instinct is not a mechanism, and a gap entry that
+   omits how it was found invites the next reader to assume a process existed. (What it was
+   investigating, and the near-miss along the way, is recorded under "A grep-shaped read of a
+   document," below.) A fourth condition is in progress, unmerged, on another branch; it adds no
+   symbol this tree has, so it is not named here.
 
 ## From the freeze review — six the frozen suite cannot see
 
@@ -91,10 +279,24 @@ readers now error rather than falling back, so there is no fallback value for a 
 coincide with); `apply`'s `size > 0` guard (closed as a side effect of moving
 `evicted.push` inside it — the guard acquired an observable consequence).
 
-**Masked by a working first line — allowlist, with procedure.** `retrieve::passes -> true`
-and its four boundary mutants; `vectors::delete -> Ok(())`. Not excuses: to mutation-test
-`filter_sql`, **disable `passes` first** — with it enabled these cannot fail. See
-`.cargo/mutants.toml`.
+**Masked by a working first line — allowlist, with procedure.** `retrieve::passes -> true` and
+its four boundary mutants. Not excuses: to mutation-test `filter_sql`, **disable `passes`
+first** — with it enabled these cannot fail. See `.cargo/mutants.toml`.
+
+**Retired in the backend-sqlite defect lane (commit `667909d`; a diff claim — check with
+`git show 667909d`).** The `vectors::delete -> Ok(())` entry described a mutant masked by
+`ON DELETE CASCADE`, and justified keeping the explicit call as defence against a future
+schema that drops the cascade. That justification did not survive measurement: dropping
+`ON DELETE CASCADE` from the schema fails 4 tests and
+disabling the `foreign_keys` pragma fails 5, so the second line of defence guarded a failure
+the suite already catches loudly — while its unscoped, unconditional call in the eviction loop
+was itself the defect it now records. On an out-of-scope eviction it **widowed a live item in
+another scope**: `items::delete` correctly refuses, which is precisely why the cascade never
+fires, and the unscoped delete then strips the vector from an item still alive elsewhere. That
+item stays readable through `get` and `list` while being permanently invisible to vector
+search, with no error. Note the direction: an *orphaned vector* — a vector row with no item —
+is structurally impossible while the cascade holds. See `.cargo/mutants.toml`'s retired entry
+for the measurements and the three tests that pin the cascade and the pragma.
 
 **Equivalent under reachable states.** `neighbours`' `||` → `&&`: the test embedder's id is
 `format!("deterministic-{dim}")`, so the guard's two operands are perfectly correlated for
@@ -114,9 +316,6 @@ predicate: `items.id` is `TEXT PRIMARY KEY` and `get` already refused an out-of-
   Seed one correct.
 - **`portability::export`'s `AuditFilter.limit`** is droppable with nothing noticing —
   nothing pins how many audit rows an export returns.
-- **`SqliteBackend::forget_tenant`** — `pub`, zero callers, body replaceable with `()`.
-  Documented as the operator half of tenant deletion. Decide: test it (delete the tenant's
-  files, then show a cached handle would have served stale reads) or remove it.
 - **Two `TIMEOUT`s, not kills** — `keyword.rs`'s `/` → `*` and `scope_embedder`'s constant
   return. Unresolved verdicts caused by the harness, not the code; checked that neither is a
   real `dim`-0 hang.
@@ -154,6 +353,311 @@ Nix-based setup the fix is generally to put the toolchain's `libstdc++` on
 `LD_LIBRARY_PATH` for the run; the specific store path is machine-local and deliberately
 not written down here, because a pinned path rots and a rotted path is worse than none.
 Find yours rather than copying someone else's.
+## A class, not a lone mutant: the declared-but-unreachable API
+
+`SqliteBackend::forget_tenant` was recorded here as a lone surviving mutant. It isn't one — it
+is a member of a recurring class, and naming the class is worth more than the entry it
+replaces.
+
+**The class: a broken promise.** The API declares a capability the code does not deliver, and
+a reader cannot tell which parts of the surface are real. Not merely unused internally —
+**exposed**, so a consumer can find it, depend on it, or configure it, and get nothing. The
+defect is not the unused code; it is that the observable surface and the actual behaviour have
+quietly separated. That is the same failure the retired `vectors::delete` entry above
+describes from the storage side: there, an *orphaned* vector row — one with no item — would be
+invisible to every read path, and is now structurally prevented by the FK cascade; here, a
+capability sits on the surface with no path that reaches it. Two shapes of one failure.
+
+Members differ in the size of the promise they break, ranked accordingly.
+
+**"This mechanism runs" — broken. Severe: the capability is not delivered at all.**
+
+- **`AuditFilter.subject`. Open.** Inspected: `crates/memorysafe-backend-sqlite/src/audit.rs`'s
+  `query` builds its base predicate as `WHERE subject = ?1 AND namespace = ?2` from the
+  **scope** argument, and extends it only for `filter.events`, `filter.since`, `filter.until`
+  and `filter.after` — `filter.subject` is never read (neither is `filter.namespace`, on the
+  same predicate). `AuditFilter::subject`'s own doc calls narrowing by subject "THE compliance
+  query," inexpressible without it once a purge has taken the item ids away; `Backend::audit`'s
+  trait doc, which spells out `item`, `since`, `until`, `after` and `limit` in detail, says
+  nothing about `subject` at all. "Gaps that the freeze locks in" above already records that no
+  test sets these fields; this is the same field found dead in the implementation, not merely
+  untested.
+- **`EngineCache::put_stats` — the write half of its per-scope statistics cache. Open. Cite
+  `c3e0d01`** (Task 37's cache work; this branch is based on `8dd7ee6` and does not contain the
+  file — a tree claim, verified at that commit via
+  `git show c3e0d01:crates/memorysafe-engine/src/cache.rs`, not this one). `EngineCache::stats`
+  and `EngineCache::put_stats` are defined in `crates/memorysafe-engine/src/cache.rs`. Every
+  call to `put_stats` is `#[cfg(test)]`: in `crates/memorysafe-engine/src/maintain.rs` and
+  `crates/memorysafe-engine/src/mutate.rs` every call sits below each file's `#[cfg(test)]`
+  boundary, and the rest are in `tests/cache.rs` — so the stats map is never written outside a
+  test. Production reads bypass it entirely: `gather.rs`, `maintain.rs` and `read.rs` each call
+  `backend.scope_stats(...)` directly. Its sharp edge: `CacheConfig` exposes `stats_capacity`
+  and `stats_ttl` as public, defaulted, tunable fields — operator-facing knobs for a cache that
+  is never populated. `stats_ttl`'s own doc comment prices the governance cost of a stale
+  corpus mean skewing every assessment made against it, which shows the author had already
+  reasoned this through; wiring it now would ratify a decision already made, not fix an
+  oversight. No disposition recorded here — that call belongs to the engine lane.
+- **`SqliteBackend::forget_tenant`. Open.** `pub`, zero callers in `crates/` other than the
+  module doc at the top of the same file instructing an operator to "Call
+  [`SqliteBackend::forget_tenant`] first" — a doc reference, not a call. Measured:
+  `grep -rn "forget_tenant" crates/ --include=*.rs` returns exactly those two lines.
+  Documented as the operator half of tenant deletion. Decide: test it (delete the tenant's
+  files, then show a cached handle would have served stale reads) or remove it.
+
+**"This value is used" — broken. Milder: the mechanism runs, a caller-supplied value just
+never feeds it.**
+
+- **`MergeWrite.byte_size`. Open; disposition is deleting the field, a tidy-up rather than a
+  defect fix.** Inspected: `items::merge` ignores the caller-supplied `byte_size` entirely — it
+  is not even a parameter — and instead measures `before = existing.byte_size()` and
+  `after = updated.byte_size()` at the storage layer, returning the difference, which
+  accumulates into `delta_bytes` and lands in the single `capacity::adjust` at the end of
+  `apply`'s transaction. The accounting is correct, and it ignores the field deliberately: a
+  caller's claim about how many bytes it is writing cannot be verified, while a row diff can.
+  Crate-local test: `a_merge_folds_the_item_and_adjusts_capacity_by_the_delta_not_the_new_size`.
+  **Do not read this as a capacity-accounting defect** — that was the hypothesis that routed it
+  here, and the code refutes it; the promise it breaks is "this value is used," not "this
+  mechanism runs." See "Derive from what exists, not from what the caller claims" below for
+  why the field went dead rather than merely untested.
+
+**Closed — the member that shows the class is fixable, not just a complaint.**
+
+- **`serde_json` in `memorysafe-policy`.** Measured: it sat under `[dependencies]` while every
+  real use was test-only (`grep -c` for `serde_json` across
+  `crates/memorysafe-policy/src/*.rs` finds twelve hits; eleven are calls in `value.rs` below
+  its `#[cfg(test)]` line, the twelfth is a doc comment in `eviction.rs`) — so every downstream
+  consumer of the policy crate compiled a JSON parser it could never reach. Fixed by another
+  lane: `crates/memorysafe-policy/Cargo.toml` now carries `serde_json.workspace = true` under
+  `[dev-dependencies]`.
+
+**Why the configuration-surface shape is the worst of the three.** Dead code wastes space; a
+tunable knob for a mechanism that does not run **misinforms** — it invites an operator to
+conclude a thing works because they configured it, which is a stronger and falser belief than
+simply not knowing the code exists.
+
+## Three kinds of unreachable, and only two of them are a defect
+
+They differ in **what would make the thing reachable**, which is the only distinction that
+changes what a reader should do about it.
+
+1. **Foreclosed by construction.** An orphaned vector row — a vector with no item — is reachable
+   only by changing the schema: `vectors.item_id REFERENCES items(id) ON DELETE CASCADE` with
+   the `foreign_keys` pragma on forecloses it structurally. Already recorded above, under
+   "Retired in the backend-sqlite defect lane" — see that entry rather than restating it here.
+2. **Unreachable by convention.** A mis-scoped vector row — FK-valid, its item alive, but the
+   row's own `subject`/`namespace` naming a scope the item is not in — is not structural: nothing
+   ties those columns to the item's actual scope, so a bug or a new code path could produce one.
+   Already recorded too, both further below in this file: "The vectors table stores scope
+   twice," under "Elsewhere," and the proposal rejected for reintroducing exactly this risk,
+   under "Derive from what exists, not from what the caller claims."
+3. **Unreachable by collaborator choice.** The new one, and the point of this section.
+
+**The third case, stated carefully.** `memorysafe-engine`'s `remember` has a
+merge-with-failed-embed branch: `write.rs`'s `Action::Merge` arm still runs when `embedding` is
+`None`, building a `MergeWrite` whose `vector` is then `None` too. **`BaselinePolicy` cannot
+reach it, and this is inspected, not measured** — established by reading, not by running:
+`gather::assess_context` fetches neighbours only when there is an embedding to probe with
+(`Some(e) => backend.neighbours(...)`, `None => vec![]`); `redundancy::assess(&[], _)` returns
+`Score::ZERO` with an empty `near_duplicates` (pinned by its own test,
+`no_neighbours_means_no_redundancy`); and `admit::decide`'s `Verdict::Mergeable` arm needs
+`RedundancyAssessment::best()` (`near_duplicates.first()`) to be `Some`, or it falls through to
+`Retain`. No embedding means no neighbours means no candidate to merge into: a merge decision
+paired with a failed embed is structurally unreachable **through this policy**, though nothing
+about the branch itself is unreachable.
+
+**Relayed, from the engine lane, and not run by me:** today that branch is exercised only through
+a test double. The `BaselinePolicy` chain above is the part read for this entry; whether a test
+double is presently the only caller that reaches it was not independently re-derived here, so it
+keeps the weaker mark.
+
+**The code is correct and necessary anyway.** A different `GovernancePolicy` could decide `Merge`
+on some signal other than the candidate's own neighbours, and the type should not lie about what
+is representable by refusing the combination. This is not dead code.
+
+**Why it earns a section rather than a bullet, and this is the sentence that matters:**
+
+> Its reachability is bounded by a **collaborator's** behaviour, not by its own structure. A new
+> policy makes it live tomorrow with **no change to this code at all.**
+
+**It is the one a future reader is most likely to delete.** It looks like dead code, and — once
+it has tests — they will look like they exercise a fiction. The correct response is the opposite
+of the obvious one: **reachability here is not this code's property to determine.**
+
+**This is NOT the declared-but-unreachable-API class above, and here is why in one line:** those
+members shipped a promise the code does not keep — `forget_tenant` is callable and nothing calls
+it, `AuditFilter.subject` is read from nowhere. This one keeps a promise nobody currently asks it
+to keep: no caller today needs a merge to survive a failed embed, so its silence is patience, not
+breakage. Filing it under that class would say the code is broken; it is the opposite.
+
+## Derive from what exists, not from what the caller claims
+
+Three instances in this crate; the first two verified by reading, the third a proposal that
+was rejected for violating what the first two establish.
+
+1. **Import takes a vector's scope from the item it belongs to, not from the stream.**
+   `portability::import`'s SQLite implementation reconstructs `scope: Scope` from
+   `item.scope.clone()` and passes that same `scope` into
+   `vectors::insert(&tx, &item.id, &scope, &q)` — not a scope carried separately on the
+   vector's own stream record. This is the path where trusting the payload would have been
+   most tempting, because the stream record is right there.
+2. **`items::merge` takes bytes from the rows, not from `MergeWrite.byte_size`.** It computes
+   `before = existing.byte_size()` and `after = updated.byte_size()` and returns the
+   difference; the caller-supplied field is not even a parameter. That is exactly why the
+   field is dead — see the class entry above — rather than merely a broken promise with no
+   explanation: the mechanism it would feed already has a source of truth it trusts more.
+3. **A proposed repair that was rejected for violating it.** Adding
+   `subject=excluded.subject, namespace=excluded.namespace` to `vectors::insert`'s
+   `ON CONFLICT(item_id) DO UPDATE SET` — which today updates only `embedder`, `dim`, `scale`
+   and `q` — would have made the `vectors` row agree with whatever scope the caller passed
+   rather than with what `items` says, propagating a wrong scope as readily as correcting a
+   stale one, and silently healing the symptom on every re-embed so the underlying bug gets
+   *harder* to find.
+
+The first two are why the third is wrong: this codebase already has an established practice of
+deriving scope and size from what is actually stored rather than from what a caller claims, so
+a repair that inverts that practice for the sake of a scope column agreeing with the caller
+would be a regression dressed as a fix. That is the durable form of the rejection — it survives
+someone re-proposing the repair in six months when nobody remembers the conversation.
+
+## An instrument that produces a wrong answer indistinguishable from a real result
+
+Four instances, from three separate lanes on one day. No lane could see the pattern from where
+it sat.
+
+1. **A too-literal grep.** Measured, and self-demonstrating:
+
+       grep -c "vectors::insert storing a wrong" docs/superpowers/plans/2026-09-05-engine-and-sqlite.md
+       -> 0
+       grep -o '`vectors::insert` storing a wrong `namespace`' docs/superpowers/plans/2026-09-05-engine-and-sqlite.md
+       -> `vectors::insert` storing a wrong `namespace`
+
+   The real text carries backticks the unbackticked literal never will, so the first grep's
+   zero read exactly like "the claim is false" and came within one keystroke of retracting a
+   correct finding. The second grep is the point: it shows the instrument *can* report
+   presence, which is what proves the first zero was the instrument's fault, not the world's.
+2. **A piped exit code. Relayed** — not reproduced for this entry; reported to have happened
+   twice independently the same day. `cargo test … | tail` reports the pipe's exit status, not
+   cargo's. In this lane, a baseline run piped through `tail -30` silently discarded the test
+   summary while the command still reported success, so parsing the truncated output produced
+   "0 passed, 0 failed" — a manufactured absence that read as a measurement. General trap, not
+   one lane's mistake: `| tail` masks the real exit status and truncates the evidence in the
+   same stroke.
+3. **`vectors::count`'s own scope predicate was unpinned. Closed. Cite `49fca6d`** (the tip of
+   `worktree-sdd-sqlite-defects`; this branch is based on `8dd7ee6` and does not contain the
+   fix — measured via `git show 49fca6d:crates/memorysafe-backend-sqlite/src/vectors.rs`, not
+   this branch's HEAD). `vectors::count` is the accessor built
+   specifically to detect scope leaks, which is what makes this the sharpest of the four: the
+   instrument *was* the leak detector, and its own predicate went untested. The surviving
+   mutant replaced the entire `WHERE` with `?1 IS NOT NULL AND ?2 IS NOT NULL` — the bound
+   params still referenced, so the code reads as using them, while the predicate restricts
+   nothing, turning a per-scope count into a whole-tenant-file count. Why it survived, in the
+   fix's own words: **"exercised at 0 and at 1" was exercise, not coverage** — every test
+   reading through `count` kept exactly one vector row in the entire tenant at a time, so a
+   per-scope count and a whole-file count are numerically identical. Closed by
+   `count_is_scoped_by_subject_and_namespace_not_the_whole_tenant_file`, which plants a vector
+   in three scopes differing from `home` in exactly one coordinate each, asserts the tenant
+   file genuinely holds three rows first (a positive control, so counts of 1 prove scoping
+   rather than an empty file), then asserts each scope counts 1 — a predicate dropping the
+   whole `WHERE`, or just its subject half, or just its namespace half, each makes a different
+   one of the three come out too high.
+4. **A survey that searched for the wrong statement shape.** Measured, and the most
+   instructive of the four. This file's own "Elsewhere" entry said the `vectors` table's
+   `subject`/`namespace` are duplicated "with exactly one reader, `scope_embedder`" — wrong,
+   and wrong before any of today's work:
+   `grep -rn "FROM vectors\|JOIN vectors\|INTO vectors\|UPDATE vectors" crates/memorysafe-backend-sqlite/src/*.rs`
+   finds two production readers at this branch's HEAD, not one — `vectors::scope_embedder` and
+   **`purge::subject`** (`DELETE FROM vectors WHERE subject = ?1`), which predates the entry
+   entirely; a third reader is arriving in another lane's in-flight work, unlanded and not
+   named here. **A `WHERE` clause reads a column whether or not the statement is a `SELECT`**
+   — the entry counted `SELECT`s and missed a `DELETE`. In the other three instances the faulty
+   instrument was a tool — grep, a pipe, a test run; here it was a human-authored question
+   ("which queries read this column?") that silently excluded a whole category of caller. The
+   class is not about tooling; it is about any procedure that can return absence. See
+   "Elsewhere" below for the corrected count; this entry owns the error class, that one owns
+   the correction.
+
+**The rule that falls out, stated as procedure:** when an instrument reports absence, first
+show the instrument can report presence. A grep that finds nothing should be shown finding
+something. A counter used to detect a difference should be shown returning different numbers.
+A test should be shown failing before it is trusted passing — TDD's premise, generalised past
+tests to every instrument. The formulation to use: *absence of evidence manufactured by the
+instrument, not by the world.*
+
+**Two things this file and the plan already contain turn out to be the same class, stated once
+each.** The engine-and-sqlite plan's Global Constraints already warn about one costume of this
+without naming the general case: under "Mutation-test every mechanism you add, and paste the
+output," they require grepping for `error[E` and `could not compile` in the same pass as test
+failures, because a mutation that fails to compile and a mutation nothing catches produce the
+same silence. The project already knew the specific instance and paid for the general one
+three times in one day. And "Surviving mutants" above's "Masked by a working first line" entry
+— `retrieve::passes -> true` and its four boundary mutants, unfailable while `passes` is
+enabled — is the same class with its remedy already applied by hand to one case: disable
+`passes` before mutation-testing `filter_sql` *is* "show the instrument can report presence,"
+written before the rule was.
+
+**Another costume of the same class: a fixture that correlates two filter dimensions. Relayed**
+from the SQLite lane, whose reviewer both hit it and fixed it. The first fixture for
+`AuditFilter::item` put item A and the `Admitted` event on the same rows, so the mutant gating
+the `item` predicate on `events.is_empty()` survived: with the two axes moving together, "filter
+by item" and "filter by event" select identical rows, and no input can tell a backend that ANDs
+the two predicates from one that drops either. The committed fixture decorrelates: item A on
+rows both matching and not matching the event filter, item B likewise, plus a trap row satisfying
+every other predicate except `item`. Sits beside `vectors::count`'s "exercised at 0 and at 1 was
+exercise, not coverage" above — both are corpora that exercise a mechanism while structurally
+unable to discriminate one of its failure modes, and the remedy is the same: show the instrument
+can distinguish the axes before trusting what it reports.
+
+**The instruments that check are not exempt.** Several of this class's own members are
+themselves verification procedures — a grep (the too-literal grep, above), a leak-detecting
+counter (`vectors::count`, above), a fixture (the decorrelation trap, just above), a
+pass-counting method, and a SHA map (the durability-hierarchy check, above). That is a pattern
+about verification procedures specifically, not about tooling in general.
+
+**The pass-counting method, concretely, since it is this lane's own. Measured:** summing
+`test result: ok. N passed` lines across a multi-target run is truncation-vulnerable in a shape
+that looks like data — if a run halts, later targets never emit their line, and the sum comes
+back smaller, indistinguishable from a legitimate smaller count. The complete instrument is
+three reads of one log, guards before the number:
+
+    headers == results              no target began without finishing
+    count of `test result: FAILED`  nothing unexpectedly red
+    sum of `N passed`               the count itself
+
+The fault shapes are self-diagnosing:
+
+    started == finished > 0      complete
+    started >  finished > 0      REAL TRUNCATION
+    started == 0, finished > 0   CAPTURE FAULT (split streams, or --quiet)
+    started == 0, finished == 0  nothing ran, or nothing captured
+
+Genuine truncation can only produce `started > finished`, never `started == 0` — the halting
+target has already printed its `Running` line. Shell note: `2>&1 > log` splits the streams;
+`> log 2>&1` combines them — the pipe-eats-the-exit-code trick with the redirection order
+reversed. A zero where a number was expected is the tell.
+
+## A grep-shaped read of a document — a new costume, and the first where the instrument is attention
+
+**Relayed**, from the engine lane, as its own self-diagnosis.
+
+It quoted a sentence from `conformance/atomicity.rs`'s doc comment — *"`is_valid` is exercised
+only by … unit tests … never go through the trait"* — as a present-tense coverage claim. **The
+sentence correcting it was two lines below, in the same block it was quoting from.** It read far
+enough to find something confirming a hypothesis and stopped. (What it was investigating, and
+what the correction actually meant, is recorded under "Gaps that the freeze locks in," above —
+the `WriteTransaction::is_valid` entry.)
+
+**Why this earns its own entry rather than a bullet under "An instrument that produces a wrong
+answer," above:** in every instance there, the faulty instrument was a *tool*, and the artifact
+it read was wrong, stale, or ambiguous. **Here the document was correct and complete**, and the
+tense was legible from context two lines on. **No improvement to the document would have
+prevented it** — which rules out the remedy a reader reaches for first (write clearer docs). The
+remedy is procedural:
+
+> **When a sentence settles a question you came looking to settle, read to the end of the block
+> before acting on it.**
+
+The instrument is the reader's own attention, and it has a bad grep's signature: a confident
+answer to a question narrower than the one that mattered.
 
 ## One process note, because it cost a near-miss at the freeze
 
@@ -175,21 +679,33 @@ for the pattern you most recently removed, before committing a fix for anything 
 
 ## Elsewhere
 
-- **Every transaction is `DEFERRED`.** `apply` now opens with a write (`capacity::ensure_row`),
-  so the `SQLITE_BUSY_SNAPSHOT` exposure is closed on that path — **by ordering, which no
-  test pins**. `TransactionBehavior::Immediate` would make it structural.
+- **Every transaction now opens `TransactionBehavior::Immediate`. Correction, measured**
+  (see "Surviving mutants" above): this entry read "every transaction is `DEFERRED`," true only
+  while `apply`'s opening write (`capacity::ensure_row`) closed the `SQLITE_BUSY_SNAPSHOT`
+  exposure by ordering alone — **by ordering, which no test pinned** — and it stayed unrevised
+  after the fix landed.
+  `grep -rn "TransactionBehavior::Immediate" crates/memorysafe-backend-sqlite/src/` finds four
+  call sites: `purge.rs:25`, `portability.rs:152`, `lib.rs:111`, `lib.rs:198`. The exposure is
+  now closed structurally, not by the position of one call.
 - **The `vectors` table stores scope twice.** `subject`/`namespace` are duplicated from
-  `items`, and they now have **three** readers, not the one this entry used to claim:
-  `vectors::scope_embedder` (`SELECT embedder, dim FROM vectors WHERE subject=?1 AND
-  namespace=?2`), the newly-scoped `vectors::delete` (`item_id AND subject AND namespace`),
-  and `purge::subject`'s `DELETE FROM vectors WHERE subject = ?1`. `vectors::search` is
-  still not among them — it filters through the `items` join and never reads these columns,
-  which is why no recall leak or sensitivity-ceiling consequence follows from a divergent
-  row. Nothing in the schema ties either column to the referenced item's scope
-  (`vectors.item_id` has a foreign key; `subject`/`namespace` are plain `TEXT NOT NULL`),
-  and `vectors::insert`'s `ON CONFLICT(item_id) DO UPDATE SET` list omits both, so a
-  divergence cannot self-heal. Every call site passes the item's own scope, so the property
-  holds today **by convention, not by construction**; it is now pinned by
+  `items`. **Correction, measured** (see "An instrument that produces a wrong answer" above):
+  the original "exactly one reader, `scope_embedder`" count was an inspection, not a
+  measurement, and was wrong from the start. The reproducible form:
+  `grep -rn "FROM vectors\|JOIN vectors\|INTO vectors\|UPDATE vectors" crates/memorysafe-backend-sqlite/src/*.rs`,
+  minus the hits inside `#[cfg(test)] mod tests`. At this commit it finds **four** production
+  readers of these two columns, not one and not the three an earlier revision of this entry
+  claimed: `vectors::scope_embedder` (`SELECT embedder, dim FROM vectors WHERE subject=?1 AND
+  namespace=?2`), the scoped `vectors::delete` (`item_id AND subject AND namespace`, the merge
+  path's), `vectors::count` (`SELECT COUNT(*) FROM vectors WHERE subject=?1 AND namespace=?2`,
+  under the public `SqliteBackend::vector_row_count`), and `purge::subject`'s `DELETE FROM
+  vectors WHERE subject = ?1`, which predates this entry entirely. `vectors::search` is still
+  not among them — it filters through the `items` join and never reads these columns, which is
+  why no recall leak or sensitivity-ceiling consequence follows from a divergent row. Nothing in
+  the schema ties either column to the referenced item's scope (`vectors.item_id` has a foreign
+  key; `subject`/`namespace` are plain `TEXT NOT NULL`), and `vectors::insert`'s
+  `ON CONFLICT(item_id) DO UPDATE SET` list omits both, so a divergence cannot self-heal. Every
+  call site passes the item's own scope, so the property holds today **by convention, not by
+  construction**; it is pinned by
   `tests::every_vector_rows_scope_columns_agree_with_the_item_it_references` in
   `memorysafe-backend-sqlite`, whose doc comment carries the full consequence list. Schema
   owner's call; the join cost is unmeasured.

@@ -177,6 +177,25 @@ pub trait Backend: Send + Sync {
     /// pins it crate-locally in
     /// `tests::replacing_a_row_in_one_transaction_preserves_its_access_history`,
     /// and `memorysafe-engine` pins the three engine paths that depend on it.
+    ///
+    /// **`txn.idempotency_key`, when set, is scoped to `txn.scope` — never
+    /// global.** A backend must key its idempotency record on the `Scope`
+    /// together with the key string, never on the key string alone. Two
+    /// transactions carrying the identical key string are two independent
+    /// writes whenever their scopes differ in tenant, subject, *or*
+    /// namespace: neither replays the other, and neither may raise
+    /// [`BackendError::IdempotencyConflict`] against the other. A backend
+    /// keyed on the bare key — or on `(tenant, key)`, dropping subject, or on
+    /// `(tenant, subject, key)`, dropping namespace — would serve one
+    /// subject's write back as a replay of a different subject's, or refuse a
+    /// second subject's legitimate write as a conflict with the first's: a
+    /// cross-subject data leak in a system whose central promise is scope
+    /// isolation.
+    /// `conformance::atomicity::idempotency_keys_do_not_collide_across_subjects`
+    /// enforces this on both the subject and the namespace axis, and
+    /// separately confirms that *within* one scope the same key still
+    /// conflicts on a different payload, so a backend that has disabled
+    /// idempotency entirely does not pass by omission.
     async fn apply(&self, txn: WriteTransaction) -> Result<AppliedWrite, BackendError>;
 
     /// Writes the recall's audit row **and**, in the same transaction, updates
@@ -269,6 +288,17 @@ pub trait Backend: Send + Sync {
     /// off every record's timestamp, on purpose: it tests the window without
     /// depending on the inclusivity choice, so the two tests fail for
     /// different reasons.
+    ///
+    /// `filter.item`, when `Some(id)`, narrows the result to records whose
+    /// `items` contain an `ItemRef` for that `ItemId`; `None` leaves the
+    /// result unnarrowed. It ANDs with `events`, `since`, `until` and `after`
+    /// exactly as they AND with each other, and it is applied **before**
+    /// `limit` — the `min(filter.limit, rows matching the whole filter)` rule
+    /// below still holds with `item` set, which a filter applied after
+    /// truncation would silently break.
+    /// `conformance::lifecycle::audit_filter_narrows_by_item` enforces this,
+    /// including the arm a count alone cannot: a record that names no item at
+    /// all must be excluded rather than treated as a match for every `item`.
     ///
     /// **Truncation is detectable from the page size, so there is no
     /// `truncated` flag.** An implementation must return exactly
