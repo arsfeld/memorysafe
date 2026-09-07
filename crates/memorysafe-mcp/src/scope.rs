@@ -54,6 +54,23 @@ fn strip_bearer(value: &str) -> Option<&str> {
 }
 
 impl ScopeSource {
+    /// The scope a client sees before it names one. `None` over HTTP, where the
+    /// scope is a property of the request rather than of the server.
+    pub fn default_scope(&self) -> Option<Scope> {
+        match self {
+            ScopeSource::Stdio {
+                tenant,
+                subject,
+                default_namespace,
+            } => Some(Scope {
+                tenant: tenant.clone(),
+                subject: subject.clone(),
+                namespace: default_namespace.clone(),
+            }),
+            ScopeSource::Http { .. } => None,
+        }
+    }
+
     pub fn resolve(
         &self,
         extensions: &Extensions,

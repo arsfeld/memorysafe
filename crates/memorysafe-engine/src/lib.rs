@@ -474,4 +474,54 @@ impl Engine {
     ) -> Result<memorysafe_core::CapacityState, EngineError> {
         Ok(self.backend.capacity_state(scope).await?)
     }
+
+    /// A namespace's corpus shape, read through to the backend. Sibling of
+    /// `capacity_state` immediately above and `review`/`audit` further up:
+    /// same straight pass-through, no caching, for the same reason —
+    /// `capacity_state`'s doc comment applies verbatim.
+    pub async fn scope_stats(
+        &self,
+        scope: &Scope,
+    ) -> Result<memorysafe_core::ScopeStats, EngineError> {
+        Ok(self.backend.scope_stats(scope).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memorysafe_backend_sqlite::SqliteBackend;
+    use memorysafe_embed::DeterministicEmbedder;
+    use memorysafe_policy::BaselinePolicy;
+
+    fn engine() -> Engine {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Engine::new(EngineConfig::new(
+            Arc::new(SqliteBackend::open(dir.keep())),
+            Arc::new(DeterministicEmbedder::new(256)),
+            Arc::new(BaselinePolicy::default()),
+        ))
+    }
+
+    fn scope() -> Scope {
+        Scope::new("acme", "user-42", "agent").unwrap()
+    }
+
+    /// `Engine::scope_stats` is a one-line pass-through to
+    /// `Backend::scope_stats`, mirroring `capacity_state` immediately above.
+    /// Written one memory in, then asked for the corpus shape back, so a
+    /// broken or absent pass-through fails on real numbers, not on a type
+    /// check alone.
+    #[tokio::test]
+    async fn scope_stats_reports_the_corpus_the_backend_holds() {
+        let e = engine();
+        let s = scope();
+        e.remember(RememberRequest::new(s.clone(), "a distinct memory body"))
+            .await
+            .unwrap();
+
+        let stats = e.scope_stats(&s).await.unwrap();
+        assert_eq!(stats.item_count, 1);
+        assert!(stats.total_bytes > 0);
+    }
 }
