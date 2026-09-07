@@ -156,13 +156,36 @@ impl ServerHandler for MemorySafeServer {
                     "item_count": stats.item_count,
                     "total_bytes": stats.total_bytes,
                     "median_item_bytes": stats.median_item_bytes,
-                    "mean_neighbour_similarity": stats.mean_neighbour_similarity,
+                    // `Backend::scope_stats` never computes a real value here:
+                    // `memorysafe-backend-sqlite::capacity::stats` leaves it at
+                    // `ScopeStats`'s `0.0` "no data" sentinel unconditionally
+                    // (see that field's own doc — "any consumer reading it
+                    // directly must check `item_count` first"). Only the
+                    // engine's in-flight assessment path
+                    // (`gather::assess_context`) ever computes a real figure,
+                    // and `Engine::scope_stats` does not go through it — so
+                    // this key would read `0.0` on *every* scope, populated or
+                    // not, which is not a low similarity, it is an absent one.
+                    // `null`, not omitted: the field is named explicitly in
+                    // this resource's specified JSON shape, so dropping it
+                    // silently would remove a specified key rather than
+                    // honestly saying "not available from this read". Publish
+                    // a real number once a path exists to compute one outside
+                    // admission.
+                    "mean_neighbour_similarity": serde_json::Value::Null,
                 })
             }
         };
 
         let text = serde_json::to_string_pretty(&body)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(text, request.uri)]).into())
+        // `ResourceContents::text` defaults its own `mimeType` to
+        // `text/plain`; without this override the per-read content block
+        // would contradict the `application/json` the listing advertises —
+        // and the content block is what a client dispatches rendering on.
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(text, request.uri).with_mime_type("application/json"),
+        ])
+        .into())
     }
 }

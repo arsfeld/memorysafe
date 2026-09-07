@@ -175,6 +175,36 @@ mod tests {
         assert_eq!(r.actor.kind, ActorKind::Agent);
     }
 
+    /// `default_scope` is a second, independent construction of the same
+    /// scope `resolve` produces with no overrides — deliberately duplicated
+    /// rather than built by calling `resolve` internally (see its own doc).
+    /// That duplication is only safe if the two agree, which is what this
+    /// pins: `list_resources` advertises URIs built from `default_scope`, and
+    /// a client that reads one back goes through `resolve` — if the two ever
+    /// disagreed, `list_resources` could advertise a URI `read_resource`
+    /// would refuse.
+    #[test]
+    fn default_scope_agrees_with_what_resolve_produces_with_no_overrides() {
+        assert_eq!(
+            stdio().default_scope(),
+            Some(
+                stdio()
+                    .resolve(&Extensions::new(), None, None)
+                    .unwrap()
+                    .scope
+            )
+        );
+
+        let g = generate(TenantId::new("acme").unwrap(), "ci").unwrap();
+        let http = ScopeSource::Http {
+            keys: Arc::new(ApiKeyStore::new(vec![g.record])),
+        };
+        assert!(
+            http.default_scope().is_none(),
+            "HTTP has no default scope — it is a property of the request, not the server"
+        );
+    }
+
     #[test]
     fn stdio_lets_a_call_override_the_namespace_but_never_the_subject() {
         // The spec is explicit: stdio is configured with tenant AND subject;

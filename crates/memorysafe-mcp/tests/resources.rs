@@ -4,6 +4,19 @@ use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams};
 use serde_json::json;
 use support::{args, connect, engine};
 
+/// Every read in this file needs both the text and the content block's own
+/// `mimeType` — the field a client actually dispatches rendering on, as
+/// distinct from the listed `Resource`'s `mimeType` (already checked in
+/// `the_server_lists_its_audit_and_stats_resources`).
+fn text_and_mime(contents: &rmcp::model::ResourceContents) -> (String, Option<String>) {
+    match contents {
+        rmcp::model::ResourceContents::TextResourceContents {
+            text, mime_type, ..
+        } => (text.clone(), mime_type.clone()),
+        other => panic!("expected text contents, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn the_server_lists_its_audit_and_stats_resources() {
     let (eng, _dir) = engine();
@@ -51,10 +64,12 @@ async fn the_audit_resource_shows_the_decisions_without_the_bodies() {
         .await
         .unwrap();
 
-    let text = match &read.contents[0] {
-        rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
-        other => panic!("expected text contents, got {other:?}"),
-    };
+    let (text, mime_type) = text_and_mime(&read.contents[0]);
+    assert_eq!(
+        mime_type.as_deref(),
+        Some("application/json"),
+        "the content block's own mimeType, not just the listing's, must say JSON"
+    );
     let value: serde_json::Value = serde_json::from_str(&text).expect("the audit resource is JSON");
     let records = value["records"].as_array().expect("records array");
     assert_eq!(records.len(), 1);
@@ -73,17 +88,45 @@ async fn the_audit_resource_shows_the_decisions_without_the_bodies() {
 #[tokio::test]
 async fn the_stats_resource_reports_capacity_and_corpus_shape() {
     let (eng, _dir) = engine();
-    let client = connect(eng).await;
-    for i in 0..3 {
+    let client = connect(eng.clone()).await;
+
+    // Deliberately different lengths, not "distinct memory {i}" (which are
+    // all the same size): a used_bytes/used_items or item_count/total_bytes
+    // transposition must fail loudly, not coincidentally match a small item
+    // count.
+    let bodies = [
+        "a short memory about topic zero".to_string(),
+        "a considerably longer memory body describing topic one, with extra \
+         clauses and context so its byte count clearly differs from the first"
+            .to_string(),
+        "an even longer memory body about topic two, deliberately padded with \
+         additional distinct words and phrases so this item's byte size is the \
+         largest of the three and the median sits between the other two without \
+         coinciding with any count"
+            .to_string(),
+    ];
+    for body in &bodies {
         client
             .call_tool(
-                CallToolRequestParams::new("memory_remember").with_arguments(args(
-                    json!({ "body": format!("distinct memory {i} on topic {i}") }),
-                )),
+                CallToolRequestParams::new("memory_remember")
+                    .with_arguments(args(json!({ "body": body }))),
             )
             .await
             .unwrap();
     }
+
+    // The expected values come from the engine directly, not from hand
+    // computing the byte-charge formula — this test's job is to check the
+    // resource relays the engine's own numbers under the right keys, not to
+    // re-derive `MemoryItem::byte_size`'s arithmetic.
+    let scope = memorysafe_core::Scope::new("acme", "user-42", "coding-agent").unwrap();
+    let expected_capacity = eng.capacity_state(&scope).await.unwrap();
+    let expected_stats = eng.scope_stats(&scope).await.unwrap();
+    // The fixture must actually discriminate a transposition, or the
+    // assertions below would pass by coincidence.
+    assert_ne!(expected_capacity.used_items, expected_capacity.used_bytes);
+    assert_ne!(expected_stats.item_count, expected_stats.total_bytes);
+    assert_ne!(expected_stats.total_bytes, expected_stats.median_item_bytes);
 
     let read = client
         .read_resource(ReadResourceRequestParams::new(
@@ -91,16 +134,90 @@ async fn the_stats_resource_reports_capacity_and_corpus_shape() {
         ))
         .await
         .unwrap();
-    let text = match &read.contents[0] {
-        rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
-        other => panic!("expected text contents, got {other:?}"),
-    };
+    let (text, mime_type) = text_and_mime(&read.contents[0]);
+    assert_eq!(
+        mime_type.as_deref(),
+        Some("application/json"),
+        "the content block's own mimeType, not just the listing's, must say JSON"
+    );
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
 
-    assert_eq!(value["item_count"], json!(3));
-    assert!(value["used_bytes"].as_u64().is_some_and(|b| b > 0));
-    assert!(value["total_bytes"].as_u64().is_some());
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("stats resource is a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "budget",
+            "item_count",
+            "mean_neighbour_similarity",
+            "median_item_bytes",
+            "scope",
+            "total_bytes",
+            "used_bytes",
+            "used_items",
+        ],
+        "the exact key set, so deleting or renaming one is caught"
+    );
+
+    assert_eq!(value["scope"], serde_json::to_value(&scope).unwrap());
+    assert_eq!(value["used_items"], json!(expected_capacity.used_items));
+    assert_eq!(value["used_bytes"], json!(expected_capacity.used_bytes));
+    assert_eq!(value["item_count"], json!(expected_stats.item_count));
+    assert_eq!(value["total_bytes"], json!(expected_stats.total_bytes));
+    assert_eq!(
+        value["median_item_bytes"],
+        json!(expected_stats.median_item_bytes)
+    );
     assert!(value["budget"].is_object());
+    // The backend never computes a real mean-neighbour-similarity figure
+    // (only the engine's in-flight assessment path does, and this read does
+    // not go through it) — publishing its `0.0` "no data" sentinel as though
+    // it were a measurement would misread as "this corpus sits at minimum
+    // similarity". `null` says "not available from this read" instead. See
+    // `lib.rs`'s `read_resource` for the full explanation.
+    assert_eq!(value["mean_neighbour_similarity"], serde_json::Value::Null);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_empty_scope_reads_as_a_successful_empty_document_not_an_error() {
+    // A governance decision is not an error, and neither is the absence of
+    // one: an empty audit trail and an empty scope's stats are both
+    // successful reads. This is the deliberate converse of
+    // `an_unknown_resource_uri_is_an_error_not_an_empty_document` — the pair
+    // a refactor most easily collapses the wrong way ("no rows, so 404").
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
+
+    let audit = client
+        .read_resource(ReadResourceRequestParams::new(
+            "memorysafe://acme/user-42/coding-agent/audit",
+        ))
+        .await
+        .expect("an empty audit trail is a successful read");
+    let (audit_text, _) = text_and_mime(&audit.contents[0]);
+    let audit_value: serde_json::Value = serde_json::from_str(&audit_text).unwrap();
+    assert_eq!(audit_value["records"], json!([]));
+
+    let stats = client
+        .read_resource(ReadResourceRequestParams::new(
+            "memorysafe://acme/user-42/coding-agent/stats",
+        ))
+        .await
+        .expect("an empty scope's stats are a successful read");
+    let (stats_text, _) = text_and_mime(&stats.contents[0]);
+    let stats_value: serde_json::Value = serde_json::from_str(&stats_text).unwrap();
+    assert_eq!(stats_value["item_count"], json!(0));
+    assert_eq!(stats_value["total_bytes"], json!(0));
+    assert_eq!(stats_value["median_item_bytes"], json!(0));
+    assert_eq!(stats_value["used_items"], json!(0));
+    assert_eq!(stats_value["used_bytes"], json!(0));
+
     client.cancel().await.unwrap();
 }
 
