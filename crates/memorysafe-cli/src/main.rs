@@ -32,6 +32,21 @@ enum Command {
     Recall(cmd::memory::RecallArgs),
     /// List what is stored in this scope.
     Review(cmd::memory::ReviewArgs),
+    /// Delete memories by id, tag, or kind.
+    Forget(cmd::curate::ForgetArgs),
+    /// Pin or protect a memory.
+    Protect(cmd::curate::ProtectArgs),
+    /// Show the governance decisions recorded for this scope.
+    Audit(cmd::curate::AuditArgs),
+    /// Run maintenance: expiry, decay, consolidation, reclaim.
+    Maintain(cmd::curate::MaintainArgs),
+    /// Delete everything belonging to one subject.
+    PurgeSubject(cmd::curate::PurgeArgs),
+    /// Manage API keys for the HTTP and MCP-over-HTTP servers.
+    Keys {
+        #[command(subcommand)]
+        command: cmd::keys::KeysCommand,
+    },
 }
 
 fn main() -> Result<()> {
@@ -56,6 +71,14 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli, config: MsafeConfig) -> Result<()> {
+    let tenant = resolve_scope(&cli, &config)?.tenant;
+
+    // Keys commands don't need the engine or scope, only the config.
+    if let Command::Keys { command } = cli.command {
+        return cmd::keys::run(command, &tenant, &config, cli.config.as_deref(), cli.json);
+    }
+
+    // All other commands need the engine and scope.
     let engine = build::build_engine(&config)?;
     let scope = resolve_scope(&cli, &config)?;
 
@@ -63,6 +86,14 @@ async fn run(cli: Cli, config: MsafeConfig) -> Result<()> {
         Command::Remember(args) => cmd::memory::remember(&engine, scope, cli.json, args).await,
         Command::Recall(args) => cmd::memory::recall(&engine, scope, cli.json, args).await,
         Command::Review(args) => cmd::memory::review(&engine, scope, cli.json, args).await,
+        Command::Forget(args) => cmd::curate::forget(&engine, scope, cli.json, args).await,
+        Command::Protect(args) => cmd::curate::protect(&engine, scope, cli.json, args).await,
+        Command::Audit(args) => cmd::curate::audit(&engine, scope, cli.json, args).await,
+        Command::Maintain(args) => cmd::curate::maintain(&engine, scope, cli.json, args).await,
+        Command::PurgeSubject(args) => {
+            cmd::curate::purge_subject(&engine, &scope.tenant, cli.json, args).await
+        }
+        Command::Keys { .. } => unreachable!(),
     }
 }
 

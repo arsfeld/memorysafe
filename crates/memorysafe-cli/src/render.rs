@@ -29,7 +29,8 @@ pub fn write_outcome(out: &WriteOutcome) {
         println!("{verb}");
     }
     for reason in &out.reasons {
-        println!("  because {:?}: {}", reason.code, reason.detail);
+        let code_str = format!("{:?}", reason.code).to_lowercase();
+        println!("  because {code_str}: {}", reason.detail);
     }
     for evicted in &out.evicted {
         println!("  evicted {evicted}");
