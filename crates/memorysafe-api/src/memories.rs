@@ -7,6 +7,7 @@
 use crate::AppState;
 use crate::auth::Auth;
 use crate::error::ApiError;
+use crate::json::ValidatedJson;
 use crate::query::ValidatedQuery;
 use crate::scope::ScopeParams;
 use axum::Json;
@@ -56,7 +57,7 @@ pub struct RememberBody {
 pub async fn remember(
     State(state): State<AppState>,
     auth: Auth,
-    Json(body): Json<RememberBody>,
+    ValidatedJson(body): ValidatedJson<RememberBody>,
 ) -> Result<Json<WriteOutcome>, ApiError> {
     let scope = body.scope.resolve(&auth)?;
     let mut req = RememberRequest::new(scope, &body.body);
@@ -99,7 +100,7 @@ pub struct RecallBody {
 pub async fn recall(
     State(state): State<AppState>,
     auth: Auth,
-    Json(body): Json<RecallBody>,
+    ValidatedJson(body): ValidatedJson<RecallBody>,
 ) -> Result<Json<WorkingSet>, ApiError> {
     let req = RecallRequest {
         scope: body.scope.resolve(&auth)?,
@@ -110,11 +111,18 @@ pub async fn recall(
         occurred_before: timestamp(body.occurred_before, "occurred_before")?,
         mode: body.mode,
         budget: body.budget,
-        // No per-key clearance exists in v1, so an unstated ceiling excludes
-        // nothing. See "Deferred to a later plan".
+        // No per-key clearance exists in v1, so a caller must name the
+        // ceiling explicitly to see anything above it. Fails closed to
+        // `Internal`, matching `memorysafe_backend::query::HardFilters`'s own
+        // documented default for this exact field (`// Fail closed.`) and
+        // `memorysafe-mcp`'s `tools_write.rs`'s identical default for the
+        // same reason: the cost of guessing too narrow (a visible, reported
+        // annoyance a caller fixes by passing the argument) is not symmetric
+        // with the cost of guessing too wide (a silent over-disclosure
+        // nobody notices).
         sensitivity_ceiling: body
             .sensitivity_ceiling
-            .unwrap_or(SensitivityLevel::Restricted),
+            .unwrap_or(SensitivityLevel::Internal),
     };
     Ok(Json(state.engine.recall(req).await?))
 }
@@ -153,7 +161,17 @@ pub async fn review(
     Ok(Json(ReviewResponse {
         items,
         offset: page.offset,
-        limit: page.limit,
+        // Not `page.limit`: the backend clamps to `Page::effective_limit()`
+        // (`MAX_PAGE_LIMIT`) before running the query, and this echo is the
+        // only exhaustion signal a caller has — no `truncated` flag exists,
+        // by this workspace's own paging convention (`AuditFilter::limit`'s
+        // doc states the same rule). Echoing the raw, unclamped request would
+        // make a caller asking for more than the ceiling see fewer items
+        // than the (wrong) limit it was told, and wrongly conclude the scope
+        // was exhausted — silently hiding part of what is stored, exactly
+        // the failure `memorysafe-mcp`'s `tools_curate.rs::memory_review`
+        // (the same shape, over MCP) already fixed and documents in full.
+        limit: page.effective_limit(),
     }))
 }
 
@@ -201,7 +219,7 @@ pub struct ForgetBody {
 pub async fn forget(
     State(state): State<AppState>,
     auth: Auth,
-    Json(body): Json<ForgetBody>,
+    ValidatedJson(body): ValidatedJson<ForgetBody>,
 ) -> Result<Json<ForgetOutcome>, ApiError> {
     let scope = body.scope.resolve(&auth)?;
 
@@ -237,7 +255,7 @@ pub async fn protect(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
-    Json(body): Json<ProtectBody>,
+    ValidatedJson(body): ValidatedJson<ProtectBody>,
 ) -> Result<Json<WriteOutcome>, ApiError> {
     let scope = body.scope.resolve(&auth)?;
     let id = item_id(&id)?;

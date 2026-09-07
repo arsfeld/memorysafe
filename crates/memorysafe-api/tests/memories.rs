@@ -311,3 +311,225 @@ async fn review_pages_and_reports_the_page_it_returned() {
     assert_eq!(reply.body["offset"], json!(2));
     assert_eq!(reply.body["limit"], json!(2));
 }
+
+#[tokio::test]
+async fn review_echoes_the_clamped_limit_not_the_requested_one() {
+    // The backend clamps `Page::limit` to `MAX_PAGE_LIMIT` before running the
+    // query (`Page::effective_limit`), and this workspace's own paging
+    // convention (`AuditFilter::limit`'s doc) makes `returned.len() < limit`
+    // the SOLE exhaustion signal — there is deliberately no `truncated`
+    // flag. If the echoed `limit` were the raw, unclamped request, a client
+    // paging with a large limit would see fewer items than that limit and
+    // wrongly conclude the scope was exhausted, silently hiding the rest of
+    // what is stored — precisely what `GET /v1/memories` exists to make
+    // visible.
+    let h = harness();
+    remember(&h, "one memory in a very large requested page", json!([])).await;
+
+    let reply = send(
+        &h.app,
+        get(
+            "/v1/memories?subject=user-42&namespace=agent&limit=5000",
+            Some(&h.key),
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    assert_eq!(
+        reply.body["limit"],
+        json!(memorysafe_backend::MAX_PAGE_LIMIT),
+        "the echoed limit must be the backend's clamped ceiling, not the raw request: {}",
+        reply.text
+    );
+}
+
+#[tokio::test]
+async fn deleting_or_forgetting_an_absent_id_is_a_successful_empty_result_not_a_404() {
+    // The central constraint on this whole surface: a governance no-op is
+    // 200 with nothing forgotten, never a 404. `DELETE /v1/memories/{id}`
+    // and `POST /v1/forget` share the same `Engine::forget` call underneath
+    // and must agree.
+    let h = harness();
+    let absent = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    let deleted = send(
+        &h.app,
+        delete(
+            &format!("/v1/memories/{absent}?subject=user-42&namespace=agent"),
+            Some(&h.key),
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::OK, "{}", deleted.text);
+    assert_eq!(deleted.body["forgotten"], json!([]));
+
+    let mut payload = scope();
+    payload["ids"] = json!([absent]);
+    let forgotten = send(&h.app, post("/v1/forget", Some(&h.key), payload)).await;
+    assert_eq!(forgotten.status, StatusCode::OK, "{}", forgotten.text);
+    assert_eq!(forgotten.body["forgotten"], json!([]));
+}
+
+#[tokio::test]
+async fn reusing_an_idempotency_key_with_a_different_payload_is_a_conflict() {
+    // The engine seam and the §9 status mapping are both pinned elsewhere
+    // (`memorysafe-engine`'s `tests/write.rs`, `memorysafe-api`'s
+    // `error.rs`); this is the composition of the two over this route —
+    // the first HTTP-level 409 on this API.
+    let h = harness();
+
+    let mut first = scope();
+    first["body"] = json!("the first payload under this idempotency key");
+    first["idempotency_key"] = json!("shared-key");
+    let ok = send(&h.app, post("/v1/memories", Some(&h.key), first)).await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.text);
+
+    let mut second = scope();
+    second["body"] = json!("a completely different payload under the same key");
+    second["idempotency_key"] = json!("shared-key");
+    let conflict = send(&h.app, post("/v1/memories", Some(&h.key), second)).await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT, "{}", conflict.text);
+    assert_eq!(conflict.body["error"], "conflict");
+}
+
+#[tokio::test]
+async fn recall_hard_filters_are_threaded_into_the_backend_query() {
+    // `tags_any`, `kinds`, `occurred_after` and `occurred_before` must reach
+    // `RecallRequest`, not be dropped on the way — deleting any one of them
+    // from the handler leaves both items admitted, since a two-item scope is
+    // small enough that both survive relevance ranking on their own.
+    let h = harness();
+
+    let mut a = scope();
+    a["body"] = json!("the quarterly infrastructure review happens every March");
+    a["tags"] = json!(["alpha"]);
+    a["kind"] = json!("note");
+    a["occurred_at"] = json!(1_000_000);
+    assert_eq!(
+        send(&h.app, post("/v1/memories", Some(&h.key), a))
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    let mut b = scope();
+    b["body"] = json!("grocery list for the weekend farmers market");
+    b["tags"] = json!(["beta"]);
+    b["kind"] = json!("fact");
+    b["occurred_at"] = json!(2_000_000);
+    assert_eq!(
+        send(&h.app, post("/v1/memories", Some(&h.key), b))
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    async fn search_with(
+        h: &support::Harness,
+        field: &str,
+        value: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut payload = scope();
+        payload["mode"] = json!("search");
+        payload["query"] = json!("memory");
+        payload[field] = value;
+        send(&h.app, post("/v1/recall", Some(&h.key), payload))
+            .await
+            .body
+    }
+
+    let by_tag = search_with(&h, "tags_any", json!(["alpha"])).await;
+    assert_eq!(
+        by_tag["items"].as_array().unwrap().len(),
+        1,
+        "tags_any was not threaded into the query: {by_tag}"
+    );
+    assert_eq!(by_tag["items"][0]["item"]["tags"], json!(["alpha"]));
+
+    let by_kind = search_with(&h, "kinds", json!(["fact"])).await;
+    assert_eq!(
+        by_kind["items"].as_array().unwrap().len(),
+        1,
+        "kinds was not threaded into the query: {by_kind}"
+    );
+    assert_eq!(by_kind["items"][0]["item"]["kind"], json!("fact"));
+
+    let by_after = search_with(&h, "occurred_after", json!(1_500_000)).await;
+    assert_eq!(
+        by_after["items"].as_array().unwrap().len(),
+        1,
+        "occurred_after was not threaded into the query: {by_after}"
+    );
+    assert_eq!(by_after["items"][0]["item"]["kind"], json!("fact"));
+
+    let by_before = search_with(&h, "occurred_before", json!(1_500_000)).await;
+    assert_eq!(
+        by_before["items"].as_array().unwrap().len(),
+        1,
+        "occurred_before was not threaded into the query: {by_before}"
+    );
+    assert_eq!(by_before["items"][0]["item"]["kind"], json!("note"));
+}
+
+#[tokio::test]
+async fn recall_sensitivity_ceiling_defaults_closed_and_widens_when_named() {
+    // Pins Important 3's fix directly: an unstated ceiling must fail closed
+    // to `Internal`, and naming `restricted` explicitly must widen recall to
+    // include a restricted item. Deleting `sensitivity_ceiling` from the
+    // `RecallRequest` construction (defaulting to the engine's own
+    // permit-everything behaviour) or reverting the default back to
+    // `Restricted` both make the first half of this test fail.
+    let h = harness();
+    remember(
+        &h,
+        "a routine note about a scheduled backup job",
+        json!(["ceiling-test"]),
+    )
+    .await;
+    remember(
+        &h,
+        "the api key for staging is stored in vault",
+        json!(["ceiling-test"]),
+    )
+    .await;
+
+    let mut payload = scope();
+    payload["mode"] = json!("search");
+    payload["query"] = json!("memory");
+    payload["tags_any"] = json!(["ceiling-test"]);
+
+    let default_ceiling = send(&h.app, post("/v1/recall", Some(&h.key), payload.clone())).await;
+    assert_eq!(
+        default_ceiling.status,
+        StatusCode::OK,
+        "{}",
+        default_ceiling.text
+    );
+    let items = default_ceiling.body["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the unstated ceiling must fail closed to Internal, excluding the \
+         restricted item: {}",
+        default_ceiling.text
+    );
+    assert!(
+        items[0]["item"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("routine"),
+        "the item that survived the default ceiling must be the non-restricted one: {}",
+        default_ceiling.text
+    );
+
+    payload["sensitivity_ceiling"] = json!("restricted");
+    let widened = send(&h.app, post("/v1/recall", Some(&h.key), payload)).await;
+    assert_eq!(widened.status, StatusCode::OK, "{}", widened.text);
+    assert_eq!(
+        widened.body["items"].as_array().unwrap().len(),
+        2,
+        "naming the ceiling explicitly must widen recall to include the \
+         restricted item: {}",
+        widened.text
+    );
+}

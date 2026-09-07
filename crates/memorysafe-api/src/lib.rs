@@ -6,11 +6,13 @@
 
 pub mod auth;
 pub mod error;
+pub mod json;
 pub mod memories;
 pub mod query;
 pub mod scope;
 
 pub use error::{ApiError, Problem};
+pub use json::ValidatedJson;
 pub use query::ValidatedQuery;
 pub use scope::ScopeParams;
 
