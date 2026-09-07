@@ -136,7 +136,7 @@ pub async fn import(
 
 /// Reads and, when a manifest is present, verifies. Verification happens before
 /// the caller touches the engine, so a corrupt archive changes nothing.
-fn read_stream(path: &Path) -> Result<String> {
+pub(crate) fn read_stream(path: &Path) -> Result<String> {
     if path.is_dir() {
         let ndjson_path = path.join(NDJSON_FILE);
         let ndjson = std::fs::read_to_string(&ndjson_path)

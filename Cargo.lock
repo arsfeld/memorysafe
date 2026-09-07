@@ -1358,6 +1358,7 @@ dependencies = [
  "memorysafe-engine",
  "memorysafe-mcp",
  "memorysafe-policy",
+ "memorysafe-shadow",
  "predicates",
  "rmcp",
  "serde",

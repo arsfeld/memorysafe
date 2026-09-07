@@ -13,9 +13,8 @@ pub mod run;
 pub mod scenario;
 pub mod trace;
 
-// `replay` is filled in by Task 17; this task leaves it as an empty module
-// (see its own doc comment), so nothing is re-exported from it yet.
 pub use diff::{DecisionChange, TraceDiff, diff};
+pub use replay::Replay;
 pub use run::run;
 pub use scenario::{Scenario, ScenarioWrite, Unreplayable};
 pub use trace::{Trace, TracedAction, TracedDecision, TracedProtection};

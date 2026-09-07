@@ -46,6 +46,8 @@ enum Command {
     Export(cmd::portable::ExportArgs),
     /// Read a portable archive back in.
     Import(cmd::portable::ImportArgs),
+    /// Replay an archive's decisions against another policy and diff them.
+    Shadow(cmd::shadow::ShadowArgs),
     /// Manage API keys for the HTTP and MCP-over-HTTP servers.
     Keys {
         #[command(subcommand)]
@@ -84,6 +86,18 @@ async fn run(cli: Cli, config: MsafeConfig) -> Result<()> {
     if let Command::Keys { command } = cli.command {
         let tenant = resolve_tenant(&cli.tenant, &config.tenant)?;
         return cmd::keys::run(command, &tenant, &config, cli.config.as_deref(), cli.json);
+    }
+
+    // `shadow` reads neither the tenant, the subject, nor the namespace: it
+    // never touches the live engine at all (see `cmd::shadow::shadow`'s own
+    // signature — `config`, not `Scope` or `Arc<Engine>`), replaying an
+    // archive's own recorded scopes through throwaway engines it builds
+    // itself. Dispatching it here, before `resolve_scope`, follows the same
+    // rule `Keys` and `Serve` already do: use only the resolution a command
+    // actually needs, not a three-field resolve for a command that needs
+    // none of the three.
+    if let Command::Shadow(args) = cli.command {
+        return cmd::shadow::shadow(&config, cli.json, args).await;
     }
 
     let engine = build::build_engine(&config)?;
@@ -131,7 +145,7 @@ async fn run(cli: Cli, config: MsafeConfig) -> Result<()> {
         }
         Command::Export(args) => cmd::portable::export(&engine, scope, cli.json, args).await,
         Command::Import(args) => cmd::portable::import(&engine, scope, cli.json, args).await,
-        Command::Keys { .. } | Command::Serve(_) => unreachable!(),
+        Command::Keys { .. } | Command::Serve(_) | Command::Shadow(_) => unreachable!(),
     }
 }
 

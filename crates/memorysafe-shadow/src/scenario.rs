@@ -47,7 +47,12 @@ pub struct Scenario {
     pub unreplayable: Vec<Unreplayable>,
 }
 
-fn default_dim() -> u16 {
+// `pub(crate)`, not private: `replay.rs` reuses this as the width a replayed
+// scenario states (a real archive does not record which embedder produced
+// its vectors in a form this harness can reconstruct, and the vectors are
+// recomputed anyway) — one constant for "the default embedder width",
+// instead of a second copy that could drift from this one.
+pub(crate) fn default_dim() -> u16 {
     256
 }
 
@@ -68,5 +73,12 @@ impl Scenario {
             return 1.0;
         }
         self.writes.len() as f32 / total as f32
+    }
+
+    /// Turns a real export archive back into a scenario. A convenience over
+    /// `replay::from_export_ndjson` for a caller that only wants the
+    /// scenario and not the archive's recorded decisions.
+    pub fn from_export_ndjson(name: &str, ndjson: &str) -> Result<Scenario, ShadowError> {
+        Ok(crate::replay::from_export_ndjson(name, ndjson)?.scenario)
     }
 }

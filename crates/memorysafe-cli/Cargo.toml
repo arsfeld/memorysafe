@@ -22,6 +22,7 @@ memorysafe-core.workspace = true
 memorysafe-embed.workspace = true
 memorysafe-engine.workspace = true
 memorysafe-policy.workspace = true
+memorysafe-shadow.workspace = true
 memorysafe-api.workspace = true
 memorysafe-mcp.workspace = true
 anyhow.workspace = true
