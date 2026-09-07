@@ -166,4 +166,53 @@ mod tests {
         assert_eq!(api_err.parts().0, StatusCode::FORBIDDEN);
         assert_eq!(api_err.parts().1, "forbidden");
     }
+
+    /// New Minor 3, fix round 2: `AuthError::is_unauthenticated()`
+    /// (`memorysafe-auth`) and the exhaustive `match e` above (this file) are
+    /// two independent classifications of the same eight variants — one per
+    /// crate — and nothing forces them to agree. The `match` above already
+    /// fails to compile if `memorysafe-auth` adds a ninth, unclassified
+    /// variant (Important 3, fix round 1); that guarantee says nothing about
+    /// two variants BOTH sides already classify quietly drifting apart — the
+    /// same copied-decision-table shape this plan has already been bitten by
+    /// more than once (a reserved-word check that diverged between
+    /// transports; a protection table that diverged three ways; §9's own
+    /// mapping, fixed in this task's fix round 1).
+    ///
+    /// Chose this over routing the 401 arm through `is_unauthenticated()`
+    /// directly: doing that would mean going back to an `if
+    /// e.is_unauthenticated() { .. } else { match e { .. } }` shape, and the
+    /// `else` arm's `match` would need a wildcard again (the compiler cannot
+    /// know which variants `is_unauthenticated()` already excluded) — trading
+    /// away Important 3's compile-time exhaustiveness to buy back agreement
+    /// with `is_unauthenticated()`. This test keeps both: the match stays
+    /// exhaustive and wildcard-free, and agreement is checked here, over one
+    /// instance of every variant, instead of assumed.
+    #[test]
+    fn every_variant_agrees_with_is_unauthenticated() {
+        let variants: Vec<AuthError> = vec![
+            AuthError::Missing,
+            AuthError::Malformed,
+            AuthError::Unknown,
+            AuthError::Disabled,
+            AuthError::WrongTenant {
+                authorized: "acme".into(),
+                requested: "globex".into(),
+            },
+            AuthError::Reserved {
+                component: "_admin",
+            },
+            AuthError::Scope(CoreError::Empty { field: "subject" }),
+            AuthError::Rng,
+        ];
+        for variant in variants {
+            let is_unauthenticated = variant.is_unauthenticated();
+            let status = ApiError::from(variant).parts().0;
+            assert_eq!(
+                status == StatusCode::UNAUTHORIZED,
+                is_unauthenticated,
+                "status {status} disagrees with is_unauthenticated() == {is_unauthenticated}"
+            );
+        }
+    }
 }

@@ -88,13 +88,19 @@ async fn the_bearer_scheme_is_accepted_case_insensitively() {
         );
         assert_eq!(reply.body["tenant"], "acme");
     }
+}
 
+#[tokio::test]
+async fn a_bearer_scheme_with_no_space_before_the_credential_is_refused() {
     // The scheme boundary: `strip_bearer` requires exactly one space after
     // the scheme (`split_once(' ')`), matching `memorysafe-mcp`'s own test
     // (`http_accepts_the_bearer_scheme_case_insensitively`). Without this, a
     // regression to `strip_prefix("Bearer")` (no trailing space) combined
     // with the existing `.map(str::trim)` would accept `Bearer<key>` as a
-    // valid credential and pass every other test in this file.
+    // valid credential and pass every other test in this file, including
+    // `the_bearer_scheme_is_accepted_case_insensitively` above — that test's
+    // own cases all carry the required space.
+    let h = harness();
     let request = axum::http::Request::builder()
         .method("GET")
         .uri("/v1/whoami")

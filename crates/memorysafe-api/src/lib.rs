@@ -33,7 +33,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/whoami", get(whoami))
-        .fallback(not_found)
+        // ADD EVERY NEW `.route(...)` ABOVE THIS LINE, NEVER BELOW IT.
+        //
         // `Router::fallback` only covers an unmatched *path*. A matched path
         // called with the wrong method (e.g. `POST /v1/health`) never reaches
         // `fallback` — axum's `MethodRouter` answers that itself, by default
@@ -41,6 +42,21 @@ pub fn router(state: AppState) -> Router {
         // failure on this API returns. Nearly invisible today with two GET
         // routes; Tasks 8-10 add POST/PUT/DELETE, where a wrong-method call
         // becomes a real, everyday client mistake.
+        .fallback(not_found)
+        // Ordering hazard, not just style: `method_not_allowed_fallback`
+        // (`axum-0.8.9/src/routing/path_router.rs`'s
+        // `PathRouter::method_not_allowed_fallback`, confirmed by reading the
+        // vendored source, not just its doc) mutates only the
+        // `MethodRouter`s already present in `self.routes` at the moment
+        // it's called — `for (_, endpoint) in self.routes.iter_mut() { ...
+        // }`, a one-time pass, not a router-wide default that new routes
+        // inherit later. A `.route(...)` added BELOW this call silently
+        // falls back to axum's own bare, empty-bodied 405 for that one
+        // route — with no compile error, no panic, and no test failure
+        // unless something specifically POSTs/PUTs/DELETEs that route and
+        // checks the body, which is exactly the kind of gap `/v1/health`'s
+        // own test (a GET-only route registered above this line) cannot
+        // catch for a route added below it.
         .method_not_allowed_fallback(method_not_allowed)
         // `TraceLayer::new_for_http()`'s default span (`DefaultMakeSpan::new()`)
         // does NOT include headers (`include_headers: false`), so the

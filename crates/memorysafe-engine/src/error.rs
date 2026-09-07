@@ -23,7 +23,7 @@ pub enum EngineError {
 }
 
 /// Hand-written rather than `#[from]` on the `Backend` variant: a blanket
-/// `#[from] BackendError` collapses every one of `BackendError`'s seven kinds
+/// `#[from] BackendError` collapses every one of `BackendError`'s eight kinds
 /// into `EngineError::Backend`, which every adapter answers as 503. §9 of the
 /// spec (the adapters' error contract) is explicit that an idempotency
 /// conflict is 409 and a malformed query is 400 — both real `BackendError`
@@ -33,6 +33,13 @@ pub enum EngineError {
 /// wrong for every kind except `Storage`, which really is "the backend itself
 /// is unavailable" and really is the only kind an adapter should answer 503
 /// (with a retry hint) for.
+///
+/// `BackendError::ItemNotFound` is not constructed anywhere in the workspace
+/// today (confirmed by the fix-round-1 re-review) — dead code, not a live
+/// path, unlike the other seven kinds — but it is classified below anyway,
+/// on the same basis as those: a `match` this exhaustive costs nothing extra
+/// to get right up front, and "unreachable today" is exactly the kind of
+/// claim a future backend implementation can quietly falsify.
 impl From<BackendError> for EngineError {
     fn from(e: BackendError) -> Self {
         // Message text is `BackendError`'s own `Display`, computed once
