@@ -62,6 +62,12 @@ pub async fn a_failed_transaction_leaves_no_trace<F: BackendFactory>(factory: &F
         attrs: Default::default(),
         vector: None,
         byte_size: 11,
+        // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+        // biconditional, now enforced by `is_valid()` — not a judgement about
+        // this test's subject (a failed transaction leaving no trace). The
+        // transaction must still pass `is_valid()` so it reaches the
+        // backend and fails on `MergeTargetMissing`, the thing under test.
+        pending_embedding: true,
     });
     txn.evictions = vec![existing.id.clone()];
 
@@ -169,6 +175,11 @@ pub async fn an_invalid_transaction_is_rejected_and_writes_nothing<F: BackendFac
         attrs: Default::default(),
         vector: None,
         byte_size: 41,
+        // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+        // biconditional, now enforced by `is_valid()` — not a judgement about
+        // this test's subject (`is_valid()` rejecting an invalid transaction
+        // shape for an unrelated reason: `upsert` and `merge` both set).
+        pending_embedding: true,
     });
     txn.evictions = vec![bystander.id.clone()];
     assert!(

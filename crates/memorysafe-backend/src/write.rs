@@ -21,7 +21,45 @@ pub struct MergeWrite {
     pub tags: Vec<String>,
     pub attrs: BTreeMap<String, serde_json::Value>,
     pub vector: Option<QuantizedVector>,
+    /// **Advisory. A backend must never use this for capacity accounting.**
+    ///
+    /// It is not the merged item's storage charge and does not claim to be.
+    /// Both engine construction sites set it to `body.len()` — the merged
+    /// body's length in bytes — while the charge that capacity is kept in is
+    /// [`memorysafe_core::MemoryItem::charge`], which additionally counts
+    /// `kind`, the tags, the serialised attrs, the source id, the scope
+    /// components and a fixed overhead. The two differ for every real item.
+    ///
+    /// The authoritative number is the **delta**, and only the backend can
+    /// compute it: a merge folds new tags and attrs into the target's
+    /// existing ones, so the post-merge charge depends on the stored row, not
+    /// on this write. `memorysafe-backend-sqlite` does exactly that
+    /// (`items::merge` reads the target, computes `after - before`, and
+    /// returns it), which is why nothing has ever read this field.
+    ///
+    /// **Stated because an unread public field on a frozen contract is a trap
+    /// rather than a harmless leftover.** Plan 2's Postgres backend is free
+    /// to trust it, would then account capacity in a unit SQLite does not,
+    /// and would pass the frozen suite while doing so — no conformance test
+    /// reads capacity across a merge, and the suite's own `MergeWrite`
+    /// literals set this to hand-written constants (`11`, `41`) that are not
+    /// any item's charge.
+    ///
+    /// Deleting the field would be better than documenting it, and is not
+    /// available: it is constructed by name at three sites inside the frozen
+    /// conformance suite, so removing it is a change to the suite. Revisit
+    /// with the next contract batch.
     pub byte_size: u64,
+    /// Mirrors `MemoryItem::pending_embedding`'s own rule
+    /// (`write.rs`: `pending_embedding = embedding.is_none()`): true exactly
+    /// when `vector` is `None`. The two are one fact, not two independently
+    /// settable ones — a backend applying this write must keep the target's
+    /// `pending_embedding` column and its `vectors` row in that same
+    /// agreement (delete the row when this is true, write it when it is
+    /// not), or a merge that drops content while its re-embed fails leaves
+    /// the item recallable by vector search under exactly the body the merge
+    /// just removed.
+    pub pending_embedding: bool,
 }
 
 /// One atomic unit of change. Item write, evictions, and the audit record
@@ -51,8 +89,10 @@ impl WriteTransaction {
         }
     }
 
-    /// A transaction is invalid if it both inserts and merges, or if its
-    /// scope-bearing fields disagree about which scope this write belongs to.
+    /// A transaction is invalid if it both inserts and merges, if its
+    /// scope-bearing fields disagree about which scope this write belongs to,
+    /// or if a `merge` carries a `pending_embedding` that disagrees with its
+    /// own `vector`.
     ///
     /// `scope`, the upserted item's own `scope`, and `audit.scope` are three
     /// independently-settable public fields, and a real backend reads
@@ -64,12 +104,26 @@ impl WriteTransaction {
     /// this product sells would point somewhere else. `MergeWrite` carries
     /// no scope of its own, so there is nothing to check there; a merge is
     /// always addressed by `scope`.
+    ///
+    /// **The `pending_embedding`/`vector` check makes `MergeWrite::pending_embedding`'s
+    /// own doc — "true exactly when `vector` is `None`" — enforced here
+    /// rather than merely documented and hoped for at each construction
+    /// site.** Every real caller already builds the two from the same
+    /// `Option`, so this can only ever reject a hand-built (almost always
+    /// test) transaction that got the pairing wrong — exactly the shape of
+    /// mistake this check exists to catch before it reaches a backend that
+    /// trusts the pairing to key its vector-row deletion.
     pub fn is_valid(&self) -> bool {
         if self.upsert.is_some() && self.merge.is_some() {
             return false;
         }
         if let Some(w) = &self.upsert
             && w.item.scope != self.scope
+        {
+            return false;
+        }
+        if let Some(m) = &self.merge
+            && m.pending_embedding != m.vector.is_none()
         {
             return false;
         }
@@ -208,6 +262,11 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: 6,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // own biconditional — not a judgement about this test's subject
+            // (mutual exclusivity with `upsert`), but a fixed requirement of
+            // any `vector: None` literal now that `is_valid` enforces it.
+            pending_embedding: true,
         });
         assert!(txn.is_valid());
         txn.upsert = Some(ItemWrite {

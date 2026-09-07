@@ -62,8 +62,13 @@ pub fn item_with(
 /// everything ties there and the tie-break is then the only thing ordering the
 /// pages.
 ///
-/// This builder exists for the two tests that need the opposite corpus —
-/// distinct, increasing timestamps:
+/// This builder exists for the tests that need the opposite corpus —
+/// distinct, increasing timestamps. It said "the two tests" and named two;
+/// `grep -rn 'item_at(' src/conformance/` finds many more, in `lifecycle.rs`
+/// as well as `retrieval.rs`, and one of the `lifecycle.rs` hits is inside a
+/// shared corpus helper with callers of its own. The two named below are the
+/// ones whose *reason* for needing it is specific, so they are kept as
+/// examples rather than as a census:
 ///
 /// - `retrieval::list_pages_are_disjoint_and_complete`, which isolates the
 ///   offset/limit arithmetic from ordering entirely: with no ties, no
@@ -476,6 +481,10 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: 11,
+            // Paired with `vector: None`: `is_valid()` now enforces
+            // `MergeWrite::pending_embedding`'s biconditional, so this must
+            // be `true` regardless of what this test is about.
+            pending_embedding: true,
         });
         assert!(txn.is_valid());
     }

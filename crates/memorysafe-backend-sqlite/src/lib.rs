@@ -146,9 +146,16 @@ impl Backend for SqliteBackend {
         // nothing**, and rejecting after writing half of it is the same defect
         // with an error attached.
         if !txn.is_valid() {
+            // Enumerates all four of `is_valid`'s conditions, not two. The
+            // message is what an operator sees when a write is refused, and a
+            // message that lists half the reasons sends them looking at the
+            // wrong field — the pairing check in particular is invisible in
+            // "scope-bearing fields must agree".
             return Err(BackendError::InvalidTransaction(
-                "a transaction may not both insert and merge, and its scope-bearing \
-                 fields must agree"
+                "a transaction may not both insert and merge; its scope-bearing fields \
+                 (scope, the upserted item's own scope, and audit.scope) must agree; \
+                 and a merge's pending_embedding must be true exactly when its vector \
+                 is absent"
                     .into(),
             ));
         }
@@ -209,13 +216,34 @@ impl Backend for SqliteBackend {
                 // fail if the order regresses.
                 capacity::ensure_row(&tx, &txn.scope)?;
 
+                // **A transaction whose `evictions` names the same id its
+                // `upsert` writes is a row *replacement*, and `Backend::apply`
+                // requires the item's accumulated access statistics to survive
+                // it.** They cannot survive on their own: `last_access` and
+                // `access_count` do not live on `MemoryItem`, so `items::insert`
+                // cannot write them and the re-inserted row would come back at
+                // the schema defaults. Read here, before the eviction loop
+                // deletes the row it is being read from; written back after the
+                // insert below. See `items::AccessHistory`.
+                //
+                // The eviction loop itself is deliberately left alone rather
+                // than made to skip the replaced id: `AppliedWrite::evicted`
+                // means "the ids actually removed", and a replace *does* remove
+                // the old row, so the report and the capacity counters keep
+                // exactly the meaning their own docs give them.
+                let replaced = match &txn.upsert {
+                    Some(w) if txn.evictions.contains(&w.item.id) => {
+                        items::access_history(&tx, &txn.scope, &w.item.id)?
+                    }
+                    _ => None,
+                };
+
                 let mut delta_items: i64 = 0;
                 let mut delta_bytes: i64 = 0;
                 let mut evicted = Vec::new();
 
                 for id in &txn.evictions {
                     let size = items::delete(&tx, &txn.scope, id)?;
-                    vectors::delete(&tx, id)?;
                     if size > 0 {
                         delta_items -= 1;
                         delta_bytes -= size as i64;
@@ -234,6 +262,15 @@ impl Backend for SqliteBackend {
 
                 if let Some(w) = &txn.upsert {
                     items::insert(&tx, &w.item)?;
+                    // The second half of the replace read above. Only when the
+                    // row really existed before: `None` here means the id named
+                    // no row in this scope, and a fresh insert must keep the
+                    // schema's own "never recalled" defaults rather than have
+                    // zeros written over them from a struct that stands for
+                    // nothing.
+                    if let Some(history) = replaced {
+                        items::restore_access_history(&tx, &txn.scope, &w.item.id, history)?;
+                    }
                     if let Some(v) = &w.vector {
                         vectors::insert(&tx, &w.item.id, &txn.scope, v)?;
                     }
@@ -243,10 +280,32 @@ impl Backend for SqliteBackend {
                 }
 
                 if let Some(m) = &txn.merge {
-                    let diff =
-                        items::merge(&tx, &txn.scope, &m.target, &m.body, &m.tags, &m.attrs)?;
+                    let diff = items::merge(
+                        &tx,
+                        &txn.scope,
+                        &m.target,
+                        &m.body,
+                        &m.tags,
+                        &m.attrs,
+                        m.pending_embedding,
+                    )?;
+                    // A pending-embedding item and a vector row are mutually
+                    // exclusive: `m.pending_embedding` is `m.vector.is_none()`
+                    // by construction (see `MergeWrite::pending_embedding`'s
+                    // own doc), so the branch below on `m.vector` already
+                    // decides both facts at once. Written as this guard
+                    // — insert on `Some`, delete on `None` — rather than an
+                    // unconditional delete ahead of a conditional insert, so
+                    // it reads as enforcing the invariant rather than as an
+                    // incidental cleanup someone could "simplify" away. A
+                    // merge replaces the target's body wholesale
+                    // (`items::merge`), so a stale vector row here would keep
+                    // the item recallable by vector search under exactly the
+                    // pre-merge content the merge just removed.
                     if let Some(v) = &m.vector {
                         vectors::insert(&tx, &m.target, &txn.scope, v)?;
+                    } else {
+                        vectors::delete(&tx, &txn.scope, &m.target)?;
                     }
                     delta_bytes += diff;
                     item_id = Some(m.target.clone());
@@ -446,7 +505,8 @@ mod tests {
     use super::*;
     use memorysafe_backend::conformance::fx;
     use memorysafe_core::{
-        Actor, ActorKind, AuditEvent, AuditRecord, ItemRef, PolicyId, Reason, ReasonCode,
+        Actor, ActorKind, AuditEvent, AuditRecord, ItemRef, PolicyId, Protection, Reason,
+        ReasonCode,
     };
     use time::{Duration, OffsetDateTime};
 
@@ -506,6 +566,60 @@ mod tests {
             .unwrap()
     }
 
+    /// The per-item counterpart to [`vector_scope_columns`]; see that helper
+    /// for why an unjoined read is the only thing that can observe this
+    /// state. `search` cannot substitute for this: it joins `vectors` to
+    /// `items` on `item_id` and filters on the *item's* scope, so it would
+    /// report zero for a vector row orphaned in another scope just as
+    /// readily as for one that was actually deleted.
+    async fn vector_rows_for_item(b: &SqliteBackend, scope: &Scope, id: &ItemId) -> i64 {
+        let (subject, namespace, id) = (
+            scope.subject.as_str().to_string(),
+            scope.namespace.as_str().to_string(),
+            id.as_str().to_string(),
+        );
+        b.tenants
+            .with_conn(&scope.tenant.clone(), move |c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM vectors WHERE item_id=?1 AND subject=?2 AND namespace=?3",
+                    params![id, subject, namespace],
+                    |r| r.get(0),
+                )
+                .sql()
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Every `vectors` row's **own** scope columns, as `(item_id, subject,
+    /// namespace)`, ordered by `item_id` so a failure names a stable row.
+    ///
+    /// Read straight from `vectors` with no join to `items` at all, and that
+    /// is the whole point. `vectors::search` joins the two tables on
+    /// `item_id` and then filters on the **item's** `subject`/`namespace`, so
+    /// a row whose own scope columns have diverged from the item it
+    /// references is invisible to it in exactly the way a row that was
+    /// genuinely deleted is — an instrument that reports absence for two
+    /// different reasons cannot distinguish them. Reading the columns
+    /// themselves is the only thing that can.
+    async fn vector_scope_columns(
+        b: &SqliteBackend,
+        tenant: &TenantId,
+    ) -> Vec<(String, String, String)> {
+        b.tenants
+            .with_conn(tenant, |c| {
+                let mut stmt = c
+                    .prepare("SELECT item_id, subject, namespace FROM vectors ORDER BY item_id")
+                    .sql()?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .sql()?;
+                rows.collect::<rusqlite::Result<Vec<_>>>().sql()
+            })
+            .await
+            .unwrap()
+    }
+
     /// `AppliedWrite::evicted` is the ids **actually removed**, not the ids the
     /// caller asked to remove — see its doc on `WriteTransaction`. Nothing
     /// forbids a transaction naming an eviction that matches no row, and the
@@ -539,6 +653,141 @@ mod tests {
         // The premise: the real eviction did happen, so an empty vec cannot
         // satisfy the assertion above for the wrong reason.
         assert!(b.get(&s, &real.id).await.unwrap().is_none());
+    }
+
+    /// **`Backend::apply`'s replacement rule, which the frozen conformance
+    /// suite cannot see.** No conformance test builds a transaction whose
+    /// `evictions` and `upsert` name the same id, so a backend that treats
+    /// the pair as a literal delete-then-insert of `ItemWrite::item` passes
+    /// the suite while resetting the item's recall history — and that shape
+    /// is how `Engine::protect`, `Engine::reembed` and `Engine::maintain`'s
+    /// protection-release pass all write.
+    ///
+    /// `last_access` and `access_count` are the two columns at stake:
+    /// `record_recall` maintains them, `retrieve_candidates` and `neighbours`
+    /// report them, and neither has a `MemoryItem` field to ride back in on.
+    /// (`value_score` and `fragility_score` are in the same structural
+    /// position and are deliberately *not* asserted here: nothing in this
+    /// workspace writes either, so they are zero before and after and an
+    /// assertion on them would pass against any implementation.)
+    ///
+    /// Read back with raw SQL rather than through `retrieve_candidates`,
+    /// because this test is about the stored columns and must not depend on
+    /// a retrieval arm's filters, ranking, or its own reading of them.
+    ///
+    /// **The controls matter.** A stamped, non-default history (`7` recalls
+    /// at second `555`) means a reset to the schema default is visible as an
+    /// exact mismatch, not as a plausible-looking small number; the
+    /// unreplaced bystander proves the restore is scoped to the replaced row
+    /// rather than a blanket `UPDATE`; and the plain admit at the end proves
+    /// a *fresh* insert still gets the schema's own "never recalled"
+    /// defaults, which is what fails if the carry-forward is unconditional.
+    #[tokio::test]
+    async fn replacing_a_row_in_one_transaction_preserves_its_access_history() {
+        let b = backend();
+        let s = scope("s", "n");
+
+        let target = fx::item(&s, "the row that gets replaced");
+        let bystander = fx::item(&s, "an untouched neighbour");
+        b.apply(fx::admit_txn(&s, target.clone(), None))
+            .await
+            .unwrap();
+        b.apply(fx::admit_txn(&s, bystander.clone(), None))
+            .await
+            .unwrap();
+
+        stamp_access(&b, &s, &target.id, 7, 555).await;
+        stamp_access(&b, &s, &bystander.id, 4, 444).await;
+
+        assert_eq!(
+            stored_history(&b, &s, &target.id).await,
+            (7, Some(555)),
+            "premise: the stamp must have landed, or the replacement below \
+             would be compared against the schema default either way"
+        );
+
+        // The replacement: one transaction, same id in `evictions` and in
+        // `upsert`, with a genuinely changed item so the row really is
+        // rewritten rather than left alone.
+        let mut replaced = target.clone();
+        replaced.protection = Protection::Pinned;
+        let mut txn = fx::admit_txn(&s, replaced, None);
+        txn.evictions = vec![target.id.clone()];
+        let applied = b.apply(txn).await.unwrap();
+
+        assert_eq!(
+            applied.evicted,
+            vec![target.id.clone()],
+            "a replacement still removes the old row, so `evicted` must name it"
+        );
+        assert_eq!(
+            b.get(&s, &target.id)
+                .await
+                .unwrap()
+                .expect("the replaced row must exist")
+                .protection,
+            Protection::Pinned,
+            "premise: the row was actually rewritten"
+        );
+        assert_eq!(
+            stored_history(&b, &s, &target.id).await,
+            (7, Some(555)),
+            "apply must carry the replaced row's access history across the \
+             delete-and-reinsert"
+        );
+        assert_eq!(
+            stored_history(&b, &s, &bystander.id).await,
+            (4, Some(444)),
+            "the restore must be scoped to the replaced row"
+        );
+
+        // And a plain admit — no eviction of its own id — must still land on
+        // the schema's "never recalled" defaults.
+        let fresh = fx::item(&s, "an ordinary new admission");
+        b.apply(fx::admit_txn(&s, fresh.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_history(&b, &s, &fresh.id).await,
+            (0, None),
+            "a fresh insert must keep the schema's never-recalled defaults"
+        );
+    }
+
+    /// Writes an access history directly, so a test can establish a stamped,
+    /// non-default one without driving a real recall.
+    async fn stamp_access(b: &SqliteBackend, s: &Scope, id: &ItemId, count: i64, at: i64) {
+        let id = id.clone();
+        b.tenants
+            .with_write(&s.tenant.clone(), move |c| {
+                c.execute(
+                    "UPDATE items SET access_count = ?2, last_access = ?3 WHERE id = ?1",
+                    params![id.as_str(), count, at],
+                )
+                .sql()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// `(access_count, last_access)` straight off the row. Raw SQL on purpose:
+    /// the property under test is what is stored, and reading it back through
+    /// a retrieval arm would make the assertion depend on that arm's filters
+    /// and on its own decoding of the same two columns.
+    async fn stored_history(b: &SqliteBackend, s: &Scope, id: &ItemId) -> (i64, Option<i64>) {
+        let id = id.clone();
+        b.tenants
+            .with_conn(&s.tenant.clone(), move |c| {
+                c.query_row(
+                    "SELECT access_count, last_access FROM items WHERE id = ?1",
+                    params![id.as_str()],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+                )
+                .sql()
+            })
+            .await
+            .unwrap()
     }
     /// **The aggregate write rule, on `apply`, and this test is the only thing
     /// that can see it.**
@@ -635,6 +884,10 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: new_body.len() as u64,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // biconditional, now enforced by `is_valid()` — not a judgement
+            // about this test's subject (capacity accounting).
+            pending_embedding: true,
         });
         assert!(txn.is_valid(), "the premise: this transaction is valid");
 
@@ -714,6 +967,11 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: new_body.len() as u64,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // biconditional, now enforced by `is_valid()` — not a judgement
+            // about this test's subject (the stale post-merge `byte_size`
+            // column).
+            pending_embedding: true,
         });
         b.apply(txn).await.unwrap();
 
@@ -744,6 +1002,70 @@ mod tests {
         );
     }
 
+    /// A merge with `vector: None` must delete the target's existing vector
+    /// row, not merely skip writing a new one. `items::merge` is an
+    /// `UPDATE`, so the item row survives and no `ON DELETE CASCADE` fires —
+    /// unlike eviction, nothing else in the write path removes a vector left
+    /// behind here. Observed through `vector_rows_for_item`, which reads the
+    /// `vectors` table directly rather than through `search`'s join to
+    /// `items`: a row orphaned by a dropped or swapped scope predicate would
+    /// still be invisible to a joined reader.
+    ///
+    /// **The precondition is asserted before the merge.** A target with no
+    /// vector row to begin with reports zero afterwards whether or not the
+    /// deletion actually runs, so the fixture admits the target through
+    /// `admit_txn_embedded` and the test confirms the row exists first — the
+    /// merge's `vector: None` deletion is only proven by a row count that
+    /// goes from one to zero, never by one that starts and stays at zero.
+    #[tokio::test]
+    async fn merging_with_no_vector_deletes_the_targets_existing_vector_row() {
+        let b = backend();
+        let s = scope("s", "n");
+
+        let target = fx::item(&s, "a body with a vector");
+        b.apply(fx::admit_txn_embedded(&s, target.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            vector_rows_for_item(&b, &s, &target.id).await,
+            1,
+            "the premise: the target must already carry a vector row, or the \
+             post-merge assertion below would pass vacuously"
+        );
+
+        let new_body = "a body with no vector at all";
+        let audit = memorysafe_core::AuditRecord::new(
+            s.clone(),
+            AuditEvent::Merged,
+            vec![memorysafe_core::ItemRef::from_item(&target)],
+            Actor::system(),
+            target.created_at,
+        );
+        let mut txn = memorysafe_backend::WriteTransaction::new(s.clone(), audit);
+        txn.merge = Some(memorysafe_backend::write::MergeWrite {
+            target: target.id.clone(),
+            body: new_body.into(),
+            tags: vec![],
+            attrs: Default::default(),
+            vector: None,
+            byte_size: new_body.len() as u64,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // biconditional, now enforced by `is_valid()` — not a judgement
+            // about this test's subject (the stale vector row).
+            pending_embedding: true,
+        });
+        assert!(txn.is_valid(), "the premise: this transaction is valid");
+
+        b.apply(txn).await.unwrap();
+
+        assert_eq!(
+            vector_rows_for_item(&b, &s, &target.id).await,
+            0,
+            "the target's stale vector row survived a merge that supplied no \
+             new vector"
+        );
+    }
+
     /// `items::merge`'s lookup is scoped by subject and namespace through
     /// `items::get`, so a merge naming a target that exists but belongs to a
     /// different subject reports `MergeTargetMissing` rather than rewriting
@@ -771,6 +1093,10 @@ mod tests {
             attrs: Default::default(),
             vector: None,
             byte_size: 11,
+            // Paired with `vector: None` per `MergeWrite::pending_embedding`'s
+            // biconditional, now enforced by `is_valid()` — not a judgement
+            // about this test's subject (the cross-scope merge-target check).
+            pending_embedding: true,
         });
         assert!(txn.is_valid(), "the premise: this transaction is valid");
 
@@ -1176,5 +1502,306 @@ mod tests {
             aggregate_rows(&b, &z.tenant).await.is_empty(),
             "tenant z holds an aggregate row for a write it never made"
         );
+    }
+
+    /// **The sixth correctness invariant, direction 1: no live item is
+    /// without a vector row, unless it is marked `pending_embedding`.**
+    ///
+    /// It lives here rather than beside the other five in
+    /// `memorysafe-engine/tests/invariants.rs` because it is not observable
+    /// from the engine's public API. The `Backend` trait exposes no
+    /// vector-observation surface at all — `retrieve_candidates`,
+    /// `neighbours`, `capacity_state`, `scope_stats`, `apply`,
+    /// `record_recall`, `get`, `list`, `audit`, `purge_subject`,
+    /// `audit_aggregates`, `export`, `import`, `set_budget`; none of them
+    /// returns a vector row or a count of them — and `SqliteBackend`'s only
+    /// public non-trait methods are `open`, `with_max_open` and
+    /// `forget_tenant`. The `vectors` table is reachable from nowhere else.
+    ///
+    /// **`pending_embedding` is this invariant's own escape hatch, and the
+    /// invariant is only as trustworthy as that flag.** `MemoryItem::
+    /// pending_embedding` is a public field set from the same `Option` the
+    /// vector comes from, and `RetrievalFilter::exclude_pending_embedding`
+    /// (`memorysafe-backend/src/query.rs`) is what keeps such items out of
+    /// vector retrieval. If the flag were ever set spuriously — true on an
+    /// item that should have been embedded — this test would still pass
+    /// while the corpus silently lost vector coverage. Task 41 owns the
+    /// backfill job that drains the flag; until it lands, the honest reading
+    /// of a green result here is "every item that claims to be embedded has
+    /// a vector row", not "every item is embedded".
+    ///
+    /// The corpus below deliberately contains items on **both** sides of the
+    /// guard, and the premise is asserted before the loop: with only
+    /// pending items the loop body would never run, and with only embedded
+    /// ones the guard itself would be untested.
+    ///
+    /// **This is not a pure Direction-1 instrument, and the same argument
+    /// Direction 2 makes about `vectors::search` applies one level up to the
+    /// helper used here.** `vector_rows_for_item` matches on `item_id AND
+    /// subject AND namespace`, so a row whose scope columns have **diverged**
+    /// reads as zero exactly as a row that is genuinely **missing** does.
+    /// This test cannot tell those two apart; it reports "no vector row for
+    /// this item in this scope", which is the union of both failures. That is
+    /// why a mutation transposing `vectors::insert`'s scope columns is killed
+    /// by this test as well as by
+    /// `every_vector_rows_scope_columns_agree_with_the_item_it_references` —
+    /// the two directions overlap here rather than partitioning cleanly.
+    /// Direction 2 is the one that can name a divergence as a divergence,
+    /// because `vector_scope_columns` reads the columns instead of filtering
+    /// on them.
+    #[tokio::test]
+    async fn no_live_item_lacks_a_vector_row_unless_it_is_pending_embedding() {
+        let b = backend();
+        let s = scope("s", "n");
+
+        // Admitted with a vector.
+        let embedded = fx::item(&s, "an ordinary embedded memory");
+        b.apply(fx::admit_txn_embedded(&s, embedded.clone()))
+            .await
+            .unwrap();
+
+        // Admitted with no vector, because the embedder was unavailable.
+        let mut unembedded = fx::item(&s, "written while the embedder was down");
+        unembedded.pending_embedding = true;
+        b.apply(fx::admit_txn(&s, unembedded.clone(), None))
+            .await
+            .unwrap();
+
+        // A merge that supplies a fresh vector keeps the target embedded...
+        let remerged = fx::item(&s, "a merge target that keeps its vector");
+        b.apply(fx::admit_txn_embedded(&s, remerged.clone()))
+            .await
+            .unwrap();
+        b.apply(merge_txn(&s, &remerged, "a re-embedded body", true))
+            .await
+            .unwrap();
+
+        // ...and a merge that supplies none drops it, and must say so.
+        let demoted = fx::item(&s, "a merge target that loses its vector");
+        b.apply(fx::admit_txn_embedded(&s, demoted.clone()))
+            .await
+            .unwrap();
+        b.apply(merge_txn(&s, &demoted, "a body with no vector", false))
+            .await
+            .unwrap();
+
+        let stored = b
+            .list(
+                &s,
+                &Page {
+                    offset: 0,
+                    limit: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 4, "the fixture lost an item");
+        let pending = stored.iter().filter(|i| i.pending_embedding).count();
+        assert_eq!(
+            (pending, stored.len() - pending),
+            (2, 2),
+            "the premise: the corpus must straddle the `pending_embedding` \
+             guard, or one side of this invariant is untested"
+        );
+
+        for item in &stored {
+            let rows = vector_rows_for_item(&b, &s, &item.id).await;
+            if item.pending_embedding {
+                // The escape hatch. Deliberately not asserted the other way
+                // round here: "a pending item has no vector row" is a
+                // different property, and `WriteTransaction::is_valid`
+                // already enforces the merge half of it structurally.
+                continue;
+            }
+            assert_eq!(
+                rows, 1,
+                "item {} claims to be embedded but has {rows} vector rows",
+                item.id
+            );
+        }
+    }
+
+    /// **The sixth correctness invariant, direction 2: every vector row's
+    /// `subject`/`namespace` agree with the scope of the item it
+    /// references.**
+    ///
+    /// The schema is why this needs saying. `vectors.item_id` is `TEXT
+    /// PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE`, but `subject` and
+    /// `namespace` are plain `TEXT NOT NULL` columns with **nothing** tying
+    /// them to the referenced item's scope. What a divergent row costs, in
+    /// descending sharpness:
+    ///
+    /// 1. **The upsert cannot heal it. Exactly one path can.**
+    ///    `vectors::insert` is an upsert whose conflict clause is
+    ///    `ON CONFLICT(item_id) DO UPDATE SET embedder=…, dim=…, scale=…,
+    ///    q=…`. `subject` and `namespace` are not in that `SET` list, so an
+    ///    insert that **hits** the conflict leaves the divergence exactly
+    ///    where it was. That is the merge path: `items::merge` is an
+    ///    `UPDATE`, the item row survives, no `ON DELETE CASCADE` fires, and
+    ///    the re-embed lands on the existing vector row — so **a merge
+    ///    preserves divergence.**
+    ///
+    ///    A re-embedding pass does not. `Engine::reembed` in
+    ///    `memorysafe-engine`'s `reembed.rs` — the shared body of
+    ///    `Engine::backfill_embeddings` and `Engine::reembed_scope` — cannot
+    ///    `UPDATE` an item at all, because `items::insert` is a plain
+    ///    `INSERT` with no conflict clause and re-inserting a live id would
+    ///    violate the primary key. So it names the item in `txn.evictions`
+    ///    alongside its `upsert`, and that eviction is **required, not
+    ///    gratuitous**: `apply` runs the eviction loop *before* the upsert
+    ///    branch, `items::delete` removes the item row, and the
+    ///    `ON DELETE CASCADE` above takes the vector row with it. The
+    ///    upsert's `vectors::insert` therefore hits **no** conflict and
+    ///    writes `subject`/`namespace` fresh from the item's own scope.
+    ///    **Re-embedding heals Direction-2 divergence**; nothing else
+    ///    *repairs* it. `forget` and `purge::subject` reach a divergent row
+    ///    through the same cascade, but they erase it along with the item —
+    ///    which ends the divergence by ending the data. Re-embedding is the
+    ///    only path that leaves a correct row where a wrong one was.
+    /// 2. **The scoped `vectors::delete` silently no-ops on such a row** — it
+    ///    matches on `item_id AND subject AND namespace`. With (1): a merge
+    ///    that drops an embedding leaves a stale vector row that no *merge's*
+    ///    later insert corrects and no scoped delete removes — until a
+    ///    re-embedding pass over that scope replaces the row wholesale.
+    /// 3. **`vectors::scope_embedder` mis-attributes.** It reads `SELECT
+    ///    embedder, dim FROM vectors WHERE subject=?1 AND namespace=?2 LIMIT
+    ///    1`, so a row leaked into scope T makes T report an embedder and
+    ///    dimension it has no items for.
+    /// 4. **`PurgeReport::vectors_removed` under-counts.** `purge::subject`
+    ///    deletes vectors by `vectors.subject` first, then items by
+    ///    `items.subject`, and the foreign-key cascade takes the divergent
+    ///    row with it. **The data is still erased** — the count is wrong, the
+    ///    erasure is not. There is no right-to-erasure consequence here.
+    /// 5. **`vectors::search` is unaffected**, because it never reads these
+    ///    columns. No recall leak, no sensitivity-ceiling consequence.
+    ///
+    /// **The honest bound.** Nothing structurally prevents divergence, no
+    /// upsert heals it (only the delete-and-reinsert in `Engine::reembed`
+    /// does, per (1)), and a one-line mutation produces it — but **no
+    /// current engine path produces one**, because every `vectors::insert`
+    /// call site passes the item's own scope. It is foreclosed **by
+    /// convention, not by construction**, and this test is what makes the
+    /// convention observable. It is not speculative; it is a property with a
+    /// present mechanism and, until now, no test that could fail.
+    ///
+    /// **Deliberately not asserted here: "no orphan vector rows"** — a vector
+    /// row whose `item_id` matches no item. The `ON DELETE CASCADE` gives
+    /// that for free, and
+    /// `schema::tests::initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector`
+    /// already pins it. Asserting it here would test SQLite, not this code.
+    #[tokio::test]
+    async fn every_vector_rows_scope_columns_agree_with_the_item_it_references() {
+        let b = backend();
+        // Three scopes inside one tenant that differ on *both* columns, so a
+        // swapped, constant or transposed pair cannot coincide with the truth.
+        let home = scope("subject-one", "namespace-one");
+        let other_subject = scope("subject-two", "namespace-one");
+        let other_namespace = scope("subject-one", "namespace-two");
+
+        // Expected `(item_id, subject, namespace)`, recorded from what this
+        // test itself wrote rather than read back from `items` — a reader that
+        // derived the expectation from the same join `search` uses could not
+        // see a divergence at all.
+        let mut expected: Vec<(String, String, String)> = Vec::new();
+        let note = |scope: &Scope, id: &ItemId, expected: &mut Vec<_>| {
+            expected.push((
+                id.as_str().to_string(),
+                scope.subject.as_str().to_string(),
+                scope.namespace.as_str().to_string(),
+            ));
+        };
+
+        // Path 1: `apply`'s upsert branch, in each of the three scopes.
+        for s in [&home, &other_subject, &other_namespace] {
+            let item = fx::item(s, "an admitted memory with a vector");
+            b.apply(fx::admit_txn_embedded(s, item.clone()))
+                .await
+                .unwrap();
+            note(s, &item.id, &mut expected);
+        }
+
+        // Path 2: `apply`'s merge branch, which re-inserts over an existing
+        // `item_id` and so exercises the `ON CONFLICT` arm that cannot rewrite
+        // these two columns.
+        let merged = fx::item(&other_subject, "a merge target, re-embedded");
+        b.apply(fx::admit_txn_embedded(&other_subject, merged.clone()))
+            .await
+            .unwrap();
+        b.apply(merge_txn(
+            &other_subject,
+            &merged,
+            "the merged body, re-embedded",
+            true,
+        ))
+        .await
+        .unwrap();
+        note(&other_subject, &merged.id, &mut expected);
+
+        // Path 3: `import`, the third and last `vectors::insert` call site.
+        let imported = fx::item(&other_namespace, "an imported memory with a vector");
+        let stream: ImportStream = vec![
+            memorysafe_backend::ExportRecord::Header {
+                format_version: memorysafe_backend::FORMAT_VERSION,
+                exported_at: 0,
+            },
+            memorysafe_backend::ExportRecord::Item {
+                item: Box::new(imported.clone()),
+                vector: Some(memorysafe_backend::ExportVector::from_quantized(
+                    &fx::vector_for(&imported.body),
+                )),
+            },
+        ];
+        let report = b.import(&home.tenant, stream).await.unwrap();
+        assert_eq!(
+            (report.items_imported, report.vectors_imported),
+            (1, 1),
+            "the premise: the import must have written a vector row"
+        );
+        note(&other_namespace, &imported.id, &mut expected);
+
+        expected.sort();
+        let actual = vector_scope_columns(&b, &home.tenant).await;
+        assert_eq!(
+            actual.len(),
+            5,
+            "the premise: all three `vectors::insert` call sites must have \
+             written a row, or this compares two empty lists"
+        );
+        assert_eq!(
+            actual, expected,
+            "a vector row's scope columns disagree with the scope of the item \
+             it references; nothing heals that and no scoped delete removes it"
+        );
+    }
+
+    /// A merge transaction over `target`, honouring
+    /// `MergeWrite::pending_embedding`'s biconditional with `vector`.
+    /// `embed` false is the "the embedder was unavailable" case: no vector,
+    /// `pending_embedding: true`.
+    fn merge_txn(
+        scope: &Scope,
+        target: &MemoryItem,
+        body: &str,
+        embed: bool,
+    ) -> memorysafe_backend::WriteTransaction {
+        let audit = AuditRecord::new(
+            scope.clone(),
+            AuditEvent::Merged,
+            vec![ItemRef::from_item(target)],
+            Actor::system(),
+            target.created_at,
+        );
+        let mut txn = memorysafe_backend::WriteTransaction::new(scope.clone(), audit);
+        txn.merge = Some(memorysafe_backend::write::MergeWrite {
+            target: target.id.clone(),
+            body: body.into(),
+            tags: vec![],
+            attrs: Default::default(),
+            vector: embed.then(|| fx::vector_for(body)),
+            byte_size: body.len() as u64,
+            pending_embedding: !embed,
+        });
+        assert!(txn.is_valid(), "the premise: this transaction is valid");
+        txn
     }
 }

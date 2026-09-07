@@ -80,6 +80,31 @@ fn unreadable(column: &str, detail: String) -> rusqlite::Error {
     )
 }
 
+/// **Three of `AuditFilter`'s fields are ignored here, silently: `item`,
+/// `subject` and `namespace`.**
+///
+/// Honoured: `events`, `since`, `until`, `after`, `limit`. The other three are
+/// not read at all — there is no `WHERE` clause for any of them below — so a
+/// caller that sets `item: Some(id)` gets the whole scope's newest page, not
+/// that item's history, with no error and no signal that the narrowing did
+/// not happen. `memorysafe-engine`'s `write::replayed_outcome` is the one
+/// caller that sets one; its doc comment states what that costs there.
+///
+/// `subject` and `namespace` are a different shape of ignored: this function
+/// already binds `scope.subject` and `scope.namespace` unconditionally, so a
+/// filter naming *the same* subject and namespace as the scope is a no-op
+/// rather than a wrong answer, and one naming a different pair would be a
+/// cross-scope query this function is not built to serve. `item` is the field
+/// with a genuinely unserved meaning.
+///
+/// **Not fixed here, deliberately.** `Backend::audit`'s contract says nothing
+/// about these three fields, and no conformance test sets any of them
+/// (`docs/known-gaps.md` ranks this second among the gaps the freeze locks
+/// in), so implementing them means writing the contract *and* the test — a
+/// change to the frozen suite, which is a coordination round with the
+/// Postgres plan. It belongs to the next contract batch. What this comment
+/// closes is the silence: the behaviour was undocumented at the only place a
+/// reader would look for it.
 pub fn query(
     conn: &Connection,
     scope: &Scope,
@@ -216,11 +241,20 @@ mod tests {
         )
     }
 
-    /// The `policy` column has no reader anywhere in this crate — `query`'s
-    /// `SELECT` omits it, and the export that reads it arrives with the
-    /// portability task. Until then this is the only thing in the workspace
-    /// that fails if `insert` binds `None` there or renders the wrong part of
-    /// the `PolicyId`, so it is written against the exact string rather than
+    /// The `policy` column has no reader anywhere in this crate: `query`'s
+    /// `SELECT` list still omits it, and `portability::export` reads audit
+    /// rows through `query`, so it does not read it either.
+    ///
+    /// **This comment used to say the reader "arrives with the portability
+    /// task". The task arrived; the reader did not** — the column is written
+    /// on every insert and read by nothing, which is a different and more
+    /// durable state of affairs than "not yet". Either give it a reader or
+    /// drop the column; `audit_aggregates` already carries the policy name and
+    /// version in queryable form, which is the argument for dropping it.
+    ///
+    /// Until then this test is the only thing in the workspace that fails if
+    /// `insert` binds `None` there or renders the wrong part of the
+    /// `PolicyId`, so it is written against the exact string rather than
     /// against `Display` re-derived at assertion time.
     #[test]
     fn the_policy_column_renders_the_decision_and_is_null_without_one() {

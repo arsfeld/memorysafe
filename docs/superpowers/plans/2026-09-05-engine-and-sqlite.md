@@ -9561,8 +9561,10 @@ license.workspace = true
 [dependencies]
 memorysafe-core.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 time.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
@@ -13150,7 +13152,7 @@ Add `pub mod read;` to `lib.rs`. `RecallRequest`, `ScoredCandidate`, and `Compos
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 22 tests ok.
+Expected: PASS — 78 tests ok.
 
 - [ ] **Step 5: Commit**
 
@@ -13570,7 +13572,23 @@ and pass it as `ItemWrite { item, vector }`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 28 tests ok.
+Expected: PASS — 93 tests ok.
+
+**Re-propagated after Task 35 landed 93, not 84.** Mutation testing found
+fourteen genuine survivors this brief's own literal tests never reached; a
+first review pass caught 12 with new/strengthened tests, leaving two more
+that a subsequent fix round closed: the untested `ForgetSelector::Kind` arm,
+a duplicate-id `forget` call, `protect` on a nonexistent item, the stored
+protection/action/reason values `protect` actually writes, `purge_subject`'s
+audit-row accounting under `Cascade`, its namespace choice across a
+multi-namespace subject, its fallback for a subject owning nothing,
+`protect`'s embedding hardcoded to `None` (the same failure mode Task 34
+shipped once already), `forget`'s per-id existence pre-check — misclassified
+as an equivalent mutant in the first pass, corrected to genuine once review
+found the unscoped `vectors::delete` it actually guards against — and
+`protect`'s silent reset of an item's accumulated access history. See Task
+35's report for the full mutation evidence. Every count below this point is
+walked forward by the resulting +9.
 
 - [ ] **Step 5: Commit**
 
@@ -13892,7 +13910,7 @@ pub use maintain::{MAINTAIN_BATCH, MaintainCursor, MaintainReport};
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 33 tests ok.
+Expected: PASS — 106 tests ok (97 planned + the 9 propagated from Task 35's mutation-testing closures). Task 36's own executor found the brief's mandated five insufficient — the merge arm required by the brief's prose (see "The requirement is restated here" above) needed its own coverage across both `MergeStrategy` arms and its three defensive guards (pinning, self-merge, missing target) plus the tag/attr union and re-embed step, and a first review round found two further gaps (the cursor's arithmetic under a merge, and the mandated eviction loop's own missing batch-membership check) that needed their own tests too — eight tests beyond the five mandated in total.
 
 - [ ] **Step 5: Commit**
 
@@ -14110,7 +14128,7 @@ Add `pub mod cache;` and `pub use cache::{CacheConfig, EngineCache};` to `lib.rs
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 38 tests ok.
+Expected: PASS — 121 tests ok (112 planned + the 9 propagated from Task 35's mutation-testing closures). The brief's literal wiring invalidates only `remember`'s own scope (`write.rs`); the task's own ruling (see its report) found four other write surfaces — `forget`, `protect`, and `purge_subject` in `mutate.rs`, and both the decision-application call and `apply_merge` in `maintain.rs` — that would otherwise leave stale `ScopeStats` behind, and extended invalidation to all of them, each needing its own test. Mutation testing separately found the brief's own five tests never exercise `stats_ttl`'s expiry mechanism at all, and — on review — that `embed_cached` (the one mechanism this task places on a production path, called from both `write.rs` and `read.rs`) had no coverage at all: deleting its cache-hit early return, or reverting either call site to the direct embedder call it replaced, passed every test that existed at first submission. Ten tests beyond the five mandated in total: four for `mutate.rs`'s three extra write paths (`purge_subject` needed two — one multi-namespace positive case, one empty-subject negative control), three for `maintain.rs`'s two write sites (one of the three a negative control for the guarded write that does neither), one for the TTL gap, and two (added on review) proving `embed_cached` is actually consulted from both of its production call sites.
 
 - [ ] **Step 5: Commit**
 
@@ -14418,7 +14436,7 @@ Add `pub mod retention;` and
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 44 tests ok.
+Expected: PASS — 128 tests ok (117 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: Task 37 landed 121, not 111 — see its own Step 4 note — carrying a further +10 into every later count in this plan. Re-propagated again: Task 38's own review fix round 1 added a serde round-trip test for `RetentionSpan`/`RetentionProfile` — a third shipped mechanism the original mutation pass missed — carrying a further +1 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -14730,7 +14748,7 @@ Add `pub mod portability;` to `lib.rs`.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine`
-Expected: PASS — 50 tests ok.
+Expected: PASS — 148 tests ok (124 planned + the 9 propagated from Task 35's mutation-testing closures). (Re-propagated: see Task 37's Step 4 note — its ruling and its review fix round carry a +10 into every later count in this plan. Re-propagated again: see Task 38's Step 4 note — its review fix round 1 carries a further +1 into every later count in this plan. Re-propagated again: the 2026-09-06 byte-reclaim ruling batch — `protect`'s missing `pending_embedding` on an embedder failure, the fabricated eviction-evidence scrub, an explicit doc comment on `recall`'s fail-closed stance, and a ULID-ordering flake sweep — added 4 tests, carrying a further +4 into every later count in this plan. Re-propagated again: Task 39's own mutation-testing pass found three survivors in its own mandated Step 1 suite — `Engine::import`'s "keeps whichever level is higher" guarantee was untested in the direction where the payload's claimed sensitivity is already higher than fresh detection; `import_ndjson`'s line-number prefix could not be distinguished from an off-by-one by the mandated malformed-input test, because `serde_json`'s own error text independently contains "line 1" for any single-physical-line fragment; and the blank-line-skip branch (needed for `Backend::import`'s documented "concatenation of two exports" case) had no test putting a blank line in a stream at all — three tests added to close them, carrying a further +3 into every later count in this plan. Re-propagated again: Task 39's fix round 1 clamped a forged far-future `Protection::Protected { until }` (the variant-vs-value Critical finding), escaped structural markdown in the export, and pinned the sensitivity-detection/configured-policy trade-off as a characterization test — three tests added, carrying a further +3 into every later count in this plan.)
 
 - [ ] **Step 5: Commit**
 
@@ -14741,10 +14759,14 @@ git commit -m "feat(engine): portable ndjson export/import plus a human-readable
 
 ---
 
-## Task 40: The five correctness invariants
+## Task 40: The five correctness invariants (plus a sixth, ruled in during execution)
 
 **Files:**
 - Create: `crates/memorysafe-engine/tests/invariants.rs`
+- Modify: `crates/memorysafe-engine/src/lib.rs` (the `capacity_state` accessor, Step 3)
+- Modify: `crates/memorysafe-backend-sqlite/src/lib.rs` (the sixth invariant, Step 3b --
+  it CANNOT live in the engine crate; see that step for why)
+- Modify: `docs/known-gaps.md` (Step 3b corrects a stale claim there)
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
@@ -14985,7 +15007,7 @@ Add the missing read-through accessor to `crates/memorysafe-engine/src/lib.rs`:
 
 Any invariant that then fails is a real defect, not a test problem. The two most likely, and their fixes:
 
-- **Capacity exceeded.** `Engine::remember` offers eviction candidates only when `capacity.budget.is_bounded()` (Task 33, `gather::admit_context`). Confirm the budget is read fresh per write rather than cached — `CacheConfig` caches `ScopeStats`, never `CapacityState`, and that distinction is load-bearing.
+- **Capacity exceeded.** `Engine::remember` offers eviction candidates only when `capacity.budget.is_bounded()` (Task 33, `gather::admit_context`). Confirm the budget is read fresh per write rather than cached. **Correction, verified on this branch before dispatch:** this sentence originally warned that `CacheConfig` caches `ScopeStats` but never `CapacityState`. That distinction is real but currently INERT — nothing on the read path reads the stats cache. `gather.rs:36`, `read.rs:98` and `maintain.rs:84` all call `backend.scope_stats()` directly, and the only callers of `EngineCache::stats()`/`put_stats()` in the whole workspace are that crate's own tests (`cache.rs:40-41` says so in its own doc comment). So there is no stale-cache risk to chase here. If `capacity_is_never_exceeded` reports drift, the cause is in the SQLite accounting or in the admission path, NOT in a stale cached stat. Do not transcribe the original warning as a live concern.
 - **Audit count mismatch.** A rejected write must still write exactly one audit record. Confirm the `Action::Reject` branch in `remember` builds a `WriteTransaction` with no `upsert` and no `merge` but still passes its audit record through `backend.apply`.
 
 Add the invariants job to `.github/workflows/ci.yml`:
@@ -15002,10 +15024,101 @@ Add the invariants job to `.github/workflows/ci.yml`:
           PROPTEST_CASES: 64
 ```
 
+- [ ] **Step 3b: The sixth invariant — vector/item scope consistency**
+
+Ruled in during execution, after the five above were written. It is a real gap in the
+five: nothing in Invariants 1-5 can observe the `vectors` table at all.
+
+**It does NOT go in `crates/memorysafe-engine/tests/invariants.rs`.** Neither direction is
+observable from the engine's public API, and this was verified on this branch before
+dispatch, not assumed:
+
+- The `Backend` trait exposes no vector-observation surface whatsoever. Its methods are
+  `retrieve_candidates`, `neighbours`, `capacity_state`, `scope_stats`, `apply`,
+  `record_recall`, `get`, `list`, `audit`, `purge_subject`, `audit_aggregates`, `export`,
+  `import`, `set_budget`. None returns a vector row or a count of them.
+- `SqliteBackend`'s only public non-trait methods are `open`, `with_max_open` and
+  `forget_tenant`.
+- `vectors::search` cannot substitute, and the reason is already written down in
+  `vector_rows_for_item`'s doc comment in `crates/memorysafe-backend-sqlite/src/lib.rs`:
+  search joins `vectors` to `items` on `item_id` and filters on the **item's** scope, so it
+  reports zero for a vector row whose own scope columns diverged exactly as readily as for
+  one that was genuinely deleted. An instrument that reports absence for two different
+  reasons cannot distinguish them.
+
+So it goes in the **existing `mod tests` in `crates/memorysafe-backend-sqlite/src/lib.rs`**,
+as a plain `#[tokio::test]`. That crate has `tokio` with the `macros` feature as a *main*
+dependency, so `#[tokio::test]` works with no manifest change. It has **no** `proptest`
+dev-dependency: do not add one, and do not write this as a property test. A handful of
+explicit cases plus the two mutations below is the right shape here.
+
+Reuse the existing `vector_rows_for_item(b, scope, id)` helper in that module for the
+per-item direction. Direction 2 needs one new unjoined aggregate read in the same style
+(`b.tenants.with_conn(...)`).
+
+**DIRECTION 1 — no live item is without a vector row, UNLESS it is marked
+`pending_embedding`.** `MemoryItem::pending_embedding` is a public field, and
+`RetrievalFilter::exclude_pending_embedding` (`memorysafe-backend/src/query.rs:48`) is what
+keeps such items out of vector retrieval. CONSEQUENCE, to be stated in the test's doc
+comment: this invariant is only as trustworthy as `pending_embedding` itself. That flag is
+the invariant's own escape hatch — if it were set spuriously, the invariant would pass
+while the corpus silently lost vector coverage. Task 41 owns the backfill that drains it.
+
+**DIRECTION 2 — every vector row's `subject`/`namespace` agree with the scope of the item
+it references.** This is the one with teeth, and the schema is why: `vectors.item_id` is
+`TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE`, but `subject` and `namespace`
+are plain `TEXT NOT NULL` columns with **nothing** tying them to the referenced item's
+scope.
+
+Consequences of a divergent row, verified against the code, in descending sharpness —
+put these in the doc comment, and do not inflate them:
+
+1. **Divergence cannot self-heal.** `vectors::insert` is an upsert whose conflict clause is
+   `ON CONFLICT(item_id) DO UPDATE SET embedder=..., dim=..., scale=..., q=...`.
+   `subject` and `namespace` are **not in that SET list**, so every subsequent re-embed
+   preserves the divergence.
+2. **The scoped `vectors::delete` silently no-ops on such a row** — it matches on
+   `item_id AND subject AND namespace`. Combined with (1): a merge that drops an embedding
+   leaves a stale vector row that no later insert corrects and no scoped delete removes.
+3. **`vectors::scope_embedder` mis-attributes.** It reads `SELECT embedder, dim FROM vectors
+   WHERE subject=?1 AND namespace=?2 LIMIT 1` — a row leaked into scope T makes T report an
+   embedder and dimension it has no items for.
+4. **`PurgeReport::vectors_removed` under-counts.** `purge::subject` deletes vectors by
+   `vectors.subject` first, but then deletes items by `items.subject`, and the FK cascade
+   takes the divergent row with it. **The data IS still erased** — the count is wrong, the
+   erasure is not. Do not claim a right-to-erasure consequence here; there isn't one.
+5. **`vectors::search` is unaffected**, because it never reads these columns. There is no
+   recall leak and no sensitivity-ceiling consequence.
+
+**DO NOT assert "no orphan vector rows"** (a vector row whose `item_id` matches no item).
+The FK cascade gives that for free and it is already pinned by
+`schema::tests::initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector`.
+Asserting it here would test SQLite, not this code.
+
+**HONEST BOUND — keep this in the doc comment, in these terms.** Nothing structurally
+prevents divergence, the upsert cannot heal it, and a one-line mutation produces it — but
+**no current engine path produces one**, because every `vectors::insert` call site passes
+the item's own scope. It is foreclosed **by convention, not by construction**. State it
+that way, or a later reader will call the invariant speculative and delete it.
+
+**Correct the stale claim in `docs/known-gaps.md`.** Its "Elsewhere" section says the
+`vectors` table's duplicated scope columns have "exactly one reader, `scope_embedder`".
+That is now wrong in two ways: the newly-scoped `vectors::delete` reads both columns, and
+`purge.rs`'s `DELETE FROM vectors WHERE subject = ?1` reads `subject`. Update the entry to
+name all three readers and to note that this test now pins the property. Cite the entry by
+its symbol and description. **Use no commit hashes anywhere** — a repo-wide history
+rewrite orphaned every pre-rewrite SHA in this repository, so a hex reference in a comment
+is a dead pointer.
+
+**Mutation-test both directions** (Global Constraint). At minimum: delete the scope columns
+from `vectors::insert`'s parameter list so they take a wrong-but-valid value (wrong-value
+class), and remove the `pending_embedding` guard from Direction 1's assertion (absence
+class). Report survivors.
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings`
-Expected: PASS — the whole workspace green: 5 invariants, 50 backend conformance tests, and the unit and integration suites of all six crates.
+Expected: PASS — the whole workspace green. **MEASURED ON COMPLETION at head `8e227b3` with the canonical `cargo test --workspace --all-features`: workspace 547 passing (headers 44 == results 44, FAILED 0), `memorysafe-engine` 154, `memorysafe-backend-sqlite` lib 94.** Six invariants shipped, not five — the sixth (vector/item scope consistency, Step 3b) lives in the sqlite crate and so does not appear in the engine figure. The earlier prediction of 153 engine tests was taken WITHOUT `--all-features` and read 3 low workspace-wide; `memorysafe-embed`'s non-default `model2vec` feature is the difference. Every re-propagation note that preceded this line is superseded by the measurement.
 
 - [ ] **Step 5: Commit**
 
@@ -15022,6 +15135,8 @@ git commit -m "test(engine): the five correctness invariants as property tests"
 - Create: `crates/memorysafe-engine/src/reembed.rs`
 - Modify: `crates/memorysafe-engine/src/lib.rs`
 - Create: `crates/memorysafe-engine/tests/reembed.rs`
+- Modify: `crates/memorysafe-backend-sqlite/src/lib.rs` (Step 3a item 4 — this task
+  falsifies one sentence in Task 40's sixth-invariant doc comment)
 
 **Interfaces:**
 - Consumes: `Backend::list`, `Backend::apply`, `Embedder`.
@@ -15376,10 +15491,68 @@ pub mod reembed;
 pub use reembed::{REEMBED_BATCH, ReembedCursor, ReembedReport};
 ```
 
+- [ ] **Step 3a: Corrections to the block above, all verified against this branch before dispatch**
+
+The Step 3 code was written before Tasks 32-40 existed. Four things in it need attention. The
+first three are defects in the block; the fourth is a consequence of it that lands outside
+this task's files.
+
+1. **`OffsetDateTime` is used and never imported.** `AuditRecord::new`'s fifth parameter is an
+   `OffsetDateTime` and the block passes `OffsetDateTime::now_utc()`, but the `use` list names
+   only `memorysafe_core::{...}` and `memorysafe_embed::{...}`. Add `use time::OffsetDateTime;`.
+   `time` is already a dependency of `memorysafe-engine`.
+
+2. **`refs` is dead.** The block declares `let mut refs: Vec<ItemRef> = Vec::new();`, pushes to
+   it once per embedded item, and never reads it. It is vestigial from an earlier design in
+   which one audit record covered the whole run — the design this task's own prose explicitly
+   rejects, because Invariant 4 requires one record per mutation. Delete the declaration and
+   the push. Do not "use" it to justify keeping it.
+
+3. **`still_pending` over-reports for `reembed_scope`.** The counter is incremented whenever
+   `embed` fails, but under `reembed_scope` (`pending_only = false`) a failing item was very
+   likely never pending: it keeps its existing vector and its `pending_embedding` column stays
+   `false`. So the report would claim N still-pending while `review()` shows none — a report
+   that disagrees with the data it describes. `backfill_embeddings` is unaffected, since every
+   target there was already pending. Decide and DOCUMENT one of: rename the meaning in the
+   doc comment to "targets left without a fresh vector", or count only genuinely-pending items.
+   State which you chose and why. Do not leave the disagreement undocumented.
+
+4. **This task falsifies one sentence in Task 40's sixth invariant, and you must correct it.**
+   `crates/memorysafe-backend-sqlite/src/lib.rs`, in the Direction 2 doc comment
+   (`every_vector_rows_scope_columns_agree_with_the_item_it_references`), consequence 1 reads
+   that `vectors::insert`'s `ON CONFLICT(item_id) DO UPDATE SET` omits the scope columns, "so
+   every subsequent re-embed preserves the divergence."
+
+   The first clause stays true. The inference does not, once this task exists. Verified:
+   `items::insert` is a PLAIN `INSERT` with no conflict clause, so re-inserting an existing id
+   would violate the primary key — which is exactly why the block above sets
+   `txn.evictions = vec![item.id.clone()]` alongside its `upsert`. That eviction is REQUIRED,
+   not gratuitous. `SqliteBackend::apply` processes `txn.evictions` BEFORE the upsert branch,
+   `items::delete` removes the item row, and `vectors.item_id REFERENCES items(id) ON DELETE
+   CASCADE` takes the vector row with it. The upsert's `vectors::insert` therefore hits NO
+   conflict and writes `subject`/`namespace` fresh from the item's own scope.
+
+   **So re-embedding HEALS Direction-2 divergence.** The merge path still preserves it, because
+   a merge is an `UPDATE` and no cascade fires — which is what the `ON CONFLICT` argument was
+   really about. Correct the sentence to say the merge path preserves divergence and that
+   `reembed` repairs it, and name the repair path. Do not delete the consequence; narrow it to
+   what is true.
+
+   Note also that `AppliedWrite::evicted` will now report a re-embedded item's id as evicted,
+   because the field is defined as ids actually removed and the row genuinely was. That is
+   correct per its own contract but surprising in a re-embed report. Say so in `reembed`'s doc
+   comment so the next reader does not file it as a bug.
+
+**Apply the audit-count correction the prose already mandates.** This task's Step 3 prose
+requires one `AuditRecord` per re-embedded item and tells you to change
+`a_scope_reembed_rewrites_every_vector_and_audits_the_run`'s assertion from
+`audit.len() == 1` to `audit.len() == 3`. That correction governs; the Step 1 block predates
+it.
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p memorysafe-engine && cargo test --workspace --all-features`
-Expected: PASS — 57 engine tests ok, whole workspace green.
+Expected: PASS — the whole workspace green. **Baselines VERIFIED at Task 40's head `8e227b3` with the plan's canonical command `cargo test --workspace --all-features`: workspace 547 passing (headers 44 == results 44, FAILED 0), `memorysafe-engine` 154.** This task's mandated Step 1 block adds 7 tests, so expect at least 161 in the engine crate plus whatever mutation-closing tests the Global Constraint requires; report the measured figures rather than these. Every earlier re-propagation note in this plan is superseded by this measurement, and one of them was wrong: counts before Task 40 were taken WITHOUT `--all-features`, which omits `memorysafe-embed`'s non-default `model2vec` tests and reads 3 low. Use the canonical command.
 
 - [ ] **Step 5: Commit**
 

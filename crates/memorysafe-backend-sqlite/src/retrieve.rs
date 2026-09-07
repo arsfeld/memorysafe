@@ -617,6 +617,54 @@ mod tests {
         );
     }
 
+    /// The mirror image of `filter_sql_sensitivity_boundary_is_exact_on_both_arms`,
+    /// and it exists for the mirror-image reason.
+    ///
+    /// That test reaches *below* `passes` because `passes` was covering for a
+    /// widened SQL predicate. Measured during the correctness-invariants task,
+    /// the asymmetry runs the other way too: neutering `passes`'s ceiling arm
+    /// — `if item.sensitivity > f.sensitivity_ceiling` mutated to `if false` —
+    /// left the **entire workspace suite green** under
+    /// `cargo test --workspace --all-features`, because
+    /// `filter_sql` was covering for `passes` in exactly the way `passes` had
+    /// been covering for `filter_sql`. Defence in depth is the right design
+    /// and neither layer should go; the consequence is that each needs a test
+    /// that reaches it with the other one out of the way, and only one of the
+    /// two existed.
+    ///
+    /// So this calls `passes` directly. It checks the same boundary in the
+    /// same two directions: an item exactly *at* the ceiling passes (ruling
+    /// out `>=`, which would wrongly reject it) and an item exactly one level
+    /// *above* does not (ruling out the check being dropped, or relaxed to a
+    /// higher level).
+    #[test]
+    fn the_rust_side_ceiling_check_is_exact_on_both_arms() {
+        let scope = Scope::new("t", "s", "n").unwrap();
+        let filters = HardFilters {
+            sensitivity_ceiling: SensitivityLevel::Personal,
+            ..HardFilters::default()
+        };
+
+        let at_ceiling = fx::item_with(&scope, "body", "fact", &[], SensitivityLevel::Personal);
+        let above_ceiling = fx::item_with(&scope, "body", "fact", &[], SensitivityLevel::Sensitive);
+        let below_ceiling = fx::item_with(&scope, "body", "fact", &[], SensitivityLevel::Public);
+
+        assert!(
+            passes(&at_ceiling, &filters),
+            "`passes` rejected an item exactly at the ceiling — the check \
+             narrowed from `>` to `>=`"
+        );
+        assert!(
+            passes(&below_ceiling, &filters),
+            "`passes` rejected an item below the ceiling"
+        );
+        assert!(
+            !passes(&above_ceiling, &filters),
+            "`passes` admitted an item one level above the ceiling — the \
+             second line of defence is not defending"
+        );
+    }
+
     /// Mutant #10 in the task-22 dispatch notes: swapping which fusion slot a
     /// vector score and a keyword score land in. `hybrid_returns_both_signal_sources`
     /// (conformance) only checks both are `Some`, which a swap leaves true, so

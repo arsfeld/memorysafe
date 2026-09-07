@@ -49,10 +49,12 @@ pub const ADMIN_COMPONENT: &str = "_admin";
 // `TenantId`, `SubjectId` and `Namespace`. Those signatures are inside a macro
 // body, so an external arity checker cannot read them off the source; it
 // resolves them from a hand-maintained table keyed by macro name. `TenantId::new`
-// alone has 66 call sites across the plan documents, so changing the arity or
-// the return type here invalidates all 66 at once and the table is the only
-// thing standing between that and a clean report. Change this macro's generated
-// signatures only together with that table.
+// alone is called from dozens of places across the plan documents
+// (`grep -ro 'TenantId::new' docs/ | wc -l`), so changing the arity or the
+// return type here invalidates every one of them at once, and the table is the
+// only thing standing between that and a clean report. Change this macro's
+// generated signatures only together with that table. (The count was written
+// out here and had drifted from the real one; it is a grep, so run the grep.)
 macro_rules! scope_component {
     ($name:ident, $field:literal) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

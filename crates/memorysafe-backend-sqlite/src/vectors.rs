@@ -40,10 +40,42 @@ pub fn insert(
     Ok(())
 }
 
-pub fn delete(conn: &Connection, id: &ItemId) -> Result<(), BackendError> {
+/// Remove `id`'s vector row, refusing an id outside `scope`.
+///
+/// **Only the merge path needs this.** Eviction does not: `items::delete`
+/// removes the item row and `vectors.item_id REFERENCES items(id) ON DELETE
+/// CASCADE` takes the vector with it, which is why the eviction loop has no
+/// explicit call and must not grow one back. A merge is different — it is an
+/// `UPDATE`, the item row survives, **so no cascade fires** and the stale
+/// vector must be removed here or not at all.
+///
+/// **The scope predicate is not decoration, and it is not currently
+/// reachable.** An earlier unscoped form — `DELETE FROM vectors WHERE
+/// item_id = ?1` — was a real defect on the eviction path: `items::delete`
+/// refused an out-of-scope id and returned `Ok(0)`, that refusal was
+/// discarded, and the unscoped delete then stripped the vector from a **live
+/// item in another scope**, leaving it readable through `get` and `list` while
+/// permanently invisible to vector search.
+///
+/// At *this* call site that could not happen today, because `items::merge`
+/// returns `Err(BackendError::MergeTargetMissing)` for an out-of-scope target
+/// and `?` aborts the transaction before the delete is reached. **Keep the
+/// predicate anyway.** Without it, the safety of this statement depends on an
+/// invariant enforced in a different function — which is exactly the shape of
+/// the defect above, where the refusal was computed and then thrown away. Do
+/// not remove it on the grounds that it cannot be reached.
+///
+/// Symmetric with `insert`, which writes the same two columns from the same
+/// `Scope`. Argument order follows `items::delete(conn, scope, id)`, the
+/// crate's other scoped delete, rather than `insert(conn, id, scope, q)`.
+pub fn delete(conn: &Connection, scope: &Scope, id: &ItemId) -> Result<(), BackendError> {
     conn.execute(
-        "DELETE FROM vectors WHERE item_id = ?1",
-        params![id.as_str()],
+        "DELETE FROM vectors WHERE item_id=?1 AND subject=?2 AND namespace=?3",
+        params![
+            id.as_str(),
+            scope.subject.as_str(),
+            scope.namespace.as_str()
+        ],
     )
     .sql()?;
     Ok(())

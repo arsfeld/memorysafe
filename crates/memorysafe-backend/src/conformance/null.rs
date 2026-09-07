@@ -331,8 +331,15 @@ macro_rules! census {
 /// suppression would come apart. The `OnceCell` makes the hook installation
 /// happen exactly once, before any conformance code runs.
 ///
-/// The hook exists because forty-seven expected panics per CI run is noise
-/// and the message is captured into the `Verdict` anyway. It is permanent —
+/// The hook exists because one expected panic per non-tolerant test, on every
+/// CI run, is noise — that is every test in the suite bar the two in
+/// [`NULL_TOLERANT`], so it is nearly the whole suite — and the message is
+/// captured into the `Verdict` anyway. (A literal count stood here; it was the
+/// figure from the census reading taken when the suite held forty-nine tests,
+/// and it did not move when the fiftieth was added. `NULL_TOLERANT`'s own doc
+/// carries the census and says to retake it rather than adjust it by
+/// arithmetic, which is the same reason not to restate it here.) It is
+/// permanent —
 /// restoring it would reintroduce the race it exists to avoid — and it is
 /// narrow: it swallows a panic only when the panic's own source file is one
 /// of the suite's, listed in [`SUPPRESSED_PANIC_SITES`]. Everything else goes

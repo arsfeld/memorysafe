@@ -168,6 +168,102 @@ pub fn insert(conn: &Connection, item: &MemoryItem) -> Result<(), BackendError> 
     Ok(())
 }
 
+/// The `items` columns that do **not** live on [`MemoryItem`], and which
+/// [`insert`] therefore cannot write.
+///
+/// Four columns are in that position — `value_score`, `fragility_score`,
+/// `last_access` and `access_count` — and **only the last two carry data.**
+/// `value_score` and `fragility_score` are written by nothing anywhere in
+/// this workspace: they appear in the schema's `CREATE TABLE` and nowhere
+/// else, in no `INSERT` column list, no `UPDATE` set clause and no `SELECT`.
+/// They hold their schema default of `0.0` for every row that has ever
+/// existed, so carrying them across a replace would carry zeros — which is
+/// why this type deliberately does not model them.
+///
+/// `last_access` and `access_count` are the opposite. `SqliteBackend::record_recall`
+/// advances both, in the same transaction as the recall's own audit row, for
+/// every item the recall returned; and `retrieve::candidates`,
+/// `vectors::search` and `keyword::search` all read them back into
+/// `ScoredCandidate::last_accessed_at`/`access_count`, where they feed the
+/// replay quota's staleness signal and the eviction ranking. Losing them
+/// resets an item's whole accumulated recall history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccessHistory {
+    /// Unix seconds, or `None` for an item that has never been recalled.
+    pub last_access: Option<i64>,
+    pub access_count: i64,
+}
+
+/// Reads the access history of a row that is about to be replaced. The first
+/// half of a replace; [`restore_access_history`] is the second.
+///
+/// Must be called **before** the [`delete`]: the row is gone afterwards, and
+/// the answer would then be `None`. `None` and `Some(AccessHistory::default())`
+/// are genuinely different answers — no such row, versus a stored item that
+/// has never been recalled — which is why this is an `Option` rather than a
+/// defaulted struct.
+pub fn access_history(
+    conn: &Connection,
+    scope: &Scope,
+    id: &ItemId,
+) -> Result<Option<AccessHistory>, BackendError> {
+    conn.query_row(
+        "SELECT last_access, access_count FROM items
+         WHERE id=?1 AND subject=?2 AND namespace=?3",
+        params![
+            id.as_str(),
+            scope.subject.as_str(),
+            scope.namespace.as_str()
+        ],
+        |r| {
+            Ok(AccessHistory {
+                last_access: r.get(0)?,
+                access_count: r.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .sql()
+}
+
+/// Writes an access history back onto a freshly re-inserted row.
+///
+/// **The pair exists because a replace is a delete plus an insert here, and
+/// `insert` writes `MemoryItem`'s fields and nothing else.** Three engine
+/// paths replace a stored row that way — `Engine::protect`, `Engine::reembed`,
+/// and `Engine::maintain`'s protection-release pass, which routes through
+/// `protect` — each handing `Backend::apply` a transaction whose `evictions`
+/// and `upsert` name the same id. Without this, every one of them reset the
+/// row's recall history to the schema defaults. See [`AccessHistory`] for
+/// what the two columns mean and who reads them.
+///
+/// Scoped exactly as [`get`] and [`merge`] are, repeating the predicate
+/// rather than trusting the id alone, for the reason `merge`'s doc gives.
+///
+/// The `items_au` FTS trigger is guarded on `body`/`tags` (see the schema),
+/// neither of which this statement touches, so restoring a history costs no
+/// FTS write.
+pub fn restore_access_history(
+    conn: &Connection,
+    scope: &Scope,
+    id: &ItemId,
+    history: AccessHistory,
+) -> Result<(), BackendError> {
+    conn.execute(
+        "UPDATE items SET last_access = ?4, access_count = ?5
+         WHERE id = ?1 AND subject = ?2 AND namespace = ?3",
+        params![
+            id.as_str(),
+            scope.subject.as_str(),
+            scope.namespace.as_str(),
+            history.last_access,
+            history.access_count,
+        ],
+    )
+    .sql()?;
+    Ok(())
+}
+
 pub fn get(
     conn: &Connection,
     scope: &Scope,
@@ -276,6 +372,7 @@ pub fn merge(
     body: &str,
     tags: &[String],
     attrs: &std::collections::BTreeMap<String, serde_json::Value>,
+    pending_embedding: bool,
 ) -> Result<i64, BackendError> {
     let Some(existing) = get(conn, scope, target)? else {
         return Err(BackendError::MergeTargetMissing(target.clone()));
@@ -297,10 +394,12 @@ pub fn merge(
     updated.body = body.to_string();
     updated.tags = merged_tags;
     updated.attrs = merged_attrs;
+    updated.pending_embedding = pending_embedding;
     let after = updated.byte_size() as i64;
 
     conn.execute(
-        "UPDATE items SET body = ?4, tags = ?5, attrs = ?6, byte_size = ?7
+        "UPDATE items SET body = ?4, tags = ?5, attrs = ?6, byte_size = ?7,
+             pending_embedding = ?8
          WHERE id = ?1 AND subject = ?2 AND namespace = ?3",
         params![
             target.as_str(),
@@ -310,6 +409,7 @@ pub fn merge(
             serde_json::to_string(&updated.tags).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&updated.attrs).unwrap_or_else(|_| "{}".into()),
             after,
+            i64::from(updated.pending_embedding),
         ],
     )
     .sql()?;
@@ -612,7 +712,16 @@ mod tests {
         let mut new_attrs = BTreeMap::new();
         new_attrs.insert("k-new".to_string(), serde_json::Value::String("new".into()));
 
-        let delta = merge(&conn, &s, &existing.id, new_body, &new_tags, &new_attrs).unwrap();
+        let delta = merge(
+            &conn,
+            &s,
+            &existing.id,
+            new_body,
+            &new_tags,
+            &new_attrs,
+            false,
+        )
+        .unwrap();
 
         let stored = get(&conn, &s, &existing.id)
             .unwrap()
@@ -672,6 +781,64 @@ mod tests {
         );
     }
 
+    /// `merge`'s own `UPDATE` did not touch `pending_embedding` until this
+    /// test's premise: `insert` writes the column (see
+    /// `every_column_survives_a_round_trip_including_the_ones_with_defaults`
+    /// above) but `merge` skipped it entirely, so a merge whose re-embed
+    /// failed had nowhere to record that fact — the flag stayed at whatever
+    /// the target's *pre-merge* value happened to be, forever, no matter what
+    /// `merge`'s caller passed. Both directions are exercised, mirroring
+    /// `MergeWrite::pending_embedding`'s own doc: a merge can both set the
+    /// flag (target was clean, re-embed failed) and clear a stale one
+    /// (target was pending, re-embed succeeded) — either direction being
+    /// silently ignored would still leave every other assertion in this
+    /// module passing.
+    #[test]
+    fn merge_persists_the_pending_embedding_flag_in_both_directions() {
+        let conn = db();
+        let s = scope("s", "n");
+
+        let mut clean = item(&s, "a clean target");
+        clean.pending_embedding = false;
+        insert(&conn, &clean).unwrap();
+        merge(
+            &conn,
+            &s,
+            &clean.id,
+            "new body",
+            &[],
+            &BTreeMap::new(),
+            true,
+        )
+        .unwrap();
+        let after_set = get(&conn, &s, &clean.id).unwrap().unwrap();
+        assert!(
+            after_set.pending_embedding,
+            "merge must be able to SET pending_embedding, not just leave it \
+             at the target's pre-merge value"
+        );
+
+        let mut stale = item(&s, "a stale target");
+        stale.pending_embedding = true;
+        insert(&conn, &stale).unwrap();
+        merge(
+            &conn,
+            &s,
+            &stale.id,
+            "new body",
+            &[],
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        let after_clear = get(&conn, &s, &stale.id).unwrap().unwrap();
+        assert!(
+            !after_clear.pending_embedding,
+            "merge must be able to CLEAR a stale pending_embedding, not just \
+             leave it at the target's pre-merge value"
+        );
+    }
+
     /// A merge whose supplied tag already exists on the target must not
     /// create a duplicate.
     #[test]
@@ -689,6 +856,7 @@ mod tests {
             "body",
             &["shared".to_string()],
             &BTreeMap::new(),
+            false,
         )
         .unwrap();
 
@@ -707,7 +875,16 @@ mod tests {
         insert(&conn, &existing).unwrap();
         let before = existing.byte_size() as i64;
 
-        let delta = merge(&conn, &s, &existing.id, "short", &[], &BTreeMap::new()).unwrap();
+        let delta = merge(
+            &conn,
+            &s,
+            &existing.id,
+            "short",
+            &[],
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
         let stored = get(&conn, &s, &existing.id).unwrap().unwrap();
         let after = stored.byte_size() as i64;
 
@@ -734,6 +911,7 @@ mod tests {
             "stolen body",
             &[],
             &BTreeMap::new(),
+            false,
         )
         .unwrap_err();
         assert!(
@@ -759,7 +937,7 @@ mod tests {
         let conn = db();
         let s = scope("s", "n");
         let ghost = ItemId::new();
-        let err = merge(&conn, &s, &ghost, "body", &[], &BTreeMap::new()).unwrap_err();
+        let err = merge(&conn, &s, &ghost, "body", &[], &BTreeMap::new(), false).unwrap_err();
         assert!(matches!(&err, BackendError::MergeTargetMissing(id) if *id == ghost));
     }
 }

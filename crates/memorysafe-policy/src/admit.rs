@@ -149,18 +149,14 @@ pub fn decide(
         let mut ranked: Vec<&MaintenanceCandidate> = ctx.eviction_candidates.iter().collect();
         ranked.sort_by(|x, y| eviction::cost(x).total_cmp(&eviction::cost(y)));
 
-        let mut freed_items = 0u64;
-        let mut freed_bytes = 0u64;
-        for c in ranked {
-            let still_over = {
-                let mut projected = ctx.capacity;
-                projected.used_items = projected.used_items.saturating_sub(freed_items);
-                projected.used_bytes = projected.used_bytes.saturating_sub(freed_bytes);
-                projected.would_exceed(1, assessed.candidate.byte_size)
-            };
-            if !still_over {
-                break;
-            }
+        // `eviction::evictions_needed` is the one mechanism this loop and
+        // `maintain::capacity_reclaim`'s both need — see its doc comment.
+        // `(1, assessed.candidate.byte_size)` is the pending-write shape:
+        // this candidate has not been admitted yet, so it counts toward the
+        // projection admission checks against.
+        let needed =
+            eviction::evictions_needed(ctx.capacity, &ranked, 1, assessed.candidate.byte_size);
+        for c in &ranked[..needed] {
             evictions.push(Eviction {
                 item: c.item.id.clone(),
                 reason: Reason::new(
@@ -173,9 +169,9 @@ pub fn decide(
                     },
                 ),
             });
-            freed_items += 1;
-            freed_bytes += c.item.byte_size();
         }
+        let freed_items = needed as u64;
+        let freed_bytes: u64 = ranked[..needed].iter().map(|c| c.item.byte_size()).sum();
 
         let mut projected = ctx.capacity;
         projected.used_items = projected.used_items.saturating_sub(freed_items);
@@ -430,6 +426,83 @@ mod tests {
             d.action
         );
         assert_eq!(d.evictions.len(), 1);
+    }
+
+    #[test]
+    fn a_byte_only_budget_needing_two_evictions_spares_the_third_candidate() {
+        // The gap fix round 1's review found: after `eviction::evictions_needed`
+        // was extracted (Important 1), this module's only byte fixture above
+        // offers exactly ONE evictable candidate, so its loop only ever
+        // evaluates a single iteration — a correct `freed_bytes` accumulation
+        // and one that never accumulates agree on that single iteration (both
+        // decide "evict it"), so neither the accumulation bug nor its absence
+        // is visible there. Distinguishing them needs a candidate the
+        // CORRECT run must spare — one that a broken accumulator, which never
+        // notices the budget clearing, evicts anyway because it keeps seeing
+        // the ORIGINAL (unrelieved) byte count on every iteration.
+        //
+        // Three 76-byte candidates (`"aaaa"`/`"bbbb"`/`"cccc"`, see
+        // `maintain::tests`' derivation of `MemoryItem::byte_size` for this
+        // fixture body length), `used_bytes: 228` against `max_bytes:
+        // Some(150)`, admitting a 12-byte candidate ("a new memory", from
+        // `assessed`'s fixed `candidate_from` body):
+        //   before any eviction: 228 + 12 = 240 > 150 — over.
+        //   after evicting one:  228 - 76 + 12 = 164 > 150 — still over.
+        //   after evicting two:  228 - 152 + 12 = 88 <= 150 — clear.
+        // The third candidate must survive. Mirrors
+        // `maintain::tests::a_byte_only_budget_needing_two_evictions_reclaims_exactly_two`,
+        // added for the identical reason on the maintenance side; together
+        // the two are what makes a mutation inside the shared helper's
+        // `freed_bytes` tracking symmetrically killable from both callers —
+        // confirmed by mutation testing (task report, fix round 1).
+        let cfg = BaselineConfig::default();
+        let first = evictable("aaaa", 0.1, 0.1);
+        let second = evictable("bbbb", 0.1, 0.1);
+        let third = evictable("cccc", 0.1, 0.1);
+        assert_eq!(
+            first.item.byte_size(),
+            76,
+            "byte accounting drifted from the derivation above"
+        );
+        let admit_ctx = AdmitContext {
+            scope: scope(),
+            capacity: CapacityState {
+                budget: Budget {
+                    max_items: None,
+                    max_bytes: Some(150),
+                },
+                used_items: 0,
+                used_bytes: 228,
+            },
+            eviction_candidates: vec![first, second, third],
+            stats: ScopeStats::default(),
+            now: OffsetDateTime::UNIX_EPOCH,
+        };
+        let (c, a) = assessed(0.1, 0.8, 0.2, SensitivityLevel::Internal);
+        assert_eq!(
+            c.byte_size, 12,
+            "byte accounting drifted from the derivation above"
+        );
+        let d = decide(
+            &Assessed {
+                candidate: &c,
+                assessment: &a,
+            },
+            &admit_ctx,
+            &cfg,
+            pid(),
+        );
+        assert!(
+            matches!(d.action, Action::Retain { .. }),
+            "two evictions should have freed enough bytes to fit; got {:?}",
+            d.action
+        );
+        assert_eq!(
+            d.evictions.len(),
+            2,
+            "a third candidate must be spared once two evictions clear the budget: {:?}",
+            d.evictions
+        );
     }
 
     #[test]

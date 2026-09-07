@@ -54,6 +54,17 @@ impl CapacityState {
     /// caller shape is `would_exceed(1, item.byte_size())`, admitting one item
     /// at a time. If a caller ever needs a variable item count, replace these
     /// positional parameters with a named-field argument before doing so.
+    ///
+    /// **A second legitimate shape: `would_exceed(0, 0)`**, asking "is this
+    /// state, with no further admission, already over budget" rather than
+    /// "would admitting more break it" — zero contributes nothing on either
+    /// side of `saturating_add`, so this is the same OR-of-both-dimensions
+    /// comparison, evaluated against the state as it stands rather than
+    /// against a pending write. A `(0, 0)` call site is that standing check,
+    /// not a transposition bug. `memorysafe_policy::eviction::evictions_needed`
+    /// is built on exactly this pair of shapes (the pending-admission one and
+    /// this standing one) — see its doc comment for the fuller account of who
+    /// calls which and why.
     pub fn would_exceed(&self, items: u64, bytes: u64) -> bool {
         let items_over = self
             .budget
