@@ -22,7 +22,10 @@ memorysafe-core.workspace = true
 memorysafe-embed.workspace = true
 memorysafe-engine.workspace = true
 memorysafe-policy.workspace = true
+memorysafe-api.workspace = true
+memorysafe-mcp.workspace = true
 anyhow.workspace = true
+axum.workspace = true
 blake3.workspace = true
 clap.workspace = true
 serde.workspace = true
@@ -37,6 +40,9 @@ tracing-subscriber.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
+tower.workspace = true
 
 [lints]
 workspace = true

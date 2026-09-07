@@ -45,6 +45,39 @@ pub async fn serve_stdio(engine: Arc<Engine>, source: ScopeSource) -> anyhow::Re
     Ok(())
 }
 
+/// Deployment knobs for the streamable-HTTP transport.
+#[derive(Debug, Clone)]
+pub struct HttpTransportConfig {
+    /// Hostnames or `host:port` authorities this server answers for. Loopback
+    /// only by default — accepting any `Host` is a DNS-rebinding hole against
+    /// locally running servers.
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for HttpTransportConfig {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: vec!["localhost".into(), "127.0.0.1".into()],
+        }
+    }
+}
+
+pub fn http_service_with(
+    engine: Arc<Engine>,
+    source: ScopeSource,
+    config: HttpTransportConfig,
+) -> StreamableHttpService<MemorySafeServer, LocalSessionManager> {
+    let mut server_config = StreamableHttpServerConfig::default();
+    server_config.allowed_hosts = config.allowed_hosts;
+    StreamableHttpService::new(
+        move || Ok(MemorySafeServer::new(engine.clone(), source.clone())),
+        Arc::new(LocalSessionManager::default()),
+        server_config
+            .with_legacy_session_mode(false)
+            .with_json_response(true),
+    )
+}
+
 /// A tower service ready to be mounted, typically at `/mcp`.
 ///
 /// With `legacy_session_mode(false)`, `StreamableHttpServerConfig`'s own doc
@@ -60,13 +93,7 @@ pub fn http_service(
     engine: Arc<Engine>,
     source: ScopeSource,
 ) -> StreamableHttpService<MemorySafeServer, LocalSessionManager> {
-    StreamableHttpService::new(
-        move || Ok(MemorySafeServer::new(engine.clone(), source.clone())),
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
-            .with_json_response(true),
-    )
+    http_service_with(engine, source, HttpTransportConfig::default())
 }
 
 #[cfg(test)]

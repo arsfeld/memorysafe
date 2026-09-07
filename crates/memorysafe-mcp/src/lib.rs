@@ -12,7 +12,7 @@ mod tools_write;
 mod transport;
 
 pub use scope::{Resolved, ScopeSource};
-pub use transport::{http_service, serve_stdio};
+pub use transport::{HttpTransportConfig, http_service, http_service_with, serve_stdio};
 
 use crate::resources::{ResourceKind, resource_uri, uri_template};
 use memorysafe_core::AuditFilter;

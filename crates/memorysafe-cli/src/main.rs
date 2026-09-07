@@ -51,6 +51,8 @@ enum Command {
         #[command(subcommand)]
         command: cmd::keys::KeysCommand,
     },
+    /// Run the MCP server (stdio) or the HTTP API plus MCP transport.
+    Serve(cmd::serve::ServeArgs),
 }
 
 fn main() -> Result<()> {
@@ -100,6 +102,7 @@ async fn run(cli: Cli, config: MsafeConfig) -> Result<()> {
         Command::Export(args) => cmd::portable::export(&engine, scope, cli.json, args).await,
         Command::Import(args) => cmd::portable::import(&engine, scope, cli.json, args).await,
         Command::Keys { .. } => unreachable!(),
+        Command::Serve(args) => cmd::serve::serve(engine, &config, scope, args).await,
     }
 }
 
