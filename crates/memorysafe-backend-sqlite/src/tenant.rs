@@ -585,9 +585,27 @@ mod tests {
     /// path whose entire purpose is that one bad closure cannot take a tenant
     /// out.
     ///
-    /// The bound is deliberately far below the 5s `busy_timeout` and far above
-    /// the ~7ms the healed path takes, so it discriminates without being
-    /// timing-sensitive.
+    /// **This used to be a wall-clock proxy** (`elapsed < 2s`) and it was
+    /// flaky: under CPU contention the *correct* path — release, then a fresh
+    /// `~7ms` write — can itself take longer than any fixed budget for
+    /// reasons that have nothing to do with the lock, so the bound produced
+    /// false failures. Widening the bound was rejected too: it only makes the
+    /// false failure rarer, and it directly weakens the real regression this
+    /// test exists to catch, because a *genuinely* blocked replacement waits
+    /// on SQLite's `busy_timeout` (5s) and a wider budget can simply
+    /// accommodate that wait and pass anyway.
+    ///
+    /// The replacement below asserts the structural property the old
+    /// message already named — *the write succeeds* — and nothing about
+    /// timing. `busy_timeout` is what turns "the replacement waits on the
+    /// poisoned lock" into a deterministic outcome either way: released in
+    /// time, the write succeeds in single-digit milliseconds; not released,
+    /// the write blocks for the full 5s and then fails with `database is
+    /// locked`. Both outcomes are non-flaky; only their duration differs, and
+    /// duration is not what this test checks. Confirmed by breaking the
+    /// healing path (dropping `drop(handle)` in `with_conn`) and observing
+    /// this assertion fail deterministically at ~5s with that exact error —
+    /// see `d4-report.md`.
     #[tokio::test]
     async fn healing_releases_the_write_lock_the_panicking_closure_held() {
         let dir = tempfile::tempdir().unwrap();
@@ -607,7 +625,12 @@ mod tests {
             .await;
         assert!(blown.is_err(), "a panicking closure returned Ok");
 
-        let started = std::time::Instant::now();
+        // The structural property, not a timing proxy for it: if the poisoned
+        // connection were still alive here, this write would contend for its
+        // write lock and, bounded by `busy_timeout` (`schema::initialise`),
+        // fail with `database is locked` rather than merely run slowly — so
+        // success itself is the deterministic signal that the poisoned
+        // connection was dropped before the reopen.
         let rows: i64 = mgr
             .with_write(&t, |c| {
                 c.execute("INSERT INTO meta(key,value) VALUES('after','ok')", [])
@@ -616,15 +639,10 @@ mod tests {
                     .sql()
             })
             .await
-            .expect("the tenant did not recover from a panic inside a transaction");
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "the replacement connection waited on the poisoned one's write lock \
-             for {elapsed:?}; the poisoned connection was not dropped before \
-             the reopen"
-        );
+            .expect(
+                "the replacement connection did not get a clean write lock: \
+                 the poisoned connection was not dropped before the reopen",
+            );
         // schema_version + after. The panicking transaction rolled back with
         // the connection it was opened on.
         assert_eq!(rows, 2, "the uncommitted write survived the panic");

@@ -81,6 +81,25 @@ pub fn delete(conn: &Connection, scope: &Scope, id: &ItemId) -> Result<(), Backe
     Ok(())
 }
 
+/// The number of `vectors` rows stored for `scope`, read from this table's
+/// **own** `subject`/`namespace` columns — no join to `items`.
+///
+/// This is the low-level half of
+/// [`crate::SqliteBackend::vector_row_count`], the public accessor built on
+/// it; see that method's doc for why an unjoined, table-own count is the
+/// thing worth exposing at all rather than a count derived from `search` or
+/// `scope_embedder`.
+pub fn count(conn: &Connection, scope: &Scope) -> Result<u64, BackendError> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM vectors WHERE subject=?1 AND namespace=?2",
+            params![scope.subject.as_str(), scope.namespace.as_str()],
+            |r| r.get(0),
+        )
+        .sql()?;
+    Ok(n as u64)
+}
+
 /// Which embedder this scope's vectors were produced by. `None` when the scope
 /// holds no vectors yet. Comparing across models yields silently meaningless
 /// similarities, so every search gates on this.
@@ -534,5 +553,69 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "vector row survived its item");
+    }
+
+    /// D1 fix round 1's review (C2): `count` had a real surviving mutant —
+    /// its entire predicate replaced with `?1 IS NOT NULL AND ?2 IS NOT
+    /// NULL` (the bound params still referenced, so it reads as used, but
+    /// the `WHERE` no longer restricts anything), turning a per-scope count
+    /// into a whole-tenant-file count. It survived because every test that
+    /// read through `count` (via `SqliteBackend::vector_row_count`) kept
+    /// exactly one vector row in the entire tenant at a time — a per-scope
+    /// count and a whole-file count are numerically identical whenever
+    /// nothing else in the file holds a vector, so "exercised at 0 and at 1"
+    /// was exercise, not coverage.
+    ///
+    /// **One dimension varied at a time**, the methodology
+    /// `search_and_scope_embedder_are_scoped_by_subject_and_namespace`
+    /// above documents and this file already established: `home` holds a
+    /// vector, and so do two neighbours that each differ from `home` in
+    /// exactly one coordinate. A predicate that drops the whole `WHERE`
+    /// (the mutant above), or just its subject half, or just its namespace
+    /// half, each lets a different one of these three counts come out too
+    /// high.
+    #[test]
+    fn count_is_scoped_by_subject_and_namespace_not_the_whole_tenant_file() {
+        let c = conn();
+        let e = DeterministicEmbedder::new(256);
+
+        let home = memorysafe_core::Scope::new("t", "s", "n").unwrap();
+        let subject_neighbour = memorysafe_core::Scope::new("t", "other-s", "n").unwrap();
+        let namespace_neighbour = memorysafe_core::Scope::new("t", "s", "other-n").unwrap();
+
+        for (scope, body) in [
+            (&home, "alpha"),
+            (&subject_neighbour, "beta"),
+            (&namespace_neighbour, "gamma"),
+        ] {
+            let item = memorysafe_backend::conformance::fx::item(scope, body);
+            crate::items::insert(&c, &item).unwrap();
+            let q = memorysafe_embed::QuantizedVector::from_embedding(&e.embed(body).unwrap());
+            insert(&c, &item.id, scope, &q).unwrap();
+        }
+
+        // Positive control first: the tenant file genuinely holds three
+        // vector rows, so a `count` returning 1 for every scope below is
+        // proof of scoping, not an accident of an empty file.
+        let total: i64 = c
+            .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3, "the fixture did not actually plant three rows");
+
+        assert_eq!(
+            count(&c, &home).unwrap(),
+            1,
+            "count must be scoped to home alone, not the tenant file's total"
+        );
+        assert_eq!(
+            count(&c, &subject_neighbour).unwrap(),
+            1,
+            "count leaked across the subject boundary"
+        );
+        assert_eq!(
+            count(&c, &namespace_neighbour).unwrap(),
+            1,
+            "count leaked across the namespace boundary"
+        );
     }
 }

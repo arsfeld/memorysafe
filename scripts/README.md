@@ -43,6 +43,19 @@ surviving mutant, all hit for real here:
 Silence means "no test caught it" only after 1 and 2 are excluded. And a survivor is a
 finding only if some input distinguishes the mutant from the original.
 
+**A fourth way, that wears no error message at all: a mutant left applied in the working
+tree.** This is what "the working tree is never touched" above is *for* — but only when
+`mutate` is what did the touching. Hand-applied mutation testing (edit a file, run the
+suite, revert, repeat — necessary whenever the mutation isn't a clean textual anchor `mutate`
+can target) has no such guarantee, and there is nothing to warn you: the tree still
+compiles and the suite still passes, which is exactly what a genuine survivor looks like.
+No red test, no build error, no clippy warning — it ships as if it were the fix. The only
+reliable tell is reading `git diff` before every commit, not just after a run that reported
+a survivor. Worth naming precisely: documenting a mutant in prose (a comment recording that a
+`WHERE` clause turned into a tautology survived) and actually leaving that tautology in the
+compiled `WHERE` clause look identical to a `grep` for the mutated string — the search finds
+both, and cannot tell you which one it found.
+
 ## Not yet a CI gate
 
 `stub-sweep` becomes one when the count reaches zero — a step asserting it stays there is

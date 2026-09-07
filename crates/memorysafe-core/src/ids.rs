@@ -310,6 +310,40 @@ mod tests {
         );
     }
 
+    /// `ADMIN_COMPONENT` is a stored word too, not just an internal check
+    /// value: Task 2 writes every tenant-level audit row under a `Scope`
+    /// whose subject and namespace are both this literal (see
+    /// `the_admin_scope_is_recognisable_and_is_not_a_normal_scope` below),
+    /// and adapters compare caller input against this same constant to
+    /// reject it (`memorysafe-auth`'s `RESERVED_COMPONENTS`). Nothing else in
+    /// this crate pins the literal `"_admin"` — it appears exactly once, at
+    /// the const definition — so changing the constant's value would compile
+    /// clean and pass every other test here, while silently orphaning every
+    /// already-written `_admin` audit row and un-reserving the string
+    /// `"_admin"` itself in every adapter that checks against the constant.
+    ///
+    /// **Vacuous if** rewritten to `assert_eq!(ADMIN_COMPONENT, ADMIN_COMPONENT)`
+    /// or to any comparison against the constant itself; the literal on the
+    /// right is the whole test.
+    #[test]
+    fn the_admin_component_literal_is_frozen_and_is_a_legal_component() {
+        assert_eq!(
+            ADMIN_COMPONENT, "_admin",
+            "ADMIN_COMPONENT is written into stored audit rows and compared \
+             against by name in adapters; changing its spelling orphans every \
+             row already filed under the old one and silently un-reserves it"
+        );
+        assert!(
+            Namespace::new(ADMIN_COMPONENT).is_ok(),
+            "a leading underscore must stay legal, or Scope::admin could not \
+             be built at all"
+        );
+        assert!(
+            SubjectId::new(ADMIN_COMPONENT).is_ok(),
+            "core does not reject the reserved word; an adapter does"
+        );
+    }
+
     #[test]
     fn ulid_ids_parse_back_and_reject_garbage() {
         let id = ItemId::new();

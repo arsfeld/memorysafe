@@ -1,8 +1,21 @@
 use crate::AuthError;
 use crate::key::{ApiKeyRecord, hash_presented, parse_presented};
-use memorysafe_core::{ADMIN_COMPONENT, Actor, ActorKind, Scope, TenantId};
+use memorysafe_core::{ADMIN_COMPONENT, Actor, ActorKind, PURGED_COMPONENT, Scope, TenantId};
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
+
+/// Subject/namespace values a caller may never supply. Both are legal
+/// components by `memorysafe-core`'s validation (that crate cannot enforce
+/// caller-input rules — see `PURGED_COMPONENT`'s doc), so guarding against
+/// them is this adapter's job.
+///
+/// A slice, not a chain of `||`s: the failure mode this guards against is a
+/// third reserved word landing in `memorysafe-core` and someone updating this
+/// adapter's rejection logic without noticing there is now a second `||` to
+/// add too — which is exactly how `PURGED_COMPONENT` was missed here the
+/// first time. Adding a word to this slice is the only step required; the
+/// check below iterates it and cannot itself go stale.
+const RESERVED_COMPONENTS: &[&str] = &[ADMIN_COMPONENT, PURGED_COMPONENT];
 
 #[derive(Debug, Clone, Default)]
 pub struct ApiKeyStore {
@@ -85,10 +98,11 @@ impl Authenticated {
     /// taken from the credential and never from the request, so a scope that
     /// crosses tenants is unrepresentable rather than merely rejected.
     pub fn scope(&self, subject: &str, namespace: &str) -> Result<Scope, AuthError> {
-        if subject == ADMIN_COMPONENT || namespace == ADMIN_COMPONENT {
-            return Err(AuthError::Reserved {
-                component: ADMIN_COMPONENT,
-            });
+        if let Some(&component) = RESERVED_COMPONENTS
+            .iter()
+            .find(|&&reserved| subject == reserved || namespace == reserved)
+        {
+            return Err(AuthError::Reserved { component });
         }
         Ok(Scope::new(self.tenant.as_str(), subject, namespace)?)
     }
@@ -187,17 +201,64 @@ mod tests {
         // Task 2 writes tenant-level audit rows under `_admin`. A caller that
         // could name that scope could read another tenant's policy history —
         // or forge rows that look like the engine wrote them.
+        //
+        // Pin the returned `component` to the literal, not just the variant:
+        // `Err(AuthError::Reserved { .. })` alone is satisfied by a `scope`
+        // that always reports "_admin" regardless of which reserved word
+        // actually matched -- a caller rejected for "_purged" would then be
+        // told "'_admin' is reserved". That degree of freedom does not exist
+        // in the old single-word check; the `RESERVED_COMPONENTS` slice
+        // introduced it, so the test has to close it.
         let (store, secret, _) = store_with("ci");
         let auth = store.authenticate(&secret).unwrap();
 
         assert!(matches!(
             auth.scope(memorysafe_core::ADMIN_COMPONENT, "agent"),
-            Err(AuthError::Reserved { .. })
+            Err(AuthError::Reserved {
+                component: "_admin"
+            })
         ));
         assert!(matches!(
             auth.scope("user-42", memorysafe_core::ADMIN_COMPONENT),
-            Err(AuthError::Reserved { .. })
+            Err(AuthError::Reserved {
+                component: "_admin"
+            })
         ));
+    }
+
+    #[test]
+    fn purged_is_refused_in_either_position() {
+        // `_purged` is where the engine files a purged subject's `SubjectPurged`
+        // residue when the subject owned no items (memorysafe-core's
+        // `PURGED_COMPONENT` doc). A caller who names an ordinary subject or
+        // namespace `_purged` puts its own audit rows alongside purge records.
+        // Hardcode the literal here (not by referencing the production
+        // constant list) so this test still fails if the fix's reserved-word
+        // slice ever drops `_purged`.
+        let (store, secret, _) = store_with("ci");
+        let auth = store.authenticate(&secret).unwrap();
+
+        // Pin the returned `component` to "_purged", not just the variant --
+        // see the comment on `the_reserved_component_is_refused_in_either_position`
+        // for why `Err(AuthError::Reserved { .. })` alone is not enough.
+        assert!(
+            matches!(
+                auth.scope("_purged", "agent"),
+                Err(AuthError::Reserved {
+                    component: "_purged"
+                })
+            ),
+            "'_purged' as subject was accepted, or reported the wrong component"
+        );
+        assert!(
+            matches!(
+                auth.scope("user-42", "_purged"),
+                Err(AuthError::Reserved {
+                    component: "_purged"
+                })
+            ),
+            "'_purged' as namespace was accepted, or reported the wrong component"
+        );
     }
 
     #[test]

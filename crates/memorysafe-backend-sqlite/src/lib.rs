@@ -63,6 +63,56 @@ impl SqliteBackend {
     pub fn forget_tenant(&self, tenant: &TenantId) {
         self.tenants.forget(tenant);
     }
+
+    /// The number of `vectors` rows stored for `scope`.
+    ///
+    /// **Why this exists: neither failure shape a `vectors`/`items`
+    /// mismatch can take is visible any other way.** There are two, and
+    /// they are opposite:
+    ///
+    /// - A **widowed item** — an `items` row that survives while its
+    ///   `vectors` row is gone. This is what D1 actually produced: a live
+    ///   item, fully readable through `get`/`list`, permanently invisible to
+    ///   vector search. `vector_row_count` dropping for a scope that made no
+    ///   eviction of its own is what makes this observable, since nothing
+    ///   else in the crate counts `vectors` at all — `capacity` never does,
+    ///   and `vectors::search` (so `neighbours`) joins `vectors` to `items`
+    ///   on `item_id`, which cannot show a row that used to exist there.
+    /// - An **orphaned vector** — a `vectors` row with no matching `items`
+    ///   row. `ON DELETE CASCADE` with `foreign_keys=ON` forbids this from
+    ///   existing at all in the schema as written, so it is reachable only
+    ///   if that enforcement itself fails (a future schema without the
+    ///   cascade, or a connection with the pragma off) — not by D1. When it
+    ///   does exist, `vector_row_count` staying nonzero after every `items`
+    ///   row in that scope is gone is what shows it; `export` round-trips
+    ///   through the same `items` join `search` does, so it would silently
+    ///   *drop* an orphan on export/import rather than failing on it.
+    ///
+    /// `PurgeReport::vectors_removed` is this codebase's only other public
+    /// vector-count surface, and it is purge-specific, not a general
+    /// observer. This is called directly by D1's eviction tests
+    /// (`tests::eviction_out_of_scope_does_not_widow_another_scopes_item`,
+    /// `tests::eviction_in_scope_still_deletes_the_vector_row`), which is
+    /// the entire reason it exists — see them for the property it makes
+    /// assertable without reaching into raw SQL from a test.
+    ///
+    /// It has few or no other callers today. That is deliberate, not an
+    /// oversight: documented here so it doesn't read, later, as the kind of
+    /// unexplained public accessor `known-gaps.md` already flags for
+    /// `forget_tenant`. A later referential-integrity invariant (no vector
+    /// row without a live item row in the same scope) is expected to build
+    /// on it — this fix does not implement that invariant, only the
+    /// observer it will need.
+    ///
+    /// On the concrete type deliberately, **not** on `Backend`: a trait
+    /// method binds every backend to a contract, which is a decision for
+    /// whoever owns that trait, not a side effect of one crate's defect fix.
+    pub async fn vector_row_count(&self, scope: &Scope) -> Result<u64, BackendError> {
+        let scope = scope.clone();
+        self.tenants
+            .with_conn(&scope.tenant.clone(), move |c| vectors::count(c, &scope))
+            .await
+    }
 }
 
 /// Every method real. Task 20 implements `get`, `list`, `audit`,
@@ -204,16 +254,19 @@ impl Backend for SqliteBackend {
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|e| tenant::storage_error(e, false))?;
-                // Must stay the transaction's first statement, ahead of the
-                // eviction loop below — this is an `INSERT OR IGNORE` (a
-                // write) so a DEFERRED transaction takes its write lock right
-                // here, before the eviction loop's `items::delete` can open
-                // it with a `SELECT` instead. `capacity::adjust` also calls
-                // `ensure_row` internally, so this call is redundant for
-                // *its* correctness — its only job is to go first. See
-                // `crate::aggregates`' module doc for the hazard this
-                // ordering closes and why nothing in this crate's suite can
-                // fail if the order regresses.
+                // Stays the transaction's first statement, ahead of the
+                // eviction loop below — but not because statement order
+                // decides the lock any more. This transaction opens as
+                // `TransactionBehavior::Immediate`, which takes the write
+                // lock the moment it opens, before any statement runs, so
+                // going first no longer determines how the transaction
+                // opened. `capacity::adjust` also calls `ensure_row`
+                // internally, so this call was always redundant for *its*
+                // own correctness. It stays first anyway, as defence in
+                // depth: insurance against a future path that opens this
+                // transaction as `Deferred` again, at which point statement
+                // order would matter exactly as it used to. See
+                // `crate::aggregates`' module doc for the full history.
                 capacity::ensure_row(&tx, &txn.scope)?;
 
                 // **A transaction whose `evictions` names the same id its
@@ -244,6 +297,63 @@ impl Backend for SqliteBackend {
 
                 for id in &txn.evictions {
                     let size = items::delete(&tx, &txn.scope, id)?;
+                    // D1 (see the task report's appendices for the fix's
+                    // full history): no separate `vectors::delete` call here
+                    // — deliberately. The scoped `vectors::delete` this crate
+                    // does carry exists for the merge path alone, which has
+                    // no cascade to lean on: `items::merge` is an `UPDATE`,
+                    // the item row survives it, and the stale vector must be
+                    // removed explicitly there. This loop must not grow a
+                    // call to it back. `vectors.item_id` is `REFERENCES
+                    // items(id) ON DELETE CASCADE` and `schema::initialise`
+                    // turns `foreign_keys` on for every connection this loop
+                    // runs on, so `items::delete`'s own `DELETE FROM items
+                    // ...` above already removes the matching `vectors` row
+                    // whenever it actually deletes an `items` row — measured
+                    // to fire inside exactly this shape of transaction by
+                    // `tests::the_cascade_fires_inside_an_immediate_transaction_on_an_initialised_connection`.
+                    //
+                    // A second, manual `vectors::delete(&tx, id)` used to sit
+                    // here, unconditionally and with no scope predicate of
+                    // its own. That call is D1: `items::delete`'s own
+                    // subject/namespace predicate correctly refused an
+                    // out-of-scope id (`size` stayed `0`, so the cascade
+                    // never had an `items` deletion to fire from), but the
+                    // manual `vectors` delete ran anyway — widowing a live
+                    // item in another scope, stripping its vector while the
+                    // item itself stayed fully readable through `get`/`list`.
+                    //
+                    // A later fix round restored that call with a scope
+                    // predicate of its own, as recorded defence-in-depth
+                    // against the cascade failing (a future schema dropping
+                    // `ON DELETE CASCADE`, or a connection with
+                    // `foreign_keys` off). Retired again, deliberately: both
+                    // failure modes the defence targeted are already caught
+                    // loudly by the existing suite the moment they occur —
+                    // dropping `ON DELETE CASCADE` from the DDL fails 4
+                    // tests outright (`foreign_keys=ON` then rejects the
+                    // `items` delete itself, `FOREIGN KEY constraint
+                    // failed`), and flipping `schema::initialise`'s
+                    // `foreign_keys` pragma to `"OFF"` with the cascade
+                    // intact fails 5, including
+                    // `tests::eviction_in_scope_still_deletes_the_vector_row`'s
+                    // `scope_embedder` assertion specifically — see the task
+                    // report for both runs. Three tests pin the cascade and
+                    // the pragma today:
+                    // `schema::tests::initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector`,
+                    // `vectors::tests::deleting_an_item_cascades_to_its_vector`,
+                    // `tenant::tests::a_freshly_opened_tenant_is_in_wal_mode_with_foreign_keys_on`.
+                    // A defence that duplicates a check the suite already
+                    // makes loudly, at the cost of a second, independently
+                    // scoped `DELETE` statement that must itself stay
+                    // correct forever, was paying more than it protected —
+                    // and what it protected against, both times it existed,
+                    // is exactly what this comment exists to make sure never
+                    // comes back as a silent regression instead of a design
+                    // decision.
+                    //
+                    // See `tests::eviction_out_of_scope_does_not_widow_another_scopes_item`
+                    // and `tests::eviction_in_scope_still_deletes_the_vector_row`.
                     if size > 0 {
                         delta_items -= 1;
                         delta_bytes -= size as i64;
@@ -789,6 +899,229 @@ mod tests {
             .await
             .unwrap()
     }
+
+    /// D1: an out-of-scope eviction **widows** a live item — not a
+    /// cross-scope *orphan*, and not a tenant-isolation defect. Terminology,
+    /// precisely, because the two failure shapes are opposite and this is
+    /// the one D1 actually produces: with `vectors.item_id ... ON DELETE
+    /// CASCADE` and `foreign_keys=ON`, a `vectors` row with no matching
+    /// `items` row (an orphan) cannot exist at all — the FK forbids it. What
+    /// the pre-fix code produced instead was an `items` row that stays
+    /// fully readable through `get`/`list` while its `vectors` row is gone:
+    /// a live item stripped of its vector, permanently invisible to vector
+    /// search, with no error anywhere. One database file per tenant is
+    /// structural and unaffected here; `subject`/`namespace` are query
+    /// predicates within that one file, and this is where the eviction loop
+    /// dropped one of them.
+    ///
+    /// The eviction loop used to call a `vectors::delete(&tx, id)` that
+    /// carried no scope predicate of its own, unconditionally, outside the
+    /// `if size > 0` guard that `items::delete`'s own subject/namespace
+    /// predicate already computed. So a transaction scoped to B naming A's
+    /// id as an eviction left A's `items` row alone (the scoped `DELETE`
+    /// matched no row, `size == 0`, so the cascade never had anything to
+    /// fire from) but still deleted A's `vectors` row — the refusal was
+    /// computed and then thrown away, widowing A's item.
+    ///
+    /// `b.get` proves the item survives (the existing scoped guard already
+    /// gets that right — this is not a duplicate of
+    /// `a_phantom_eviction_is_not_reported_as_evicted`); `vector_row_count`
+    /// is what actually distinguishes the buggy version from the fixed one
+    /// — `home` holds exactly one vector throughout, so its count dropping
+    /// to 0 while the item itself survives is precisely the widowing this
+    /// test exists to catch.
+    ///
+    /// **One dimension varied at a time**, the same methodology
+    /// `vectors::tests::search_and_scope_embedder_are_scoped_by_subject_and_namespace`
+    /// documents and uses. After the fix, an out-of-scope eviction is
+    /// refused by `items::delete`'s own predicate alone — `size` stays `0`,
+    /// so the cascade (the fix's sole mechanism on this path; the crate's
+    /// `vectors::delete` is the merge path's alone) never has an `items` row
+    /// deleted for it to fire from, and nothing else touches `vectors` at
+    /// all. A version of this test that varied only the subject would pass
+    /// a fix whose predicate dropped the namespace half, and vice versa —
+    /// so `attacker_subject` differs from home in subject alone and
+    /// `attacker_namespace` differs in namespace alone, each sharing home's
+    /// other coordinate.
+    #[tokio::test]
+    async fn eviction_out_of_scope_does_not_widow_another_scopes_item() {
+        let b = backend();
+        let home = scope("s", "n");
+        let attacker_subject = scope("other-s", "n");
+        let attacker_namespace = scope("s", "other-n");
+
+        let item = fx::item(&home, "owned by home, embedded for search");
+        b.apply(fx::admit_txn_embedded(&home, item.clone()))
+            .await
+            .unwrap();
+
+        for attacker in [&attacker_subject, &attacker_namespace] {
+            // Scoped to the attacker; its evictions name home's id.
+            // `items::delete` refuses (home's item is out of scope for the
+            // attacker) — on the pre-fix code, the bug ran an unscoped
+            // `vectors::delete` anyway, widowing home's item regardless of
+            // which half of the predicate the attacker differed on.
+            b.apply(fx::evict_txn(attacker, vec![item.id.clone()]))
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            b.get(&home, &item.id).await.unwrap().is_some(),
+            "an out-of-scope eviction deleted the item itself, not just its vector"
+        );
+
+        assert_eq!(
+            b.vector_row_count(&home).await.unwrap(),
+            1,
+            "an eviction scoped to a different subject or namespace deleted \
+             home's vector row for an id it was never allowed to touch"
+        );
+    }
+
+    /// D1's companion: the in-scope path must still remove the vector row —
+    /// via the cascade, which is the shipped fix's sole mechanism (see the
+    /// task report's appendices for why an earlier round's explicit,
+    /// scoped `vectors::delete` was tried and then retired). The fix must
+    /// not satisfy the widow test above by deleting nothing ever — this
+    /// proves the good path still works. No conformance test binds this
+    /// today — every eviction call site in
+    /// `crates/memorysafe-backend/src/conformance/` builds a single scope, so
+    /// the in-scope cleanup path is unexercised there, and this is the only
+    /// place left standing that fails if an over-broad fix quietly stops
+    /// deleting the vector row on the *good* path.
+    ///
+    /// **Three readers, because none alone is diagnostic for every failure
+    /// shape.** `b.get` proves the item itself is gone — necessary, but not
+    /// sufficient. `neighbours` is the user-visible outcome, but on its own
+    /// it **cannot** distinguish "the vector row was actually removed" from
+    /// "it survived as an invisible orphan": `vectors::search`'s query is an
+    /// `INNER JOIN` on `items` (see that function's doc), so once
+    /// `items::delete` has removed the `items` row — which it does
+    /// correctly here, on both the buggy and the fixed code, since this
+    /// eviction is genuinely in scope — the join drops any orphaned
+    /// `vectors` row regardless of whether one exists. Asserting
+    /// `hits.is_empty()` alone would pass identically whether or not the fix
+    /// actually cleaned up `vectors`.
+    ///
+    /// `vectors::scope_embedder` is what closes that gap: it reads
+    /// `vectors`' own `subject`/`namespace` directly, with **no** join to
+    /// `items`. This scope holds no other vector, so if the evicted item's
+    /// row survived as an orphan, `scope_embedder` would still report
+    /// `Some(("deterministic-256", 256))` — a stale model identity for a
+    /// scope that (from `neighbours`' point of view) looks empty. Asserting
+    /// it is `None` is the assertion that actually fails if the vector row
+    /// lingers. `vector_row_count` is kept as the most direct instrument of
+    /// the three, and the one every mutation below is checked against
+    /// first — it is the same unjoined, table-own read as `scope_embedder`,
+    /// just phrased as a count.
+    #[tokio::test]
+    async fn eviction_in_scope_still_deletes_the_vector_row() {
+        use memorysafe_embed::Embedder;
+
+        let b = backend();
+        let s = scope("s", "n");
+        let item = fx::item(&s, "owned by s, embedded for search");
+        b.apply(fx::admit_txn_embedded(&s, item.clone()))
+            .await
+            .unwrap();
+
+        b.apply(fx::evict_txn(&s, vec![item.id.clone()]))
+            .await
+            .unwrap();
+
+        assert!(
+            b.get(&s, &item.id).await.unwrap().is_none(),
+            "the in-scope eviction did not remove the item itself"
+        );
+
+        let probe = fx::embedder().embed(&item.body).unwrap();
+        let hits = b.neighbours(&s, &probe, 10).await.unwrap();
+        assert!(
+            hits.is_empty(),
+            "the evicted item's vector still came back through neighbours"
+        );
+
+        let embedder_identity = b
+            .tenants
+            .with_conn(&s.tenant.clone(), {
+                let s = s.clone();
+                move |c| vectors::scope_embedder(c, &s)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            embedder_identity, None,
+            "scope_embedder still reports a stored model after the scope's \
+             only vector was evicted — the vectors row survived as an \
+             orphan that neighbours/search cannot see, because their query \
+             joins through items, which the eviction correctly deleted"
+        );
+
+        assert_eq!(
+            b.vector_row_count(&s).await.unwrap(),
+            0,
+            "an in-scope eviction left the vector row behind"
+        );
+    }
+
+    /// **Isolates one question: does the `ON DELETE CASCADE` on
+    /// `vectors.item_id` fire inside a `TransactionBehavior::Immediate`
+    /// transaction, on a connection that went through `schema::initialise`
+    /// (which turns `foreign_keys` on)?** `apply` opens exactly this kind of
+    /// transaction, so this measures the transaction-shape question that a
+    /// bare, non-transactional unit test cannot answer.
+    ///
+    /// **What this test does *not* claim.** Unlike
+    /// `schema::tests::initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector`,
+    /// this test does not force `PRAGMA foreign_keys=OFF` before calling
+    /// `initialise` — so it cannot tell an `initialise` with the
+    /// `foreign_keys` pragma line deleted from one with it present; that
+    /// regression is that other test's job. It also uses
+    /// `Connection::open_in_memory`, not `Connection::open(&path)` — the
+    /// pool's own connections are file-backed with WAL in effect
+    /// (`tenant::Pool::handle`) — so this measures the cascade/transaction
+    /// interaction on a connection built the same way (`initialise`, then a
+    /// manual `Immediate` transaction), not on a connection that is
+    /// byte-for-byte the one `apply` runs on. `foreign_keys` semantics do
+    /// not depend on in-memory vs. file-backed storage, so the substance
+    /// carries over, but the claim is scoped to what was actually run.
+    ///
+    /// This test calls `items::delete` directly — the crate's
+    /// `vectors::delete` serves the merge path and is never called on
+    /// eviction. The cascade measured here is the *only* mechanism that removes a
+    /// `vectors` row on eviction; see the task report's appendices for why
+    /// an earlier fix round's explicit, scoped `vectors::delete` (a second,
+    /// independent line of defence) was tried and then retired as
+    /// redundant with what this test proves.
+    #[test]
+    fn the_cascade_fires_inside_an_immediate_transaction_on_an_initialised_connection() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        schema::initialise(&conn).unwrap();
+
+        let s = scope("s", "n");
+        let item = fx::item(&s, "cascade probe");
+        items::insert(&conn, &item).unwrap();
+        let q = fx::vector_for(&item.body);
+        vectors::insert(&conn, &item.id, &s, &q).unwrap();
+
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let size = items::delete(&tx, &s, &item.id).unwrap();
+        assert!(size > 0, "the probe's own item::delete must have matched");
+        tx.commit().unwrap();
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "the ON DELETE CASCADE did not fire inside an Immediate transaction \
+             on an initialise()-opened connection"
+        );
+    }
+
     /// **The aggregate write rule, on `apply`, and this test is the only thing
     /// that can see it.**
     ///

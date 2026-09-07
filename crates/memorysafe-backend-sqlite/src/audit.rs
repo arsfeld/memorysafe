@@ -9,6 +9,23 @@
 //! **Every insert here is one half of a pair.** The other half is
 //! `aggregates::increment`, in the same transaction. The rule is stated once,
 //! on `memorysafe_backend::aggregates`, and binds every audit-writing path.
+//!
+//! **`decision`'s `f64` evidence round-trips bit-for-bit.** `insert` stores
+//! `record.decision` as `serde_json::to_string`, and `query` reads it back
+//! with `serde_json::from_str`. Its absence loses 1 ULP on the bit patterns
+//! `f32`-widened evidence produces -- e.g. `0.98_f32 as f64`, the shape of
+//! `NearDuplicate`'s `threshold` evidence -- so this depends on the
+//! `float_roundtrip` Cargo feature being enabled on `serde_json`. That is
+//! set on the **workspace** dependency (root `Cargo.toml`), not here: the
+//! parser must not vary by build scope. `memorysafe-core` -- which owns
+//! `Decision`/`FeatureMap` -- cannot depend on this or any backend crate
+//! (real, and CI-enforced via the purity job's `cargo tree` dependency
+//! check, not a build), so it cannot inherit a crate-level feature from
+//! one. A crate-level override here would unify into a full workspace run
+//! but silently revert to the inexact parser under any per-crate build,
+//! `cargo test -p memorysafe-core` being the obvious one. Proven and
+//! pinned by `audit::tests::
+//! evidence_shaped_by_f32_widening_survives_the_audit_round_trip_exactly`.
 
 use crate::tenant::SqlResultExt;
 use memorysafe_backend::BackendError;
@@ -128,6 +145,32 @@ pub fn query(
         for n in names {
             args.push(Box::new(n.to_string()));
         }
+    }
+    // `filter.item`, when set, narrows to records whose `items` column (a
+    // JSON array of `ItemRef { id, digest }` objects — see the module doc)
+    // contains an element whose `id` matches. This must stay a SQL predicate
+    // ANDed in here, before `ORDER BY ... LIMIT` is appended below, rather
+    // than a Rust-side filter applied to the fetched rows: `limit` is
+    // documented on `AuditFilter` as `min(limit, rows matching the WHOLE
+    // filter)`, and a caller relies on `returned.len() < limit` as the only
+    // signal the log is exhausted (there is deliberately no `truncated`
+    // flag). Filtering after an item-blind `LIMIT` would satisfy a
+    // `len()`-only test while quietly returning fewer than `min(limit,
+    // matching)` rows.
+    //
+    // Matches the parsed `id` field specifically via `json_extract`, not a
+    // `LIKE` over the raw column: an `ItemId` is a 26-character ULID and a
+    // `digest` is BLAKE3 hex, so a substring match could in principle match
+    // the wrong field, or a prefix of a longer id. Follows the
+    // `json_each`-over-a-JSON-array precedent in `retrieve.rs`'s
+    // `filter_sql`, adapted for an array of objects rather than of strings.
+    if let Some(item_id) = &filter.item {
+        args.push(Box::new(item_id.as_str().to_string()));
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM json_each(items) \
+               WHERE json_extract(json_each.value, '$.id') = ?{})",
+            args.len()
+        ));
     }
     if let Some(since) = filter.since {
         args.push(Box::new(since.unix_timestamp()));
@@ -458,5 +501,335 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(query(&conn, &s, &capped).unwrap().len(), 1);
+    }
+
+    /// `filter.item` narrows to records whose `items` column references that
+    /// `ItemId`, and only those. Two records, each referencing a distinct
+    /// item, plus a third record referencing no item at all (an eviction,
+    /// the same shape `record`/`insert` produce when `items` is left `vec![]`)
+    /// — asserted in both directions, on the exact id returned rather than a
+    /// count, so a backend that ignores `filter.item` (returns all three) or
+    /// one that treats `item: Some(_)` as merely "items is non-empty"
+    /// (returns the item-referencing pair but not the phantom) both fail
+    /// here.
+    #[test]
+    fn filter_item_narrows_to_records_referencing_that_item() {
+        let conn = db();
+        let s = scope("s", "n");
+        let item_a = item(&s, "a body");
+        let item_b = item(&s, "b body");
+
+        let mut rec_a = record(&s, AuditEvent::Admitted, 100);
+        rec_a.items = vec![ItemRef::from_item(&item_a)];
+        insert(&conn, &rec_a).unwrap();
+
+        let mut rec_b = record(&s, AuditEvent::Admitted, 200);
+        rec_b.items = vec![ItemRef::from_item(&item_b)];
+        insert(&conn, &rec_b).unwrap();
+
+        // A phantom eviction: no item reference at all.
+        let phantom = record(&s, AuditEvent::Forgotten, 300);
+        insert(&conn, &phantom).unwrap();
+
+        let for_a = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(item_a.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            for_a.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![rec_a.id.clone()],
+            "filtering by item A's id must return exactly A's record, not B's \
+             or the phantom's"
+        );
+
+        let for_b = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(item_b.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            for_b.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![rec_b.id.clone()],
+            "filtering by item B's id must return exactly B's record, not A's \
+             or the phantom's"
+        );
+    }
+
+    /// The residual left open by the conformance suite: it only ever queries
+    /// `item` against `AuditFilter::default()`, whose `limit` is 100, so it
+    /// never combines `item` with a constraining `limit` and — since nothing
+    /// implemented the field before this change — could not have. Per
+    /// `Backend::audit`'s contract, `item` is applied BEFORE `limit`, so
+    /// `limit` means `min(limit, rows matching the WHOLE filter)`.
+    ///
+    /// A backend that filters a fetched page in Rust *after* an
+    /// item-blind `SQL LIMIT` would satisfy `filter_item_narrows_to_records_
+    /// referencing_that_item` above (that test's `limit` is the default 100,
+    /// comfortably wider than its three-row corpus) while still breaking the
+    /// contract here: `AuditFilter::limit`'s doc makes `returned.len() <
+    /// limit` the *only* signal the log is exhausted, so a caller fed a short
+    /// page for the wrong reason wrongly concludes it reached the end.
+    ///
+    /// The corpus interleaves matching and non-matching rows by id
+    /// (newest-first is the row order) so that the newest `limit` rows,
+    /// taken WITHOUT the item predicate, are *not* the same set as the
+    /// newest `limit` rows that reference item A: id5/id3/id1 (the three
+    /// newest, unfiltered) reference item B, while item A is on id4/id2/id0.
+    /// A page-then-filter backend intersects those two sets and returns only
+    /// id4 (one row); the correct SQL-first ordering returns id4, id2, id0
+    /// (three rows) — `min(limit=3, matching=3)`.
+    #[test]
+    fn filter_item_is_applied_before_limit_not_after() {
+        let conn = db();
+        let s = scope("s", "n");
+        let item_a = item(&s, "a body");
+        let item_b = item(&s, "b body");
+
+        let ids = [
+            "01ARZ3NDEKTSV4RRFFQ69G5FB0", // oldest
+            "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB3",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB4",
+            "01ARZ3NDEKTSV4RRFFQ69G5FB5", // newest
+        ];
+        // Even indices (0, 2, 4) reference item A; odd indices (1, 3, 5)
+        // reference item B. Three rows match `item: Some(item_a)`.
+        for (i, id) in ids.iter().enumerate() {
+            let mut rec = record(&s, AuditEvent::Admitted, 100 + i as i64);
+            rec.id = AuditId::parse(id).unwrap();
+            rec.items = vec![ItemRef::from_item(if i % 2 == 0 {
+                &item_a
+            } else {
+                &item_b
+            })];
+            insert(&conn, &rec).unwrap();
+        }
+
+        let got: Vec<String> = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(item_a.id.clone()),
+                limit: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id.as_str().to_string())
+        .collect();
+
+        assert_eq!(
+            got,
+            vec![ids[4].to_string(), ids[2].to_string(), ids[0].to_string()],
+            "limit=3 with item=A must return all three item-A rows \
+             (min(limit, matching) = 3), newest first — a backend that cuts \
+             the SQL LIMIT before filtering by item would instead intersect \
+             the newest 3 rows overall ({}, {}, {}, only one of which is \
+             item A) with the item filter and return just one row",
+            ids[5],
+            ids[4],
+            ids[3],
+        );
+    }
+
+    /// Clause 2 of `filter.item`'s contract — "ANDs with `events`/`since`/
+    /// `until`/`after`" — had zero coverage before this test: every other
+    /// test in this module sets `item` alone against
+    /// `AuditFilter::default()`, or sets `events`/`since`/`until`/`after`
+    /// without `item`. A predicate that silently stops applying itself
+    /// whenever *any one* of the other fields is also set — e.g. `filter
+    /// .item.as_ref().filter(|_| filter.events.is_empty())`, or the same
+    /// gated on `after`, or on `since`/`until` both being unset — compiles
+    /// and leaves every other test in this file green, because none of them
+    /// combine `item` with a second active predicate.
+    ///
+    /// **Decorrelated deliberately**, to avoid a trap a naive version of
+    /// this test falls into: if item A only ever appeared on rows that also
+    /// satisfy `events`, dropping the item predicate under an
+    /// `events`-gated mutant would still coincidentally return the right
+    /// set, because `events` alone already happens to pick out exactly the
+    /// item-A rows. So: item A appears on both an `events`-matching row
+    /// (`id0`) and a non-matching one (`id2`); item B appears on both an
+    /// `events`-matching row (`id1`) and a non-matching one (`id4`). `id1`
+    /// — item B, event `Admitted`, timestamped inside the `since`/`until`
+    /// window, and older than the `after` cursor — is the trap row: it
+    /// satisfies every predicate in this filter *except* `item`, so it is
+    /// exactly what leaks back in the moment any one of
+    /// `events`/`since`/`until`/`after` silently disables the item
+    /// predicate, regardless of which one does it.
+    #[test]
+    fn filter_item_ands_with_events_since_until_and_after_without_being_bypassed() {
+        let conn = db();
+        let s = scope("s", "n");
+        let item_a = item(&s, "a body");
+        let item_b = item(&s, "b body");
+
+        let ids = [
+            "01ARZ3NDEKTSV4RRFFQ69G5FC0", // id0
+            "01ARZ3NDEKTSV4RRFFQ69G5FC1", // id1 -- the trap row
+            "01ARZ3NDEKTSV4RRFFQ69G5FC2", // id2
+            "01ARZ3NDEKTSV4RRFFQ69G5FC3", // id3 -- the `after` cursor value
+            "01ARZ3NDEKTSV4RRFFQ69G5FC4", // id4
+            "01ARZ3NDEKTSV4RRFFQ69G5FC5", // id5
+        ];
+        let items_for_rows = [
+            &item_a, // id0: item A, matches events, inside window, before cursor
+            &item_b, // id1: item B, matches events, inside window, before cursor -- the trap
+            &item_a, // id2: item A, but wrong event
+            &item_a, // id3: item A, matches events and window, but IS the cursor (excluded)
+            &item_b, // id4: item B, wrong event, outside window, past cursor
+            &item_b, // id5: item B, matches events, but outside window and past cursor
+        ];
+        let events_for_rows = [
+            AuditEvent::Admitted,
+            AuditEvent::Admitted,
+            AuditEvent::Forgotten,
+            AuditEvent::Admitted,
+            AuditEvent::Forgotten,
+            AuditEvent::Admitted,
+        ];
+        let ats = [100, 150, 200, 220, 400, 450];
+
+        for i in 0..ids.len() {
+            let mut rec = record(&s, events_for_rows[i], ats[i]);
+            rec.id = AuditId::parse(ids[i]).unwrap();
+            rec.items = vec![ItemRef::from_item(items_for_rows[i])];
+            insert(&conn, &rec).unwrap();
+        }
+
+        let got: Vec<String> = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(item_a.id.clone()),
+                events: vec![AuditEvent::Admitted],
+                since: Some(OffsetDateTime::from_unix_timestamp(50).unwrap()),
+                until: Some(OffsetDateTime::from_unix_timestamp(250).unwrap()),
+                after: Some(AuditId::parse(ids[3]).unwrap()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id.as_str().to_string())
+        .collect();
+
+        assert_eq!(
+            got,
+            vec![ids[0].to_string()],
+            "item must keep narrowing the result even with events/since/ \
+             until/after all set too -- id1 (item B) matches every other \
+             predicate in this filter and must never appear; got {got:?}"
+        );
+    }
+
+    /// Regression guard against the `LIKE '%...%'` shape the brief
+    /// explicitly warned off: a raw substring match over the `items` column
+    /// can match the wrong *field*, not just the right field at the wrong
+    /// position. This row is inserted directly (bypassing `insert`, which
+    /// can only ever produce a `digest` from a real `ItemRef::from_item`) so
+    /// its `digest` field can be crafted to literally contain a different
+    /// id's string as a substring, while its own `id` field does not equal
+    /// that id. A `LIKE`-based predicate over the raw column text would
+    /// match this row when queried by the *contained* id; `json_extract`
+    /// reaching only `$.id` must not.
+    #[test]
+    fn filter_item_does_not_match_an_id_that_only_appears_inside_a_digest() {
+        let conn = db();
+        let s = scope("s", "n");
+
+        let needle = "01ARZ3NDEKTSV4RRFFQ69G5FD0"; // never any row's own `id` field below
+        let planted_digest = format!("aa{needle}bb"); // contains `needle` as a raw substring
+        let items_json =
+            format!(r#"[{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FD1","digest":"{planted_digest}"}}]"#);
+
+        conn.execute(
+            "INSERT INTO audit (id, at, subject, namespace, event, items, assessment, decision,
+                 actor, policy)
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,?7,NULL)",
+            params![
+                "01ARZ3NDEKTSV4RRFFQ69G5FD2",
+                1_700_000_000_i64,
+                s.subject.as_str(),
+                s.namespace.as_str(),
+                AuditEvent::Admitted.as_str(),
+                items_json,
+                serde_json::to_string(&Actor::system()).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let got = query(
+            &conn,
+            &s,
+            &AuditFilter {
+                item: Some(ItemId::parse(needle).unwrap()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            got.is_empty(),
+            "the requested id appears only inside another item's digest, \
+             never as any item's own `id` field -- a LIKE-based substring \
+             match over the raw `items` column would incorrectly match this \
+             row; json_extract must not. got {got:?}"
+        );
+    }
+
+    /// D3 reproduction. `Reason.evidence` values shaped by this codebase's
+    /// actual `f32 -> f64` widening -- every `PolicyConfig` threshold is
+    /// `f32`, and `features!` casts it `as f64` (see
+    /// `memorysafe_policy::admit::decide`'s `NearDuplicate` reason, whose
+    /// `threshold` evidence is `cfg.duplicate_threshold` widened from its
+    /// `f32` default `0.98`) -- do NOT survive this table's `decision`
+    /// column round trip bit-for-bit. A plain decimal literal such as
+    /// `0.1_f64` does NOT reproduce this; only bit patterns that arise from
+    /// widening an `f32` do, because the loss lives in `serde_json`'s
+    /// DEFAULT (non-`float_roundtrip`) float parser -- see `insert`'s and
+    /// `query`'s doc comment for the mechanism -- not in anything this
+    /// crate or `memorysafe-core` does with the bytes.
+    #[test]
+    fn evidence_shaped_by_f32_widening_survives_the_audit_round_trip_exactly() {
+        let conn = db();
+        let s = scope("s", "n");
+        // The exact shape of `NearDuplicate`'s `threshold` evidence:
+        // `BaselineConfig::duplicate_threshold` is `f32` and defaults to
+        // `0.98`; `features!` widens it `as f64`.
+        let widened = 0.98_f32 as f64;
+        let mut evidence = memorysafe_core::FeatureMap::new();
+        evidence.insert("threshold".to_string(), widened);
+
+        let mut rec = record(&s, AuditEvent::Rejected, 1);
+        rec.decision = Some(Decision::reject(
+            PolicyId::new("baseline", "0.1.0"),
+            Reason::new(ReasonCode::NearDuplicate, "near duplicate", evidence),
+        ));
+
+        insert(&conn, &rec).unwrap();
+        let back = query(&conn, &s, &AuditFilter::default()).unwrap();
+        let stored = back[0].decision.as_ref().unwrap().reasons[0].evidence["threshold"];
+
+        assert_eq!(
+            stored.to_bits(),
+            widened.to_bits(),
+            "the audit round trip moved a bit: wrote {:016x} ({}), read back {:016x} ({})",
+            widened.to_bits(),
+            widened,
+            stored.to_bits(),
+            stored,
+        );
     }
 }

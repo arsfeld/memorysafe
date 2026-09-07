@@ -56,13 +56,6 @@ build_timeout_multiplier = 10.0
 #   TO MUTATION-TEST filter_sql: disable `passes` first. With it enabled these
 #   cannot fail. That is the procedure, and it is the reason this entry exists.
 #
-# vectors::delete -> Ok(())
-#   `schema.rs`'s vectors DDL is `REFERENCES items(id) ON DELETE CASCADE`, so
-#   the row goes when the item does. The explicit delete is defence against a
-#   future schema that drops the cascade.
-#   TO TEST: assert on the vectors table directly after an eviction, not
-#   through any read path that joins items.
-#
 # --- equivalent under reachable states --------------------------------------
 #
 # Backend::neighbours, `||` -> `&&` in the cross-model guard.
@@ -80,3 +73,47 @@ build_timeout_multiplier = 10.0
 #   `items.id` is TEXT PRIMARY KEY, so `WHERE id = ?1` matches at most one row
 #   in the file, and merge's own `get` has already refused an out-of-scope
 #   target. No input distinguishes it. The predicate stays as defence.
+#
+# --- retired: an allowlist entry whose function no longer exists ------------
+#
+# vectors::delete -> Ok(()) used to live here (in "masked by a working first
+# line"). The function is gone — `crates/memorysafe-backend-sqlite/src/vectors.rs`
+# has no `delete` any more — so there is nothing left to allowlist. Recorded
+# for whoever next reaches for the old entry.
+#
+# It existed as an explicit, unconditional DELETE FROM vectors WHERE item_id
+# = ?1 in the eviction loop, called before the size > 0 guard that
+# items::delete's own subject/namespace predicate had already computed. Its
+# original justification (this entry, as it read before this edit) was
+# defence against `schema.rs`'s `ON DELETE CASCADE` not firing — a future
+# schema change, or foreign_keys off. That call being UNSCOPED, not merely
+# present, is what widowed a live item in another scope on an out-of-scope
+# eviction: a real defect (D1 — see the task's own report), not equivalence.
+#
+# A later fix round restored a scoped version of the same call, as
+# defence-in-depth. Retired a second time, this time for good, on measured
+# grounds rather than argued ones: both failure modes the defence targeted
+# are already caught loudly by the existing suite the moment they occur.
+#   - Drop `ON DELETE CASCADE` from the `vectors` DDL: `foreign_keys=ON`
+#     then rejects the `items` delete itself outright —
+#     `SqliteFailure(..., "FOREIGN KEY constraint failed")` — failing 4
+#     tests immediately, none of them a false pass.
+#   - Flip `schema::initialise`'s `foreign_keys` pragma to `"OFF"`, cascade
+#     intact: fails 5 tests, including
+#     `tests::eviction_in_scope_still_deletes_the_vector_row`'s
+#     `scope_embedder` assertion specifically (`Some(("deterministic-256",
+#     256))` where `None` was expected — the shape of an orphaned vector
+#     row, the mirror image of D1's widowed item).
+# Three tests pin the cascade and the pragma today, so either regression is
+# caught on its own without any help from a redundant delete:
+# `schema::tests::initialise_turns_foreign_keys_on_and_an_item_delete_cascades_to_its_vector`,
+# `vectors::tests::deleting_an_item_cascades_to_its_vector`,
+# `tenant::tests::a_freshly_opened_tenant_is_in_wal_mode_with_foreign_keys_on`.
+#
+# TO TEST what remains: the eviction path's only mechanism now is the
+# cascade, exercised inside the exact transaction shape `apply` uses by
+# `tests::the_cascade_fires_inside_an_immediate_transaction_on_an_initialised_connection`,
+# and its scope correctness (an out-of-scope eviction must never reach an
+# `items` delete to cascade from) by
+# `tests::eviction_out_of_scope_does_not_widow_another_scopes_item` and
+# `items::tests::delete_returns_the_removed_charge_and_is_scoped`.
