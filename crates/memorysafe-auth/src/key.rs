@@ -102,10 +102,13 @@ mod tests {
         // secret. That made the old check *more* sensitive than the one
         // below, not less: any JSON containing the whole secret necessarily
         // contains that suffix too, so the old assertion fired in a strict
-        // superset of the cases this one does. (Correction of `ec22ff0`,
-        // which called this replacement "strictly stronger" -- backwards;
-        // see that commit's follow-up for the measurement.) What was wrong
-        // with the old needle was never its sensitivity -- it was that the
+        // superset of the cases this one does. (Correction of `66c7b41`
+        // [formerly `ec22ff0`; this branch's author identity was rewritten
+        // after that commit landed, giving every commit on it a new SHA --
+        // see the history-rewrite note at the end of this branch's commit
+        // log], which called this replacement "strictly stronger" --
+        // backwards; see that commit's follow-up for the measurement.) What
+        // was wrong with the old needle was never its sensitivity -- it was that the
         // needle's length and position were unspecifiable in advance. On the
         // days the body's last `_` fell near the end, the needle was one or
         // two characters, too short to mean anything, and matched the
