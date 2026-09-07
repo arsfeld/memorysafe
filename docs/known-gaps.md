@@ -1,7 +1,7 @@
 # Known gaps at the conformance freeze
 
-State at `bc3de76`, after the SQLite backend passed the fifty-test suite and the suite was
-frozen at `2d5701c`. Every line was verified by running something, not by reading.
+State at `6e75fe4`, after the SQLite backend passed the fifty-test suite and the suite was
+frozen at `8187bd9`. Every line was verified by running something, not by reading.
 
 **Why this file exists.** These were tracked in a cross-session conversation and a
 git-ignored workspace. Both are `/tmp` with extra steps — the same failure as the audit
@@ -40,11 +40,12 @@ asserted that everything in it was run.
 three branches at once; a claim about another lane's code is true on the branch that wrote it
 and can become false at the merge, and nothing checks that automatically, because each branch
 reviews green against its own tree. Prefer wording true in both states; where that's
-impossible, name the commit. Durable: "As of `ce8168e`, the unscoped `vectors::delete` call in
+impossible, name the commit. Durable: "As of `667909d`, the unscoped `vectors::delete` call in
 the eviction loop was retired." Branch-dependent, therefore wrong on some branch: "There is no
 `vectors::delete`" — the function is `vectors.rs`'s `pub fn delete`, still present on the
-branch this file ships from, and absent at `0163047`. Either present-tense form is false
-somewhere.
+branch this file ships from, and absent at `49fca6d` (a tree claim — check with
+`git show 49fca6d:crates/memorysafe-backend-sqlite/src/vectors.rs`). Either present-tense form
+is false somewhere.
 
 **The quietest sub-case: a comment naming a future task as its remedy.** That deferral goes
 stale exactly when the named task *succeeds* — worse than a branch merge, because a merge is
@@ -98,10 +99,17 @@ it** — one grep, at the one moment someone is guaranteed to already be looking
 name. Nothing else in the process ever revisits a comment that names a task, which is exactly
 why this class stays quiet.
 
+**A third instance shows the same class failing the other way.** This file's own "Elsewhere"
+section named `TransactionBehavior::Immediate` as the pending upgrade from an ordering-based
+closure to a structural one; the fix landed and the entry kept naming it pending until this
+pass corrected it (see "Elsewhere," below) — same remedy, now shown to fail whichever direction
+a deferral ages. A sibling instance lives in `aggregates.rs`'s module doc, in another lane's
+crate — not this file's to fix, but the same class once more.
+
 ## The freeze, and what it costs to change
 
-`git diff crates/memorysafe-backend/src/conformance/` between `520fda7` (where the SQLite
-crate began) and `2d5701c` is **two files, zero non-comment lines** — both documentation.
+`git diff crates/memorysafe-backend/src/conformance/` between `ce1af6b` (where the SQLite
+crate began) and `8187bd9` is **two files, zero non-comment lines** — both documentation.
 The backend was implemented against a stationary target, which is what makes "it passes the
 suite" mean anything. Checkable by anyone holding the two SHAs.
 
@@ -185,10 +193,11 @@ coincide with); `apply`'s `size > 0` guard (closed as a side effect of moving
 its four boundary mutants. Not excuses: to mutation-test `filter_sql`, **disable `passes`
 first** — with it enabled these cannot fail. See `.cargo/mutants.toml`.
 
-**Retired in the backend-sqlite defect lane (commit `ce8168e`).** The `vectors::delete ->
-Ok(())` entry described a mutant masked by `ON DELETE CASCADE`, and justified keeping the
-explicit call as defence against a future schema that drops the cascade. That justification
-did not survive measurement: dropping `ON DELETE CASCADE` from the schema fails 4 tests and
+**Retired in the backend-sqlite defect lane (commit `667909d`; a diff claim — check with
+`git show 667909d`).** The `vectors::delete -> Ok(())` entry described a mutant masked by
+`ON DELETE CASCADE`, and justified keeping the explicit call as defence against a future
+schema that drops the cascade. That justification did not survive measurement: dropping
+`ON DELETE CASCADE` from the schema fails 4 tests and
 disabling the `foreign_keys` pragma fails 5, so the second line of defence guarded a failure
 the suite already catches loudly — while its unscoped, unconditional call in the eviction loop
 was itself the defect it now records. On an out-of-scope eviction it **widowed a live item in
@@ -256,10 +265,11 @@ Members differ in the size of the promise they break, ranked accordingly.
   test sets these fields; this is the same field found dead in the implementation, not merely
   untested.
 - **`EngineCache::put_stats` — the write half of its per-scope statistics cache. Open. Cite
-  `e5d810c`** (Task 37's cache work; this branch is based on `b91f72b` and does not contain the
-  file — verified at that commit, not this one). `EngineCache::stats` and
-  `EngineCache::put_stats` are defined in `crates/memorysafe-engine/src/cache.rs`. Every call to
-  `put_stats` is `#[cfg(test)]`: in `crates/memorysafe-engine/src/maintain.rs` and
+  `c3e0d01`** (Task 37's cache work; this branch is based on `8dd7ee6` and does not contain the
+  file — a tree claim, verified at that commit via
+  `git show c3e0d01:crates/memorysafe-engine/src/cache.rs`, not this one). `EngineCache::stats`
+  and `EngineCache::put_stats` are defined in `crates/memorysafe-engine/src/cache.rs`. Every
+  call to `put_stats` is `#[cfg(test)]`: in `crates/memorysafe-engine/src/maintain.rs` and
   `crates/memorysafe-engine/src/mutate.rs` every call sits below each file's `#[cfg(test)]`
   boundary, and the rest are in `tests/cache.rs` — so the stats map is never written outside a
   test. Production reads bypass it entirely: `gather.rs`, `maintain.rs` and `read.rs` each call
@@ -360,9 +370,9 @@ it sat.
    "0 passed, 0 failed" — a manufactured absence that read as a measurement. General trap, not
    one lane's mistake: `| tail` masks the real exit status and truncates the evidence in the
    same stroke.
-3. **`vectors::count`'s own scope predicate was unpinned. Closed. Cite `0163047`** (the tip of
-   `worktree-sdd-sqlite-defects`; this branch is based on `b91f72b` and does not contain the
-   fix — measured via `git show 0163047:crates/memorysafe-backend-sqlite/src/vectors.rs`, not
+3. **`vectors::count`'s own scope predicate was unpinned. Closed. Cite `49fca6d`** (the tip of
+   `worktree-sdd-sqlite-defects`; this branch is based on `8dd7ee6` and does not contain the
+   fix — measured via `git show 49fca6d:crates/memorysafe-backend-sqlite/src/vectors.rs`, not
    this branch's HEAD). `vectors::count` is the accessor built
    specifically to detect scope leaks, which is what makes this the sharpest of the four: the
    instrument *was* the leak detector, and its own predicate went untested. The surviving
@@ -433,9 +443,14 @@ for the pattern you most recently removed, before committing a fix for anything 
 
 ## Elsewhere
 
-- **Every transaction is `DEFERRED`.** `apply` now opens with a write (`capacity::ensure_row`),
-  so the `SQLITE_BUSY_SNAPSHOT` exposure is closed on that path — **by ordering, which no
-  test pins**. `TransactionBehavior::Immediate` would make it structural.
+- **Every transaction now opens `TransactionBehavior::Immediate`. Correction, measured**
+  (see "Surviving mutants" above): this entry read "every transaction is `DEFERRED`," true only
+  while `apply`'s opening write (`capacity::ensure_row`) closed the `SQLITE_BUSY_SNAPSHOT`
+  exposure by ordering alone — **by ordering, which no test pinned** — and it stayed unrevised
+  after the fix landed.
+  `grep -rn "TransactionBehavior::Immediate" crates/memorysafe-backend-sqlite/src/` finds four
+  call sites: `purge.rs:25`, `portability.rs:152`, `lib.rs:111`, `lib.rs:198`. The exposure is
+  now closed structurally, not by the position of one call.
 - **The `vectors` table stores scope twice.** `subject`/`namespace` are duplicated from
   `items`. **Correction, measured** (see "An instrument that produces a wrong answer" above):
   the original "exactly one reader, `scope_embedder`" count was an inspection, not a
