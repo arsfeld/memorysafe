@@ -1050,6 +1050,7 @@ dependencies = [
  "anyhow",
  "http",
  "memorysafe-auth",
+ "memorysafe-backend",
  "memorysafe-backend-sqlite",
  "memorysafe-core",
  "memorysafe-embed",

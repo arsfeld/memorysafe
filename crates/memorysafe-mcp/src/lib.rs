@@ -6,6 +6,7 @@
 
 pub mod dto;
 pub mod scope;
+mod tools_curate;
 mod tools_write;
 
 pub use scope::{Resolved, ScopeSource};
@@ -29,7 +30,7 @@ impl MemorySafeServer {
         Self {
             engine,
             source,
-            tool_router: Self::write_router(),
+            tool_router: Self::write_router() + Self::curate_router(),
         }
     }
 }

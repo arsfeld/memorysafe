@@ -8,6 +8,7 @@ description = "MCP server for the MemorySafe governed-memory engine"
 
 [dependencies]
 memorysafe-auth.workspace = true
+memorysafe-backend.workspace = true
 memorysafe-core.workspace = true
 memorysafe-engine.workspace = true
 anyhow.workspace = true

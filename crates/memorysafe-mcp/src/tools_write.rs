@@ -11,7 +11,12 @@ use time::{Duration, OffsetDateTime};
 
 /// Engine failures are the only tool errors. A rejection, a merge, or an empty
 /// working set is a successful call carrying a decision.
-fn engine_error(e: memorysafe_engine::EngineError) -> ErrorData {
+///
+/// `pub(crate)`, not private: `tools_curate.rs` (Task 4) maps the same
+/// `EngineError` variants the same way for `memory_review`/`memory_forget`/
+/// `memory_protect`, and a second hand-copy of this match is exactly the kind
+/// of duplication that drifts silently.
+pub(crate) fn engine_error(e: memorysafe_engine::EngineError) -> ErrorData {
     match &e {
         memorysafe_engine::EngineError::Validation(_)
         | memorysafe_engine::EngineError::NotFound(_)

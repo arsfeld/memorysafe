@@ -51,6 +51,21 @@ pub fn protection_name(p: &Protection) -> &'static str {
     }
 }
 
+/// `pinned` is absolute; `protected` is a window and must carry its deadline.
+/// Defaulting the deadline would silently turn a time-boxed exemption into a
+/// permanent one.
+///
+/// The five-branch decision table itself lives in `memorysafe_core::parse_protection`,
+/// not here: it is pure logic about the `Protection` type, and the HTTP and
+/// CLI adapters need the identical table. This function is the thin,
+/// MCP-specific part — mapping `memorysafe_core::ProtectionParseError` into
+/// `rmcp::ErrorData` — so a rename or a new branch in the shared table cannot
+/// silently drift out of step with what this adapter reports.
+pub fn parse_protection(level: &str, until: Option<i64>) -> Result<Protection, ErrorData> {
+    memorysafe_core::parse_protection(level, until)
+        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct MemoryView {
     pub id: String,
@@ -283,6 +298,66 @@ pub struct RecallParams {
     pub namespace: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ReviewParams {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub subject: Option<String>,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReviewedMemory {
+    #[serde(flatten)]
+    pub memory: MemoryView,
+    /// The most recent recorded decision naming this item. `null` when the
+    /// decision is older than the audit window this review looked at — the item
+    /// is still governed, its reason is simply out of reach from here.
+    pub reason_code: Option<String>,
+    pub reason_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReviewResult {
+    pub items: Vec<ReviewedMemory>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ForgetParams {
+    pub ids: Option<Vec<String>>,
+    pub tag: Option<String>,
+    pub kind: Option<String>,
+    pub subject: Option<String>,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ForgetResult {
+    pub forgotten: Vec<String>,
+    pub audit_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProtectParams {
+    pub id: String,
+    /// `normal`, `protected`, or `pinned`. `protected` requires `until`.
+    pub level: String,
+    /// Unix seconds. Required for `protected`, rejected for the others.
+    pub until: Option<i64>,
+    pub subject: Option<String>,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ProtectResult {
+    pub item_id: String,
+    pub protection: String,
+    pub protected_until: Option<i64>,
+    pub audit_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +447,53 @@ mod tests {
                 "{action:?} disagrees with core's own serde tag"
             );
         }
+    }
+
+    #[test]
+    fn protection_parsing_maps_the_core_error_into_error_data() {
+        // The six-row decision table itself is tested exhaustively in
+        // `memorysafe_core::item::tests` — this only pins that the MCP
+        // wrapper actually delegates to it (rather than re-deriving the
+        // table) and turns its structured error into `ErrorData::invalid_params`
+        // with the same message text a caller would see from `memorysafe_core`
+        // directly.
+        assert_eq!(
+            parse_protection("pinned", None).unwrap(),
+            Protection::Pinned
+        );
+        assert_eq!(
+            parse_protection("normal", None).unwrap(),
+            Protection::Normal
+        );
+
+        let err = parse_protection("protected", None).unwrap_err();
+        assert_eq!(
+            err.message.as_ref(),
+            "'protected' requires 'until'; use 'pinned' for permanent protection"
+        );
+
+        let err = parse_protection("pinned", Some(1)).unwrap_err();
+        assert_eq!(
+            err.message.as_ref(),
+            "'until' is meaningless for level 'pinned'"
+        );
+
+        let err = parse_protection("locked", None).unwrap_err();
+        assert_eq!(
+            err.message.as_ref(),
+            "unknown protection level 'locked'; expected normal, protected, or pinned"
+        );
+
+        let err = parse_protection("protected", Some(i64::MAX)).unwrap_err();
+        assert_eq!(
+            err.message.as_ref(),
+            "'until' is not a valid Unix timestamp"
+        );
+
+        assert!(matches!(
+            parse_protection("protected", Some(0)).unwrap(),
+            Protection::Protected { until } if until == time::OffsetDateTime::UNIX_EPOCH
+        ));
     }
 
     #[test]
