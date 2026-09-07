@@ -42,6 +42,17 @@ fn auth_error(e: AuthError) -> ErrorData {
     ErrorData::invalid_params(e.to_string(), None)
 }
 
+/// Strips a case-insensitive `Bearer` scheme from an `Authorization` header
+/// value, still requiring exactly the one space `strip_prefix("Bearer ")`
+/// required. RFC 7235 auth schemes are case-insensitive
+/// (`bearer <token>` is a valid credential), so a literal
+/// `strip_prefix("Bearer ")` rejects a spec-legal client for no reason this
+/// crate has any stake in.
+fn strip_bearer(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(rest)
+}
+
 impl ScopeSource {
     pub fn resolve(
         &self,
@@ -95,7 +106,7 @@ impl ScopeSource {
                     .headers
                     .get(http::header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "))
+                    .and_then(strip_bearer)
                     .ok_or_else(|| auth_error(AuthError::Missing))?;
                 let auth = keys.authenticate(presented).map_err(auth_error)?;
 
@@ -216,6 +227,41 @@ mod tests {
                 .resolve(&parts(Some(&g.secret)), Some("user-42"), Some("agent"))
                 .is_err(),
             "a bare key without the Bearer scheme must be refused"
+        );
+    }
+
+    #[test]
+    fn http_accepts_the_bearer_scheme_case_insensitively() {
+        // RFC 7235 auth schemes are case-insensitive. `Bearer`, `bearer`, and
+        // `BEARER` must all work; the single space after the scheme is still
+        // required, so `Bearerx` (no space) must still be refused.
+        let g = generate(TenantId::new("acme").unwrap(), "ci").unwrap();
+        let source = ScopeSource::Http {
+            keys: Arc::new(ApiKeyStore::new(vec![g.record])),
+        };
+
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            assert!(
+                source
+                    .resolve(
+                        &parts(Some(&format!("{scheme} {}", g.secret))),
+                        Some("user-42"),
+                        Some("agent"),
+                    )
+                    .is_ok(),
+                "scheme '{scheme}' was refused"
+            );
+        }
+
+        assert!(
+            source
+                .resolve(
+                    &parts(Some(&format!("Bearer{}", g.secret))),
+                    Some("user-42"),
+                    Some("agent"),
+                )
+                .is_err(),
+            "a missing space after the scheme must still be refused"
         );
     }
 

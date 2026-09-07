@@ -72,6 +72,7 @@ impl MemorySafeServer {
             .as_deref()
             .map(parse_sensitivity)
             .transpose()?;
+        req.occurred_at = timestamp(params.occurred_at, "occurred_at")?;
         req.ttl = params.ttl_seconds.map(Duration::seconds);
         req.idempotency_key = params.idempotency_key;
 
@@ -113,12 +114,19 @@ impl MemorySafeServer {
                 max_tokens: params.max_tokens.or(default_budget.max_tokens),
                 max_items: params.max_items.or(default_budget.max_items),
             },
+            // Fail closed, matching `memorysafe_backend::query::HardFilters`'s
+            // own documented default for this exact field. A caller that
+            // wants personal, sensitive, or restricted memories back must
+            // name the ceiling explicitly; the cost of guessing too narrow
+            // (a visible, reported annoyance fixed by passing the argument)
+            // is not symmetric with the cost of guessing too wide (a silent
+            // over-disclosure nobody notices).
             sensitivity_ceiling: params
                 .sensitivity_ceiling
                 .as_deref()
                 .map(parse_sensitivity)
                 .transpose()?
-                .unwrap_or(SensitivityLevel::Restricted),
+                .unwrap_or(SensitivityLevel::Internal),
         };
 
         let ws = self.engine.recall(req).await.map_err(engine_error)?;

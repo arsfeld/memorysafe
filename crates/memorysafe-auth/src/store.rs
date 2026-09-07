@@ -118,9 +118,21 @@ impl Authenticated {
         }
     }
 
-    /// The only constructor of a `Scope` in the network adapters. The tenant is
-    /// taken from the credential and never from the request, so a scope that
-    /// crosses tenants is unrepresentable rather than merely rejected.
+    /// The constructor of a `Scope` for any adapter path that authenticates
+    /// an API key. The tenant is taken from the credential and never from
+    /// the request, so a scope that crosses tenants is unrepresentable
+    /// rather than merely rejected.
+    ///
+    /// Not the only site a `Scope` is built in the network adapters, so do
+    /// not assume routing a caller-supplied subject/namespace through this
+    /// method is the only way scope construction gets guarded: MCP's stdio
+    /// transport (`memorysafe-mcp`'s `ScopeSource::Stdio` arm) builds one
+    /// directly, because there is no API key to authenticate on that path at
+    /// all — the tenant (and there, the subject too) is the server's own
+    /// configuration, fixed when the process starts, the way a CLI process
+    /// already runs as a fixed OS user. That site is safe for the same
+    /// reason this one is: tenant comes from a value the caller never
+    /// supplies, never from request input, on either path.
     pub fn scope(&self, subject: &str, namespace: &str) -> Result<Scope, AuthError> {
         check_reserved(Some(subject), Some(namespace))?;
         Ok(Scope::new(self.tenant.as_str(), subject, namespace)?)

@@ -69,20 +69,43 @@ pub struct MemoryView {
 
 impl From<&MemoryItem> for MemoryView {
     fn from(item: &MemoryItem) -> Self {
+        // Destructured, not read by field access off `item` directly: a
+        // struct LITERAL reading named fields off `&MemoryItem` compiles
+        // fine and silently drops a field `MemoryItem` gains later, which is
+        // exactly what this module's doc comment claims cannot happen. A
+        // destructuring pattern with no `..` is exhaustive, so a new field on
+        // `MemoryItem` fails this match to compile until it is named here —
+        // even the fields this view does not carry (`scope`, `source`,
+        // `attrs`, `ttl`) are bound, to `_`, to keep the pattern exhaustive.
+        let MemoryItem {
+            id,
+            scope: _,
+            body,
+            kind,
+            source: _,
+            occurred_at,
+            created_at,
+            tags,
+            attrs: _,
+            sensitivity,
+            ttl: _,
+            protection,
+            pending_embedding,
+        } = item;
         Self {
-            id: item.id.to_string(),
-            body: item.body.clone(),
-            kind: item.kind.clone(),
-            tags: item.tags.clone(),
-            sensitivity: sensitivity_name(item.sensitivity),
-            protection: protection_name(&item.protection).to_owned(),
-            protected_until: match item.protection {
+            id: id.to_string(),
+            body: body.clone(),
+            kind: kind.clone(),
+            tags: tags.clone(),
+            sensitivity: sensitivity_name(*sensitivity),
+            protection: protection_name(protection).to_owned(),
+            protected_until: match protection {
                 Protection::Protected { until } => Some(until.unix_timestamp()),
                 _ => None,
             },
-            created_at: item.created_at.unix_timestamp(),
-            occurred_at: item.occurred_at.map(|t| t.unix_timestamp()),
-            pending_embedding: item.pending_embedding,
+            created_at: created_at.unix_timestamp(),
+            occurred_at: occurred_at.as_ref().map(|t| t.unix_timestamp()),
+            pending_embedding: *pending_embedding,
         }
     }
 }
@@ -222,6 +245,13 @@ pub struct RememberParams {
     pub tags: Option<Vec<String>>,
     /// May only raise the level the detectors assign, never lower it.
     pub sensitivity_hint: Option<String>,
+    /// When this memory happened, if different from when it was written.
+    /// Unix seconds. Without it, this item's `occurred_at` is `None` on
+    /// write, and `memory_recall`'s `occurred_after`/`occurred_before`
+    /// bounds can never match it — an item with no `occurred_at` matches
+    /// neither bound (`NULL >= x` is `NULL`, not true), not "matches
+    /// everything."
+    pub occurred_at: Option<i64>,
     pub ttl_seconds: Option<i64>,
     /// A retried write with the same key returns the original outcome.
     pub idempotency_key: Option<String>,
@@ -244,7 +274,10 @@ pub struct RecallParams {
     pub occurred_after: Option<i64>,
     pub occurred_before: Option<i64>,
     /// Items above this level are excluded in the backend query. Defaults to
-    /// `restricted`, which excludes nothing.
+    /// `internal`, matching `memorysafe_backend::query::HardFilters`'s own
+    /// documented fail-closed default for this exact field — personal,
+    /// sensitive, and restricted memories are excluded unless a caller names
+    /// a wider ceiling explicitly.
     pub sensitivity_ceiling: Option<String>,
     pub subject: Option<String>,
     pub namespace: Option<String>,
@@ -256,17 +289,89 @@ mod tests {
 
     #[test]
     fn wire_names_match_the_core_serde_names() {
-        assert_eq!(sensitivity_name(SensitivityLevel::Restricted), "restricted");
+        // All five levels, not a two-of-five spot check: the previous
+        // version only pinned `Restricted` and `Personal`, so renaming
+        // `Sensitive` (or `Public`, or `Internal`) would compile, run, and
+        // pass every test in this module while quietly changing the wire
+        // name a client sees. The length assertion closes the matching gap
+        // in the other direction — a variant added to `SensitivityLevel`
+        // without a corresponding row here.
+        let expected = [
+            (SensitivityLevel::Public, "public"),
+            (SensitivityLevel::Internal, "internal"),
+            (SensitivityLevel::Personal, "personal"),
+            (SensitivityLevel::Sensitive, "sensitive"),
+            (SensitivityLevel::Restricted, "restricted"),
+        ];
         assert_eq!(
-            parse_sensitivity("personal").unwrap(),
-            SensitivityLevel::Personal
+            expected.len(),
+            SensitivityLevel::ALL.len(),
+            "a SensitivityLevel variant was added or removed without updating this test"
         );
+        for (level, name) in expected {
+            assert_eq!(
+                sensitivity_name(level),
+                name,
+                "{level:?} renders inconsistently"
+            );
+            assert_eq!(
+                parse_sensitivity(name).unwrap(),
+                level,
+                "'{name}' did not parse back to {level:?}"
+            );
+        }
         assert!(
             parse_sensitivity("Personal").is_err(),
             "wire names are lowercase"
         );
         assert_eq!(parse_mode("search").unwrap(), RecallMode::Search);
         assert_eq!(parse_mode("working_set").unwrap(), RecallMode::WorkingSet);
+    }
+
+    #[test]
+    fn remember_result_action_names_match_the_core_serde_names() {
+        // `RememberResult::from`'s action string is a hand-written match, not
+        // a derive — `ReasonCode`'s own doc warns these strings are a stored
+        // wire format, and `Action` carries the same "renaming a variant is a
+        // breaking change" property. Mirrors
+        // `protection_names_survive_a_round_trip_through_core`: pin each
+        // hand-written string against `Action`'s own serde tag, not just
+        // against a hardcoded literal, so an `Action` rename is caught here
+        // even if the hand-written match is edited to match it.
+        let cases = [
+            (
+                Action::Retain {
+                    protection: Protection::Normal,
+                },
+                "retain",
+            ),
+            (
+                Action::Merge {
+                    into: memorysafe_core::ItemId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+                    strategy: memorysafe_core::MergeStrategy::AppendAndUnion,
+                },
+                "merge",
+            ),
+            (Action::Reject, "reject"),
+        ];
+        for (action, expected) in cases {
+            let out = WriteOutcome {
+                item_id: None,
+                action: action.clone(),
+                reasons: vec![],
+                merged_into: None,
+                evicted: vec![],
+                audit_id: memorysafe_core::AuditId::new(),
+            };
+            let result = RememberResult::from(&out);
+            assert_eq!(result.action, expected, "{action:?} renders inconsistently");
+
+            let serialised = serde_json::to_value(&action).unwrap();
+            assert_eq!(
+                serialised["kind"], expected,
+                "{action:?} disagrees with core's own serde tag"
+            );
+        }
     }
 
     #[test]

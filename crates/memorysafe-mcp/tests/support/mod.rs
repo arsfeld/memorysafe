@@ -6,14 +6,29 @@ use memorysafe_mcp::{MemorySafeServer, ScopeSource};
 use memorysafe_policy::BaselinePolicy;
 use rmcp::{RoleClient, ServiceExt, service::RunningService};
 use std::sync::Arc;
+use tempfile::TempDir;
 
-pub fn engine() -> Arc<Engine> {
+/// Returns the engine alongside the `TempDir` guard for its SQLite backend's
+/// on-disk database. The guard must be held by the caller for as long as the
+/// engine is in use — its `Drop` removes the directory, which is what
+/// actually cleans up after each test now.
+///
+/// Not `dir.keep()`: that call disables `TempDir`'s cleanup entirely (it
+/// exists for callers who want the directory to *outlive* the process), so
+/// every test run using it leaked a directory under the OS temp root with no
+/// path to ever get it back. Passing `dir.path().to_path_buf()` to
+/// `SqliteBackend::open` and returning `dir` itself gets the same
+/// still-alive-when-the-engine-needs-it behaviour without the leak — the
+/// directory is removed the moment the caller's binding goes out of scope.
+pub fn engine() -> (Arc<Engine>, TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    Arc::new(Engine::new(EngineConfig::new(
-        Arc::new(SqliteBackend::open(dir.keep())),
+    let backend = SqliteBackend::open(dir.path().to_path_buf());
+    let engine = Arc::new(Engine::new(EngineConfig::new(
+        Arc::new(backend),
         Arc::new(DeterministicEmbedder::new(256)),
         Arc::new(BaselinePolicy::default()),
-    )))
+    )));
+    (engine, dir)
 }
 
 pub fn stdio_source() -> ScopeSource {

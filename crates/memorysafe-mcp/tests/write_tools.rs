@@ -13,7 +13,8 @@ fn structured(result: &rmcp::model::CallToolResult) -> &serde_json::Value {
 
 #[tokio::test]
 async fn the_server_advertises_the_write_tools_with_schemas() {
-    let client = connect(engine()).await;
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
     let tools = client.list_all_tools().await.unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
 
@@ -31,7 +32,8 @@ async fn the_server_advertises_the_write_tools_with_schemas() {
 
 #[tokio::test]
 async fn remembering_returns_the_governance_decision_not_just_an_id() {
-    let client = connect(engine()).await;
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
     let result = client
         .call_tool(
             CallToolRequestParams::new("memory_remember").with_arguments(args(json!({
@@ -57,7 +59,8 @@ async fn remembering_returns_the_governance_decision_not_just_an_id() {
 async fn a_rejected_duplicate_is_a_successful_tool_call() {
     // An agent learning its memory was redundant is the product working. If
     // this surfaces as a tool error, every client will retry it forever.
-    let client = connect(engine()).await;
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
     let body = "the deploy key rotates every ninety days";
     for _ in 0..2 {
         let result = client
@@ -91,7 +94,8 @@ async fn a_rejected_duplicate_is_a_successful_tool_call() {
 
 #[tokio::test]
 async fn an_empty_body_is_a_tool_error_because_nothing_was_decided() {
-    let client = connect(engine()).await;
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
     let result = client
         .call_tool(
             CallToolRequestParams::new("memory_remember")
@@ -107,7 +111,8 @@ async fn an_empty_body_is_a_tool_error_because_nothing_was_decided() {
 
 #[tokio::test]
 async fn recall_returns_a_governed_working_set_with_its_audit_id() {
-    let client = connect(engine()).await;
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
     for body in [
         "the production migration runs on Sundays",
         "the on-call rotation starts Monday morning",
@@ -156,7 +161,8 @@ async fn recall_returns_a_governed_working_set_with_its_audit_id() {
 
 #[tokio::test]
 async fn recall_over_an_empty_namespace_is_an_empty_success() {
-    let client = connect(engine()).await;
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
     let result = client
         .call_tool(
             CallToolRequestParams::new("memory_recall").with_arguments(args(json!({
@@ -177,8 +183,73 @@ async fn recall_over_an_empty_namespace_is_an_empty_success() {
 }
 
 #[tokio::test]
+async fn occurred_at_is_reachable_through_the_recall_time_filters() {
+    // `RememberParams` had no `occurred_at` field: every item written
+    // through MCP got `occurred_at: None`, and `memorysafe-backend`'s
+    // `query.rs` documents that `NULL >= x` / `NULL <= x` are `NULL`, so a
+    // recall bound never matches a `None` -- the time-filter machinery
+    // `RecallRequest` exists to expose was present but unreachable from any
+    // MCP caller. Proves it end to end, both directions: a window that
+    // brackets the written `occurred_at` must find it, and a window that
+    // does not must not -- the second half is what rules out "the filter is
+    // silently ignored and this always finds everything by text alone."
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
+    let anchor: i64 = 1_700_000_000;
+
+    client
+        .call_tool(
+            CallToolRequestParams::new("memory_remember").with_arguments(args(json!({
+                "body": "the anchor incident happened during the maintenance window",
+                "occurred_at": anchor
+            }))),
+        )
+        .await
+        .unwrap();
+
+    let bracketed = client
+        .call_tool(
+            CallToolRequestParams::new("memory_recall").with_arguments(args(json!({
+                "query": "the anchor incident maintenance window",
+                "occurred_after": anchor - 60,
+                "occurred_before": anchor + 60
+            }))),
+        )
+        .await
+        .unwrap();
+    let bracketed_value = structured(&bracketed);
+    assert!(
+        !bracketed_value["items"]
+            .as_array()
+            .expect("items array")
+            .is_empty(),
+        "a window bracketing occurred_at did not find the item: {bracketed_value}"
+    );
+
+    let missed = client
+        .call_tool(
+            CallToolRequestParams::new("memory_recall").with_arguments(args(json!({
+                "query": "the anchor incident maintenance window",
+                "occurred_after": anchor + 3600,
+                "occurred_before": anchor + 7200
+            }))),
+        )
+        .await
+        .unwrap();
+    let missed_value = structured(&missed);
+    assert_eq!(
+        missed_value["items"].as_array().unwrap().len(),
+        0,
+        "a window that does not bracket occurred_at still matched: {missed_value}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_stdio_client_cannot_switch_subject() {
-    let client = connect(engine()).await;
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
     let result = client
         .call_tool(
             CallToolRequestParams::new("memory_remember").with_arguments(args(json!({
