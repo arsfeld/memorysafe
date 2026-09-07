@@ -8,7 +8,7 @@ mod key;
 mod store;
 
 pub use key::{ApiKeyRecord, GeneratedKey, KEY_PREFIX, generate};
-pub use store::{ApiKeyStore, Authenticated};
+pub use store::{ApiKeyStore, Authenticated, check_reserved};
 
 use memorysafe_core::CoreError;
 use thiserror::Error;

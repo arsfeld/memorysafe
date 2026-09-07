@@ -1,5 +1,5 @@
-use memorysafe_auth::{ApiKeyStore, AuthError};
-use memorysafe_core::{ADMIN_COMPONENT, Actor, ActorKind, Namespace, Scope, SubjectId, TenantId};
+use memorysafe_auth::{ApiKeyStore, AuthError, check_reserved};
+use memorysafe_core::{Actor, ActorKind, Namespace, Scope, SubjectId, TenantId};
 use rmcp::ErrorData;
 use rmcp::model::Extensions;
 use std::sync::Arc;
@@ -49,9 +49,13 @@ impl ScopeSource {
         subject: Option<&str>,
         namespace: Option<&str>,
     ) -> Result<Resolved, ErrorData> {
-        if subject == Some(ADMIN_COMPONENT) || namespace == Some(ADMIN_COMPONENT) {
-            return Err(invalid(format!("'{ADMIN_COMPONENT}' is reserved")));
-        }
+        // Runs for BOTH transports, before either branch, not just inside the
+        // `Http` arm's own `Authenticated::scope` call: the `Stdio` arm never
+        // builds an `Authenticated`, so without this prelude it would refuse
+        // neither `_admin` nor `_purged`. One call, one reserved-word list,
+        // owned by `memorysafe-auth` (`memorysafe-core` deliberately does not
+        // enforce this — see `PURGED_COMPONENT`'s doc there).
+        check_reserved(subject, namespace).map_err(auth_error)?;
 
         match self {
             ScopeSource::Stdio {
@@ -228,17 +232,37 @@ mod tests {
     }
 
     #[test]
-    fn the_reserved_admin_scope_is_unreachable_from_either_transport() {
+    fn reserved_components_are_unreachable_from_either_transport() {
+        // `_admin` is where tenant-level audit rows live; `_purged` is where
+        // a purged subject's `SubjectPurged` residue is filed when the
+        // subject owned no items. Both are legal `memorysafe-core`
+        // components (core deliberately does not reject them — see
+        // `PURGED_COMPONENT`'s doc); rejecting caller input that names
+        // either is this adapter's job, on BOTH transports, not just HTTP's.
+        // Four combinations, not two: each transport against each word.
         let g = generate(TenantId::new("acme").unwrap(), "ci").unwrap();
+        let secret = g.secret.clone();
         let http = ScopeSource::Http {
             keys: Arc::new(ApiKeyStore::new(vec![g.record])),
         };
-        let ext = parts(Some(&format!("Bearer {}", g.secret)));
-        assert!(http.resolve(&ext, Some("_admin"), Some("_admin")).is_err());
-        assert!(
-            stdio()
-                .resolve(&Extensions::new(), None, Some("_admin"))
-                .is_err()
-        );
+        let ext = parts(Some(&format!("Bearer {secret}")));
+
+        for word in ["_admin", "_purged"] {
+            let err = http
+                .resolve(&ext, Some(word), Some(word))
+                .expect_err("reserved word must be refused over http");
+            assert!(
+                format!("{err:?}").contains(word),
+                "http error did not name '{word}': {err:?}"
+            );
+
+            let err = stdio()
+                .resolve(&Extensions::new(), None, Some(word))
+                .expect_err("reserved word must be refused over stdio");
+            assert!(
+                format!("{err:?}").contains(word),
+                "stdio error did not name '{word}': {err:?}"
+            );
+        }
     }
 }
