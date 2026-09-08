@@ -93,8 +93,9 @@ the model which transport it is on, because after D3 nothing depends on the answ
 
 `check_reserved` keeps its role, now applied to the namespace only — subject is no longer
 caller-supplied, so there is no caller-supplied subject left to reject. The startup check in
-`transport::reject_reserved_configuration` still applies to operator-configured values and gains
-the API key records as a second source (§9).
+`transport::reject_reserved_configuration` is gone; the check moved into `FixedScope::new`,
+making an unchecked configuration unconstructible rather than merely rejected at startup.
+API key records gain `check_reserved` validation at mint time and in `Authenticated::scope` (§9).
 
 ---
 
@@ -107,14 +108,19 @@ pub trait ScopeResolver: Send + Sync + 'static {
     /// property of the request rather than of the server.
     fn default_scope(&self) -> Option<Scope>;
 
-    /// Resolve one call. `namespace` is the only caller-supplied component.
-    fn resolve(&self, ext: &Extensions, namespace: Option<&str>)
-        -> Result<Resolved, ErrorData>;
+    /// Resolve one call. `namespace` is the only caller-supplied component;
+    /// `headers` carries the credential and the connection's declared
+    /// namespace, and is empty for transports that have neither.
+    fn resolve(&self, headers: &HeaderMap, namespace: Option<&str>) -> Result<Resolved, AuthError>;
 }
 ```
 
 `subject` is absent from the signature. That absence is the enforcement mechanism: D3 is not a
 rule reviewers must remember, it is a parameter that does not exist.
+
+The trait lives in `memorysafe-auth` (taking `&HeaderMap` and returning `AuthError`), not in
+`memorysafe-mcp`: §9 requires `memorysafe-api` to hold a resolver, which is impossible if the
+trait returns `rmcp::ErrorData` without dragging `rmcp` into the REST adapter.
 
 The public crate ships two implementations:
 
@@ -288,16 +294,11 @@ adapters with different scope rules and leaves §2's second defect open on the R
 listed separately only so the cost is visible, not to invite skipping it.
 
 **Timing.** These are breaking changes to crates that are not yet published and not yet depended
-on from outside the workspace. Plan 3 is mid-flight: Task 14 is uncommitted, and Tasks 15-17
-(shadow) touch no scope code at all.
-
-Task 18 is the reason to move now rather than after. It writes `docs/adapters.md` and the README
-walkthrough, and what it documents is precisely the rule §4 replaces — *"Over stdio the server is
-bound to one tenant and one subject; ... over HTTP the API key identifies the tenant and each
-call carries subject and namespace"*, plus REST reads taking `subject` as a query parameter, plus
-the resource URI grammar. Landing this design after Task 18 means rewriting freshly written
-documentation and a freshly written end-to-end walkthrough test. Landing it before means Task 18
-documents the rule once, correctly.
+on from outside the workspace. Plan 3 merged to `master` as `00a46a0` on 2026-09-07, before this
+plan was written, so the original argument for landing before Plan 3's Task 18 is spent. The change
+lands as an ordinary change on `master`, and Task 9 of this plan rewrites the `docs/adapters.md` and
+walkthrough content Task 18 wrote — the cost the original paragraph hoped to avoid, now scheduled
+rather than dodged.
 
 ---
 
