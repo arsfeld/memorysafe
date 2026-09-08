@@ -111,10 +111,30 @@ memorysafe/
 See [`docs/adapters.md`](docs/adapters.md) for configuration, the CLI, the MCP
 server, the HTTP API, and shadow evaluation.
 
+Create `msafe.toml`:
+
+```toml
+data_dir = "tenants"
+tenant = "acme"
+subject = "user-42"
+namespace = "coding-agent"
+retention = "balanced"
+```
+
+Use the CLI:
+
 ```sh
 cargo install --path crates/memorysafe-cli
 msafe remember "the production migration runs on Sundays"
 msafe recall "when does the migration run"
+```
+
+Connect an MCP client:
+
+```bash
+msafe mcp install              # writes .mcp.json for local stdio
+msafe mcp install --remote     # writes .mcp.json; the key stays in your environment
+export MEMORYSAFE_API_KEY=msk_...
 ```
 
 ---

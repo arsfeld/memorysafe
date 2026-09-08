@@ -53,9 +53,9 @@ msafe purge-subject user-42 --yes
 Every command takes `--json` and prints the engine's own types. A rejected write
 exits `0`: governance working is not a failure.
 
-`msafe keys add`/`msafe keys list` read only the tenant — a key belongs to a
-tenant, not to a subject or namespace — so neither needs `--subject` or
-`--namespace`.
+`msafe keys add` inherits the configured subject (or takes an explicit
+`--subject`) and an optional default `--namespace`. `msafe keys list` lists the
+configured key records.
 
 `msafe recall`'s `--sensitivity-ceiling` defaults to `internal` — the same
 fail-closed default as MCP's `memory_recall` and `POST /v1/recall`, for the
@@ -73,6 +73,8 @@ item paging — `returned.len() < limit` is the sole exhaustion signal — while
 ## MCP
 
 ```sh
+msafe mcp install              # writes .mcp.json for local stdio
+msafe mcp install --remote     # writes .mcp.json for hosted MemorySafe
 msafe serve --transport stdio
 ```
 
@@ -84,10 +86,24 @@ memorysafe://{tenant}/{subject}/{namespace}/audit
 memorysafe://{tenant}/{subject}/{namespace}/stats
 ```
 
-Over stdio the server is bound to one tenant and one subject; the namespace
-defaults from the working directory (`msafe serve --transport stdio` needs no
-`--namespace`) and a call may override it. Over streamable HTTP the API key
-identifies the tenant and each call carries subject and namespace.
+Resource URIs still carry a subject as an identifier; it is compared against the
+credential rather than trusted.
+
+### Scope
+
+Every adapter follows one rule:
+
+- **tenant** comes from the credential — the configuration over stdio, the API key over HTTP.
+- **subject** comes from the credential too. No caller, on any transport, may name a subject.
+- **namespace** is the only component a caller supplies. It resolves in order: the call's own
+  `namespace` argument; the namespace the connection declared (the working directory over stdio,
+  the `MemorySafe-Namespace` header over HTTP, else the key's own default); then `default`.
+
+This is why the same MCP client entry works against a local `msafe` and a hosted MemorySafe:
+`memory_remember{body}` names no scope, and is a legal call on both.
+
+`_admin` and `_purged` are reserved and may not be named as a namespace, nor minted as a key's
+subject.
 
 `memory_recall`'s `sensitivity_ceiling` defaults to `internal` — fail closed,
 since recall results feed straight into an agent's working set. `memory_review`
@@ -160,12 +176,12 @@ Errors carry a uniform body:
 
 A rejected or merged write is `200 OK`.
 
-Reads take `subject` and `namespace` as query parameters; writes take them in the
-JSON body. Neither is defaulted. `GET /v1/audit` takes its event filter as one
-comma-separated value, and pages with `limit` plus `after=<last audit id>`; the
-response carries `truncated` so a compliance query cannot stop short silently —
-`limit` is clamped to `MAX_AUDIT_LIMIT` and the response echoes the effective
-value.
+Reads take an optional `namespace` query parameter; writes take it in the
+body. Subject is never accepted from a request. `GET /v1/audit` takes its event
+filter as one comma-separated value, and pages with `limit` plus `after=<last
+audit id>`; the response carries `truncated` so a compliance query cannot stop
+short silently — `limit` is clamped to `MAX_AUDIT_LIMIT` and the response echoes
+the effective value.
 
 ## Shadow evaluation
 
