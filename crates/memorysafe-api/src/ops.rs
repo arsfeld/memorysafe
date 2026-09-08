@@ -15,12 +15,11 @@ use crate::query::ValidatedQuery;
 use crate::scope::ScopeParams;
 use crate::text::ValidatedText;
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
-use memorysafe_auth::check_reserved;
 use memorysafe_backend::{ImportReport, ScopeSelector};
-use memorysafe_core::{AuditEvent, AuditFilter, AuditId, AuditRecord, ItemId, SubjectId};
+use memorysafe_core::{AuditEvent, AuditFilter, AuditId, AuditRecord, ItemId};
 use memorysafe_engine::{MaintainCursor, MaintainReport, PurgeOutcome};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -204,17 +203,11 @@ pub async fn import(
 pub async fn purge_subject(
     State(state): State<AppState>,
     auth: Auth,
-    Path(subject): Path<String>,
 ) -> Result<Json<PurgeOutcome>, ApiError> {
-    // Same reasoning as `export`'s `check_reserved` call above: no `Scope`
-    // exists here to route the check through `Authenticated::scope`, and the
-    // original inline check missed `_purged`.
-    check_reserved(Some(&subject), None)?;
-    let subject = SubjectId::new(&subject)?;
     Ok(Json(
         state
             .engine
-            .purge_subject(auth.tenant(), &subject, &auth.actor())
+            .purge_subject(auth.tenant(), auth.subject(), &auth.actor())
             .await?,
     ))
 }

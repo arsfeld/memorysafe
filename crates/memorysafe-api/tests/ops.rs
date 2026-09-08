@@ -377,18 +377,53 @@ async fn purging_the_credential_subject_removes_its_memories() {
 }
 
 #[tokio::test]
-async fn the_reserved_subject_cannot_be_purged() {
+async fn a_foreign_subject_path_cannot_choose_the_purge_target() {
     let h = harness();
-    let reply = send(&h.app, delete("/v1/subjects/_admin", Some(&h.key))).await;
-    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    remember(&h, "a memory belonging to the credential subject").await;
+
+    let foreign_scope = memorysafe_core::Scope::new("acme", "someone-else", "agent").unwrap();
+    h.engine
+        .remember(memorysafe_engine::RememberRequest::new(
+            foreign_scope.clone(),
+            "a memory belonging to someone else",
+        ))
+        .await
+        .unwrap();
+
+    let reply = send(&h.app, delete("/v1/subjects/someone-else", Some(&h.key))).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+
+    let foreign = h
+        .engine
+        .review(&foreign_scope, &memorysafe_backend::Page::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign.len(),
+        1,
+        "a path-supplied foreign subject was purged"
+    );
+
+    let own = h
+        .engine
+        .review(
+            &memorysafe_core::Scope::new("acme", "user-42", "agent").unwrap(),
+            &memorysafe_backend::Page::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        own.len(),
+        0,
+        "the credential subject was not the purge target"
+    );
 }
 
 /// Fix round 1, Important 2: the brief's own hand-rolled check compared only
 /// against `ADMIN_COMPONENT`, missing `PURGED_COMPONENT` (`_purged`) —
-/// `memorysafe_auth::check_reserved` covers both, and its own doc says it
-/// exists as a free function precisely for adapter paths with no
-/// `Authenticated::scope` to route through, which `export` and
-/// `purge_subject` both are.
+/// `memorysafe_auth::check_reserved` covers both. Export has no direct
+/// `Authenticated::scope` call, unlike subject purge, whose target now comes
+/// directly from the credential.
 #[tokio::test]
 async fn the_purged_reserved_word_cannot_be_named_as_an_export_namespace() {
     let h = harness();
@@ -399,15 +434,6 @@ async fn the_purged_reserved_word_cannot_be_named_as_an_export_namespace() {
         "{}",
         by_namespace.text
     );
-}
-
-/// Fix round 1, Important 2: the `_purged` half of the same gap, on the
-/// purge route itself.
-#[tokio::test]
-async fn the_purged_reserved_word_cannot_be_purged_either() {
-    let h = harness();
-    let reply = send(&h.app, delete("/v1/subjects/_purged", Some(&h.key))).await;
-    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text);
 }
 
 /// The `SubjectPurged` row must name the caller who ordered the erasure, not
