@@ -3,10 +3,10 @@ use anyhow::{Context, Result};
 use axum::Router;
 use clap::Args;
 use memorysafe_api::{AppState, router as api_router};
-use memorysafe_auth::ApiKeyStore;
-use memorysafe_core::{ADMIN_COMPONENT, Namespace, SubjectId, TenantId};
+use memorysafe_auth::{ApiKeyScope, ApiKeyStore, FixedScope};
+use memorysafe_core::{ADMIN_COMPONENT, Namespace, Scope, SubjectId, TenantId};
 use memorysafe_engine::Engine;
-use memorysafe_mcp::{HttpTransportConfig, ScopeSource, http_service_with, serve_stdio};
+use memorysafe_mcp::{HttpTransportConfig, http_service_with, serve_stdio};
 use std::sync::Arc;
 
 const MAX_COMPONENT_BYTES: usize = 240;
@@ -58,15 +58,55 @@ pub struct ServeArgs {
     pub bind: Option<String>,
 }
 
-pub fn http_router(engine: Arc<Engine>, keys: Arc<ApiKeyStore>, serve: &ServeConfig) -> Router {
+pub fn http_router(engine: Arc<Engine>, resolver: Arc<ApiKeyScope>, serve: &ServeConfig) -> Router {
     let mcp = http_service_with(
         engine.clone(),
-        ScopeSource::Http { keys: keys.clone() },
+        resolver.clone(),
         HttpTransportConfig {
             allowed_hosts: serve.allowed_hosts.clone(),
         },
     );
-    api_router(AppState { engine, keys }).nest_service(&serve.mcp_path, mcp)
+    api_router(AppState { engine, resolver }).nest_service(&serve.mcp_path, mcp)
+}
+
+pub async fn serve(
+    engine: Arc<Engine>,
+    config: &MsafeConfig,
+    scope: Scope,
+    args: ServeArgs,
+) -> Result<()> {
+    match args.transport.as_str() {
+        "stdio" => {
+            let resolver = Arc::new(FixedScope::new(
+                scope.tenant.clone(),
+                scope.subject.clone(),
+                namespace_from_cwd(),
+            )?);
+            serve_stdio(engine, resolver).await
+        }
+        "http" => {
+            let resolver = Arc::new(ApiKeyScope::new(Arc::new(ApiKeyStore::new(
+                config.keys.clone(),
+            ))));
+            let bind = args.bind.as_deref().unwrap_or(&config.serve.bind);
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("binding {bind}"))?;
+            let address = listener.local_addr()?;
+            eprintln!(
+                "msafe listening on http://{address} (MCP at {})",
+                config.serve.mcp_path
+            );
+
+            axum::serve(listener, http_router(engine, resolver, &config.serve))
+                .with_graceful_shutdown(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await
+                .context("serving HTTP")
+        }
+        other => anyhow::bail!("unknown transport '{other}'; expected stdio or http"),
+    }
 }
 
 /// `msafe serve --transport stdio`. Tenant and subject are fixed for the
@@ -83,13 +123,9 @@ pub async fn serve_stdio_transport(
     tenant: TenantId,
     subject: SubjectId,
 ) -> Result<()> {
-    let source = ScopeSource::Stdio {
-        tenant,
-        subject,
-        default_namespace: namespace_from_cwd(),
-    };
+    let resolver = Arc::new(FixedScope::new(tenant, subject, namespace_from_cwd())?);
     // Nothing is printed here: stdout is the transport.
-    serve_stdio(engine, source).await
+    serve_stdio(engine, resolver).await
 }
 
 /// `msafe serve --transport http`. Reads no scope component at startup at
@@ -101,7 +137,9 @@ pub async fn serve_http_transport(
     config: &MsafeConfig,
     args: &ServeArgs,
 ) -> Result<()> {
-    let keys = Arc::new(ApiKeyStore::new(config.keys.clone()));
+    let resolver = Arc::new(ApiKeyScope::new(Arc::new(ApiKeyStore::new(
+        config.keys.clone(),
+    ))));
     let bind = args.bind.as_deref().unwrap_or(&config.serve.bind);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -113,7 +151,7 @@ pub async fn serve_http_transport(
         config.serve.mcp_path
     );
 
-    axum::serve(listener, http_router(engine, keys, &config.serve))
+    axum::serve(listener, http_router(engine, resolver, &config.serve))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
