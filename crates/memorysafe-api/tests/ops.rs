@@ -255,6 +255,38 @@ async fn export_takes_its_subject_from_the_credential() {
     );
 }
 
+#[tokio::test]
+async fn export_without_namespace_includes_entire_subject_corpus() {
+    let h = harness();
+
+    // Remember in "agent" namespace
+    remember(&h, "memory in agent namespace").await;
+
+    // Remember in "workspace" namespace
+    let reply = send(
+        &h.app,
+        post(
+            "/v1/memories",
+            Some(&h.key),
+            json!({ "namespace": "workspace", "body": "memory in workspace namespace" }),
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+
+    // Export without namespace includes both
+    let entire = send(&h.app, get("/v1/export", Some(&h.key))).await;
+    assert_eq!(entire.status, StatusCode::OK, "{}", entire.text);
+    assert!(entire.text.contains("memory in agent namespace"));
+    assert!(entire.text.contains("memory in workspace namespace"));
+
+    // Export with namespace filters to just that namespace
+    let single = send(&h.app, get("/v1/export?namespace=agent", Some(&h.key))).await;
+    assert_eq!(single.status, StatusCode::OK, "{}", single.text);
+    assert!(single.text.contains("memory in agent namespace"));
+    assert!(!single.text.contains("memory in workspace namespace"));
+}
+
 /// Fix round 1, Important 5: `ExportQuery::include_audit` was threaded into
 /// `ScopeSelector` with no test ever setting it — a handler that silently
 /// hardcoded `include_audit: true` would have passed every other test in

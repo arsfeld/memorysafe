@@ -141,19 +141,19 @@ pub struct ExportQuery {
 pub async fn export(
     State(state): State<AppState>,
     auth: Auth,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     ValidatedQuery(query): ValidatedQuery<ExportQuery>,
 ) -> Result<Response, ApiError> {
-    let scope = ScopeParams {
-        namespace: query.namespace,
+    let mut selector = ScopeSelector::for_subject(auth.tenant().clone(), auth.subject().clone());
+    selector.include_audit = query.include_audit;
+
+    if let Some(ns) = &query.namespace
+        && !ns.is_empty()
+    {
+        memorysafe_auth::check_reserved(None, Some(ns.as_str()))?;
+        let namespace = memorysafe_core::Namespace::new(ns)?;
+        selector = selector.in_namespace(namespace);
     }
-    .resolve(&state.resolver, &headers)?;
-    let selector = ScopeSelector {
-        tenant: scope.tenant,
-        subject: Some(scope.subject),
-        namespace: Some(scope.namespace),
-        include_audit: query.include_audit,
-    };
 
     match query.format.as_deref() {
         None | Some("ndjson") => {

@@ -139,31 +139,21 @@ async fn run(cli: Cli, config: MsafeConfig) -> Result<()> {
 
     let engine = build::build_engine(&config)?;
 
-    // `serve` resolves only what its own transport actually reads: `stdio`
-    // fixes the tenant and subject for the session, with the namespace
-    // coming from the working directory rather than a flag (see
-    // `resolve_tenant_and_subject`'s doc); `http` reads no scope component
-    // at all, since `ScopeSource::Http` derives tenant, subject and
-    // namespace per request from the presented API key. Both used to go
-    // through the full three-field `resolve_scope` before dispatch, which
-    // made `serve --transport stdio` reject on a missing `--namespace`
-    // before it ever reached the cwd-derived default it exists to use —
-    // Task 14's headline feature was unreachable — and made `--transport
-    // http` demand a subject and namespace nothing on that path reads.
     if let Command::Serve(args) = cli.command {
-        return match args.transport.as_str() {
-            "stdio" => {
-                let (tenant, subject) = resolve_tenant_and_subject(
-                    &cli.tenant,
-                    &config.tenant,
-                    &cli.subject,
-                    &config.subject,
-                )?;
-                cmd::serve::serve_stdio_transport(engine, tenant, subject).await
-            }
-            "http" => cmd::serve::serve_http_transport(engine, &config, &args).await,
-            other => anyhow::bail!("unknown transport '{other}'; expected stdio or http"),
+        // `serve`'s stdio transport needs a tenant and subject, but derives
+        // the namespace from the working directory rather than forcing one here.
+        // Its http transport reads no scope component at startup at all.
+        // We resolve tenant and subject here, then pass a dummy namespace to
+        // build the `Scope` that the unified `serve` signature expects, avoiding
+        // a failure on a missing `--namespace` flag.
+        let (tenant, subject) =
+            resolve_tenant_and_subject(&cli.tenant, &config.tenant, &cli.subject, &config.subject)?;
+        let scope = memorysafe_core::Scope {
+            tenant,
+            subject,
+            namespace: memorysafe_core::Namespace::new("dummy").unwrap(),
         };
+        return cmd::serve::serve(engine, &config, scope, args).await;
     }
 
     // Every remaining command genuinely reads subject and namespace too.
