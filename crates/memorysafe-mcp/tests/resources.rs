@@ -259,18 +259,9 @@ async fn an_empty_scope_reads_as_a_successful_empty_document_not_an_error() {
 }
 
 #[tokio::test]
-async fn a_resource_in_another_subject_is_refused_over_stdio() {
-    // Same rule as the tools: stdio is bound to one subject. A resource URI is
-    // not a way around it.
+async fn a_resource_in_another_tenant_is_refused_over_stdio() {
     let (eng, _dir) = engine();
     let client = connect(eng).await;
-    let denied = client
-        .read_resource(ReadResourceRequestParams::new(
-            "memorysafe://acme/someone-else/coding-agent/audit",
-        ))
-        .await;
-    assert!(denied.is_err(), "a resource URI crossed a subject boundary");
-
     let other_tenant = client
         .read_resource(ReadResourceRequestParams::new(
             "memorysafe://globex/user-42/coding-agent/audit",
@@ -280,6 +271,38 @@ async fn a_resource_in_another_subject_is_refused_over_stdio() {
         other_tenant.is_err(),
         "a resource URI crossed a tenant boundary"
     );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_resource_uri_naming_another_subject_is_not_found() {
+    // The URI grammar still carries a subject, because it identifies a
+    // resource. That does not make caller-supplied scope: it must be compared
+    // against the credential's subject just as the tenant is.
+    let (eng, _dir) = engine();
+    let client = connect(eng).await;
+
+    let mine = client
+        .read_resource(ReadResourceRequestParams::new(
+            "memorysafe://acme/user-42/coding-agent/audit",
+        ))
+        .await;
+    assert!(mine.is_ok(), "a caller must still read their own audit");
+
+    for uri in [
+        "memorysafe://acme/someone-else/coding-agent/audit",
+        "memorysafe://acme/someone-else/coding-agent/stats",
+        "memorysafe://globex/user-42/coding-agent/audit",
+    ] {
+        let err = client
+            .read_resource(ReadResourceRequestParams::new(uri))
+            .await
+            .expect_err("reading another scope's resource must fail");
+        assert!(
+            format!("{err:?}").contains("no such resource"),
+            "{uri} was refused with the wrong error: {err:?}"
+        );
+    }
     client.cancel().await.unwrap();
 }
 

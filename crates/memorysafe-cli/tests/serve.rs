@@ -1,13 +1,60 @@
+use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin;
 use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use serde_json::json;
+use std::path::Path;
+
+fn msafe(dir: &Path) -> Command {
+    let mut command = Command::cargo_bin("msafe").expect("binary");
+    command.current_dir(dir);
+    command
+}
 
 fn workspace() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("msafe.toml"), "data_dir = \"tenants\"\n").unwrap();
     dir
+}
+
+#[test]
+fn a_minted_key_records_the_subject_it_acts_as() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("msafe.toml"),
+        "tenant = \"acme\"\nsubject = \"user-42\"\n",
+    )
+    .unwrap();
+
+    let out = msafe(dir.path())
+        .args(["keys", "add", "--label", "laptop", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let config = std::fs::read_to_string(dir.path().join("msafe.toml")).unwrap();
+    assert!(
+        config.contains("subject = \"user-42\""),
+        "the key record did not carry a subject: {config}"
+    );
+
+    // An explicit subject overrides the configured one.
+    let out = msafe(dir.path())
+        .args([
+            "keys",
+            "add",
+            "--label",
+            "ci",
+            "--subject",
+            "build-bot",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let config = std::fs::read_to_string(dir.path().join("msafe.toml")).unwrap();
+    assert!(config.contains("build-bot"), "{config}");
 }
 
 /// The spec's own acceptance test: a real MCP client driving the real binary

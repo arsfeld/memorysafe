@@ -6,7 +6,7 @@ pub mod cmd;
 pub mod config;
 pub mod render;
 
-use memorysafe_auth::ApiKeyStore;
+use memorysafe_auth::{ApiKeyScope, ApiKeyStore};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,5 +19,6 @@ pub fn http_router_for_tests(root: &Path) -> axum::Router {
         ..Default::default()
     };
     let engine = build::build_engine(&config).expect("engine");
-    cmd::serve::http_router(engine, Arc::new(ApiKeyStore::default()), &config.serve)
+    let resolver = Arc::new(ApiKeyScope::new(Arc::new(ApiKeyStore::default())));
+    cmd::serve::http_router(engine, resolver, &config.serve)
 }

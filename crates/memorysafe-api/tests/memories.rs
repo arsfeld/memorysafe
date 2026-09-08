@@ -5,7 +5,7 @@ use serde_json::json;
 use support::{delete, get, harness, post, send};
 
 fn scope() -> serde_json::Value {
-    json!({ "subject": "user-42", "namespace": "agent" })
+    json!({ "namespace": "agent" })
 }
 
 async fn remember(h: &support::Harness, body: &str, tags: serde_json::Value) -> serde_json::Value {
@@ -26,6 +26,55 @@ async fn a_write_returns_two_hundred_with_the_decision() {
     assert!(out["item_id"].is_string());
     assert!(out["audit_id"].is_string());
     assert!(!out["reasons"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_write_takes_its_subject_from_the_key_and_never_from_the_body() {
+    // This must fail if a request body can choose a subject. The harness key
+    // is minted for user-42, while this body deliberately names someone else.
+    let h = harness();
+
+    let first = send(
+        &h.app,
+        post(
+            "/v1/memories",
+            Some(&h.key),
+            json!({ "body": "the API is versioned", "namespace": "agent" }),
+        ),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+
+    let second = send(
+        &h.app,
+        post(
+            "/v1/memories",
+            Some(&h.key),
+            json!({
+                "body": "written as someone else?",
+                "namespace": "agent",
+                "subject": "someone-else"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.text);
+
+    let review = send(&h.app, get("/v1/memories?namespace=agent", Some(&h.key))).await;
+    assert_eq!(review.status, StatusCode::OK, "{}", review.text);
+    assert_eq!(
+        review.body["items"].as_array().map(Vec::len),
+        Some(2),
+        "a body-supplied subject moved the write: {}",
+        review.text
+    );
+}
+
+#[tokio::test]
+async fn a_read_with_no_namespace_lands_in_the_fallback_rather_than_failing() {
+    let h = harness();
+    let response = send(&h.app, get("/v1/memories", Some(&h.key))).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text);
 }
 
 #[tokio::test]
@@ -66,11 +115,7 @@ async fn a_retried_write_with_the_same_key_returns_the_same_outcome() {
     assert_eq!(second.status, StatusCode::OK);
     assert_eq!(first.body["item_id"], second.body["item_id"]);
 
-    let listed = send(
-        &h.app,
-        get("/v1/memories?subject=user-42&namespace=agent", Some(&h.key)),
-    )
-    .await;
+    let listed = send(&h.app, get("/v1/memories?namespace=agent", Some(&h.key))).await;
     assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
 }
 
@@ -131,7 +176,7 @@ async fn recall_in_search_mode_is_still_scoped_and_audited() {
         reply.text
     );
 
-    let mut elsewhere = json!({ "subject": "user-42", "namespace": "other" });
+    let mut elsewhere = json!({ "namespace": "other" });
     elsewhere["mode"] = json!("search");
     elsewhere["query"] = json!("memory");
     let empty = send(&h.app, post("/v1/recall", Some(&h.key), elsewhere)).await;
@@ -152,10 +197,7 @@ async fn a_single_memory_can_be_fetched_and_a_missing_one_is_404() {
 
     let found = send(
         &h.app,
-        get(
-            &format!("/v1/memories/{id}?subject=user-42&namespace=agent"),
-            Some(&h.key),
-        ),
+        get(&format!("/v1/memories/{id}?namespace=agent"), Some(&h.key)),
     )
     .await;
     assert_eq!(found.status, StatusCode::OK);
@@ -164,7 +206,7 @@ async fn a_single_memory_can_be_fetched_and_a_missing_one_is_404() {
     let missing = send(
         &h.app,
         get(
-            "/v1/memories/01ARZ3NDEKTSV4RRFFQ69G5FAV?subject=user-42&namespace=agent",
+            "/v1/memories/01ARZ3NDEKTSV4RRFFQ69G5FAV?namespace=agent",
             Some(&h.key),
         ),
     )
@@ -173,10 +215,7 @@ async fn a_single_memory_can_be_fetched_and_a_missing_one_is_404() {
 
     let malformed = send(
         &h.app,
-        get(
-            "/v1/memories/not-a-ulid?subject=user-42&namespace=agent",
-            Some(&h.key),
-        ),
+        get("/v1/memories/not-a-ulid?namespace=agent", Some(&h.key)),
     )
     .await;
     assert_eq!(
@@ -197,20 +236,13 @@ async fn deleting_by_id_removes_exactly_that_memory() {
 
     let reply = send(
         &h.app,
-        delete(
-            &format!("/v1/memories/{id}?subject=user-42&namespace=agent"),
-            Some(&h.key),
-        ),
+        delete(&format!("/v1/memories/{id}?namespace=agent"), Some(&h.key)),
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body["forgotten"], json!([id]));
 
-    let left = send(
-        &h.app,
-        get("/v1/memories?subject=user-42&namespace=agent", Some(&h.key)),
-    )
-    .await;
+    let left = send(&h.app, get("/v1/memories?namespace=agent", Some(&h.key))).await;
     assert_eq!(left.body["items"].as_array().unwrap().len(), 1);
 }
 
@@ -262,11 +294,7 @@ async fn protecting_a_memory_pins_it_and_is_visible_in_review() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
     assert_eq!(reply.body["action"]["protection"]["kind"], "pinned");
 
-    let listed = send(
-        &h.app,
-        get("/v1/memories?subject=user-42&namespace=agent", Some(&h.key)),
-    )
-    .await;
+    let listed = send(&h.app, get("/v1/memories?namespace=agent", Some(&h.key))).await;
     let item = listed.body["items"]
         .as_array()
         .unwrap()
@@ -277,13 +305,9 @@ async fn protecting_a_memory_pins_it_and_is_visible_in_review() {
 }
 
 #[tokio::test]
-async fn the_reserved_subject_is_403_on_every_route_that_takes_a_scope() {
+async fn the_reserved_namespace_is_403_on_every_route_that_takes_a_scope() {
     let h = harness();
-    let query = send(
-        &h.app,
-        get("/v1/memories?subject=_admin&namespace=_admin", Some(&h.key)),
-    )
-    .await;
+    let query = send(&h.app, get("/v1/memories?namespace=_admin", Some(&h.key))).await;
     assert_eq!(query.status, StatusCode::FORBIDDEN);
 
     let body = send(
@@ -291,23 +315,11 @@ async fn the_reserved_subject_is_403_on_every_route_that_takes_a_scope() {
         post(
             "/v1/memories",
             Some(&h.key),
-            json!({
-                "subject": "_admin", "namespace": "_admin", "body": "forged"
-            }),
+            json!({ "namespace": "_admin", "body": "forged" }),
         ),
     )
     .await;
     assert_eq!(body.status, StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn a_missing_scope_parameter_is_400_not_a_default_scope() {
-    // Defaulting a namespace here would silently write into someone else's
-    // budget. The caller must say where.
-    let h = harness();
-    let reply = send(&h.app, get("/v1/memories?subject=user-42", Some(&h.key))).await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-    assert_eq!(reply.body["error"], "validation");
 }
 
 #[tokio::test]
@@ -320,7 +332,7 @@ async fn review_pages_and_reports_the_page_it_returned() {
     let reply = send(
         &h.app,
         get(
-            "/v1/memories?subject=user-42&namespace=agent&limit=2&offset=2",
+            "/v1/memories?namespace=agent&limit=2&offset=2",
             Some(&h.key),
         ),
     )
@@ -347,10 +359,7 @@ async fn review_echoes_the_clamped_limit_not_the_requested_one() {
 
     let reply = send(
         &h.app,
-        get(
-            "/v1/memories?subject=user-42&namespace=agent&limit=5000",
-            Some(&h.key),
-        ),
+        get("/v1/memories?namespace=agent&limit=5000", Some(&h.key)),
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
@@ -374,7 +383,7 @@ async fn deleting_or_forgetting_an_absent_id_is_a_successful_empty_result_not_a_
     let deleted = send(
         &h.app,
         delete(
-            &format!("/v1/memories/{absent}?subject=user-42&namespace=agent"),
+            &format!("/v1/memories/{absent}?namespace=agent"),
             Some(&h.key),
         ),
     )

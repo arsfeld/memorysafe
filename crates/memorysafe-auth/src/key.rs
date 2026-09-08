@@ -1,6 +1,6 @@
 use crate::AuthError;
 use base64::Engine as _;
-use memorysafe_core::TenantId;
+use memorysafe_core::{Namespace, SubjectId, TenantId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -13,6 +13,13 @@ const SECRET_BYTES: usize = 32;
 pub struct ApiKeyRecord {
     pub id: String,
     pub tenant: TenantId,
+    /// The one subject this key acts as. Never supplied by a request — that
+    /// is the whole point. See the scope contract in `resolver.rs`.
+    pub subject: SubjectId,
+    /// The namespace this key falls back to when a request declares none.
+    /// `None` means the `FALLBACK_NAMESPACE` applies.
+    #[serde(default)]
+    pub default_namespace: Option<Namespace>,
     /// BLAKE3 of the whole presented key, hex encoded.
     pub hash: String,
     pub label: String,
@@ -42,7 +49,16 @@ impl fmt::Debug for GeneratedKey {
     }
 }
 
-pub fn generate(tenant: TenantId, label: &str) -> Result<GeneratedKey, AuthError> {
+pub fn generate(
+    tenant: TenantId,
+    subject: SubjectId,
+    label: &str,
+) -> Result<GeneratedKey, AuthError> {
+    // At mint time, not only at call time. `ScopeResolver::resolve` never
+    // sees a caller-supplied subject any more, so if a reserved one is not
+    // refused here it is never refused at all.
+    crate::store::check_reserved(Some(subject.as_str()), None)?;
+
     let id = ulid::Ulid::generate().to_string();
     let mut bytes = [0u8; SECRET_BYTES];
     getrandom::fill(&mut bytes).map_err(|_| AuthError::Rng)?;
@@ -53,6 +69,8 @@ pub fn generate(tenant: TenantId, label: &str) -> Result<GeneratedKey, AuthError
         record: ApiKeyRecord {
             id,
             tenant,
+            subject,
+            default_namespace: None,
             hash: hash_presented(&secret),
             label: label.to_owned(),
             disabled: false,
@@ -85,10 +103,52 @@ mod tests {
     use super::*;
     use memorysafe_core::TenantId;
 
+    fn subject() -> memorysafe_core::SubjectId {
+        memorysafe_core::SubjectId::new("user-42").expect("a legal subject")
+    }
+
+    #[test]
+    fn a_generated_key_carries_the_subject_it_was_minted_for() {
+        // The whole scope contract rests on this: if a key does not name a
+        // subject, the subject has to come from the request, and any key can
+        // write as any subject in its tenant.
+        let tenant = TenantId::new("acme").unwrap();
+        let subject = memorysafe_core::SubjectId::new("user-42").unwrap();
+        let g = generate(tenant.clone(), subject.clone(), "laptop").expect("generate");
+
+        assert_eq!(g.record.tenant, tenant);
+        assert_eq!(g.record.subject, subject);
+        assert_eq!(
+            g.record.default_namespace, None,
+            "a key defaults to no namespace of its own; the header or the fallback supplies one"
+        );
+    }
+
+    #[test]
+    fn a_key_may_not_be_minted_for_a_reserved_subject() {
+        // `_admin` is where tenant-level audit rows live. A key minted for it
+        // would let its holder write rows that look like the engine wrote them,
+        // and no per-call check would ever see the subject to reject it.
+        let tenant = TenantId::new("acme").unwrap();
+        for reserved in [
+            memorysafe_core::ADMIN_COMPONENT,
+            memorysafe_core::PURGED_COMPONENT,
+        ] {
+            let subject = memorysafe_core::SubjectId::new(reserved).unwrap();
+            assert!(
+                matches!(
+                    generate(tenant.clone(), subject, "bad"),
+                    Err(AuthError::Reserved { .. })
+                ),
+                "'{reserved}' was accepted as a key subject"
+            );
+        }
+    }
+
     #[test]
     fn a_generated_key_carries_its_id_in_the_clear_and_its_secret_only_once() {
         let tenant = TenantId::new("acme").unwrap();
-        let g = generate(tenant.clone(), "ci runner").expect("generate");
+        let g = generate(tenant.clone(), subject(), "ci runner").expect("generate");
 
         let (prefix, rest) = g.secret.split_once('_').expect("prefixed");
         assert_eq!(prefix, KEY_PREFIX);
@@ -136,7 +196,7 @@ mod tests {
         // "stronger" than the old needle in the case where nothing leaks --
         // and the sliding-window assertion at the end recovers partial-leak
         // sensitivity on purpose, rather than by accident of where `_` lands.
-        let g = generate(TenantId::new("acme").unwrap(), "ci").unwrap();
+        let g = generate(TenantId::new("acme").unwrap(), subject(), "ci").unwrap();
         let json = serde_json::to_string(&g.record).unwrap();
         assert!(
             !json.contains(&g.secret),
@@ -181,8 +241,8 @@ mod tests {
 
     #[test]
     fn two_generated_keys_never_collide() {
-        let a = generate(TenantId::new("acme").unwrap(), "a").unwrap();
-        let b = generate(TenantId::new("acme").unwrap(), "b").unwrap();
+        let a = generate(TenantId::new("acme").unwrap(), subject(), "a").unwrap();
+        let b = generate(TenantId::new("acme").unwrap(), subject(), "b").unwrap();
         assert_ne!(a.record.id, b.record.id);
         assert_ne!(a.record.hash, b.record.hash);
         assert_ne!(a.secret, b.secret);
@@ -206,7 +266,7 @@ mod tests {
 
     #[test]
     fn the_debug_rendering_of_a_generated_key_does_not_leak_the_secret() {
-        let generated = generate(TenantId::new("acme").unwrap(), "laptop").unwrap();
+        let generated = generate(TenantId::new("acme").unwrap(), subject(), "laptop").unwrap();
         let rendered = format!("{generated:?}");
 
         assert!(
@@ -250,12 +310,13 @@ mod tests {
 
     #[test]
     fn the_debug_rendering_of_a_generated_key_still_shows_the_record() {
-        let generated = generate(TenantId::new("acme").unwrap(), "laptop").unwrap();
+        let generated = generate(TenantId::new("acme").unwrap(), subject(), "laptop").unwrap();
         let rendered = format!("{generated:?}");
 
         // Redaction must not cost the diagnostics the type exists to give.
         assert!(rendered.contains(&generated.record.id), "{rendered}");
         assert!(rendered.contains("laptop"), "{rendered}");
         assert!(rendered.contains("acme"), "{rendered}");
+        assert!(rendered.contains("user-42"), "{rendered}");
     }
 }

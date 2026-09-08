@@ -1,8 +1,8 @@
 mod support;
 
-use memorysafe_auth::{ApiKeyStore, generate};
-use memorysafe_core::TenantId;
-use memorysafe_mcp::{ScopeSource, http_service};
+use memorysafe_auth::{ApiKeyScope, ApiKeyStore, NAMESPACE_HEADER, generate};
+use memorysafe_core::{SubjectId, TenantId};
+use memorysafe_mcp::http_service;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams};
 use rmcp::transport::{
@@ -29,13 +29,13 @@ struct Served {
 
 async fn serve() -> Served {
     let tenant = TenantId::new("acme").unwrap();
-    let g = generate(tenant, "integration").unwrap();
+    let g = generate(tenant, SubjectId::new("user-42").unwrap(), "integration").unwrap();
     let secret = g.secret.clone();
     let keys = Arc::new(ApiKeyStore::new(vec![g.record]));
     let (eng, _dir) = engine();
 
     let ct = CancellationToken::new();
-    let service = http_service(eng, ScopeSource::Http { keys });
+    let service = http_service(eng, Arc::new(ApiKeyScope::new(keys)));
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -71,6 +71,9 @@ fn transport(
     let mut config = StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp"));
     config.auth_header = credential;
     config.allow_stateless = true;
+    config
+        .custom_headers
+        .insert(NAMESPACE_HEADER.parse().unwrap(), "agent".parse().unwrap());
     StreamableHttpClientTransport::from_config(config)
 }
 
@@ -96,7 +99,6 @@ async fn an_authenticated_client_writes_and_reads_over_streamable_http() {
     let written = with_timeout(client.call_tool(
         CallToolRequestParams::new("memory_remember").with_arguments(args(json!({
             "body": "the http transport carries a request header through to scope resolution",
-            "subject": "user-42",
             "namespace": "agent"
         }))),
     ))
@@ -110,7 +112,6 @@ async fn an_authenticated_client_writes_and_reads_over_streamable_http() {
     let recalled = with_timeout(client.call_tool(
         CallToolRequestParams::new("memory_recall").with_arguments(args(json!({
             "query": "how does the http transport carry a header to scope resolution",
-            "subject": "user-42",
             "namespace": "agent"
         }))),
     ))
@@ -139,7 +140,6 @@ async fn a_client_with_no_credential_cannot_call_a_tool() {
     let result = with_timeout(client.call_tool(
         CallToolRequestParams::new("memory_remember").with_arguments(args(json!({
             "body": "this must not be stored",
-            "subject": "user-42",
             "namespace": "agent"
         }))),
     ))
@@ -153,7 +153,12 @@ async fn a_client_with_no_credential_cannot_call_a_tool() {
 #[tokio::test]
 async fn a_key_for_one_tenant_cannot_be_used_as_another() {
     let served = serve().await;
-    let stranger = generate(TenantId::new("globex").unwrap(), "stranger").unwrap();
+    let stranger = generate(
+        TenantId::new("globex").unwrap(),
+        SubjectId::new("user-42").unwrap(),
+        "stranger",
+    )
+    .unwrap();
     let client = with_timeout(().serve(transport(served.address, Some(stranger.secret.clone()))))
         .await
         .expect("client connects");
@@ -161,7 +166,6 @@ async fn a_key_for_one_tenant_cannot_be_used_as_another() {
     let result = with_timeout(client.call_tool(
         CallToolRequestParams::new("memory_remember").with_arguments(args(json!({
             "body": "a memory for a tenant this server has never heard of",
-            "subject": "user-42",
             "namespace": "agent"
         }))),
     ))
@@ -172,13 +176,13 @@ async fn a_key_for_one_tenant_cannot_be_used_as_another() {
     served.ct.cancel();
 }
 
-/// Task 5 left this gap on the record: `ScopeSource::Http` had never been
+/// Task 5 left this gap on the record: `ApiKeyScope` had never been
 /// driven through a real transport, so "can a caller read another tenant's
 /// audit trail by naming it in a resource URI" had never actually been
 /// tried against the path that matters — over HTTP, where the tenant comes
 /// from the authenticated key, not from server config. `read_resource`
 /// resolves subject/namespace from the URI but takes the tenant from
-/// `ScopeSource::resolve` (the key), then refuses when the URI's tenant
+/// the resolver (the key), then refuses when the URI's tenant
 /// segment disagrees. This is the refusal half; the next test is the
 /// success half, so this cannot pass merely because every read errors.
 #[tokio::test]
@@ -223,7 +227,6 @@ async fn a_client_can_read_its_own_tenants_resource_over_http() {
     with_timeout(client.call_tool(
         CallToolRequestParams::new("memory_remember").with_arguments(args(json!({
             "body": "a memory read back through the resource, not the tool",
-            "subject": "user-42",
             "namespace": "agent"
         }))),
     ))
@@ -245,6 +248,31 @@ async fn a_client_can_read_its_own_tenants_resource_over_http() {
         "the remembered item's audit row must be visible to its own tenant: {value}"
     );
 
+    with_timeout(client.cancel()).await.unwrap();
+    served.ct.cancel();
+}
+
+#[tokio::test]
+async fn a_call_naming_no_scope_at_all_succeeds_over_http_exactly_as_it_does_over_stdio() {
+    // The defect this design closes: `memory_remember{text}` used to work
+    // over stdio and fail with `'subject' is required over HTTP`. The agent
+    // had no way to tell which transport it was on, so the same prompt could
+    // not work against both a local and a hosted server.
+    let served = serve().await;
+    let client = with_timeout(().serve(transport(served.address, Some(served.secret.clone()))))
+        .await
+        .expect("client connects");
+
+    let result = with_timeout(
+        client.call_tool(
+            CallToolRequestParams::new("memory_remember")
+                .with_arguments(args(json!({ "body": "the API is versioned" }))),
+        ),
+    )
+    .await
+    .expect("a call naming no scope must succeed over HTTP");
+
+    assert!(!result.is_error.unwrap_or(false), "{result:?}");
     with_timeout(client.cancel()).await.unwrap();
     served.ct.cancel();
 }

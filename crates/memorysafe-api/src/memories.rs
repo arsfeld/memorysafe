@@ -12,6 +12,7 @@ use crate::query::ValidatedQuery;
 use crate::scope::ScopeParams;
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use memorysafe_backend::Page;
 use memorysafe_core::{
     ItemId, MemoryItem, RecallBudget, RecallMode, RecallRequest, SensitivityLevel, Source,
@@ -57,9 +58,10 @@ pub struct RememberBody {
 pub async fn remember(
     State(state): State<AppState>,
     auth: Auth,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<RememberBody>,
 ) -> Result<Json<WriteOutcome>, ApiError> {
-    let scope = body.scope.resolve(&auth)?;
+    let scope = body.scope.resolve(&state.resolver, &headers)?;
     let mut req = RememberRequest::new(scope, &body.body);
     req.actor = auth.actor();
     if let Some(kind) = body.kind {
@@ -99,11 +101,11 @@ pub struct RecallBody {
 
 pub async fn recall(
     State(state): State<AppState>,
-    auth: Auth,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<RecallBody>,
 ) -> Result<Json<WorkingSet>, ApiError> {
     let req = RecallRequest {
-        scope: body.scope.resolve(&auth)?,
+        scope: body.scope.resolve(&state.resolver, &headers)?,
         query: body.query,
         tags_any: body.tags_any,
         kinds: body.kinds,
@@ -127,14 +129,10 @@ pub async fn recall(
     Ok(Json(state.engine.recall(req).await?))
 }
 
-/// Query strings are deserialized by `serde_urlencoded`, which does not support
-/// `#[serde(flatten)]` — flattening buffers every value as a string and the
-/// numeric fields then fail to deserialize. Query structs therefore spell out
-/// `subject` and `namespace`; only JSON bodies flatten `ScopeParams`.
 #[derive(Debug, Deserialize)]
 pub struct ReviewQuery {
-    pub subject: String,
-    pub namespace: String,
+    #[serde(flatten)]
+    pub scope: ScopeParams,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
@@ -148,10 +146,10 @@ pub struct ReviewResponse {
 
 pub async fn review(
     State(state): State<AppState>,
-    auth: Auth,
+    headers: HeaderMap,
     ValidatedQuery(query): ValidatedQuery<ReviewQuery>,
 ) -> Result<Json<ReviewResponse>, ApiError> {
-    let scope = crate::scope::resolve(&auth, &query.subject, &query.namespace)?;
+    let scope = query.scope.resolve(&state.resolver, &headers)?;
     let default_page = Page::default();
     let page = Page {
         offset: query.offset.unwrap_or(default_page.offset),
@@ -177,11 +175,11 @@ pub async fn review(
 
 pub async fn get_one(
     State(state): State<AppState>,
-    auth: Auth,
     Path(id): Path<String>,
+    headers: HeaderMap,
     ValidatedQuery(scope): ValidatedQuery<ScopeParams>,
 ) -> Result<Json<MemoryItem>, ApiError> {
-    let scope = scope.resolve(&auth)?;
+    let scope = scope.resolve(&state.resolver, &headers)?;
     let id = item_id(&id)?;
     state
         .engine
@@ -193,11 +191,11 @@ pub async fn get_one(
 
 pub async fn delete_one(
     State(state): State<AppState>,
-    auth: Auth,
     Path(id): Path<String>,
+    headers: HeaderMap,
     ValidatedQuery(scope): ValidatedQuery<ScopeParams>,
 ) -> Result<Json<ForgetOutcome>, ApiError> {
-    let scope = scope.resolve(&auth)?;
+    let scope = scope.resolve(&state.resolver, &headers)?;
     let id = item_id(&id)?;
     Ok(Json(
         state
@@ -218,10 +216,10 @@ pub struct ForgetBody {
 
 pub async fn forget(
     State(state): State<AppState>,
-    auth: Auth,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<ForgetBody>,
 ) -> Result<Json<ForgetOutcome>, ApiError> {
-    let scope = body.scope.resolve(&auth)?;
+    let scope = body.scope.resolve(&state.resolver, &headers)?;
 
     let given = [body.ids.is_some(), body.tag.is_some(), body.kind.is_some()]
         .into_iter()
@@ -253,11 +251,11 @@ pub struct ProtectBody {
 
 pub async fn protect(
     State(state): State<AppState>,
-    auth: Auth,
     Path(id): Path<String>,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<ProtectBody>,
 ) -> Result<Json<WriteOutcome>, ApiError> {
-    let scope = body.scope.resolve(&auth)?;
+    let scope = body.scope.resolve(&state.resolver, &headers)?;
     let id = item_id(&id)?;
     // The five-branch decision table lives in `memorysafe_core::parse_protection`,
     // not here — see `ApiError`'s `From<ProtectionParseError>` impl for why.

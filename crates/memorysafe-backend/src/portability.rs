@@ -23,6 +23,22 @@ pub struct ScopeSelector {
     pub include_audit: bool,
 }
 
+impl ScopeSelector {
+    pub fn for_subject(tenant: TenantId, subject: SubjectId) -> Self {
+        Self {
+            tenant,
+            subject: Some(subject),
+            namespace: None,
+            include_audit: false,
+        }
+    }
+
+    pub fn in_namespace(mut self, namespace: Namespace) -> Self {
+        self.namespace = Some(namespace);
+        self
+    }
+}
+
 /// One line of the export stream. Newline-delimited JSON.
 ///
 /// Tagged `"record"`: every line names its record type under that key
