@@ -4,15 +4,13 @@ use axum::http::StatusCode;
 use serde_json::json;
 use support::{delete, get, harness, post, send};
 
-async fn remember(h: &support::Harness, subject: &str, body: &str) -> serde_json::Value {
+async fn remember(h: &support::Harness, body: &str) -> serde_json::Value {
     let reply = send(
         &h.app,
         post(
             "/v1/memories",
             Some(&h.key),
-            json!({
-                "subject": subject, "namespace": "agent", "body": body
-            }),
+            json!({ "namespace": "agent", "body": body }),
         ),
     )
     .await;
@@ -23,13 +21,9 @@ async fn remember(h: &support::Harness, subject: &str, body: &str) -> serde_json
 #[tokio::test]
 async fn the_audit_route_returns_decisions_and_never_bodies() {
     let h = harness();
-    remember(&h, "user-42", "a body that must not appear in the trail").await;
+    remember(&h, "a body that must not appear in the trail").await;
 
-    let reply = send(
-        &h.app,
-        get("/v1/audit?subject=user-42&namespace=agent", Some(&h.key)),
-    )
-    .await;
+    let reply = send(&h.app, get("/v1/audit?namespace=agent", Some(&h.key))).await;
     assert_eq!(reply.status, StatusCode::OK);
     let records = reply.body["records"].as_array().unwrap();
     assert_eq!(records.len(), 1);
@@ -45,20 +39,12 @@ async fn the_audit_route_returns_decisions_and_never_bodies() {
 async fn the_audit_route_says_when_it_truncated() {
     let h = harness();
     for i in 0..5 {
-        remember(
-            &h,
-            "user-42",
-            &format!("distinct memory {i} about topic {i}"),
-        )
-        .await;
+        remember(&h, &format!("distinct memory {i} about topic {i}")).await;
     }
 
     let capped = send(
         &h.app,
-        get(
-            "/v1/audit?subject=user-42&namespace=agent&limit=2",
-            Some(&h.key),
-        ),
+        get("/v1/audit?namespace=agent&limit=2", Some(&h.key)),
     )
     .await;
     assert_eq!(capped.body["records"].as_array().unwrap().len(), 2);
@@ -70,10 +56,7 @@ async fn the_audit_route_says_when_it_truncated() {
 
     let whole = send(
         &h.app,
-        get(
-            "/v1/audit?subject=user-42&namespace=agent&limit=100",
-            Some(&h.key),
-        ),
+        get("/v1/audit?namespace=agent&limit=100", Some(&h.key)),
     )
     .await;
     assert_eq!(whole.body["truncated"], json!(false));
@@ -82,25 +65,19 @@ async fn the_audit_route_says_when_it_truncated() {
 #[tokio::test]
 async fn the_audit_route_filters_by_event() {
     let h = harness();
-    let id = remember(&h, "user-42", "a memory that will be deleted").await["item_id"]
+    let id = remember(&h, "a memory that will be deleted").await["item_id"]
         .as_str()
         .unwrap()
         .to_owned();
     send(
         &h.app,
-        delete(
-            &format!("/v1/memories/{id}?subject=user-42&namespace=agent"),
-            Some(&h.key),
-        ),
+        delete(&format!("/v1/memories/{id}?namespace=agent"), Some(&h.key)),
     )
     .await;
 
     let reply = send(
         &h.app,
-        get(
-            "/v1/audit?subject=user-42&namespace=agent&event=forgotten",
-            Some(&h.key),
-        ),
+        get("/v1/audit?namespace=agent&event=forgotten", Some(&h.key)),
     )
     .await;
     let records = reply.body["records"].as_array().unwrap();
@@ -110,7 +87,7 @@ async fn the_audit_route_filters_by_event() {
     let several = send(
         &h.app,
         get(
-            "/v1/audit?subject=user-42&namespace=agent&event=admitted,forgotten",
+            "/v1/audit?namespace=agent&event=admitted,forgotten",
             Some(&h.key),
         ),
     )
@@ -123,10 +100,7 @@ async fn the_audit_route_filters_by_event() {
 
     let nonsense = send(
         &h.app,
-        get(
-            "/v1/audit?subject=user-42&namespace=agent&event=exploded",
-            Some(&h.key),
-        ),
+        get("/v1/audit?namespace=agent&event=exploded", Some(&h.key)),
     )
     .await;
     assert_eq!(nonsense.status, StatusCode::BAD_REQUEST);
@@ -136,12 +110,7 @@ async fn the_audit_route_filters_by_event() {
 async fn maintenance_reports_what_it_scanned_and_can_be_resumed() {
     let h = harness();
     for i in 0..3 {
-        remember(
-            &h,
-            "user-42",
-            &format!("healthy memory {i} about topic {i}"),
-        )
-        .await;
+        remember(&h, &format!("healthy memory {i} about topic {i}")).await;
     }
 
     let reply = send(
@@ -149,7 +118,7 @@ async fn maintenance_reports_what_it_scanned_and_can_be_resumed() {
         post(
             "/v1/maintain",
             Some(&h.key),
-            json!({ "subject": "user-42", "namespace": "agent" }),
+            json!({ "namespace": "agent" }),
         ),
     )
     .await;
@@ -181,7 +150,7 @@ async fn maintenance_reports_what_it_scanned_and_can_be_resumed() {
         post(
             "/v1/maintain",
             Some(&h.key),
-            json!({ "subject": "user-42", "namespace": "agent", "cursor": 3 }),
+            json!({ "namespace": "agent", "cursor": 3 }),
         ),
     )
     .await;
@@ -197,9 +166,9 @@ async fn maintenance_reports_what_it_scanned_and_can_be_resumed() {
 #[tokio::test]
 async fn export_returns_ndjson_and_records_who_asked() {
     let h = harness();
-    remember(&h, "user-42", "the thing to export").await;
+    remember(&h, "the thing to export").await;
 
-    let reply = send(&h.app, get("/v1/export", Some(&h.key))).await;
+    let reply = send(&h.app, get("/v1/export?namespace=agent", Some(&h.key))).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(reply.text.contains("the thing to export"));
     assert!(
@@ -207,11 +176,7 @@ async fn export_returns_ndjson_and_records_who_asked() {
         "a header line and an item line"
     );
 
-    let admin = send(
-        &h.app,
-        get("/v1/audit?subject=_admin&namespace=_admin", Some(&h.key)),
-    )
-    .await;
+    let admin = send(&h.app, get("/v1/audit?namespace=_admin", Some(&h.key))).await;
     assert_eq!(
         admin.status,
         StatusCode::FORBIDDEN,
@@ -237,9 +202,13 @@ async fn export_returns_ndjson_and_records_who_asked() {
 #[tokio::test]
 async fn export_can_render_markdown_for_a_person_to_read() {
     let h = harness();
-    remember(&h, "user-42", "the on-call rotation starts Monday").await;
+    remember(&h, "the on-call rotation starts Monday").await;
 
-    let reply = send(&h.app, get("/v1/export?format=markdown", Some(&h.key))).await;
+    let reply = send(
+        &h.app,
+        get("/v1/export?namespace=agent&format=markdown", Some(&h.key)),
+    )
+    .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(reply.text.contains("# MemorySafe export"));
     assert!(reply.text.contains("the on-call rotation starts Monday"));
@@ -271,34 +240,18 @@ async fn export_can_render_markdown_for_a_person_to_read() {
     assert_eq!(rows[0].actor.kind, memorysafe_core::ActorKind::ApiKey);
 }
 
-/// Fix round 1, Important 5: `ExportQuery::subject` was threaded into
-/// `ScopeSelector` with no test ever setting it — a handler that silently
-/// dropped the query parameter (`subject: None` unconditionally) would have
-/// passed every other test in this file, on the one route that can hand a
-/// caller an entire tenant's corpus at once.
+/// Export is scoped to the credential's subject.
 #[tokio::test]
-async fn export_narrows_to_the_requested_subject_and_excludes_others() {
+async fn export_takes_its_subject_from_the_credential() {
     let h = harness();
-    remember(
-        &h,
-        "alpha",
-        "alpha's private memory, narrowed exports must include this",
-    )
-    .await;
-    remember(
-        &h,
-        "bravo",
-        "bravo's private memory, a narrowed export must never include this",
-    )
-    .await;
+    remember(&h, "the credential subject owns this export").await;
 
-    let reply = send(&h.app, get("/v1/export?subject=alpha", Some(&h.key))).await;
+    let reply = send(&h.app, get("/v1/export?namespace=agent", Some(&h.key))).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
-    assert!(reply.text.contains("alpha's private memory"));
     assert!(
-        !reply.text.contains("bravo's private memory"),
-        "narrowing to subject=alpha still leaked bravo's item: {}",
-        reply.text
+        reply
+            .text
+            .contains("the credential subject owns this export")
     );
 }
 
@@ -312,12 +265,11 @@ async fn export_omits_audit_records_unless_include_audit_is_requested() {
     let h = harness();
     remember(
         &h,
-        "user-42",
         "a memory whose own audit trail must not leak by default",
     )
     .await;
 
-    let default_export = send(&h.app, get("/v1/export", Some(&h.key))).await;
+    let default_export = send(&h.app, get("/v1/export?namespace=agent", Some(&h.key))).await;
     assert_eq!(
         default_export.status,
         StatusCode::OK,
@@ -330,7 +282,14 @@ async fn export_omits_audit_records_unless_include_audit_is_requested() {
         default_export.text
     );
 
-    let with_audit = send(&h.app, get("/v1/export?include_audit=true", Some(&h.key))).await;
+    let with_audit = send(
+        &h.app,
+        get(
+            "/v1/export?namespace=agent&include_audit=true",
+            Some(&h.key),
+        ),
+    )
+    .await;
     assert_eq!(with_audit.status, StatusCode::OK, "{}", with_audit.text);
     assert!(
         with_audit.text.contains("\"record\":\"audit\""),
@@ -344,11 +303,14 @@ async fn export_omits_audit_records_unless_include_audit_is_requested() {
 async fn an_export_round_trips_through_import() {
     let source = harness();
     for body in ["first exported memory", "second exported memory"] {
-        remember(&source, "user-42", body).await;
+        remember(&source, body).await;
     }
-    let ndjson = send(&source.app, get("/v1/export", Some(&source.key)))
-        .await
-        .text;
+    let ndjson = send(
+        &source.app,
+        get("/v1/export?namespace=agent", Some(&source.key)),
+    )
+    .await
+    .text;
 
     let target = harness();
     let request = axum::http::Request::builder()
@@ -365,10 +327,7 @@ async fn an_export_round_trips_through_import() {
 
     let listed = send(
         &target.app,
-        get(
-            "/v1/memories?subject=user-42&namespace=agent",
-            Some(&target.key),
-        ),
+        get("/v1/memories?namespace=agent", Some(&target.key)),
     )
     .await;
     assert_eq!(listed.body["items"].as_array().unwrap().len(), 2);
@@ -404,27 +363,17 @@ async fn an_oversized_import_is_a_json_problem_not_a_plain_text_413() {
 }
 
 #[tokio::test]
-async fn purging_a_subject_removes_only_that_subject() {
+async fn purging_the_credential_subject_removes_its_memories() {
     let h = harness();
-    remember(&h, "doomed", "a memory belonging to the doomed subject").await;
-    remember(&h, "keeper", "a memory belonging to someone else").await;
+    remember(&h, "a memory belonging to the credential subject").await;
+    remember(&h, "another memory belonging to the credential subject").await;
 
-    let reply = send(&h.app, delete("/v1/subjects/doomed", Some(&h.key))).await;
+    let reply = send(&h.app, delete("/v1/subjects/user-42", Some(&h.key))).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
-    assert_eq!(reply.body["items_removed"], json!(1));
+    assert_eq!(reply.body["items_removed"], json!(2));
 
-    let gone = send(
-        &h.app,
-        get("/v1/memories?subject=doomed&namespace=agent", Some(&h.key)),
-    )
-    .await;
+    let gone = send(&h.app, get("/v1/memories?namespace=agent", Some(&h.key))).await;
     assert_eq!(gone.body["items"].as_array().unwrap().len(), 0);
-    let kept = send(
-        &h.app,
-        get("/v1/memories?subject=keeper&namespace=agent", Some(&h.key)),
-    )
-    .await;
-    assert_eq!(kept.body["items"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -441,21 +390,9 @@ async fn the_reserved_subject_cannot_be_purged() {
 /// `Authenticated::scope` to route through, which `export` and
 /// `purge_subject` both are.
 #[tokio::test]
-async fn the_purged_reserved_word_cannot_be_named_as_an_export_subject_or_namespace() {
+async fn the_purged_reserved_word_cannot_be_named_as_an_export_namespace() {
     let h = harness();
-    let by_subject = send(&h.app, get("/v1/export?subject=_purged", Some(&h.key))).await;
-    assert_eq!(
-        by_subject.status,
-        StatusCode::FORBIDDEN,
-        "{}",
-        by_subject.text
-    );
-
-    let by_namespace = send(
-        &h.app,
-        get("/v1/export?subject=user-42&namespace=_purged", Some(&h.key)),
-    )
-    .await;
+    let by_namespace = send(&h.app, get("/v1/export?namespace=_purged", Some(&h.key))).await;
     assert_eq!(
         by_namespace.status,
         StatusCode::FORBIDDEN,
@@ -485,15 +422,15 @@ async fn the_purged_reserved_word_cannot_be_purged_either() {
 #[tokio::test]
 async fn purge_is_audited_with_the_actor_who_asked_for_it() {
     let h = harness();
-    remember(&h, "doomed", "a memory belonging to the doomed subject").await;
+    remember(&h, "a memory belonging to the credential subject").await;
 
-    let reply = send(&h.app, delete("/v1/subjects/doomed", Some(&h.key))).await;
+    let reply = send(&h.app, delete("/v1/subjects/user-42", Some(&h.key))).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
 
     let rows = h
         .engine
         .audit(
-            &memorysafe_core::Scope::new("acme", "doomed", "agent").unwrap(),
+            &memorysafe_core::Scope::new("acme", "user-42", "agent").unwrap(),
             &memorysafe_core::AuditFilter {
                 events: vec![memorysafe_core::AuditEvent::SubjectPurged],
                 ..Default::default()
@@ -527,11 +464,15 @@ async fn export_and_purge_never_cross_a_tenant_boundary() {
             std::sync::Arc::new(memorysafe_policy::BaselinePolicy::default()),
         ),
     ));
-    let acme =
-        memorysafe_auth::generate(memorysafe_core::TenantId::new("acme").unwrap(), "acme-key")
-            .unwrap();
+    let acme = memorysafe_auth::generate(
+        memorysafe_core::TenantId::new("acme").unwrap(),
+        memorysafe_core::SubjectId::new("shared-subject-name").unwrap(),
+        "acme-key",
+    )
+    .unwrap();
     let globex = memorysafe_auth::generate(
         memorysafe_core::TenantId::new("globex").unwrap(),
+        memorysafe_core::SubjectId::new("shared-subject-name").unwrap(),
         "globex-key",
     )
     .unwrap();
@@ -541,7 +482,7 @@ async fn export_and_purge_never_cross_a_tenant_boundary() {
     ]));
     let app = memorysafe_api::router(memorysafe_api::AppState {
         engine: engine.clone(),
-        keys,
+        resolver: std::sync::Arc::new(memorysafe_auth::ApiKeyScope::new(keys)),
     });
 
     let write = send(
@@ -550,7 +491,6 @@ async fn export_and_purge_never_cross_a_tenant_boundary() {
             "/v1/memories",
             Some(&acme.secret),
             json!({
-                "subject": "shared-subject-name",
                 "namespace": "agent",
                 "body": "acme's private memory, not globex's to read or erase"
             }),
@@ -586,10 +526,7 @@ async fn export_and_purge_never_cross_a_tenant_boundary() {
 
     let still_there = send(
         &app,
-        get(
-            "/v1/memories?subject=shared-subject-name&namespace=agent",
-            Some(&acme.secret),
-        ),
+        get("/v1/memories?namespace=agent", Some(&acme.secret)),
     )
     .await;
     assert_eq!(

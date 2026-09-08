@@ -16,13 +16,11 @@ use crate::scope::ScopeParams;
 use crate::text::ValidatedText;
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::header;
+use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use memorysafe_auth::check_reserved;
 use memorysafe_backend::{ImportReport, ScopeSelector};
-use memorysafe_core::{
-    AuditEvent, AuditFilter, AuditId, AuditRecord, ItemId, Namespace, SubjectId,
-};
+use memorysafe_core::{AuditEvent, AuditFilter, AuditId, AuditRecord, ItemId, SubjectId};
 use memorysafe_engine::{MaintainCursor, MaintainReport, PurgeOutcome};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -42,8 +40,8 @@ fn timestamp(seconds: Option<i64>, field: &str) -> Result<Option<OffsetDateTime>
 /// is a 400 rather than a silently empty filter.
 #[derive(Debug, Deserialize)]
 pub struct AuditQuery {
-    pub subject: String,
-    pub namespace: String,
+    #[serde(flatten)]
+    pub scope: ScopeParams,
     pub event: Option<String>,
     pub item: Option<String>,
     pub since: Option<i64>,
@@ -62,10 +60,10 @@ pub struct AuditResponse {
 
 pub async fn audit(
     State(state): State<AppState>,
-    auth: Auth,
+    headers: HeaderMap,
     ValidatedQuery(query): ValidatedQuery<AuditQuery>,
 ) -> Result<Json<AuditResponse>, ApiError> {
-    let scope = crate::scope::resolve(&auth, &query.subject, &query.namespace)?;
+    let scope = query.scope.resolve(&state.resolver, &headers)?;
 
     let events = query
         .event
@@ -124,17 +122,16 @@ pub struct MaintainBody {
 
 pub async fn maintain(
     State(state): State<AppState>,
-    auth: Auth,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<MaintainBody>,
 ) -> Result<Json<MaintainReport>, ApiError> {
-    let scope = body.scope.resolve(&auth)?;
+    let scope = body.scope.resolve(&state.resolver, &headers)?;
     let cursor = body.cursor.map(|offset| MaintainCursor { offset });
     Ok(Json(state.engine.maintain(&scope, cursor).await?))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ExportQuery {
-    pub subject: Option<String>,
     pub namespace: Option<String>,
     #[serde(default)]
     pub include_audit: bool,
@@ -145,24 +142,17 @@ pub struct ExportQuery {
 pub async fn export(
     State(state): State<AppState>,
     auth: Auth,
+    headers: HeaderMap,
     ValidatedQuery(query): ValidatedQuery<ExportQuery>,
 ) -> Result<Response, ApiError> {
-    // `check_reserved`, not a hand-rolled comparison against
-    // `ADMIN_COMPONENT` alone (the brief's own inline check, and this
-    // route's original implementation): this route has no `Scope` and no
-    // `Authenticated::scope` call to route the check through — export spans
-    // an optional subject/namespace, not a single scope — which is exactly
-    // the adapter shape `check_reserved`'s own doc says it is a free
-    // function for. It also covers `PURGED_COMPONENT` (`_purged`), which the
-    // inline check it replaces did not (fix round 1, Important 2).
-    check_reserved(query.subject.as_deref(), query.namespace.as_deref())?;
-    // The tenant comes from the credential alone — nothing in `ExportQuery`
-    // can name one, so an export cannot reach outside the caller's own
-    // tenant no matter what subject or namespace it asks for.
+    let scope = ScopeParams {
+        namespace: query.namespace,
+    }
+    .resolve(&state.resolver, &headers)?;
     let selector = ScopeSelector {
-        tenant: auth.tenant().clone(),
-        subject: query.subject.as_deref().map(SubjectId::new).transpose()?,
-        namespace: query.namespace.as_deref().map(Namespace::new).transpose()?,
+        tenant: scope.tenant,
+        subject: Some(scope.subject),
+        namespace: Some(scope.namespace),
         include_audit: query.include_audit,
     };
 

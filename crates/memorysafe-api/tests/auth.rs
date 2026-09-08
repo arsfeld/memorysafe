@@ -1,8 +1,8 @@
 mod support;
 
 use axum::http::StatusCode;
-use memorysafe_auth::{ApiKeyStore, generate};
-use memorysafe_core::TenantId;
+use memorysafe_auth::{ApiKeyScope, ApiKeyStore, generate};
+use memorysafe_core::{SubjectId, TenantId};
 use serde_json::json;
 use support::{get, harness, post, send};
 
@@ -15,11 +15,12 @@ async fn health_needs_no_credential() {
 }
 
 #[tokio::test]
-async fn whoami_names_the_tenant_the_key_belongs_to() {
+async fn whoami_names_the_tenant_and_subject_the_key_belongs_to() {
     let h = harness();
     let reply = send(&h.app, get("/v1/whoami", Some(&h.key))).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
     assert_eq!(reply.body["tenant"], "acme");
+    assert_eq!(reply.body["subject"], "user-42");
     assert!(reply.body["key_id"].is_string());
     assert!(
         !reply.text.contains(&h.key),
@@ -121,7 +122,12 @@ async fn an_unknown_key_is_401_not_403() {
     // 403 would tell the caller the key is real. 401 says "identify yourself",
     // which is the truth and leaks nothing.
     let h = harness();
-    let stranger = generate(TenantId::new("acme").unwrap(), "not in this store").unwrap();
+    let stranger = generate(
+        TenantId::new("acme").unwrap(),
+        SubjectId::new("someone-else").unwrap(),
+        "not in this store",
+    )
+    .unwrap();
     let reply = send(&h.app, get("/v1/whoami", Some(&stranger.secret))).await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
 }
@@ -136,12 +142,19 @@ async fn a_disabled_key_is_403_because_the_caller_is_known() {
             std::sync::Arc::new(memorysafe_policy::BaselinePolicy::default()),
         ),
     ));
-    let g = generate(TenantId::new("acme").unwrap(), "revoked").unwrap();
+    let g = generate(
+        TenantId::new("acme").unwrap(),
+        SubjectId::new("revoked").unwrap(),
+        "revoked",
+    )
+    .unwrap();
     let mut record = g.record;
     record.disabled = true;
     let app = memorysafe_api::router(memorysafe_api::AppState {
         engine,
-        keys: std::sync::Arc::new(ApiKeyStore::new(vec![record])),
+        resolver: std::sync::Arc::new(ApiKeyScope::new(std::sync::Arc::new(ApiKeyStore::new(
+            vec![record],
+        )))),
     });
 
     let reply = send(&app, get("/v1/whoami", Some(&g.secret))).await;

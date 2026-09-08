@@ -1,28 +1,23 @@
-use crate::auth::Auth;
 use crate::error::ApiError;
+use axum::http::HeaderMap;
+use memorysafe_auth::{ApiKeyScope, ScopeResolver};
 use memorysafe_core::Scope;
 use serde::Deserialize;
 
-/// Subject and namespace, always both, never defaulted. Appears as query
-/// parameters on reads and as flattened body fields on writes.
-#[derive(Debug, Clone, Deserialize)]
+/// The namespace, and only the namespace. Tenant and subject come from the
+/// credential — see `memorysafe_auth::resolver`'s module documentation for
+/// the contract this mirrors.
+///
+/// Appears as a query parameter on reads and as a flattened body field on
+/// writes. Optional in both positions: a request that names no namespace
+/// falls back exactly as an MCP call does, so the two adapters agree.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ScopeParams {
-    pub subject: String,
-    pub namespace: String,
+    pub namespace: Option<String>,
 }
 
 impl ScopeParams {
-    /// The tenant comes from the credential; only subject and namespace come
-    /// from the request. A cross-tenant scope is unrepresentable here.
-    pub fn resolve(&self, auth: &Auth) -> Result<Scope, ApiError> {
-        resolve(auth, &self.subject, &self.namespace)
+    pub fn resolve(&self, resolver: &ApiKeyScope, headers: &HeaderMap) -> Result<Scope, ApiError> {
+        Ok(resolver.resolve(headers, self.namespace.as_deref())?.scope)
     }
-}
-
-/// The same rule for query strings, which cannot use `#[serde(flatten)]`:
-/// `serde_urlencoded` buffers flattened values as strings and every numeric
-/// field beside them then fails to deserialize. Query handlers spell the two
-/// fields out and call this.
-pub fn resolve(auth: &Auth, subject: &str, namespace: &str) -> Result<Scope, ApiError> {
-    Ok(auth.0.scope(subject, namespace)?)
 }

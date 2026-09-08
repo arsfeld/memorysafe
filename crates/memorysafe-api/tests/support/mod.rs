@@ -10,9 +10,9 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use memorysafe_api::{AppState, router};
-use memorysafe_auth::{ApiKeyStore, generate};
+use memorysafe_auth::{ApiKeyScope, ApiKeyStore, generate};
 use memorysafe_backend_sqlite::SqliteBackend;
-use memorysafe_core::TenantId;
+use memorysafe_core::{SubjectId, TenantId};
 use memorysafe_embed::DeterministicEmbedder;
 use memorysafe_engine::{Engine, EngineConfig};
 use memorysafe_policy::BaselinePolicy;
@@ -32,12 +32,17 @@ pub fn harness() -> Harness {
         Arc::new(DeterministicEmbedder::new(256)),
         Arc::new(BaselinePolicy::default()),
     )));
-    let g = generate(TenantId::new("acme").unwrap(), "tests").unwrap();
+    let g = generate(
+        TenantId::new("acme").unwrap(),
+        SubjectId::new("user-42").unwrap(),
+        "tests",
+    )
+    .unwrap();
     let key = g.secret.clone();
-    let keys = Arc::new(ApiKeyStore::new(vec![g.record]));
+    let resolver = Arc::new(ApiKeyScope::new(Arc::new(ApiKeyStore::new(vec![g.record]))));
     let app = router(AppState {
         engine: engine.clone(),
-        keys,
+        resolver,
     });
     Harness { app, key, engine }
 }

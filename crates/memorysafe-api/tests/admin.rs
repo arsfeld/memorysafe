@@ -10,7 +10,7 @@ async fn a_tenant_can_read_and_set_a_namespace_budget() {
     let before = send(
         &h.app,
         get(
-            "/v1/admin/tenants/acme/budgets?subject=user-42&namespace=agent",
+            "/v1/admin/tenants/acme/budgets?namespace=agent",
             Some(&h.key),
         ),
     )
@@ -23,9 +23,7 @@ async fn a_tenant_can_read_and_set_a_namespace_budget() {
         put(
             "/v1/admin/tenants/acme/budgets",
             Some(&h.key),
-            json!({
-                "subject": "user-42", "namespace": "agent", "max_items": 3
-            }),
+            json!({ "namespace": "agent", "max_items": 3 }),
         ),
     )
     .await;
@@ -35,7 +33,7 @@ async fn a_tenant_can_read_and_set_a_namespace_budget() {
     let after = send(
         &h.app,
         get(
-            "/v1/admin/tenants/acme/budgets?subject=user-42&namespace=agent",
+            "/v1/admin/tenants/acme/budgets?namespace=agent",
             Some(&h.key),
         ),
     )
@@ -52,9 +50,7 @@ async fn a_budget_actually_bounds_the_namespace() {
         put(
             "/v1/admin/tenants/acme/budgets",
             Some(&h.key),
-            json!({
-                "subject": "user-42", "namespace": "agent", "max_items": 2
-            }),
+            json!({ "namespace": "agent", "max_items": 2 }),
         ),
     )
     .await;
@@ -66,19 +62,14 @@ async fn a_budget_actually_bounds_the_namespace() {
                 "/v1/memories",
                 Some(&h.key),
                 json!({
-                    "subject": "user-42", "namespace": "agent",
-                    "body": format!("distinct memory {i} on topic {i}")
+                    "namespace": "agent", "body": format!("distinct memory {i} on topic {i}")
                 }),
             ),
         )
         .await;
     }
 
-    let listed = send(
-        &h.app,
-        get("/v1/memories?subject=user-42&namespace=agent", Some(&h.key)),
-    )
-    .await;
+    let listed = send(&h.app, get("/v1/memories?namespace=agent", Some(&h.key))).await;
     assert!(
         listed.body["items"].as_array().unwrap().len() <= 2,
         "the budget was exceeded: {}",
@@ -207,7 +198,7 @@ async fn a_key_cannot_administer_another_tenant() {
     for uri in [
         "/v1/admin/tenants/globex/policy",
         "/v1/admin/tenants/globex/retention",
-        "/v1/admin/tenants/globex/budgets?subject=user-42&namespace=agent",
+        "/v1/admin/tenants/globex/budgets?namespace=agent",
     ] {
         let reply = send(&h.app, get(uri, Some(&h.key))).await;
         assert_eq!(reply.status, StatusCode::FORBIDDEN, "{uri} was readable");

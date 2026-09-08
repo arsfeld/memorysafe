@@ -23,6 +23,7 @@ use crate::query::ValidatedQuery;
 use crate::scope::ScopeParams;
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use memorysafe_core::{Budget, CapacityState, TenantId};
 use memorysafe_engine::RetentionProfile;
 use memorysafe_policy::BaselineConfig;
@@ -58,16 +59,16 @@ pub async fn get_budget(
     State(state): State<AppState>,
     auth: Auth,
     Path(tenant): Path<String>,
+    headers: HeaderMap,
     ValidatedQuery(scope): ValidatedQuery<ScopeParams>,
 ) -> Result<Json<BudgetResponse>, ApiError> {
     same_tenant(&auth, &tenant)?;
-    let scope = scope.resolve(&auth)?;
+    let scope = scope.resolve(&state.resolver, &headers)?;
     Ok(Json(state.engine.capacity_state(&scope).await?.into()))
 }
 
 /// Budgets are per scope, not per tenant (a `Budget` bounds a namespace), so
-/// this carries `subject`/`namespace` even though the route lives under a
-/// tenant path.
+/// this carries a namespace even though the route lives under a tenant path.
 #[derive(Debug, Deserialize)]
 pub struct SetBudgetBody {
     #[serde(flatten)]
@@ -80,10 +81,11 @@ pub async fn put_budget(
     State(state): State<AppState>,
     auth: Auth,
     Path(tenant): Path<String>,
+    headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<SetBudgetBody>,
 ) -> Result<Json<BudgetResponse>, ApiError> {
     same_tenant(&auth, &tenant)?;
-    let scope = body.scope.resolve(&auth)?;
+    let scope = body.scope.resolve(&state.resolver, &headers)?;
     state
         .engine
         .set_budget(

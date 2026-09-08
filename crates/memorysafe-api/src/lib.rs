@@ -1,8 +1,8 @@
 //! The HTTP adapter: a thin axum mirror of the engine.
 //!
-//! Authentication is `Authorization: Bearer <api-key>`, one key to one tenant.
-//! Subject and namespace arrive per request and are validated against the key's
-//! tenant. A governance decision is never an HTTP error.
+//! Authentication is `Authorization: Bearer <api-key>`, one key to one tenant
+//! and subject. Namespace is the only per-request scope component. A
+//! governance decision is never an HTTP error.
 
 pub mod admin;
 pub mod auth;
@@ -25,7 +25,7 @@ use axum::Json;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use memorysafe_auth::ApiKeyStore;
+use memorysafe_auth::ApiKeyScope;
 use memorysafe_engine::Engine;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -33,7 +33,7 @@ use tower_http::trace::TraceLayer;
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<Engine>,
-    pub keys: Arc<ApiKeyStore>,
+    pub resolver: Arc<ApiKeyScope>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -113,12 +113,13 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
-/// Which tenant this credential is. A client holding a key it did not create
-/// otherwise has no way to find out, and this is also the smallest route that
-/// exercises authentication end to end.
+/// Which tenant and subject this credential identifies. A client holding a key
+/// it did not create otherwise has no way to find out, and this is also the
+/// smallest route that exercises authentication end to end.
 async fn whoami(auth: Auth) -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "tenant": auth.tenant().to_string(),
+        "tenant": auth.tenant().as_str(),
+        "subject": auth.subject().as_str(),
         "key_id": auth.0.key_id(),
     }))
 }
