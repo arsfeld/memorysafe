@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use memorysafe_auth::NAMESPACE_HEADER;
 use std::path::Path;
+use url::Url;
 
 const CONFIG_FILE: &str = ".mcp.json";
 const KEY_ENV: &str = "MEMORYSAFE_API_KEY";
@@ -31,10 +32,10 @@ pub struct InstallArgs {
     /// Emit a spec-portable entry using environment expansion instead of a
     /// `headersHelper`. The namespace is fixed at install time rather than
     /// following the working directory.
-    #[arg(long)]
+    #[arg(long, requires = "remote")]
     pub portable: bool,
     /// The hosted base URL. Only meaningful with `--remote`.
-    #[arg(long)]
+    #[arg(long, requires = "remote")]
     pub url: Option<String>,
 }
 
@@ -45,36 +46,54 @@ pub fn run(command: McpCommand) -> Result<()> {
     }
 }
 
-fn entry(args: &InstallArgs) -> serde_json::Value {
+fn entry(args: &InstallArgs) -> Result<serde_json::Value> {
     if !args.remote {
-        return serde_json::json!({
+        return Ok(serde_json::json!({
             "command": "msafe",
             "args": ["serve", "--transport", "stdio"]
-        });
+        }));
     }
 
-    let base = args.url.as_deref().unwrap_or(DEFAULT_URL);
+    let base = remote_base_url(args.url.as_deref().unwrap_or(DEFAULT_URL))?;
     if args.portable {
         // The namespace is baked now, because there is no helper to compute
         // it per connection. Same rule, evaluated once.
-        serde_json::json!({
+        Ok(serde_json::json!({
             "type": "http",
             "url": format!("{base}/mcp"),
             "headers": {
                 "Authorization": format!("Bearer ${{{KEY_ENV}}}"),
                 NAMESPACE_HEADER: namespace_from_cwd().as_str(),
             }
-        })
+        }))
     } else {
         // `${VAR:-default}` so a local hosted instance is one env var away,
         // and `headersHelper` so the namespace follows the directory the
         // client is actually working in.
-        serde_json::json!({
+        Ok(serde_json::json!({
             "type": "http",
             "url": format!("${{MEMORYSAFE_URL:-{base}}}/mcp"),
             "headersHelper": "msafe mcp headers"
-        })
+        }))
     }
+}
+
+fn remote_base_url(raw: &str) -> Result<String> {
+    let mut url = Url::parse(raw)
+        .with_context(|| format!("invalid hosted URL {raw:?}; expected an absolute HTTP(S) URL"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        bail!("invalid hosted URL {raw:?}; expected an absolute HTTP(S) URL");
+    }
+
+    // `--url` names a hosted base, but accepting an already-complete MCP
+    // endpoint avoids writing either `//mcp` or `/mcp/mcp`.
+    let path = url.path().trim_end_matches('/');
+    let path = path.strip_suffix("/mcp").unwrap_or(path).to_owned();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    url.set_query(None);
+    url.set_fragment(None);
+
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 fn install(args: InstallArgs, path: &Path) -> Result<()> {
@@ -94,7 +113,7 @@ fn install(args: InstallArgs, path: &Path) -> Result<()> {
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .context("`mcpServers` must be a JSON object")?
-        .insert("memorysafe".to_owned(), entry(&args));
+        .insert("memorysafe".to_owned(), entry(&args)?);
 
     let mut rendered = serde_json::to_string_pretty(&doc)?;
     rendered.push('\n');

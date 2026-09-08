@@ -66,6 +66,78 @@ fn install_remote_portable_uses_env_expansion_rather_than_a_helper() {
 }
 
 #[test]
+fn install_remote_rejects_an_invalid_url_without_writing_a_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = msafe(dir.path())
+        .args(["mcp", "install", "--remote", "--url", "not-a-url"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("URL"),
+        "{out:?}"
+    );
+    assert!(
+        !dir.path().join(".mcp.json").exists(),
+        "invalid input must not leave a committed config behind"
+    );
+}
+
+#[test]
+fn install_remote_portable_normalizes_the_mcp_path_once() {
+    for (base, expected) in [
+        (
+            "https://memorysafe.example/",
+            "https://memorysafe.example/mcp",
+        ),
+        (
+            "https://memorysafe.example/api/",
+            "https://memorysafe.example/api/mcp",
+        ),
+        (
+            "https://memorysafe.example/api/mcp/",
+            "https://memorysafe.example/api/mcp",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = msafe(dir.path())
+            .args(["mcp", "install", "--remote", "--portable", "--url", base])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{base}: {out:?}");
+
+        let written = std::fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
+        assert_eq!(
+            parsed["mcpServers"]["memorysafe"]["url"], expected,
+            "{base}"
+        );
+    }
+}
+
+#[test]
+fn install_requires_remote_for_remote_only_flags() {
+    for args in [
+        ["mcp", "install", "--portable"].as_slice(),
+        ["mcp", "install", "--url", "https://memorysafe.example"].as_slice(),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = msafe(dir.path()).args(args).output().unwrap();
+
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--remote"),
+            "{args:?}: {out:?}"
+        );
+        assert!(
+            !dir.path().join(".mcp.json").exists(),
+            "{args:?}: rejected flags must not write a config"
+        );
+    }
+}
+
+#[test]
 fn headers_emits_the_namespace_for_the_current_directory() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("checkout-service");
