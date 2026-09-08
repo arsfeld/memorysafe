@@ -53,6 +53,12 @@ enum Command {
         #[command(subcommand)]
         command: cmd::keys::KeysCommand,
     },
+    /// Write an MCP client entry, or emit the headers one should use.
+    #[command(subcommand_negates_reqs = true)]
+    Mcp {
+        #[command(subcommand)]
+        command: cmd::mcp::McpCommand,
+    },
     /// Run the MCP server (stdio) or the HTTP API plus MCP transport.
     Serve(cmd::serve::ServeArgs),
 }
@@ -68,7 +74,26 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let Cli {
+        config,
+        tenant,
+        subject,
+        namespace,
+        json,
+        command,
+    } = Cli::parse();
+    let command = match command {
+        Command::Mcp { command } => return cmd::mcp::run(command),
+        command => command,
+    };
+    let cli = Cli {
+        config,
+        tenant,
+        subject,
+        namespace,
+        json,
+        command,
+    };
     let config = MsafeConfig::load(cli.config.as_deref())?;
 
     tokio::runtime::Builder::new_multi_thread()
@@ -157,7 +182,9 @@ async fn run(cli: Cli, config: MsafeConfig) -> Result<()> {
         }
         Command::Export(args) => cmd::portable::export(&engine, scope, cli.json, args).await,
         Command::Import(args) => cmd::portable::import(&engine, scope, cli.json, args).await,
-        Command::Keys { .. } | Command::Serve(_) | Command::Shadow(_) => unreachable!(),
+        Command::Keys { .. } | Command::Mcp { .. } | Command::Serve(_) | Command::Shadow(_) => {
+            unreachable!()
+        }
     }
 }
 
